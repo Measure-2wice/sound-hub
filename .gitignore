@@ -1,0 +1,33 @@
+# Dependencies
+node_modules/
+
+# Environment files (keep templates in version control)
+.env
+.env.*
+!.env.example
+!**/.env.example
+
+# Build and framework output
+dist/
+.next/
+*.tsbuildinfo
+.turbo/
+
+# Test output
+coverage/
+
+# Local databases
+**/prisma/*.db
+**/prisma/*.db-journal
+
+# pnpm workspaces use the root lockfile; ignore accidental package-level lockfiles
+**/pnpm-lock.yaml
+!/pnpm-lock.yaml
+
+# Logs
+*.log
+pnpm-debug.log*
+
+# OS and local tool settings
+.DS_Store
+.claude/settings.local.json

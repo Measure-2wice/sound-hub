@@ -1,0 +1,64 @@
+// This is your Prisma schema file,
+// learn more about it in the docs: https://pris.ly/d/prisma-schema
+
+generator client {
+  provider = "prisma-client-js"
+  output   = "../dist/generated"
+}
+
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+enum Role {
+  Artist
+  Producer
+}
+
+model User {
+  id          String   @id @default(cuid())
+  email       String   @unique
+  displayName String
+  role        Role
+  createdAt   DateTime @default(now())
+  updatedAt   DateTime @updatedAt
+  isVerified  Boolean  @default(false)
+  avatarUrl   String?
+
+  // Relations
+  producerProfile ProducerProfile?
+
+  @@map("users")
+}
+
+model ProducerProfile {
+  id                   String      @id @default(cuid())
+  userId               String      @unique
+  rateAmountMinor      Int         // Store cents/pence
+  rateCurrency         String      @default("USD")
+  bio                  String
+  genreTags            String[]
+  vibeEmbeddingVector  Float[]     // PostgreSQL supports arrays
+
+  // Relations
+  user                 User        @relation(fields: [userId], references: [id], onDelete: Cascade)
+  musicTracks          MusicTrack[]
+
+  @@map("producer_profiles")
+}
+
+model MusicTrack {
+  id              String   @id @default(cuid())
+  producerId      String
+  title           String
+  s3Key           String
+  durationSeconds Int
+  createdAt       DateTime @default(now())
+  updatedAt       DateTime @updatedAt
+
+  // Relations
+  producer        ProducerProfile @relation(fields: [producerId], references: [id], onDelete: Cascade)
+
+  @@map("music_tracks")
+}
