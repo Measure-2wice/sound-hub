@@ -20,8 +20,14 @@ but face three painful realities:
 
 ## 2. The Solution
 
-> **MVP:** SoundHub is an AI-powered marketplace that helps businesses discover Caribbean
-> musicians, agree on project terms, and pay them securely in stablecoins through Polkadot.
+> **MVP:** SoundHub is an AI-assisted creative-services marketplace that helps people and
+> organizations discover Caribbean talent, agree on project terms, exchange private file
+> deliverables, and pay securely in stablecoins through Polkadot.
+
+The music MVP serves artists, producers, musicians, managers, executives, licensing houses,
+brands, and sync buyers. The domain model must also allow later expansion to videographers,
+editors, sound engineers, influencers, and other content creatives without replacing the
+account or marketplace-permission model.
 
 **The product flow:**
 
@@ -55,12 +61,14 @@ out of scope for Phase 1.
 
 ### Building for the Buildathon
 
-- AI artist discovery — Matchmaker Agent finds and ranks Caribbean artists by vibe
+- AI talent discovery — Matchmaker Agent finds and ranks Caribbean creative talent by vibe and service
 - AI-assisted negotiation — Negotiator Agent helps buyer and artist agree on scope, timeline, and price
-- Delivery monitoring — Delivery Monitor Agent supervises the deal and auto-releases funds on confirmation
-- Stablecoin payment via Polkadot escrow — payment is secured on-chain and released programmatically
+- Versioned mutual approval — buyer and seller separately approve the same immutable terms version
+- Delivery monitoring — Delivery Monitor Agent tracks uploaded deliverables, deadlines, and reminders
+- Stablecoin payment via Polkadot escrow — buyer explicitly funds escrow and explicitly releases payment after accepting delivery
 - Basic contributor attribution — every deal records who did what, with a timestamped audit log
 - Transaction proof — each deal has an on-chain transaction hash verifiable in real time
+- AI-assisted dispute intake — AI summarizes evidence and recommends options; unresolved disputes go to manual review
 
 ### Intentionally Not Building Yet
 
@@ -74,24 +82,82 @@ The following are future directions. They should not appear in the Buildathon de
 - DAO governance
 - Rewards or incentive programs
 - Advanced proof-of-contribution infrastructure beyond the deal audit log
+- AI-only financial authorization or final dispute adjudication
+- Timer-only automatic payment release
+
+### 3.1 Authoritative Product Rules
+
+These rules govern the MVP and override conflicting language elsewhere in this document.
+
+#### Participants and capabilities
+
+- Accounts are either `Individual` or `Organization` accounts.
+- Buying and selling are independent capabilities, not mutually exclusive user roles.
+- Artists, producers, and musicians may be both buyers and sellers and may purchase services from one another.
+- Managers, executives, licensing houses, brands, and agencies are buyer-only in the MVP.
+- Seller specialties describe discoverability and services; they do not grant authorization. Initial specialties include
+  `Artist`, `Producer`, `Musician`, `Songwriter`, and `SoundEngineer`.
+- Future specialties such as `Videographer`, `VideoEditor`, and `Influencer` must fit the same seller-profile model
+  without requiring a new account system.
+
+#### Identity and wallets
+
+- SoundHub account authentication uses an off-chain identity such as an email magic link or passkey.
+- A wallet is linked separately by signing a nonce that proves wallet ownership.
+- A seller may create and publish a profile without a wallet, but must connect a verified payout wallet before
+  approving an escrow-backed deal.
+- A buyer must connect a verified wallet before funding escrow.
+- Financial transactions require an explicit wallet confirmation; an authenticated web session alone is insufficient.
+- Payment asset, fee asset, and network are separate fields. The MVP must not assume that DOT is always the fee asset.
+
+#### Agent authority and consent
+
+- Agents may search, rank, explain, draft terms, summarize, remind, identify missing evidence, and flag risk.
+- Agents may not approve terms, fund escrow, accept delivery, release or refund funds, cancel a deal, or make a
+  binding dispute decision without explicit authorized user action.
+- Buyer and seller approve the same immutable terms version independently. Any material edit creates a new
+  version and invalidates prior approvals.
+- Deal-state transitions and payment authorization are enforced by deterministic application services, not LLM output.
+
+#### Escrow, delivery, and revisions
+
+- The first end-to-end implementation uses a clearly labeled `MockEscrowProvider` behind the same interface planned
+  for `PolkadotEscrowProvider`. Real escrow is integrated only after the lifecycle and authorization rules are tested.
+- Stablecoin is the escrowed payment asset. Network-fee behavior is resolved from the selected network and wallet
+  integration at transaction time.
+- Delivery is a private file upload. Clients upload directly to object storage using short-lived presigned URLs;
+  the API stores delivery versions, file metadata, checksums, and scan status.
+- The default deal includes one revision. Negotiated terms may set zero, one, or two included revisions.
+- A revision request must be within the agreed scope. Additional revisions require a change order, added payment,
+  or mutual waiver.
+- The buyer explicitly accepts delivery to release funds. Timer-only auto-release is outside the MVP.
+
+#### Disputes
+
+- Opening a dispute freezes the deal and escrow state.
+- AI assembles the terms, messages, delivery versions, timestamps, and party statements into an evidence summary
+  and non-binding recommendation.
+- If both parties accept the recommendation, the agreed resolution may be executed explicitly.
+- Otherwise an authorized human administrator decides the outcome. Every recommendation, approval, decision,
+  and financial action is appended to the audit log.
 
 ---
 
 ## 4. What Already Exists (Do Not Rebuild)
 
-### Soundhub (`/Users/cmatteis/soundhub`)
+### SoundHub (`/Users/calebmatteis/sound-hub`)
 | What exists | File location | Status |
 |---|---|---|
-| Next.js 15 frontend | `apps/web/` | Running |
-| Express API backend | `apps/api/` | Running |
-| PostgreSQL + Prisma schema | `packages/db/` | Running |
-| Shared TypeScript types | `packages/types/` | Running |
-| AI vibe search UI | `apps/web/src/app/components/SearchPage.tsx` | Functional (mock data) |
+| Next.js 15 frontend | `apps/web/` | Scaffolded; search request is not yet routed to Express |
+| Express API backend | `apps/api/` | Scaffolded; health and mock search routes only |
+| PostgreSQL + Prisma schema | `packages/db/` | Schema present; no migration or generated client committed |
+| Shared TypeScript types | `packages/types/` | Present; still models the older producer-only domain |
+| AI vibe search UI | `apps/web/src/app/components/SearchPage.tsx` | Implemented UI over mock API results |
 | RAG service scaffold | `apps/api/src/services/rag-service.ts` | Mocked — ready to wire |
 | OpenAI + Pinecone config | `apps/api/.env.example` | Env vars defined, not wired |
-| Docker Compose (Postgres + Redis) | `docker-compose.yml` | Running |
+| Docker Compose (Postgres + Redis) | `docker-compose.yml` | Defined; runtime health not established by repository state |
 
-### Polkaward (`/Users/cmatteis/m2-development/polkaward`)
+### Polkaward (external repository; status requires separate verification)
 | What exists | File location | Status |
 |---|---|---|
 | ink! smart contract on Polkadot | `src/lib.rs` | Deployed to Rococo testnet |
@@ -136,7 +202,7 @@ The following are future directions. They should not appear in the Buildathon de
   │  │  Semantic search│  │  Drafts terms   │  │  Watches       │  │
   │  │  Ranks matches  │  │  Handles Q&A    │  │  deadlines     │  │
   │  │  Explains fit   │  │  Flags risks    │  │  Escalates     │  │
-  │  │  Asks follow-up │  │  Confirms deal  │  │  disputes      │  │
+  │  │  Asks follow-up │  │  Drafts terms   │  │  summarizes    │  │
   │  └──────────┬──────┘  └──────────┬──────┘  └────────┬───────┘  │
   │             │                    │                   │          │
   │  ┌──────────▼────────────────────▼───────────────────▼───────┐  │
@@ -227,14 +293,15 @@ packages/agents/
 
 ### Why Google ADK
 
-SoundHub is fundamentally a multi-agent workflow, not a chatbot. Three autonomous agents must
-coordinate across a shared deal lifecycle, hand work to one another, and interact with both a
-database and a blockchain. Google ADK (TypeScript) is the orchestration framework because it
-provides first-class abstractions for exactly this shape of system:
+SoundHub uses agents for reasoning-heavy assistance inside a deterministic marketplace workflow.
+Agents coordinate discovery, negotiation support, reminders, and evidence summaries, while
+application services enforce permissions, deal transitions, approvals, and financial actions.
+Google ADK (TypeScript) is the planned orchestration framework because it provides first-class
+abstractions for this shape of system:
 
 | Need | ADK primitive |
 |---|---|
-| Autonomous agents with defined tools | `Agent` class with `tools` registry |
+| Bounded agents with defined tools | `Agent` class with `tools` registry |
 | Structured agent-to-agent handoffs | `AgentHandoff` / subagent invocation |
 | Shared workflow state across agents | `WorkflowSession` / session state |
 | Long-running workflows (delivery monitor) | Persistent workflow sessions |
@@ -313,7 +380,7 @@ On clear brief:
   {
     needsClarification: false,
     matches: [
-      { artistId, rank, score, explanation }  × 3
+      { sellerId, rank, score, explanation }  × 3
     ]
   }
 ```
@@ -346,21 +413,20 @@ produces a confirmed deal ready for escrow.
 - Respond to questions from either the buyer or the artist
 - Flag risk conditions — unusual rights requests, abnormally short deadlines, pricing outliers
 - Suggest fair alternatives when flagging a risk
-- Produce a structured deal summary when both parties agree
-- Invoke `CreateDealTool` and `LockEscrowTool` upon deal confirmation
+- Produce a proposed immutable terms version for separate buyer and seller approval
+- Invoke `CreateDealTool` to persist the draft; never approve or fund it on behalf of either party
 
 #### Tools Available
 | Tool | Purpose |
 |---|---|
 | `NegotiateTool` | Appends a message to the deal thread (buyer, artist, or agent) |
 | `CreateDealTool` | Writes a confirmed Deal record to the database |
-| `LockEscrowTool` | Calls `packages/blockchain` `escrow.lock()` — secures payment on-chain |
 | `NotifyTool` | Notifies buyer and artist when terms are drafted or updated |
 
 #### Workflow Inputs
 ```
 dealId?: string            — set after deal record exists; absent on first message
-artistId: string
+sellerId: string
 buyerBrief: string
 newMessage: string
 sender: "buyer" | "artist"
@@ -375,21 +441,23 @@ sessionId: string          — links to conversation memory
     risk: string
     suggestion: string
   }
-  dealConfirmed?: {
+  proposedTerms?: {
     dealId: string
+    termsVersion: number
     deliverables: string
     deadlineDays: number
-    paymentAmountMinor: bigint
+    revisionLimit: number
+    paymentAmountMinor: string
     paymentAsset: string
     specialTerms?: string
-    txHash: string          — populated after LockEscrowTool succeeds
   }
 }
 ```
 
 #### Handoff Condition
-When `dealConfirmed` is present in the output, the `deal-lifecycle` workflow transitions the
-deal status to `Funded` and activates the Delivery Monitor Agent.
+When `proposedTerms` is present, the workflow waits for buyer and seller approval of that exact
+terms version. Deterministic application services then transition to `AwaitingFunding`. The buyer
+must explicitly authorize the escrow transaction before the deal can become `Funded`.
 
 #### Memory Requirements
 - **Conversation memory:** Full negotiation thread (all messages: buyer, artist, agent)
@@ -407,8 +475,8 @@ deal status to `Funded` and activates the Delivery Monitor Agent.
 **Prompt:** `packages/agents/src/prompts/monitor.md`
 
 #### Purpose
-Autonomously supervise an active deal from escrow lock through to fund release. The agent
-runs on a schedule and on trigger events — it is never directly invoked by the buyer or artist.
+Assist with an active deal from escrow lock through delivery review. The agent runs on scheduled
+and domain events, but it cannot authorize state transitions or move funds.
 
 #### Responsibilities
 - Track deal deadline relative to current time
@@ -417,8 +485,9 @@ runs on a schedule and on trigger events — it is never directly invoked by the
 - If deadline passes without delivery: notify both parties and present options
   (extend, dispute, refund)
 - When artist marks delivery: prompt buyer to confirm
-- If buyer does not respond within 48 hours: auto-confirm and release funds
-- Escalate to human if a dispute is raised or an anomalous state is detected
+- If buyer does not respond: send reminders and route the deal to manual review; do not auto-release
+- If a dispute is raised: freeze the deal, summarize evidence, recommend non-binding options,
+  and escalate unresolved cases to an authorized human
 - Generate a post-deal summary for both parties on completion (deliverables, timeline, payment,
   blockchain proof link) — this constitutes the deal's contributor attribution record
 
@@ -427,9 +496,8 @@ runs on a schedule and on trigger events — it is never directly invoked by the
 |---|---|
 | `NotifyTool` | Sends notification to artist, buyer, or both |
 | `ScheduleReminderTool` | Creates or cancels time-based follow-up triggers |
-| `ReleaseEscrowTool` | Calls `packages/blockchain` `escrow.release()` |
-| `RefundEscrowTool` | Calls `packages/blockchain` `escrow.refund()` |
 | `EscalateDisputeTool` | Sets deal status to `Disputed`, flags for human review |
+| `SummarizeDisputeTool` | Builds a structured evidence summary and non-binding recommendation |
 
 #### Workflow Inputs
 The Delivery Monitor does not receive a message from a user. It receives a **workflow event**:
@@ -439,7 +507,7 @@ event: "reminder_50pct"
      | "deadline_passed"
      | "delivery_submitted"
      | "buyer_confirmed"
-     | "confirmation_timeout"
+     | "review_reminder"
      | "dispute_raised"
 dealId: string
 ```
@@ -447,23 +515,22 @@ dealId: string
 #### Workflow Outputs
 ```
 {
-  actionTaken: "reminded" | "released" | "refunded" | "escalated" | "no_action"
-  txHash?: string     — populated if escrow interaction occurred
+  actionTaken: "reminded" | "summarized" | "escalated" | "no_action"
   summary?: string    — post-deal summary text, populated on Completed or Disputed
 }
 ```
 
 #### Handoff Condition
-This agent terminates the `deal-lifecycle` workflow. When `actionTaken` is `released`,
-`refunded`, or `escalated`, the workflow sets final deal status and no further agent
-invocations occur.
+The agent returns advice or notifications to the workflow. Only an authorized user command,
+validated by the deterministic deal service, can accept delivery, release or refund escrow,
+or apply an agreed/manual dispute resolution.
 
 #### Memory Requirements
 - **Workflow state:** The full deal record (status, deadline, parties, payment amount,
   payment asset) is loaded from PostgreSQL at the start of each event — the agent does not
   reconstruct context from LLM memory.
-- **Audit log:** Every action taken (remind, release, escalate) is appended to `Deal.agentLog`
-  (JSON column) for legal traceability and contributor attribution.
+- **Audit log:** Every action taken (remind, summarize, escalate) is appended to the immutable
+  deal-event log for traceability and contributor attribution.
 - The agent does NOT rely on conversation history — it reasons from structured deal state.
   This makes it restartable and auditable.
 
@@ -525,13 +592,19 @@ Artist selected
   ├── drafts initial project terms
   ├── buyer/artist Q&A loop  (multiple HTTP requests, stateful via conversation memory)
   ├── risk flag? → agent explains → loop continues
-  └── both parties confirm
+  └── agent proposes immutable terms version
               │
               ▼
-        CreateDealTool  →  Deal record written (status: Accepted)
+        CreateDealTool  →  Deal + DealTermsVersion written (status: AwaitingApprovals)
               │
               ▼
-        LockEscrowTool  →  stablecoin locked in escrow (status: Funded)
+  Buyer approval + seller approval of same version
+              │
+              ▼
+        status: AwaitingFunding
+              │
+              ▼
+  Buyer explicitly authorizes LockEscrowTool (status: Funded)
               │
               ▼
   Delivery Monitor Agent activated
@@ -549,26 +622,31 @@ Artist selected
   ├── [event: delivery_submitted]  (status: Delivered)
   │       └── NotifyTool → buyer — confirm or dispute
   │
-  ├── [event: buyer_confirmed OR confirmation_timeout]
-  │       └── ReleaseEscrowTool → funds released to artist (status: Completed)
+  ├── [command: buyer_accepts_delivery]
+  │       └── deterministic DealService validates actor and state
+  │               └── ReleaseEscrowTool → funds released to seller (status: Completed)
   │               └── post-deal summary + attribution record generated
   │
+  ├── [command: buyer_requests_revision]
+  │       └── validate revision allowance → status: RevisionRequested → InProgress
+  │
   └── [event: dispute_raised]
-          └── EscalateDisputeTool → (status: Disputed) → human review queue
+          └── freeze deal → summarize evidence → mutual resolution or human review
 ```
 
 **State passed through workflow:**
 - `dealId` threads every step — all agents read deal state from DB
 - `sessionId` persists negotiation conversation memory
-- `agentLog` (JSON) captures every agent action for audit trail and attribution
+- append-only `DealEvent` records capture user, agent, system, and financial actions
 
 ---
 
 ## 10. Tools Layer
 
-Tools are the only components that touch the database, the blockchain, or external services.
-**Agents never access these systems directly.** This separation keeps agent logic testable,
-swappable, and auditable independently of side effects.
+Tools and deterministic application services are the only components that touch the database,
+blockchain, or external services. **Agents never access these systems directly.** Financial tools
+may run only after an application service validates actor authorization, current state, approved
+terms version, and idempotency key.
 
 | Tool | Package | What it touches |
 |---|---|---|
@@ -577,10 +655,11 @@ swappable, and auditable independently of side effects.
 | `RankArtistsTool` | `packages/agents` | Model provider (LLM call) |
 | `CreateDealTool` | `packages/agents` | PostgreSQL via `@soundhub/db` |
 | `NegotiateTool` | `packages/agents` | PostgreSQL (DealMessage table) |
-| `LockEscrowTool` | `packages/agents` | `@soundhub/blockchain` `escrow.lock()` |
-| `ReleaseEscrowTool` | `packages/agents` | `@soundhub/blockchain` `escrow.release()` |
-| `RefundEscrowTool` | `packages/agents` | `@soundhub/blockchain` `escrow.refund()` |
+| `LockEscrowTool` | application service | escrow provider after explicit buyer authorization |
+| `ReleaseEscrowTool` | application service | escrow provider after explicit delivery acceptance or agreed/manual resolution |
+| `RefundEscrowTool` | application service | escrow provider after agreed/manual dispute resolution |
 | `EscalateDisputeTool` | `packages/agents` | PostgreSQL (Deal status update) |
+| `SummarizeDisputeTool` | `packages/agents` | Read-only deal evidence + model provider |
 | `NotifyTool` | `packages/agents` | Email / in-app notification service |
 | `ScheduleReminderTool` | `packages/agents` | Job queue (node-cron or Redis queue) |
 
@@ -619,7 +698,7 @@ same deal state and continues correctly.
 
 ### Workflow State
 
-**Where:** ADK `WorkflowSession` + `Deal.agentLog` (JSON column)
+**Where:** ADK `WorkflowSession` + append-only `DealEvent` records
 
 **What it stores:** Current workflow position, last event processed, flags (risk flagged,
 clarification requested, etc.).
@@ -630,15 +709,15 @@ at any point to see exactly where in the flow a deal is.
 
 ### Audit Log
 
-**Where:** `Deal.agentLog` (JSON column)
+**Where:** append-only `DealEvent` records plus `PaymentTransaction` records
 
-**What it stores:** Every agent action — tool called, result, timestamp, model used, token
-count, parties involved.
+**What it stores:** Every user, agent, administrator, system, and financial action — command or
+tool, result, timestamp, model/version where applicable, token count, actor, and terms version.
 
-**Purpose:** Legal traceability for escrow decisions and contributor attribution. If a dispute
-is raised and a human reviewer asks "why did the agent release funds automatically?", the audit
-log provides a complete, timestamped record of the decision. The post-deal summary links to
-the on-chain transaction hash as external proof of payment.
+**Purpose:** Traceability for escrow decisions and contributor attribution. If a dispute is
+raised, a reviewer can reconstruct the evidence, AI recommendation, explicit party approvals,
+manual decision, and payment command. The post-deal summary links to finalized on-chain
+transaction hashes as external proof of payment.
 
 ---
 
@@ -685,31 +764,82 @@ these on CI to catch prompt regressions before they reach production.
 
 ## 13. Data Model Changes
 
-Add these models to `packages/db/prisma/schema.prisma`:
+The current singular `Artist | Producer` role is replaced by account type, marketplace
+capabilities, and seller specialties. Suggested MVP models:
 
 ```prisma
-model ArtistProfile {
-  id                  String      @id @default(cuid())
-  userId              String      @unique
+enum AccountType {
+  Individual
+  Organization
+}
+
+enum MarketplaceCapability {
+  Buyer
+  Seller
+}
+
+enum SellerSpecialty {
+  Artist
+  Producer
+  Musician
+  Songwriter
+  SoundEngineer
+  Videographer
+  VideoEditor
+  Influencer
+}
+
+model User {
+  id           String                  @id @default(cuid())
+  email        String                  @unique
+  displayName  String
+  accountType  AccountType             @default(Individual)
+  capabilities MarketplaceCapability[]
+  createdAt    DateTime                @default(now())
+  updatedAt    DateTime                @updatedAt
+  sellerProfile SellerProfile?
+  wallets      Wallet[]
+  buyerDeals   Deal[]                  @relation("BuyerDeals")
+}
+
+model SellerProfile {
+  id                  String              @id @default(cuid())
+  userId              String              @unique
   bio                 String
+  specialties         SellerSpecialty[]
   genreTags           String[]
   vibeEmbeddingVector Float[]
-  walletAddress       String?
   rateAmountMinor     Int
-  rateCurrency        String      @default("USD")
-  country             String      @default("Caribbean")
-  user                User        @relation(fields: [userId], references: [id], onDelete: Cascade)
+  rateCurrency        String              @default("USD")
+  country             String              @default("Caribbean")
+  user                User                @relation(fields: [userId], references: [id], onDelete: Cascade)
   tracks              MusicTrack[]
-  deals               Deal[]      @relation("ArtistDeals")
+  sellerDeals         Deal[]              @relation("SellerDeals")
 
-  @@map("artist_profiles")
+  @@map("seller_profiles")
+}
+
+model Wallet {
+  id          String   @id @default(cuid())
+  userId      String
+  address     String
+  network     String
+  verifiedAt DateTime?
+  user        User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+  @@unique([network, address])
+  @@map("wallets")
 }
 
 enum DealStatus {
-  Pending       // buyer proposed, waiting for artist
-  Accepted      // artist accepted, awaiting payment lock
+  Draft
+  Proposed
+  Negotiating
+  AwaitingApprovals
+  AwaitingFunding
   Funded        // stablecoin locked in escrow on-chain
+  InProgress
   Delivered     // artist marked work delivered
+  RevisionRequested
   Completed     // buyer confirmed, funds released to artist
   Disputed      // escalated to human review
   Refunded
@@ -719,26 +849,59 @@ enum DealStatus {
 model Deal {
   id                  String      @id @default(cuid())
   buyerId             String
-  artistId            String
+  sellerId            String
   description         String
-  deliverables        String?
   deadlineAt          DateTime?
   amountMinor         Int         // agreed price in display currency (for UI)
   currency            String      @default("USD")
-  paymentAmountMinor  BigInt      // on-chain escrow amount in smallest token unit
+  paymentAmountMinor  String      // on-chain smallest unit; serialized safely over JSON
   paymentAsset        String      // e.g. "USDC"
-  paymentChain        String?     // e.g. "Polkadot Asset Hub" — TODO: confirm with Andriy
-  status              DealStatus  @default(Pending)
-  txHash              String?     // escrow lock transaction hash
-  releaseTxHash       String?     // escrow release transaction hash
-  agentLog            Json?       // agent action audit trail and contributor attribution
+  feeAsset            String?
+  paymentNetwork      String?
+  status              DealStatus  @default(Draft)
+  approvedTermsId     String?
   createdAt           DateTime    @default(now())
   updatedAt           DateTime    @updatedAt
   buyer               User        @relation("BuyerDeals", fields: [buyerId], references: [id])
-  artist              ArtistProfile @relation("ArtistDeals", fields: [artistId], references: [id])
+  seller              SellerProfile @relation("SellerDeals", fields: [sellerId], references: [id])
+  termsVersions       DealTermsVersion[]
+  approvals           DealApproval[]
   messages            DealMessage[]
+  deliveries          Delivery[]
+  events              DealEvent[]
+  transactions        PaymentTransaction[]
 
   @@map("deals")
+}
+
+model DealTermsVersion {
+  id             String   @id @default(cuid())
+  dealId         String
+  version        Int
+  deliverables   String
+  deadlineAt     DateTime?
+  revisionLimit  Int      @default(1)
+  amountMinor    Int
+  currency       String   @default("USD")
+  specialTerms   String?
+  createdAt      DateTime @default(now())
+  deal           Deal     @relation(fields: [dealId], references: [id], onDelete: Cascade)
+  approvals      DealApproval[]
+  @@unique([dealId, version])
+  @@map("deal_terms_versions")
+}
+
+model DealApproval {
+  id             String   @id @default(cuid())
+  dealId         String
+  termsVersionId String
+  party          String   // "buyer" | "seller"
+  approvedById   String
+  approvedAt     DateTime @default(now())
+  deal           Deal     @relation(fields: [dealId], references: [id], onDelete: Cascade)
+  termsVersion   DealTermsVersion @relation(fields: [termsVersionId], references: [id], onDelete: Cascade)
+  @@unique([termsVersionId, party])
+  @@map("deal_approvals")
 }
 
 model DealMessage {
@@ -751,15 +914,73 @@ model DealMessage {
 
   @@map("deal_messages")
 }
+
+model Delivery {
+  id            String         @id @default(cuid())
+  dealId        String
+  version       Int
+  message       String?
+  submittedById String
+  submittedAt   DateTime       @default(now())
+  deal          Deal           @relation(fields: [dealId], references: [id], onDelete: Cascade)
+  files         DeliveryFile[]
+  @@unique([dealId, version])
+  @@map("deliveries")
+}
+
+model DeliveryFile {
+  id           String   @id @default(cuid())
+  deliveryId   String
+  storageKey   String   @unique
+  originalName String
+  mimeType     String
+  sizeBytes    BigInt
+  checksum     String
+  scanStatus   String
+  delivery     Delivery @relation(fields: [deliveryId], references: [id], onDelete: Cascade)
+  @@map("delivery_files")
+}
+
+model DealEvent {
+  id        String   @id @default(cuid())
+  dealId    String
+  actorType String   // "buyer" | "seller" | "agent" | "admin" | "system"
+  actorId   String?
+  eventType String
+  payload   Json?
+  createdAt DateTime @default(now())
+  deal      Deal     @relation(fields: [dealId], references: [id], onDelete: Cascade)
+  @@map("deal_events")
+}
+
+model PaymentTransaction {
+  id             String   @id @default(cuid())
+  dealId         String
+  operation      String   // "lock" | "release" | "refund"
+  idempotencyKey String   @unique
+  network        String
+  paymentAsset   String
+  feeAsset       String?
+  amountMinor    String
+  status         String   // submitted | finalized | failed
+  txHash         String?
+  createdAt      DateTime @default(now())
+  updatedAt      DateTime @updatedAt
+  deal           Deal     @relation(fields: [dealId], references: [id], onDelete: Cascade)
+  @@map("payment_transactions")
+}
 ```
 
-Also update `User` model — add `Buyer` to the `Role` enum.
+Buyer-only restrictions for managers, executives, licensing houses, brands, and agencies are
+validated by the application service when capabilities are assigned. Prisma enums describe
+storage values; they are not the authorization layer.
 
 ---
 
 ## 14. New Package — `packages/blockchain`
 
-Port and upgrade Polkaward's contract interaction layer into a clean TypeScript package.
+Define a provider boundary first. Build and test `MockEscrowProvider` for the initial vertical
+slice, then port and upgrade Polkaward's interaction layer as `PolkadotEscrowProvider`.
 
 ```
 packages/blockchain/
@@ -783,7 +1004,7 @@ packages/blockchain/
 ```typescript
 // TODO: confirm asset parameter type and fee behavior with Andriy
 // The selected Polkadot chain or runtime determines network fee asset
-escrow.lock(dealId: string, artist: string, asset: string, amount: bigint): Promise<EscrowResult>
+escrow.lock(dealId: string, seller: string, asset: string, amount: bigint): Promise<EscrowResult>
 escrow.release(dealId: string): Promise<EscrowResult>
 escrow.refund(dealId: string): Promise<EscrowResult>
 ```
@@ -802,15 +1023,15 @@ get_deal(deal_id: String) -> DealState
 > asset (e.g. USDC via Asset Hub XCM) is supported, and what asset pays network fees are
 > decisions to validate with Andriy before implementing the contract upgrade.
 
-This package is called only by tools in `packages/agents` — never by the API directly.
-The blockchain layer is a side effect of a tool decision, not a direct API action.
+This package is called only by deterministic application services after explicit user authorization.
+Agents may explain or recommend a payment action, but cannot invoke escrow functions directly.
 
 ---
 
 ## 15. New API Routes (`apps/api`)
 
-The API is a thin HTTP layer over the ADK workflow runner. Routes invoke workflows,
-not agents directly.
+The API is a thin HTTP layer over application services and, where appropriate, ADK workflows.
+Routes never invoke agents or blockchain clients directly.
 
 ### Search
 ```
@@ -830,29 +1051,34 @@ Body: { query: string, clarificationAnswer?: string, sessionId: string }
 POST /api/agent/negotiate
 Body: { dealId: string, message: string, sender: "buyer" | "artist", sessionId: string }
 → Continues deal-lifecycle workflow at Negotiator Agent step
-→ Returns: { agentMessage, riskFlag?, dealConfirmed? }
+→ Returns: { agentMessage, riskFlag?, proposedTerms? }
 
 POST /api/agent/monitor/:dealId
 Body: { event: MonitorEvent }
 → Triggers a specific Delivery Monitor event in the deal-lifecycle workflow
-→ Returns: { actionTaken, txHash?, summary? }
+→ Returns: { actionTaken, summary? }
 ```
 
 ### Deals
 ```
-POST   /api/deals                    — create deal from confirmed negotiation
+POST   /api/deals                    — create a draft deal
 GET    /api/deals/:id                — deal status + message history
+POST   /api/deals/:id/terms          — create a new immutable terms version
+POST   /api/deals/:id/approve        — buyer or seller approves the current terms version
 POST   /api/deals/:id/fund           — buyer locks stablecoin (triggers escrow.lock via LockEscrowTool)
-POST   /api/deals/:id/deliver        — artist marks delivered
-POST   /api/deals/:id/confirm        — buyer confirms (triggers escrow.release via ReleaseEscrowTool)
-POST   /api/deals/:id/dispute        — escalate to human review
+POST   /api/deals/:id/uploads        — authorize a private direct-to-storage upload
+POST   /api/deals/:id/deliveries     — seller submits a versioned file delivery
+POST   /api/deals/:id/revisions      — buyer requests an in-scope revision
+POST   /api/deals/:id/accept         — buyer accepts delivery and explicitly authorizes release
+POST   /api/deals/:id/disputes       — freeze deal and begin AI-assisted/manual review
 ```
 
-### Artists
+### Talent
 ```
-GET    /api/artists/:id              — public artist profile
-POST   /api/artists/profile          — create/update artist profile
-POST   /api/artists/wallet           — save Polkadot wallet address
+GET    /api/talent/:id               — public seller profile
+POST   /api/talent/profile           — create/update seller profile
+POST   /api/wallets/challenge        — create a nonce for wallet ownership proof
+POST   /api/wallets/verify           — verify signature and save wallet association
 ```
 
 ---
@@ -863,10 +1089,12 @@ POST   /api/artists/wallet           — save Polkadot wallet address
 |---|---|---|
 | Landing | `/` | Hero — "Find Caribbean artists, pay instantly in stablecoins" |
 | Search | `/search` | Existing vibe search UI + Matchmaker Agent clarification flow |
-| Artist Profile | `/artists/[id]` | Bio, genre tags, sample tracks, "Book This Artist" CTA |
-| Deal Negotiation | `/deals/new?artist=[id]` | Live chat UI with Negotiator Agent |
+| Talent Profile | `/talent/[id]` | Bio, specialties, samples, and "Book This Creative" CTA |
+| Deal Negotiation | `/deals/new?seller=[id]` | Live chat UI with Negotiator Agent |
+| Terms Approval | `/deals/[id]/terms` | Buyer and seller approve the same immutable terms version |
 | Deal Dashboard | `/deals/[id]` | Both parties see status, agent messages, delivery confirmation |
-| Wallet Connect | `/settings/wallet` | Artist connects Talisman/SubWallet |
+| Delivery | `/deals/[id]/delivery` | Private file upload, version history, acceptance, and revisions |
+| Wallet Connect | `/settings/wallet` | User verifies a funding or payout wallet |
 | My Deals | `/dashboard` | All active and past deals |
 
 **Key UI detail — Agent chat interface:**
@@ -884,20 +1112,22 @@ makes the agentic nature of the product immediately obvious to judges in the dem
 
 | Day | Task |
 |---|---|
-| 1–2 | Add `ArtistProfile`, `Deal`, `DealMessage` to Prisma schema. Run migration. Seed Caribbean artists. |
-| 3–4 | Create `packages/blockchain` — port Polkaward `contract.cjs` to TypeScript. |
-| 5–6 | Upgrade ink! contract to escrow (asset-neutral). Deploy to Paseo testnet. Test lock/release/refund. |
-| 7 | Wire real OpenAI embeddings into `RagService`. Connect Pinecone. |
+| 1 | Repair clean install/build/type-check/lint/test orchestration and frontend-to-API routing. |
+| 2–3 | Add capability-based accounts and `SellerProfile`; migrate and seed Caribbean talent. |
+| 4 | Replace random search mocks with deterministic PostgreSQL-backed search and an integration test. |
+| 5 | Add real OpenAI embeddings and Pinecone behind a search-provider interface. |
+| 6–7 | Add deals, versioned terms, mutual approvals, append-only events, and deterministic state transitions. |
 
 ### Week 2 — The Agent Layer (Days 8–14)
 
 | Day | Task |
 |---|---|
-| 8 | Scaffold `packages/agents` — install Google ADK TypeScript, configure ADK runtime, model adapter for Claude. |
-| 9 | Build `artist-discovery` workflow. Define Matchmaker Agent with `SearchArtistsTool`, `RankArtistsTool`. Wire to `POST /api/agent/brief`. Test clarification loop. |
-| 10–11 | Build `deal-lifecycle` workflow (negotiation phase). Define Negotiator Agent with all tools. Wire to `POST /api/agent/negotiate`. Test deal confirmation flow + escrow lock. |
-| 12–13 | Build Delivery Monitor Agent. Wire to scheduled job (node-cron → ADK event trigger). Test all monitor events. Test auto-release on timeout. |
-| 14 | Integration pass: full workflow end-to-end (brief → match → negotiate → lock → deliver → release). Fix handoff edge cases. |
+| 8 | Implement `MockEscrowProvider` and test explicit funding/release/refund authorization. |
+| 9 | Build Matchmaker clarification and ranking workflow; retain deterministic fallbacks and evaluations. |
+| 10–11 | Build Negotiator drafting workflow; test that it cannot approve terms or invoke escrow. |
+| 12 | Add direct-to-S3 private file delivery, metadata, checksums, and versioning. |
+| 13 | Build Delivery Monitor reminders and dispute-evidence summaries without auto-release authority. |
+| 14 | Integration pass: search → negotiate → mutual approval → mock funding → upload → explicit acceptance. |
 
 ### Week 3 — Frontend + Polish (Days 15–21)
 
@@ -905,9 +1135,9 @@ makes the agentic nature of the product immediately obvious to judges in the dem
 |---|---|
 | 15 | Build Agent chat UI on Deal Negotiation page. |
 | 16 | Build Deal Dashboard with real-time status + agent message log. |
-| 17 | Build Artist Profile page. Add wallet connect flow. |
-| 18 | Add auth (NextAuth with email magic link — fastest to ship). |
-| 19 | End-to-end test: search → agent match → negotiate → lock stablecoin → deliver → auto-release. |
+| 17 | Build talent profile and hybrid wallet-linking flow. |
+| 18 | Add email magic-link or passkey authentication; wallet remains a separate verified association. |
+| 19 | Port Polkadot escrow behind the provider interface if network, asset, fee, and contract decisions are resolved; otherwise demo the labeled mock. |
 | 20 | UI polish. Mobile responsiveness. Error states. |
 | 21 | Record demo video. Prepare pitch. |
 
@@ -948,8 +1178,8 @@ PORT=4000
 
 ## 19. Demo Script (What to Show Judges)
 
-**The product in one sentence:** *"AI agents handle everything between 'I need a Caribbean
-artist' and 'here's your payment' — permanently settled on Polkadot, no middleman required."*
+**The product in one sentence:** *"AI helps you discover Caribbean talent, agree on fair terms,
+and complete a secure creative-services deal settled transparently through Polkadot."*
 
 ---
 
@@ -961,7 +1191,7 @@ artist' and 'here's your payment' — permanently settled on Polkadot, no middle
 2. **Artist selected.** Buyer clicks "Book This Artist." The Negotiator Agent opens a
    three-way chat and drafts project terms: *"Based on your brief and Kes's standard rate, I'm
    proposing: one original soca track, 30-second ad length, non-exclusive use, delivered in 7
-   days, 500 USDC."* Artist sees this and confirms.
+   days, 500 USDC, one included revision."* Buyer and artist each approve the same terms version.
 
 3. **Agent flags a risk.** Buyer edits terms to request exclusive rights. Agent responds:
    *"Exclusive rights are unusual at this price point — Kes typically charges 3× for
@@ -973,7 +1203,8 @@ artist' and 'here's your payment' — permanently settled on Polkadot, no middle
 5. **Delivery Monitor takes over.** Agent sends artist a reminder at day 4.
    Artist submits the track on day 6. Agent notifies buyer to confirm.
 
-6. **Auto-release.** Buyer confirms delivery. Smart contract releases 500 USDC to the
+6. **Explicit release.** Buyer reviews the uploaded file and accepts delivery. The wallet asks
+   the buyer to authorize release, then the smart contract releases 500 USDC to the
    artist's wallet instantly. No bank. No invoice. No waiting.
 
 7. **Post-deal summary.** Agent generates a summary for both parties — deliverables,
@@ -998,11 +1229,11 @@ The rubric is 50% Business Strength + 50% Agentic AI Excellence, scored 1–10.
 
 | Rubric requirement | How we meet it |
 |---|---|
-| Autonomous agents | All three agents act without human triggers |
+| Bounded agent autonomy | Agents independently search, clarify, draft, monitor, and summarize within explicit authority limits |
 | Multi-agent coordination | Matchmaker → Negotiator → Monitor handoff chain via ADK workflows |
 | Workflow orchestration | ADK `deal-lifecycle` workflow passes structured state across all three agents and the blockchain layer |
-| Reasoning capability | Matchmaker asks clarifying questions; Negotiator flags risks; Monitor decides between remind / escalate / auto-release |
-| Human-in-the-loop design | Disputes escalate to human; routine confirmations are automatic |
+| Reasoning capability | Matchmaker asks clarifying questions; Negotiator flags risks; Monitor selects reminders and summarizes dispute evidence |
+| Human-in-the-loop design | Both parties approve terms; users authorize financial actions; unresolved disputes escalate to an administrator |
 | Compute efficiency | Agents only run on events (brief submitted, message sent, cron tick) — not polling |
 | Real-world impact | Caribbean artists get paid in minutes, not months |
 
