@@ -1,19 +1,53 @@
 // root eslint (ESLint v9 flat)
 import js from "@eslint/js";
+import next from "@next/eslint-plugin-next";
 import ts from "typescript-eslint";
 
 export default [
+  {
+    ignores: [
+      "**/dist/**",
+      "**/.next/**",
+      "**/node_modules/**",
+      "packages/db/src/generated/**",
+      "apps/web/next-env.d.ts",
+      "**/*.js",
+      "**/*.mjs",
+    ],
+  },
   js.configs.recommended,
-  ...ts.configs.recommendedTypeChecked,
+  ...ts.configs.recommendedTypeChecked.map((config) => ({
+    ...config,
+    files: ["**/*.ts", "**/*.tsx"],
+  })),
+  {
+    files: ["apps/web/**/*.ts", "apps/web/**/*.tsx"],
+    plugins: {
+      "@next/next": next,
+    },
+    rules: {
+      ...next.configs.recommended.rules,
+      ...next.configs["core-web-vitals"].rules,
+      "@next/next/no-html-link-for-pages": "off",
+    },
+    settings: {
+      next: {
+        rootDir: "apps/web",
+      },
+    },
+  },
   {
     files: ["**/*.ts", "**/*.tsx"],
     languageOptions: {
       parserOptions: {
-        project: true
-      }
+        projectService: {
+          allowDefaultProject: ["packages/db/prisma.config.ts"]
+        },
+        tsconfigRootDir: import.meta.dirname,
+      },
     },
     rules: {
-      "@typescript-eslint/consistent-type-imports": "error"
-    }
-  }
+      "@typescript-eslint/consistent-type-imports": "error",
+    },
+  },
 ];

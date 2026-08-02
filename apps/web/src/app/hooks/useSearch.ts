@@ -1,5 +1,5 @@
-import { useState, useCallback, useRef } from 'react';
-import type { IQueryResponse } from '@soundhub/types';
+import { useState, useCallback, useRef } from "react";
+import type { IQueryResponse } from "@soundhub/types";
 
 interface UseSearchReturn {
   results: IQueryResponse[];
@@ -7,6 +7,18 @@ interface UseSearchReturn {
   error: string | null;
   search: (query: string) => Promise<void>;
   clearResults: () => void;
+}
+
+function parseSearchResults(value: unknown): IQueryResponse[] {
+  if (typeof value !== "object" || value === null || !("results" in value)) {
+    throw new Error("Search returned an invalid response");
+  }
+
+  if (!Array.isArray(value.results)) {
+    throw new Error("Search results must be an array");
+  }
+
+  return value.results as IQueryResponse[];
 }
 
 export function useSearch(): UseSearchReturn {
@@ -35,9 +47,9 @@ export function useSearch(): UseSearchReturn {
     setError(null);
 
     try {
-      const response = await fetch('/api/search', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
+      const response = await fetch("/api/search", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ query }),
         signal: abortControllerRef.current.signal,
       });
@@ -46,11 +58,11 @@ export function useSearch(): UseSearchReturn {
         throw new Error(`Search failed: ${response.statusText}`);
       }
 
-      const data = await response.json();
-      setResults(data.results || []);
+      const data: unknown = await response.json();
+      setResults(parseSearchResults(data));
     } catch (err) {
       // Don't set error for aborted requests
-      if (err instanceof Error && err.name !== 'AbortError') {
+      if (err instanceof Error && err.name !== "AbortError") {
         setError(err.message);
         setResults([]);
       }

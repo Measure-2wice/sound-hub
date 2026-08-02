@@ -1,6 +1,6 @@
-import { create } from 'zustand';
-import { devtools } from 'zustand/middleware';
-import type { IUser, Role } from '@soundhub/types';
+import { create } from "zustand";
+import { devtools } from "zustand/middleware";
+import type { IUser, Role } from "@soundhub/types";
 
 interface AuthState {
   // State
@@ -16,9 +16,29 @@ interface AuthState {
   clearError: () => void;
 }
 
+function parseAuthenticatedUser(value: unknown): IUser {
+  if (typeof value !== "object" || value === null || !("user" in value)) {
+    throw new Error("Authentication returned an invalid response");
+  }
+
+  const user = value.user;
+  if (
+    typeof user !== "object" ||
+    user === null ||
+    !("email" in user) ||
+    typeof user.email !== "string" ||
+    !("displayName" in user) ||
+    typeof user.displayName !== "string"
+  ) {
+    throw new Error("Authentication response did not include a valid user");
+  }
+
+  return user as unknown as IUser;
+}
+
 export const useAuthStore = create<AuthState>()(
   devtools(
-    (set, get) => ({
+    (set) => ({
       // Initial state
       user: null,
       isAuthenticated: false,
@@ -29,26 +49,27 @@ export const useAuthStore = create<AuthState>()(
       login: async (email: string, password: string) => {
         set({ isLoading: true, error: null });
         try {
-          const response = await fetch('/api/auth/login', {
-            method: 'POST',
-            headers: { 'Content-Type': 'application/json' },
+          const response = await fetch("/api/auth/login", {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
             body: JSON.stringify({ email, password }),
           });
 
           if (!response.ok) {
-            throw new Error('Login failed');
+            throw new Error("Login failed");
           }
 
-          const { user } = await response.json();
+          const data: unknown = await response.json();
+          const user = parseAuthenticatedUser(data);
           set({
             user,
             isAuthenticated: true,
-            isLoading: false
+            isLoading: false,
           });
         } catch (error) {
           set({
-            error: error instanceof Error ? error.message : 'Login failed',
-            isLoading: false
+            error: error instanceof Error ? error.message : "Login failed",
+            isLoading: false,
           });
         }
       },
@@ -57,7 +78,7 @@ export const useAuthStore = create<AuthState>()(
         set({
           user: null,
           isAuthenticated: false,
-          error: null
+          error: null,
         });
         // Clear any stored tokens, etc.
       },
@@ -65,26 +86,27 @@ export const useAuthStore = create<AuthState>()(
       register: async (email: string, password: string, role: Role, displayName: string) => {
         set({ isLoading: true, error: null });
         try {
-          const response = await fetch('/api/auth/register', {
-            method: 'POST',
-            headers: { 'Content-Type': 'application/json' },
+          const response = await fetch("/api/auth/register", {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
             body: JSON.stringify({ email, password, role, displayName }),
           });
 
           if (!response.ok) {
-            throw new Error('Registration failed');
+            throw new Error("Registration failed");
           }
 
-          const { user } = await response.json();
+          const data: unknown = await response.json();
+          const user = parseAuthenticatedUser(data);
           set({
             user,
             isAuthenticated: true,
-            isLoading: false
+            isLoading: false,
           });
         } catch (error) {
           set({
-            error: error instanceof Error ? error.message : 'Registration failed',
-            isLoading: false
+            error: error instanceof Error ? error.message : "Registration failed",
+            isLoading: false,
           });
         }
       },
@@ -92,7 +114,7 @@ export const useAuthStore = create<AuthState>()(
       clearError: () => set({ error: null }),
     }),
     {
-      name: 'auth-store', // devtools name
-    }
-  )
+      name: "auth-store", // devtools name
+    },
+  ),
 );

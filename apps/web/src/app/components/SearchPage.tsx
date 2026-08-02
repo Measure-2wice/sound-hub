@@ -1,28 +1,27 @@
 "use client";
 
-import { useState } from 'react';
-import { useSearch } from '../hooks/useSearch';
-import { Card } from './ui/Card';
-import type { IQueryResponse } from '@soundhub/types';
+import { useState } from "react";
+import { useSearch } from "../hooks/useSearch";
+import { Card } from "./ui/Card";
+import type { IQueryResponse } from "@soundhub/types";
 
 export function SearchPage() {
-  const [query, setQuery] = useState('');
+  const [query, setQuery] = useState("");
   const { results, isLoading, error, search } = useSearch();
 
-  const handleSubmit = async (e: React.FormEvent) => {
+  const handleSubmit = (e: React.FormEvent) => {
     e.preventDefault();
-    await search(query);
+    void search(query);
   };
 
   return (
     <div className="max-w-4xl mx-auto px-6 py-8">
       {/* Hero Section */}
       <div className="text-center mb-8">
-        <h1 className="text-4xl font-bold text-gray-900 mb-4">
-          Find Your Perfect Producer
-        </h1>
+        <h1 className="text-4xl font-bold text-gray-900 mb-4">Find Your Perfect Producer</h1>
         <p className="text-xl text-gray-600 max-w-2xl mx-auto">
-          Describe the vibe you're looking for and let AI match you with producers who can bring your vision to life.
+          Describe the vibe you're looking for and let AI match you with producers who can bring
+          your vision to life.
         </p>
       </div>
 
@@ -49,7 +48,7 @@ export function SearchPage() {
               disabled={isLoading || !query.trim()}
               className="w-full bg-blue-600 text-white py-3 px-6 rounded-lg font-medium hover:bg-blue-700 disabled:opacity-50 disabled:cursor-not-allowed transition-colors"
             >
-              {isLoading ? 'Searching...' : 'Find Producers'}
+              {isLoading ? "Searching..." : "Find Producers"}
             </button>
           </form>
         </Card.Content>
@@ -90,7 +89,9 @@ export function SearchPage() {
       {!isLoading && results.length === 0 && query && !error && (
         <Card className="text-center py-12">
           <Card.Content>
-            <p className="text-gray-600">No producers found matching your vibe. Try a different description!</p>
+            <p className="text-gray-600">
+              No producers found matching your vibe. Try a different description!
+            </p>
           </Card.Content>
         </Card>
       )}
@@ -108,10 +109,7 @@ function ProducerCard({ result }: { result: IQueryResponse }) {
         <Card.Title>{producerProfile.displayName}</Card.Title>
         <div className="flex flex-wrap gap-2 mt-2">
           {producerProfile.genreTags.map((tag) => (
-            <span
-              key={tag}
-              className="px-2 py-1 bg-blue-100 text-blue-800 text-xs rounded-full"
-            >
+            <span key={tag} className="px-2 py-1 bg-blue-100 text-blue-800 text-xs rounded-full">
               {tag}
             </span>
           ))}

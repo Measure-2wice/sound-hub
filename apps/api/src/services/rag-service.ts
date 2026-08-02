@@ -1,4 +1,4 @@
-import type { IQueryResponse, IProducerProfile, UUID, ISODateString } from "@soundhub/types";
+import type { IQueryResponse, IProducerProfile, PublicProducerProfile } from "@soundhub/types";
 import { createUUID, createISODateString } from "@soundhub/types";
 
 /**
@@ -58,7 +58,7 @@ export class RagService {
    */
   async searchProducers(query: string): Promise<IQueryResponse[]> {
     // Simulate AI processing delay
-    await new Promise(resolve => setTimeout(resolve, 500 + Math.random() * 1000));
+    await new Promise((resolve) => setTimeout(resolve, 500 + Math.random() * 1000));
 
     // Mock semantic matching based on keywords
     const results: IQueryResponse[] = [];
@@ -67,10 +67,11 @@ export class RagService {
     for (const producer of this.mockProducers) {
       const matchScore = this.calculateMockMatchScore(queryLower, producer);
 
-      if (matchScore > 0.3) { // Threshold for relevance
+      if (matchScore > 0.3) {
+        // Threshold for relevance
         results.push({
           userQuery: query,
-          producerProfile: producer,
+          producerProfile: this.toPublicProducerProfile(producer),
           aiMatchExplanation: this.generateMockExplanation(queryLower, producer, matchScore),
           matchScore,
         });
@@ -81,6 +82,22 @@ export class RagService {
     return results.sort((a, b) => (b.matchScore || 0) - (a.matchScore || 0));
   }
 
+  private toPublicProducerProfile(producer: IProducerProfile): PublicProducerProfile {
+    return {
+      id: producer.id,
+      email: producer.email,
+      displayName: producer.displayName,
+      role: producer.role,
+      createdAt: producer.createdAt,
+      updatedAt: producer.updatedAt,
+      isVerified: producer.isVerified,
+      avatarUrl: producer.avatarUrl,
+      rate: producer.rate,
+      bio: producer.bio,
+      genreTags: producer.genreTags,
+    };
+  }
+
   /**
    * Mock similarity calculation based on keyword matching
    * In production, this would use actual vector similarity (cosine distance)
@@ -89,8 +106,8 @@ export class RagService {
     let score = 0;
 
     // Check genre tag matches
-    const genreMatches = producer.genreTags.filter(tag =>
-      query.includes(tag.toLowerCase()) || tag.toLowerCase().includes(query)
+    const genreMatches = producer.genreTags.filter(
+      (tag) => query.includes(tag.toLowerCase()) || tag.toLowerCase().includes(query),
     );
     score += genreMatches.length * 0.3;
 
@@ -98,8 +115,8 @@ export class RagService {
     const bioWords = producer.bio.toLowerCase().split(" ");
     const queryWords = query.split(" ");
 
-    const bioMatches = queryWords.filter(word =>
-      bioWords.some(bioWord => bioWord.includes(word) || word.includes(bioWord))
+    const bioMatches = queryWords.filter((word) =>
+      bioWords.some((bioWord) => bioWord.includes(word) || word.includes(bioWord)),
     );
     score += bioMatches.length * 0.2;
 
@@ -116,7 +133,7 @@ export class RagService {
   private generateMockExplanation(
     query: string,
     producer: IProducerProfile,
-    matchScore: number
+    matchScore: number,
   ): string {
     const explanations = [
       `${producer.displayName} is an excellent match for "${query}" because their production style aligns perfectly with your vision. ${producer.bio}`,

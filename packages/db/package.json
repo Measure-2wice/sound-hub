@@ -6,6 +6,7 @@
   "types": "dist/index.d.ts",
   "scripts": {
     "build": "tsc -b",
+    "type-check": "tsc --noEmit",
     "db:generate": "prisma generate",
     "db:push": "prisma db push",
     "db:migrate": "prisma migrate dev",
@@ -13,13 +14,17 @@
     "db:seed": "tsx prisma/seed.ts"
   },
   "dependencies": {
-    "@prisma/client": "^5.20.0",
-    "@soundhub/types": "workspace:*"
+    "@prisma/adapter-pg": "^7.9.1",
+    "@prisma/client": "^7.9.1",
+    "@soundhub/types": "workspace:*",
+    "pg": "^8.16.3"
   },
   "devDependencies": {
+    "@types/node": "^20.16.0",
     "autoprefixer": "^10.4.21",
+    "dotenv": "^16.4.0",
     "postcss": "^8.5.6",
-    "prisma": "^5.20.0",
+    "prisma": "^7.9.1",
     "tailwindcss": "^4.1.14",
     "tsx": "^4.19.0"
   }

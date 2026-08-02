@@ -13,10 +13,12 @@ const PORT = process.env.PORT || 4000;
 
 // Middleware
 app.use(helmet());
-app.use(cors({
-  origin: process.env.FRONTEND_URL || "http://localhost:3000",
-  credentials: true,
-}));
+app.use(
+  cors({
+    origin: process.env.FRONTEND_URL || "http://localhost:3000",
+    credentials: true,
+  }),
+);
 app.use(express.json());
 
 // Routes
@@ -25,6 +27,7 @@ app.use("/api/search", searchRoutes);
 
 // Error handling middleware
 app.use((err: Error, req: express.Request, res: express.Response, next: express.NextFunction) => {
+  void next;
   console.error("Error:", err);
   res.status(500).json({
     error: "Internal server error",

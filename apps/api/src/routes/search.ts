@@ -1,13 +1,10 @@
 import { Router } from "express";
+import type { Request, Response } from "express";
 import type { IQueryResponse } from "@soundhub/types";
 import { RagService } from "../services/rag-service.js";
 
-export const searchRoutes = Router();
+export const searchRoutes: Router = Router();
 const ragService = new RagService();
-
-interface SearchRequest {
-  query: string;
-}
 
 interface SearchResponse {
   results: IQueryResponse[];
@@ -18,18 +15,30 @@ interface SearchResponse {
   };
 }
 
-searchRoutes.post("/", async (req, res) => {
+function isSearchRequest(value: unknown): value is { query: string } {
+  return (
+    typeof value === "object" &&
+    value !== null &&
+    "query" in value &&
+    typeof value.query === "string"
+  );
+}
+
+async function handleSearch(req: Request, res: Response): Promise<void> {
   const startTime = Date.now();
 
   try {
-    const { query }: SearchRequest = req.body;
+    const body = req.body as unknown;
 
-    if (!query || typeof query !== "string" || query.trim().length === 0) {
-      return res.status(400).json({
+    if (!isSearchRequest(body) || body.query.trim().length === 0) {
+      res.status(400).json({
         error: "Invalid request",
         message: "Query is required and must be a non-empty string",
       });
+      return;
     }
+
+    const query = body.query.trim();
 
     console.log(`🔍 Searching for: "${query}"`);
 
@@ -39,7 +48,7 @@ searchRoutes.post("/", async (req, res) => {
     const response: SearchResponse = {
       results,
       metadata: {
-        query: query.trim(),
+        query,
         totalResults: results.length,
         processingTimeMs: Date.now() - startTime,
       },
@@ -53,4 +62,8 @@ searchRoutes.post("/", async (req, res) => {
       message: "Unable to process search request",
     });
   }
+}
+
+searchRoutes.post("/", (req, res) => {
+  void handleSearch(req, res);
 });

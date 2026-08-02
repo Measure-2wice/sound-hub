@@ -12,6 +12,7 @@ dist/
 .next/
 *.tsbuildinfo
 .turbo/
+packages/db/src/generated/
 
 # Test output
 coverage/

@@ -32,6 +32,10 @@ export interface IProducerProfile extends IUser {
   readonly vibeEmbeddingVector: number[];
 }
 
+// Public producer data returned over HTTP. Embeddings are internal search infrastructure
+// and must not be serialized to browser clients.
+export type PublicProducerProfile = Omit<IProducerProfile, "vibeEmbeddingVector">;
+
 // Music track data structure
 export interface IMusicTrack {
   readonly id: UUID;
@@ -46,7 +50,7 @@ export interface IMusicTrack {
 // AI query response structure for RAG
 export interface IQueryResponse {
   readonly userQuery: string;
-  readonly producerProfile: IProducerProfile;
+  readonly producerProfile: PublicProducerProfile;
   readonly aiMatchExplanation: string;
   readonly matchScore?: number;
 }
