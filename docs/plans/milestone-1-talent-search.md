@@ -1,347 +1,331 @@
-# Milestone 1: Database-Backed Talent Search
+# Milestone 1 Plan: Database-Backed Talent and Offering Search
 
-- **Status:** Ready for implementation
-- **Target:** First production-shaped vertical slice
-- **Depends on:** Milestone 0 build/tooling baseline
-- **Architecture:** [ADR-001](../architecture/adr-001-marketplace-identity.md)
+- **Status:** Ready for implementation after documentation review
+- **Product specification:** [Milestone 1 spec](../specs/milestone-1-talent-search.md)
+- **Domain language:** [`CONTEXT.md`](../../CONTEXT.md)
 - **API contract:** [Talent Search API](../contracts/search-api.md)
+- **Architecture:** [Workspaces](../adr/0001-workspaces-own-marketplace-activity.md),
+  [offerings](../adr/0002-sellers-publish-purchasable-offerings.md), and
+  [agent boundaries](../adr/0003-agents-reason-within-deterministic-workflows.md)
 
 ## Outcome
 
-A buyer can enter a natural-language creative brief in the browser and receive public Caribbean
-talent results sourced from PostgreSQL:
+An anonymous buyer enters a brief and optional filters in the browser and receives deterministic,
+public seller-and-offering results from PostgreSQL:
 
 ```text
-Seeded SellerProfile
+Seeded Workspace + SellerProfile + Active ServiceOffering
     → PostgreSQL
-    → Prisma repository
-    → deterministic TalentSearchService
-    → POST /api/search
+    → PrismaTalentSearchRepository
+    → TalentSearchService
+    → Express POST /api/search
     → Next.js proxy
-    → search results UI
+    → buyer-facing result states
 ```
 
-This slice proves the browser, API, shared contract, application service, repository, Prisma, and
-PostgreSQL boundaries before introducing semantic-search infrastructure or agents.
+The slice proves the browser, HTTP, runtime contract, application service, repository, Prisma, and
+PostgreSQL boundaries without requiring AI, vector, Redis, storage, authentication, wallet, or
+blockchain infrastructure.
 
-It does not replace the planned Matchmaker Agent. Milestone 1 produces the deterministic search
-capability that the agent will later invoke as a tool:
+It remains the future Matchmaker's retrieval primitive:
 
 ```text
-Milestone 1
-Browser → POST /api/search → TalentSearchService → PostgreSQL
-
-Later agentic discovery
-Browser → POST /api/agent/brief → Matchmaker Agent
-                                    → SearchTalentTool
-                                        → TalentSearchService
-                                            → PostgreSQL/Pinecone
+Authenticated brief
+    → Matchmaker
+        → clarification when needed
+        → required constraints + preferences
+        → SearchTalentTool
+            → TalentSearchService
 ```
 
-The API is the secured transport boundary. The Matchmaker owns clarification, reasoning,
-reranking, and explanations; `TalentSearchService` owns candidate retrieval and deterministic
-fallback behavior. The agent never receives database credentials or queries Prisma directly.
+## Scope baseline
 
-## Scope
+### Implement
 
-### Included
+- Minimal UserAccount, Workspace, and WorkspaceMembership schema foundation
+- Independent Buyer and Seller Workspace capabilities
+- SellerProfile with professional identity, specialties, location, and Caribbean affiliations
+- Controlled ServiceCategory records
+- ServiceOffering with category, IncludedServices, pricing summary, service mode, and lifecycle
+- Reviewed Prisma migration and deterministic idempotent seed
+- Repository interface plus Prisma implementation
+- Deterministic structured filtering and ranking
+- Versioned, allow-listed public DTOs and shared runtime validation
+- Standard safe API error envelope
+- Express route and Next.js proxy
+- Web initial, loading, results, empty, invalid, unavailable, and retry states
+- Focused unit, repository, contract, web, and runtime tests
 
-- Capability-based account fields needed by seller profiles
-- `SellerProfile` replacing the producer-only profile model
-- Music-focused seller specialties
-- Country/region and public rate data
-- Reviewed Prisma migration
-- Idempotent seed containing representative Caribbean talent
-- Repository interface and Prisma implementation
-- Deterministic PostgreSQL-backed matching and ranking
-- Versioned public request/response DTOs
-- Express input validation and error mapping
-- Next.js API proxy and search UI integration
-- Loading, empty, validation, and failure states
-- Unit, repository, contract, and runtime smoke tests
+### Establish structurally but do not expose behavior
 
-### Explicitly excluded
+WorkspaceMembership records exist so marketplace ownership is correct. Authentication, invitations,
+Workspace switching, membership administration, and permission screens remain deferred.
 
-- OpenAI embeddings
-- Pinecone or another vector database
-- LLM reranking or generated explanations
-- Google ADK and agent clarification flows
-- Authentication and organization membership
-- Wallet connection
-- Deals, negotiation, file delivery, and escrow
-- S3 portfolio or delivery uploads
+### Exclude
+
+- Authentication and onboarding
+- Matchmaker, Google ADK, OpenAI, embeddings, Pinecone, and generated explanations
+- ProjectRequest, Deal, negotiation, approvals, delivery, and disputes
+- Wallet, escrow, stablecoin, and Polkadot behavior
 - Redis and scheduled jobs
+- PortfolioItem, DealDeliverable, S3, and uploads
+- Sync licensing of existing works
+- Availability calendars and capacity inventory
+- Admin moderation and real verification
 - Production deployment
 
-These exclusions apply only to Milestone 1. In the intended architecture, the Matchmaker Agent is
-the primary conversational discovery path and `POST /api/search` remains its tested retrieval
-primitive and non-agentic fallback.
+## Domain baseline
 
-## Domain decisions
+### Ownership
 
-1. Use `SellerProfile` as the sell-side domain name.
-2. Use `Buyer` and `Seller` capabilities rather than one exclusive user role.
-3. A seller may have multiple specialties.
-4. Public search returns an allow-listed DTO, never a Prisma `User` or `SellerProfile` object.
-5. PostgreSQL is canonical; later vector indexes contain derived projections only.
-6. Milestone 1 ranking must be deterministic and testable.
-7. Existing mock vectors, random scoring, artificial delays, and canned AI claims are removed.
-8. The future Matchmaker calls search through `SearchTalentTool`; it does not replace or bypass the
-   search service and repository boundaries.
+- UserAccount is a private human login.
+- Workspace is the marketplace participant and owns capabilities and SellerProfile.
+- A UserAccount may join multiple Workspaces.
+- One Workspace owns at most one SellerProfile in the MVP.
+- Personal and organizational Workspaces may sell when they represent creatives, bands, studios, or
+  collectives.
 
-## Proposed implementation shape
+### Seller eligibility
+
+A search candidate is eligible only when:
 
 ```text
-packages/types/src/
-└── search.ts                       shared request/response DTOs
-
-packages/db/
-├── prisma/schema.prisma            account capabilities + SellerProfile
-├── prisma/migrations/...           reviewed migration
-├── prisma/seed.ts                  idempotent Caribbean talent fixtures
-└── src/repositories/
-    └── prisma-talent-search.ts      Prisma repository implementation
-
-apps/api/src/
-├── routes/search.ts                HTTP validation and response mapping
-├── services/talent-search.ts       normalization, ranking, public DTO mapping
-└── repositories/
-    └── talent-search.ts             repository interface/internal candidate type
-
-apps/web/src/
-├── app/hooks/useSearch.ts           typed client state
-└── app/components/SearchPage.tsx    search and result states
+Workspace is eligible and has Seller capability
+AND SellerProfile is published and not suspended
+AND ServiceOffering is Active
 ```
 
-Exact paths may change during implementation, but dependency direction may not:
+Publication and verification are separate. Milestone 1 does not display or rank a fake verification
+signal.
 
-```text
-route → service → repository interface ← Prisma repository
-                  ↓
-             shared public DTO
-```
+### Offerings
 
-## Deterministic retrieval strategy
+- Lifecycle: `Draft | Active | Paused | Archived`
+- Service mode: `Remote | InPerson | Hybrid`
+- One primary ServiceCategory per offering
+- Optional IncludedServices are bundle-only
+- Separate offerings represent independently purchasable work
+- Pricing: `StartingAt`, `Fixed`, or `ContactForQuote`
+- Price units are controlled values appropriate to the category; advertised pricing is non-binding
 
-The first implementation normalizes the query by trimming, collapsing whitespace, and applying
-case-insensitive comparison. It searches public profile fields:
+Initial category keys:
 
-- Display name
+1. `music-production`
+2. `songwriting`
+3. `custom-composition`
+4. `session-vocals`
+5. `session-instrument-performance`
+6. `featured-artist-performance`
+7. `mixing`
+8. `mastering`
+9. `recording-engineering`
+10. `live-performance`
+
+## Search behavior
+
+TalentSearchService accepts normalized text plus structured criteria divided into:
+
+- `required`: exclusionary constraints
+- `preferred`: ranking signals
+
+The direct Milestone 1 UI must not silently derive hard constraints from free text. Later, the
+Matchmaker owns clarification and translation into structured criteria.
+
+Searchable evidence includes:
+
+- Seller professional name and biography
 - Specialties
-- Genre tags
-- Biography
-- Country
+- Caribbean affiliations and current location
+- Offering title, description, primary category, IncludedServices, genres, tags, service mode, and
+  service area
 
-Ranking should use explicit weighted matches and a stable `sellerId` tie-breaker. The service must
-normalize the final score to `0..1`. The exact weights belong in named constants and unit tests,
-not SQL magic numbers scattered across routes.
+Ranking rules:
 
-PostgreSQL full-text search may be used if it remains deterministic and the migration complexity
-is proportionate. A simpler case-insensitive/tag query is acceptable for this milestone.
+- Return at most ten sellers.
+- Return one result per seller.
+- Lead with the seller's best matching offering and include at most two additional matches.
+- Required violations never enter ranking.
+- Use named weights and a stable seller identifier tie-breaker.
+- Bound relevanceScore from zero through one.
+- Treat relevanceScore as strategy-specific ordering, not probability.
+- Produce deterministic evidence-based matchReason without AI claims.
+- Do not silently relax required constraints.
 
-## Seed requirements
+## Proposed implementation seams
 
-Seed at least six profiles covering several countries and specialties, for example:
+```text
+HTTP route
+    → runtime request schema
+    → TalentSearchService
+        → TalentSearchRepository interface
+            ← PrismaTalentSearchRepository
+    → public response schema
+```
 
-- Soca vocalist/songwriter — Trinidad and Tobago
-- Reggae artist — Jamaica
-- Dancehall producer — Jamaica
-- Calypso musician — Barbados or Trinidad and Tobago
-- Afrobeats/Caribbean fusion producer — Caribbean diaspora
-- Sound engineer — Caribbean region
+Likely ownership shape:
 
-The seed must:
+```text
+packages/types
+    versioned request, response, error, and runtime schemas
 
-- Use stable identifiers or unique emails suitable for upsert
-- Be safe to run repeatedly
-- Avoid random embeddings and random business data
-- Contain no real personal contact information
-- Produce fixtures that exercise empty, single-match, multi-match, and tie-order tests
+packages/db
+    schema, migration, seed, Prisma repository
+
+apps/api
+    route, service, repository interface, composition root, tests
+
+apps/web
+    proxy, client hook, filters, result cards, state tests
+```
+
+Exact private paths may change. Dependency direction and shared contracts may not change without
+integration-owner approval.
 
 ## Work breakdown
 
-### Gate 1 — Foundation contract (single owner)
+### Gate 1 — Shared foundation
 
-Before parallel work begins:
+Single integration owner:
 
-1. Add the shared DTOs from the API contract.
-2. Add the repository interface and internal candidate type.
-3. Agree on Prisma model and enum names.
-4. Add compile-only fakes where necessary.
-5. Merge this foundation into the integration branch.
-
-Shared files are frozen after this gate unless the integration owner approves a contract change.
+1. Add shared request, response, and error schemas.
+2. Add repository interface and internal candidate contract.
+3. Establish domain names and identifiers.
+4. Add compile-only fakes where useful.
+5. Freeze shared files after focused checks pass.
 
 ### Stream A — Database
 
-**Branch/worktree:** `codex/m1-database`
+**Suggested worktree:** `codex/m1-database`
 
-**Owns:**
+Owns Prisma schema, reviewed migration, seed, Prisma repository, and repository integration tests.
 
-- `packages/db/prisma/**`
-- `packages/db/src/repositories/**`
-- DB repository tests
+Tasks:
 
-**Tasks:**
+1. Replace the pre-release role/ProducerProfile/MusicTrack scaffold.
+2. Implement minimal Workspace ownership and marketplace discovery records.
+3. Seed stable solo, multi-brand, and group Workspace examples.
+4. Seed at least six Caribbean sellers and Active offerings across all major query scenarios.
+5. Implement eligibility and candidate retrieval.
+6. Apply and test migration only against disposable local PostgreSQL.
 
-1. Implement account type, capabilities, specialties, and `SellerProfile`.
-2. Review the generated SQL before accepting the migration.
-3. Replace random/non-idempotent seed behavior with stable upserts.
-4. Implement the Prisma talent-search repository.
-5. Test query behavior against PostgreSQL.
+### Stream B — API and search service
 
-**Must not edit:** frontend files, API routes, root scripts, or shared DTOs.
+**Suggested worktree:** `codex/m1-api-search`
 
-### Stream B — API
+Owns service, internal repository seam, HTTP route, runtime mapping, and API/service tests.
 
-**Branch/worktree:** `codex/m1-api-search`
+Tasks:
 
-**Owns:**
-
-- `apps/api/src/routes/search.ts`
-- `apps/api/src/services/**`
-- `apps/api/src/repositories/**` except the DB implementation owned by Stream A
-- API and contract tests
-
-**Tasks:**
-
-1. Replace `RagService` with `TalentSearchService`.
-2. Remove random scores, fake vectors, artificial delay, and AI wording.
-3. Validate the request and map documented errors.
-4. Rank candidates deterministically.
-5. Map internal candidates to the allow-listed public DTO.
-6. Test with an in-memory fake repository before DB integration.
-
-**Must not edit:** Prisma schema/migrations, frontend files, or shared DTOs.
+1. Replace RagService with TalentSearchService.
+2. Remove random scores, fake vectors, delay, and fabricated AI text.
+3. Validate strict text and structured criteria.
+4. Apply required filters and deterministic preference ranking.
+5. Deduplicate by seller and map best/additional offerings.
+6. Map safe validation, internal, and database-unavailable errors.
 
 ### Stream C — Web
 
-**Branch/worktree:** `codex/m1-web-search`
+**Suggested worktree:** `codex/m1-web-search`
 
-**Owns:**
+Owns Next.js proxy, search state, filters, result presentation, and web tests.
 
-- `apps/web/**`
-- Web search tests
+Tasks:
 
-**Tasks:**
-
-1. Consume the shared talent-search contract.
-2. Preserve request cancellation and prevent stale-result races.
-3. Add initial, loading, empty, validation-error, server-error, and results states.
-4. Render specialties, genres, country, rate, match reason, and score.
-5. Confirm `/api/search` uses the Next.js proxy.
-
-**Must not edit:** Prisma, API internals, root scripts, or shared DTOs.
+1. Consume shared request/response schemas.
+2. Preserve cancellation and prevent stale responses or stale loading state.
+3. Render all approved states and preserve input after retryable failure.
+4. Show match evidence, pricing kind, category, service mode, location, and affiliations.
+5. Do not show relevanceScore as a buyer-facing percentage.
+6. Label bundle-only IncludedServices accurately.
 
 ## Worktree coordination
 
 Use an integration branch such as `codex/m1-talent-search`; do not merge independent worktrees
 directly into `main`.
 
-Recommended order:
-
 ```text
-foundation contract
-    ↓
+shared foundation
+       ↓
 database ─────┐
-API fake repo ├──→ integration → runtime tests → review → main
+API fake repo ├──→ integration → full checks → runtime smoke → review
 web UI ───────┘
 ```
 
 Rules:
 
-1. One agent owns each worktree.
-2. `packages/types/**`, root configuration, and the lockfile have one integration owner.
-3. Dependency additions are requested from the integration owner to avoid lockfile conflicts.
-4. Agents report assumptions and file ownership in their handoff.
-5. No agent runs a migration against shared, staging, or production databases.
-6. Stream A may use a disposable local PostgreSQL database only.
-7. Every stream runs its focused checks before handoff.
-8. The integration owner runs the complete verification after every merge.
+1. One owner per worktree.
+2. The integration owner exclusively owns shared types, root configuration, and lockfile.
+3. Dependency requests go through the integration owner.
+4. Shared contract changes require evidence, explicit approval, and notification to all streams.
+5. No migration runs against shared, staging, or production databases.
+6. Every stream runs focused checks before handoff.
+7. The integration owner runs full verification after every merge.
 
 ## Migration safety
 
-Before running `prisma migrate dev`:
+Before migration work:
 
-1. Confirm the target is disposable local PostgreSQL.
-2. Inspect `DATABASE_URL` without printing credentials.
-3. Generate the migration with a descriptive name.
-4. Read the SQL for destructive operations, table renames, and data loss.
-5. Prefer explicit rename/data-copy SQL when replacing `ProducerProfile` with `SellerProfile`.
-6. Do not use `prisma db push` as a substitute for a reviewed migration.
+1. Confirm the target is disposable local PostgreSQL without printing credentials.
+2. Confirm no valuable data depends on the pre-release scaffold.
+3. Generate a descriptively named migration.
+4. Read SQL for destructive operations, data loss, indexes, constraints, and unintended enum lock-in.
+5. Run migration from an empty database.
+6. Seed twice and verify stable row counts and values.
+7. Do not use `prisma db push` as an acceptance substitute.
 
-The migration must preserve existing users and profile data if any local data is considered useful.
+## Acceptance gates
 
-## Test strategy
-
-### Unit tests
-
-- Query normalization
-- Validation boundaries
-- Weighted deterministic ranking
-- Stable tie-breaking
-- Match-reason generation
-- Public DTO allow-listing
-
-### Repository tests
-
-- Specialty match
-- Genre match
-- Biography match
-- Country match
-- Empty result
-- Result limit
-- Stable ordering
-- Database failure behavior
-
-### Contract tests
-
-Implement every case listed in [`docs/contracts/search-api.md`](../contracts/search-api.md).
-
-### Runtime smoke test
-
-With disposable PostgreSQL running:
-
-1. Seed the database.
-2. Start API and web applications.
-3. Call Express directly.
-4. Call the same endpoint through Next.js.
-5. Confirm equivalent public response shapes.
-6. Confirm no embedding, email, wallet, or storage fields are present.
-
-## Acceptance criteria
-
-- [ ] The old exclusive `Role` model no longer controls marketplace authorization.
-- [ ] A creative account can hold both `Buyer` and `Seller` capabilities.
-- [ ] Buyer-only accounts cannot create a seller profile through application services.
-- [ ] At least six deterministic Caribbean seller profiles are seeded idempotently.
-- [ ] `POST /api/search` reads candidates from PostgreSQL.
-- [ ] Search produces deterministic results without OpenAI or Pinecone credentials.
-- [ ] The browser renders database-backed results through the Next.js proxy.
-- [ ] Loading, empty, invalid-input, and server-failure states are implemented.
-- [ ] Search responses satisfy the documented contract.
-- [ ] Private/internal fields never cross the HTTP boundary.
-- [ ] Unit, repository, contract, and runtime smoke tests pass.
-- [ ] Migration SQL has been reviewed and contains no unexplained destructive operation.
-- [ ] `pnpm check` passes from a clean checkout after Prisma generation.
-
-## Verification commands
+### Repository
 
 ```bash
-pnpm install --frozen-lockfile
-pnpm prisma:generate
-pnpm db:up
-pnpm --filter @soundhub/db db:migrate
-pnpm --filter @soundhub/db db:seed
-pnpm check
-pnpm dev
+pnpm type-check
+pnpm lint
+pnpm test
+pnpm build
+pnpm format:check
 ```
 
-`pnpm db:down` currently removes named volumes with `-v`; use it only when deleting the local
-database is intentional.
+### Database
 
-## Definition of done
+- Fresh migration succeeds against empty PostgreSQL.
+- Seed succeeds twice without duplication or random changes.
+- Repository integration tests use real PostgreSQL.
+- Draft, Paused, Archived, unpublished, suspended, and ineligible records are excluded correctly.
 
-Milestone 1 is complete when a fresh local environment can install, start disposable PostgreSQL,
-apply the reviewed migration, seed talent, search through the browser, and pass the complete test
-and build pipeline without AI, vector-database, wallet, or blockchain credentials.
+### Service and API
+
+- Repeated input and state produce identical ordering, reasons, and scores.
+- Required/preferred semantics, bundles, deduplication, and tie-breaking are covered.
+- Empty results return `200`.
+- Invalid and unknown fields use the standard error envelope.
+- Database unavailability returns safe retriable `503`.
+- Public DTOs exclude private account, wallet, embedding, storage, and internal timestamp fields.
+- Next.js proxy preserves the Express contract.
+
+### Web
+
+- Initial, loading, results, empty, invalid, unavailable, and retry states work.
+- Input survives retryable failures.
+- Canceled or older requests cannot overwrite newer state.
+- No percentage-confidence claim appears.
+
+### Runtime smoke
+
+```text
+clean PostgreSQL
+→ migrate
+→ seed twice
+→ start API and web
+→ health check
+→ successful browser search
+→ strict invalid request
+→ unavailable dependency state
+```
+
+No AI, vector, Redis, storage, wallet, or blockchain credentials are permitted in this gate.
+
+## Completion handoff
+
+Milestone 1 is complete only when the acceptance gates pass, runtime behavior matches the published
+contract, the obsolete mock path is gone, and documentation reflects any approved contract changes.
+Authentication and later MVP milestones require a new stress-test before implementation.

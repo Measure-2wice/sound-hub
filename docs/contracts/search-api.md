@@ -1,222 +1,279 @@
 # Talent Search API Contract
 
-- **Status:** Milestone 1 contract
-- **Version:** `v1`
+- **Status:** Milestone 1 baseline
+- **Contract version:** `v1`
 - **Endpoint:** `POST /api/search`
-- **Related:** [Marketplace identity ADR](../architecture/adr-001-marketplace-identity.md),
-  [Milestone 1 plan](../plans/milestone-1-talent-search.md)
+- **Authentication:** Public
+- **Specification:** [Milestone 1](../specs/milestone-1-talent-search.md)
 
 ## Purpose
 
-Return public Caribbean talent profiles matching a buyer's natural-language query. Milestone 1
-uses deterministic PostgreSQL-backed retrieval. OpenAI embeddings, Pinecone, LLM reranking, and
-agent clarification are later implementations behind the same public boundary.
+Return eligible public Caribbean talent and their matching Active ServiceOfferings. Milestone 1 uses
+deterministic PostgreSQL retrieval. A future authenticated Matchmaker calls the same
+TalentSearchService through SearchTalentTool after converting a brief into required constraints and
+preferences.
 
-This endpoint is the retrieval primitive and non-agentic fallback, not the final conversational
-discovery experience. The future Matchmaker Agent calls the underlying `TalentSearchService`
-through `SearchTalentTool`; browser clients never invoke the agent runtime or database directly.
-
-```text
-POST /api/search
-    → TalentSearchService
-        → PostgreSQL/Pinecone
-
-POST /api/agent/brief
-    → Matchmaker Agent
-        → SearchTalentTool
-            → TalentSearchService
-```
-
-The primary conversational discovery UI will eventually use `POST /api/agent/brief`. It may ask a
-clarifying question, call the same retrieval service, rerank candidates, and return structured
-explanations. `POST /api/search` remains independently testable and available when agent/model
-services are unavailable or clarification is unnecessary.
+The endpoint is a public retrieval primitive and non-agentic fallback. It never invokes an LLM,
+queries a vector index, creates a ProjectRequest, or exposes database models directly.
 
 ## Request
 
+Conceptual shared contract:
+
 ```ts
-export interface TalentSearchRequest {
-  readonly query: string;
+interface TalentSearchRequestV1 {
+  readonly query?: string;
+  readonly required?: TalentSearchRequiredCriteria;
+  readonly preferred?: TalentSearchPreferredCriteria;
+}
+
+interface TalentSearchRequiredCriteria {
+  readonly primaryCategoryKeys?: readonly string[];
+  readonly independentlyPurchasableServiceKeys?: readonly string[];
+  readonly serviceModes?: readonly ("Remote" | "InPerson" | "Hybrid")[];
+  readonly basedIn?: LocationFilter;
+  readonly serviceArea?: LocationFilter;
+}
+
+interface TalentSearchPreferredCriteria {
+  readonly categoryKeys?: readonly string[];
+  readonly includedServiceKeys?: readonly string[];
+  readonly specialties?: readonly string[];
+  readonly genreTags?: readonly string[];
+  readonly caribbeanAffiliationCodes?: readonly string[];
+  readonly basedIn?: LocationFilter;
+  readonly serviceModes?: readonly ("Remote" | "InPerson" | "Hybrid")[];
+}
+
+interface LocationFilter {
+  readonly city?: string;
+  readonly region?: string;
+  readonly countryCode?: string;
 }
 ```
+
+The implementation may refine type names while preserving these semantics. The runtime schema is
+the executable contract and must be shared across browser and API packages.
 
 Validation rules:
 
-- `Content-Type` must be `application/json`.
-- `query` is required and must be a string.
-- The trimmed query must contain between 2 and 500 characters.
-- Unknown fields are ignored in Milestone 1.
-- Authentication is not required for public search.
+- At least one of `query`, `required`, or `preferred` must contain usable criteria.
+- Query is trimmed, internal whitespace is collapsed, and length must be 2 through 500 characters.
+- Arrays are bounded, deduplicated, and reject empty strings.
+- Country and affiliation values use approved stable codes.
+- Unknown fields are rejected at every nesting level.
+- Invalid JSON returns a distinct error from valid JSON with invalid criteria.
+- Required criteria are never silently converted into preferences or dropped.
 
 Example:
 
 ```json
 {
-  "query": "upbeat soca vocalist for a summer campaign"
-}
-```
-
-## Success response
-
-```ts
-export type SellerSpecialty =
-  | "Artist"
-  | "Producer"
-  | "Musician"
-  | "Songwriter"
-  | "SoundEngineer"
-  | "Videographer"
-  | "VideoEditor"
-  | "Influencer";
-
-export interface Money {
-  readonly amountMinor: number;
-  readonly currency: string;
-}
-
-export interface TalentSearchResult {
-  readonly sellerId: string;
-  readonly displayName: string;
-  readonly specialties: readonly SellerSpecialty[];
-  readonly genreTags: readonly string[];
-  readonly bio: string;
-  readonly country: string;
-  readonly rate: Money;
-  readonly avatarUrl?: string;
-  readonly matchReason: string;
-  readonly matchScore: number;
-}
-
-export interface TalentSearchResponse {
-  readonly results: readonly TalentSearchResult[];
-  readonly metadata: {
-    readonly query: string;
-    readonly totalResults: number;
-    readonly processingTimeMs: number;
-    readonly strategy: "postgres-text-v1";
-  };
-}
-```
-
-Response rules:
-
-- Return at most 10 results.
-- Results are ordered by descending `matchScore` with `sellerId` as a stable tie-breaker.
-- `matchScore` is finite and bounded from `0` through `1`.
-- Identical database state and normalized input must produce identical ordering and scores.
-- `matchReason` is deterministic in Milestone 1 and identifies the matching specialties, genres,
-  or biography terms. It must not claim to be AI-generated.
-- An empty match set is a successful `200` response with `results: []`.
-- The API returns canonical profile data from PostgreSQL, never a vector-store document as the
-  source of truth.
-
-Example:
-
-```json
-{
-  "results": [
-    {
-      "sellerId": "cm1seller123",
-      "displayName": "Island Wave",
-      "specialties": ["Artist", "Songwriter"],
-      "genreTags": ["Soca", "Dancehall"],
-      "bio": "Trinidadian vocalist and songwriter creating energetic Caribbean records.",
-      "country": "Trinidad and Tobago",
-      "rate": {
-        "amountMinor": 50000,
-        "currency": "USD"
-      },
-      "matchReason": "Matched specialty Artist and genre Soca.",
-      "matchScore": 0.92
+  "query": "Haitian producer in New York for a remote dancehall single",
+  "required": {
+    "primaryCategoryKeys": ["music-production"],
+    "serviceModes": ["Remote"]
+  },
+  "preferred": {
+    "genreTags": ["Dancehall"],
+    "caribbeanAffiliationCodes": ["HT"],
+    "basedIn": {
+      "city": "New York",
+      "countryCode": "US"
     }
-  ],
-  "metadata": {
-    "query": "upbeat soca vocalist for a summer campaign",
-    "totalResults": 1,
-    "processingTimeMs": 18,
-    "strategy": "postgres-text-v1"
   }
 }
 ```
 
-## Error responses
-
-All errors use this shape:
+## Response
 
 ```ts
-export interface ApiErrorResponse {
-  readonly error: {
-    readonly code: string;
-    readonly message: string;
-    readonly requestId?: string;
-    readonly details?: Readonly<Record<string, string>>;
+interface MoneyV1 {
+  readonly amountMinor: number;
+  readonly currency: string;
+}
+
+type PricingSummaryV1 =
+  | {
+      readonly kind: "StartingAt";
+      readonly amount: MoneyV1;
+      readonly unit: string;
+    }
+  | {
+      readonly kind: "Fixed";
+      readonly amount: MoneyV1;
+      readonly unit: string;
+    }
+  | { readonly kind: "ContactForQuote" };
+
+interface PublicSellerSummaryV1 {
+  readonly sellerId: string;
+  readonly professionalName: string;
+  readonly specialties: readonly string[];
+  readonly bio: string;
+  readonly basedIn: {
+    readonly city?: string;
+    readonly region?: string;
+    readonly countryCode: string;
+  };
+  readonly caribbeanAffiliationCodes: readonly string[];
+  readonly avatarUrl?: string;
+}
+
+interface PublicOfferingSummaryV1 {
+  readonly offeringId: string;
+  readonly title: string;
+  readonly description: string;
+  readonly primaryCategory: {
+    readonly key: string;
+    readonly name: string;
+  };
+  readonly includedServices: readonly {
+    readonly key: string;
+    readonly name: string;
+    readonly purchaseMode: "BundleOnly";
+  }[];
+  readonly genreTags: readonly string[];
+  readonly serviceMode: "Remote" | "InPerson" | "Hybrid";
+  readonly serviceAreas: readonly {
+    readonly city?: string;
+    readonly region?: string;
+    readonly countryCode: string;
+  }[];
+  readonly pricing?: PricingSummaryV1;
+}
+
+interface TalentSearchResultV1 {
+  readonly seller: PublicSellerSummaryV1;
+  readonly bestMatchingOffering: PublicOfferingSummaryV1;
+  readonly additionalMatchingOfferings: readonly PublicOfferingSummaryV1[];
+  readonly relevanceScore: number;
+  readonly matchReason: string;
+}
+
+interface TalentSearchResponseV1 {
+  readonly results: readonly TalentSearchResultV1[];
+  readonly metadata: {
+    readonly normalizedQuery?: string;
+    readonly totalResults: number;
+    readonly processingTimeMs: number;
+    readonly strategy: "postgres-text-v1";
+    readonly appliedRequiredCriteria: TalentSearchRequiredCriteria;
+    readonly appliedPreferredCriteria: TalentSearchPreferredCriteria;
   };
 }
 ```
 
-| Status | Code                     | Condition                                               |
-| ------ | ------------------------ | ------------------------------------------------------- |
-| `400`  | `INVALID_JSON`           | Body is not valid JSON                                  |
-| `400`  | `INVALID_SEARCH_QUERY`   | Query is absent, not a string, or outside length limits |
-| `415`  | `UNSUPPORTED_MEDIA_TYPE` | Request is not JSON                                     |
-| `500`  | `SEARCH_FAILED`          | An unexpected retrieval failure occurs                  |
-| `503`  | `SEARCH_UNAVAILABLE`     | PostgreSQL is unavailable                               |
+## Result semantics
 
-Internal exception messages, database details, credentials, and stack traces are never returned.
+- Return at most ten seller results.
+- A seller appears at most once.
+- `bestMatchingOffering` is the seller's highest-scoring eligible offering.
+- Include at most two additional eligible matching offerings.
+- Only published SellerProfiles under eligible Seller-capable Workspaces and Active offerings enter
+  results.
+- A required standalone category cannot be satisfied solely by a bundle-only IncludedService.
+- Required violations are excluded before preference scoring.
+- Results order by descending relevanceScore, then stable sellerId tie-breaker.
+- relevanceScore is finite and bounded from zero through one.
+- Identical canonical data, strategy, and normalized request produce identical ordering, score, and
+  matchReason.
+- relevanceScore is not a probability, confidence estimate, quality rating, or guarantee. The buyer
+  UI must not render it as a percentage.
+- matchReason names deterministic evidence and never claims AI participation.
+- Empty results return `200` with `results: []`; constraints are not relaxed automatically.
+
+## Standard error envelope
+
+```ts
+interface ApiErrorResponseV1 {
+  readonly error: {
+    readonly code: string;
+    readonly message: string;
+    readonly fields?: readonly {
+      readonly path: string;
+      readonly code: string;
+      readonly message: string;
+    }[];
+    readonly requestId: string;
+  };
+}
+```
+
+| HTTP  | Code                      | Meaning                                               |
+| ----- | ------------------------- | ----------------------------------------------------- |
+| `400` | `INVALID_JSON`            | Body is not valid JSON                                |
+| `400` | `INVALID_SEARCH_CRITERIA` | Missing, malformed, unknown, or out-of-range criteria |
+| `415` | `UNSUPPORTED_MEDIA_TYPE`  | Request is not JSON                                   |
+| `429` | `SEARCH_RATE_LIMITED`     | Public search limit exceeded                          |
+| `500` | `SEARCH_FAILED`           | Unexpected internal failure                           |
+| `503` | `SEARCH_UNAVAILABLE`      | Canonical PostgreSQL retrieval is unavailable         |
+
+Field messages are safe for display. Internal exception text, database details, credentials, and
+stack traces never enter the response.
+
+Suggested UI mappings:
+
+- Field errors appear beside the relevant control.
+- A contract mismatch caused by an outdated client asks the user to refresh.
+- `SEARCH_UNAVAILABLE` preserves the brief and offers retry.
+- Unexpected errors show a generic message plus request ID.
 
 ## Privacy boundary
 
-The response must not contain:
+Public results must not contain:
 
-- User email addresses
-- Wallet addresses
-- Password, session, or authentication data
-- `vibeEmbeddingVector` or any other embedding
-- Pinecone identifiers or metadata
-- S3 keys or private portfolio object locations
-- Unpublished profile fields
-- Internal database timestamps unless explicitly added to a future public contract
+- Account email or authentication identifiers
+- WorkspaceMembership or private authority data
+- Wallet addresses, challenges, or authorization records
+- Internal embeddings or vector metadata
+- S3/object keys or private storage locations
+- Unpublished profiles or non-Active offerings
+- Internal timestamps not explicitly added to a later contract
+- Raw Prisma models
 
-The shared `TalentSearchResult` DTO is allow-listed field by field. Implementations must not
-serialize Prisma models directly.
+All public objects are mapped field by field through allow-listed response schemas.
 
 ## Application boundary
 
 ```ts
-export interface TalentSearchRepository {
-  search(input: {
-    readonly normalizedQuery: string;
-    readonly limit: number;
-  }): Promise<readonly TalentSearchCandidate[]>;
+interface TalentSearchRepository {
+  search(input: RepositorySearchInput): Promise<readonly TalentSearchCandidate[]>;
 }
 
-export interface TalentSearchService {
-  search(request: TalentSearchRequest): Promise<TalentSearchResponse>;
+interface TalentSearchService {
+  search(request: TalentSearchRequestV1): Promise<TalentSearchResponseV1>;
 }
 ```
 
-The Express route validates HTTP input and delegates to `TalentSearchService`. The service owns
-normalization, deterministic ranking, DTO mapping, and metadata. The repository owns Prisma
-queries and returns internal candidates. Express routes must not query Prisma directly.
+- Express owns HTTP parsing, content type, runtime validation, request IDs, and error mapping.
+- TalentSearchService owns normalization, required/preferred semantics, deterministic scoring,
+  deduplication, match evidence, DTO mapping, and strategy metadata.
+- The repository owns Prisma queries and returns internal candidates.
+- Routes and agents never query Prisma directly.
+- SearchTalentTool validates its structured input and invokes TalentSearchService without bypassing
+  eligibility or required constraints.
 
-## Compatibility rules
+## Compatibility
 
-- Adding an optional response field is backward compatible.
-- Renaming or removing fields requires a new API version or coordinated frontend deployment.
-- Switching retrieval from PostgreSQL text search to Pinecone is internal as long as this contract
-  and deterministic fallback behavior remain supported.
-- `strategy` must change when ranking behavior materially changes.
-- Agent-specific conversation fields such as `sessionId`, `needsClarification`, and
-  `clarificationQuestion` belong to the future `/api/agent/brief` contract and must not be added to
-  this deterministic retrieval contract.
+- The existing pre-release producer-only response is intentionally replaced.
+- Adding an optional response field is backward-compatible.
+- Removing, renaming, or changing field semantics requires a new contract version or coordinated
+  client release before public launch.
+- A material ranking change requires a new `strategy` value.
+- Vector retrieval is internal only while canonical hydration, eligibility, public fields, required
+  constraints, and deterministic PostgreSQL fallback remain supported.
+- Agent conversation fields belong to a future authenticated Matchmaker contract, not this endpoint.
 
-## Required contract tests
+## Contract acceptance
 
-1. Reject empty, non-string, one-character, and over-500-character queries.
-2. Normalize leading/trailing and repeated whitespace.
-3. Return an empty result set as `200`.
-4. Return stable ordering for tied candidates.
-5. Bound every score from `0` through `1`.
-6. Exclude embeddings, email, wallet, and storage fields.
-7. Map database failures to the documented error response.
-8. Confirm that the Next.js `/api/search` proxy returns the same contract as Express directly.
+1. Validate text-only, structured-only, and combined requests.
+2. Reject unknown fields and invalid nested values.
+3. Verify required constraints exclude and preferences rank.
+4. Verify bundle-only services cannot satisfy standalone requirements.
+5. Verify one result per seller and stable best/additional offerings.
+6. Verify deterministic ordering, reasons, and bounded scores.
+7. Verify empty results return `200` without relaxation.
+8. Verify private fields never serialize.
+9. Verify database failure maps to the safe `503` envelope.
+10. Verify the Next.js proxy preserves both success and error contracts.
