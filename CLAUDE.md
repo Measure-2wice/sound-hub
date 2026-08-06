@@ -1,150 +1,145 @@
 # CLAUDE.md
 
-This file provides guidance to Claude Code (claude.ai/code) when working with code in this repository.
+Guidance for Claude Code and other engineering agents working in SoundHub.
 
-## SoundHub: AI Producer Marketplace
+## Product and authority
 
-Goal: Build a full-stack TypeScript project to master Type Safety, Prisma, and Retrieval-Augmented Generation (RAG) for senior-level interviews.
-Primary Engineer: Caleb Matteis
-Assistant Role: Claude Code will serve as an architecture auditor, scaffolding assistant, and TypeScript reviewer.
+SoundHub is an AI-assisted Caribbean creative-services marketplace. Read these before changing
+domain behavior:
 
-🧠 Project Overview
+1. `CONTEXT.md` for canonical terminology
+2. Relevant accepted records in `docs/adr/`
+3. `spec.md` for the MVP product baseline
+4. The applicable feature specification, plan, and contract
 
-SoundHub is a full-stack AI-powered platform that allows Artists to find Producers by describing a “vibe.”
-Claude will help scaffold, refactor, and extend this codebase with TypeScript-first, frontend-driven, and system-design-level principles.
+Do not revive producer-only or exclusive-role terminology that conflicts with the glossary. Surface
+an ADR conflict instead of silently overriding it.
 
-Technical Stack
-Layer	Tech
-Frontend	Next.js (TypeScript, App Router)
-Backend	Express (TypeScript)
-Database	PostgreSQL + Prisma ORM
-Vector DB (RAG)	Pinecone
-AI API	OpenAI (Embeddings + Chat)
-Cloud Storage	AWS S3
-Package Manager	pnpm v9
-Lint/Format	ESLint v9 + TypeScript-ESLint v8 + Prettier v3
-Runtime	Node 20+ (ESM)
-🏗️ Monorepo Structure
-soundhub/
-├── apps/
-│   ├── web/        → Next.js frontend
-│   └── api/        → Express backend
-├── packages/
-│   ├── types/      → Shared TypeScript interfaces
-│   └── db/         → Prisma schema + client
-├── .eslint.config.js
-├── tsconfig.base.json
-├── pnpm-workspace.yaml
-├── docker-compose.yml
-└── CLAUDE.md (this file)
+## Current implementation target
 
-## Current Project Status
+Milestone 1 is the only implementation-ready milestone:
 
-**Note**: This is currently a partially scaffolded monorepo. Only the root configuration and `packages/types` exist. The `apps/web` and `apps/api` directories, database setup, and Docker configuration are not yet implemented.
+- Specification: `docs/specs/milestone-1-talent-search.md`
+- Plan: `docs/plans/milestone-1-talent-search.md`
+- API contract: `docs/contracts/search-api.md`
 
-## Common Development Commands
+Milestone 1 replaces the pre-release producer-only mock with deterministic PostgreSQL-backed seller
+and ServiceOffering search. It establishes a minimal Workspace ownership foundation but excludes
+authentication, agents, Redis, uploads, Deals, wallets, escrow, and blockchain behavior.
+
+## Actual monorepo
+
+```text
+apps/
+├── web/       Next.js App Router frontend
+└── api/       Express TypeScript API
+
+packages/
+├── types/     Shared TypeScript contracts
+└── db/        Prisma schema, client, and seed
+```
+
+Root configuration includes pnpm workspaces, TypeScript, ESLint, Prettier, and Docker Compose.
+PostgreSQL and Redis services are described in Docker Compose, but Redis is not a Milestone 1 runtime
+dependency.
+
+## Current code status
+
+- Web, API, shared types, Prisma, and Docker scaffolds exist.
+- Health routing exists.
+- Search currently uses RagService mock data, random scoring, fake vectors, artificial delay, and
+  fabricated AI explanations.
+- Shared types and Prisma still use the obsolete Role/ProducerProfile/MusicTrack model.
+- No accepted production dataset or backward-compatible public search contract exists.
+- Milestone 1 intentionally replaces these pre-release models and fixtures.
+
+## Stack
+
+- Node.js 20+ using ESM
+- pnpm workspace
+- Next.js + React + TypeScript
+- Express + TypeScript
+- PostgreSQL + Prisma
+- ESLint flat configuration + Prettier
+- Node test runner for current API tests
+
+OpenAI, Pinecone, object storage, Redis workflows, Google ADK, and Polkadot integration are planned
+later and must not be introduced into Milestone 1 without an approved scope change.
+
+## Commands
 
 ```bash
-# Install dependencies
+# Install
 pnpm install
 
-# Development (will fail until apps are created)
-pnpm dev                 # Run both web and api apps
-pnpm dev:web            # Run Next.js frontend
-pnpm dev:api            # Run Express backend
+# Development
+pnpm dev
+pnpm dev:web
+pnpm dev:api
 
-# Code quality
-pnpm lint               # Run ESLint
-pnpm format             # Format code with Prettier
+# Quality
+pnpm type-check
+pnpm lint
+pnpm test
+pnpm build
+pnpm format:check
+pnpm check
 
-# Database (not yet implemented)
-pnpm db:up              # Start PostgreSQL container
-pnpm db:down            # Stop and remove containers
-pnpm prisma:generate    # Generate Prisma client
+# Formatting mutation
+pnpm format
 
-# Build shared types
-pnpm --filter @soundhub/types build
+# Prisma and local infrastructure
+pnpm prisma:generate
+pnpm --filter @soundhub/db db:migrate
+pnpm --filter @soundhub/db db:seed
+pnpm --filter @soundhub/db db:studio
+pnpm db:up
+pnpm db:down
 ```
 
-## Core Dependencies
+`pnpm db:down` removes Compose volumes. Confirm the target and preservation requirements before
+running destructive database operations. Do not use `prisma db push` as a substitute for a reviewed
+Milestone 1 migration.
 
-- typescript: ^5.6.3
-- eslint: ^9.10.0 (with flat config)
-- typescript-eslint: ^7.18.0
-- prettier: ^3.3.3
-- concurrently: ^9.0.0
-- pnpm: ^9.0.0
+Expected local ports:
 
-## Configuration Details
+- Web: `http://localhost:3000`
+- API: `http://localhost:4000`
+- PostgreSQL: `localhost:5432`
+- Redis Compose service: `localhost:6379` when explicitly needed later
 
-### TypeScript Configuration (`tsconfig.base.json`)
-- Strict mode enabled with additional safety checks
-- ES2022 target with ESNext modules
-- Bundler module resolution for modern tooling
-- `noUncheckedIndexedAccess` for array/object safety
+## Engineering constraints
 
-### ESLint Configuration (`.eslint.config.js`)
-- Uses ESLint v9 flat configuration format
-- TypeScript-ESLint integration with type checking
-- Enforces consistent type imports
-- Configured for modern ESM projects
+- Keep public DTOs allow-listed; never serialize Prisma models directly.
+- Treat PostgreSQL as canonical. Vector indexes are derived projections.
+- Keep agents outside authorization, state-transition, deadline, approval, and payment authority.
+- Use runtime validation at untrusted JSON and tool boundaries; TypeScript alone is insufficient.
+- Required search constraints may not be silently dropped or relaxed.
+- relevanceScore is deterministic strategy-specific ordering, not buyer-facing confidence.
+- Preserve immutable terms, approvals, delivery versions, and audit evidence in later milestones.
+- Do not expose account identity, membership, wallet, embedding, or storage internals publicly.
 
-### Prettier Configuration (`.prettierrc`)
-- Double quotes, semicolons, 100 character print width
-- Consistent with TypeScript best practices
+## Milestone 1 coordination
 
-## Architecture Notes
+Use an integration branch and isolated worktrees for database, API, and web streams only after the
+shared foundation contract is merged. The integration owner exclusively owns shared types, root
+configuration, dependency changes, and the lockfile. Any shared contract change requires evidence,
+explicit approval, and notification to all streams.
 
-This is designed as a pnpm monorepo with:
-- **Shared types package**: `@soundhub/types` for type-safe communication between frontend/backend
-- **Frontend app**: Next.js with App Router (planned: `@soundhub/web`)
-- **Backend API**: Express TypeScript server (planned: `@soundhub/api`)
-- **Database layer**: Prisma + PostgreSQL (planned: `@soundhub/db`)
+Every stream runs focused tests before handoff. The integration owner runs the full acceptance gate
+and disposable-PostgreSQL runtime smoke test before completion.
 
-The type system uses branded types for UUID and ISO date strings to prevent mixing incompatible string values. The core domain models (User, ProducerProfile, MusicTrack) are designed around the AI vibe matching concept.
+## Agent skills
 
-## Development Phases
+### Issue tracker
 
-### Phase A - Complete Basic Scaffolding
-- Create missing `apps/web` (Next.js)
-- Create missing `apps/api` (Express)
-- Create `packages/db` with Prisma schema
-- Set up Docker Compose for PostgreSQL
+Specifications and tickets live in GitHub Issues. See `docs/agents/issue-tracker.md`.
 
-### Phase B - Implement Core Features
-- User authentication and profiles
-- Producer profile management with vibe embeddings
-- Music track upload and storage (S3)
-- AI-powered search using OpenAI + Pinecone
+### Triage labels
 
-### Phase C - Integration & Polish
-- Connect frontend to backend APIs
-- Implement RAG-based producer matching
-- Add comprehensive error handling and validation
+The repository uses the default engineering-skill triage vocabulary. See
+`docs/agents/triage-labels.md`.
 
-## Core Type Definitions (packages/types)
+### Domain docs
 
-The shared types package defines the core domain models:
-
-- **Branded types**: `UUID`, `ISODateString` for type safety
-- **Domain models**: `IUser`, `IProducerProfile`, `IMusicTrack`
-- **Business logic**: `Money` type, `Role` enum, `IQueryResponse` for AI matching
-
-Key architectural decisions:
-- Immutable interfaces (readonly properties)
-- Branded string types to prevent ID/date confusion
-- Vector embeddings stored as `number[]` for AI similarity matching
-
-## Single Test Command
-
-To run tests for a specific package:
-```bash
-pnpm --filter @soundhub/[package-name] test
-```
-
-## Expected Ports
-
-When fully implemented:
-- **Frontend**: http://localhost:3000 (Next.js)
-- **Backend API**: http://localhost:4000 (Express)
-- **Database**: localhost:5432 (PostgreSQL via Docker)
+SoundHub uses a single root domain context. See `docs/agents/domain.md`.

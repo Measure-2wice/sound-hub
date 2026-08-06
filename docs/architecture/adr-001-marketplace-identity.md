@@ -1,6 +1,6 @@
 # ADR-001: Marketplace Identity and Capabilities
 
-- **Status:** Accepted
+- **Status:** Superseded by [ADR-0001](../adr/0001-workspaces-own-marketplace-activity.md)
 - **Date:** 2026-08-01
 - **Decision owners:** SoundHub product and engineering
 - **Related:** [`spec.md`](../../spec.md), [Milestone 1 plan](../plans/milestone-1-talent-search.md)
