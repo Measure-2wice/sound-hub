@@ -55,6 +55,11 @@ interface LocationFilter {
 The implementation may refine type names while preserving these semantics. The runtime schema is
 the executable contract and must be shared across browser and API packages.
 
+The executable contract uses Zod schemas owned by `@soundhub/types`. TypeScript request, response,
+and safe-error types are inferred from those schemas; callers must not maintain parallel handwritten
+DTO interfaces. Express parses requests and the web client parses responses at runtime before either
+side trusts the values.
+
 Validation rules:
 
 - At least one of `query`, `required`, or `preferred` must contain usable criteria.
@@ -183,6 +188,15 @@ interface TalentSearchResponseV1 {
 - matchReason names deterministic evidence and never claims AI participation.
 - Empty results return `200` with `results: []`; constraints are not relaxed automatically.
 
+### Incremental M1.1 semantics
+
+Issue #2 establishes `postgres-text-v1` with deterministic query-token coverage over offering title
+and primary-category key/name. Its relevanceScore is matched distinct tokens divided by distinct
+normalized query tokens, and its matchReason names only the fields that supplied those matches. The
+first tracer returns one best matching offering and no additional offerings. This behavior is an
+approved incremental subset, not permission to invent preference weights or AI explanations;
+issue #6 completes the final Milestone 1 ranking and grouping semantics.
+
 ## Standard error envelope
 
 ```ts
@@ -253,6 +267,13 @@ interface TalentSearchService {
 - Routes and agents never query Prisma directly.
 - SearchTalentTool validates its structured input and invokes TalentSearchService without bypassing
   eligibility or required constraints.
+
+## Browser transport
+
+The approved Milestone 1 browser transport is the existing Next.js rewrite. Browser code calls
+same-origin `/api/search`; Next.js forwards `/api/:path*` to the server-only `API_URL` origin (with
+`http://localhost:4000` as the local default). The rewrite contains no validation or business logic
+and must preserve Express success/error status, response body, and request ID.
 
 ## Compatibility
 
