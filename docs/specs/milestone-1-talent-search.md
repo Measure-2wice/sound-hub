@@ -150,6 +150,10 @@ SearchTalentTool.
 - ProjectRequest creation, authentication, agents, Redis, uploads, Deals, and payments are excluded.
 - The primary end-to-end test seam is browser request through the Next.js proxy, Express route,
   TalentSearchService, Prisma repository, and real disposable PostgreSQL.
+- Issue #2 is both Gate 1 and the first vertical slice. Its owner is the integration owner for shared
+  types, approved dependencies, root configuration, and lockfile changes until the foundation lands.
+- Shared request, response, and safe-error runtime schemas use Zod, with TypeScript types inferred
+  from those schemas.
 
 ## Testing Decisions
 
@@ -164,6 +168,8 @@ SearchTalentTool.
   privacy, and the standard error envelope.
 - Web tests cover initial, loading, results, empty, validation, unavailable, retry, preserved-input,
   cancellation, and stale-response states.
+- The first browser tracer is an automated Playwright Chromium test against real Next.js, Express,
+  and isolated disposable PostgreSQL; later tickets expand browser-state coverage.
 - Runtime smoke testing starts clean PostgreSQL, applies the reviewed migration, seeds twice, starts
   API and web, exercises a successful and invalid search through the browser proxy, and verifies a
   service-unavailable state.

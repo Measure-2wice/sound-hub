@@ -42,7 +42,9 @@ Authenticated brief
 
 ### Implement
 
-- Minimal UserAccount, Workspace, and WorkspaceMembership schema foundation
+- Complete Milestone 1 structural schema foundation for UserAccount, Workspace,
+  WorkspaceMembership, SellerProfile, ServiceCategory, Specialty, PricingUnit, and
+  ServiceOffering
 - Independent Buyer and Seller Workspace capabilities
 - SellerProfile with professional identity, specialties, location, and Caribbean affiliations
 - Controlled ServiceCategory records
@@ -181,9 +183,131 @@ apps/web
 Exact private paths may change. Dependency direction and shared contracts may not change without
 integration-owner approval.
 
+## M1.1 execution baseline
+
+[Issue #2](https://github.com/Measure-2wice/sound-hub/issues/2) is both Gate 1 and the first vertical
+slice. It owns the shared foundation required by later tickets; it is not a disposable minimal model
+that downstream streams are expected to redesign.
+
+### Foundation completeness and authority
+
+M1.1 must establish the complete Milestone 1 schema and deterministic positive-fixture foundation:
+
+- Every Milestone 1 model, relationship, uniqueness rule, lifecycle field, and controlled-value
+  representation needed by issues #2 through #8 is included in its reviewed migration.
+- The seed includes all ten approved ServiceCategories, approved controlled records, and at least
+  six stable positive Caribbean seller/offering fixtures. Later tickets may add negative and edge
+  fixtures but must not redesign the foundation merely to implement their behavior.
+- M1.1 also establishes the shared public schemas, internal repository interface/candidate contract,
+  Prisma adapter, composition seam, and the first database-to-browser path.
+- The M1.1 owner is the Milestone 1 integration owner until the foundation is merged. That owner may
+  change shared types, dependency declarations, root scripts/configuration, and the lockfile when
+  required by the approved slice. Other streams request changes to those files through that owner.
+- A discovered foundation defect may reopen the contract through the documented integration-owner
+  process; it does not authorize a downstream ticket to choose a conflicting architecture.
+
+### Runtime validation
+
+Use Zod as the shared runtime-validation implementation:
+
+- `packages/types` owns versioned Zod request, response, and safe-error schemas and exports types
+  inferred from those schemas. Do not maintain parallel handwritten DTO interfaces.
+- Express parses untrusted request JSON with the shared request schema before invoking
+  TalentSearchService.
+- The web client parses untrusted success and error responses with the shared response schemas before
+  updating UI state.
+- Repository candidates and Prisma models remain internal and are not validated or exported as
+  public DTOs merely because they are typed by TypeScript.
+- M1.1 owns the Zod dependency and lockfile change. Later agent-tool schemas reuse the same public
+  contract instead of creating a second validation strategy.
+
+### Controlled values
+
+Use two representations based on whether a value is behavioral or extensible:
+
+- Closed, behavior-bearing states use shared Zod enums and matching Prisma enums:
+  `WorkspaceType`, `WorkspaceStatus`, `WorkspaceMembershipRole`, `MarketplaceCapability`,
+  `SellerProfileStatus`, `ServiceOfferingStatus`, `ServiceMode`, `PricingKind`, and `PurchaseMode`.
+  Their approved M1 values are respectively `Personal | Organization`, `Active | Suspended`,
+  `Owner | Admin | Member`, `Buyer | Seller`, `Draft | Published | Suspended`,
+  `Draft | Active | Paused | Archived`, `Remote | InPerson | Hybrid`,
+  `StartingAt | Fixed | ContactForQuote`, and `BundleOnly`. Contract tests must detect drift between
+  persistence and shared public values.
+- Extensible marketplace taxonomies are seeded records with stable keys, not Prisma enums:
+  ServiceCategory, Specialty, and PricingUnit. Initial PricingUnit keys are `hour`, `track`,
+  `project`, `session`, `event`, and `day`.
+- Genre tags and seller-authored tags are normalized strings, not controlled records in Milestone 1.
+- Location and CaribbeanAffiliation codes are uppercase ISO 3166-1 alpha-2 strings. The shared
+  contract validates their shape; the application validates CaribbeanAffiliation against the
+  supported Caribbean-code set. SoundHub does not redefine nationality.
+- PostgreSQL and its idempotent seed are canonical for extensible records. Public schemas validate
+  stable-key shape and the application/repository resolves whether a referenced key exists.
+
+### Baseline relevance behavior
+
+M1.1 implements only deterministic text evidence needed for its happy-path tracer:
+
+1. Normalize the query by trimming, collapsing whitespace, lowercasing, removing surrounding
+   punctuation, and deduplicating non-empty tokens.
+2. Match distinct query tokens against the seeded offering title and primary ServiceCategory key and
+   display name using case-insensitive comparison.
+3. Compute relevanceScore as `matched distinct query tokens / distinct query tokens`, bounded from
+   zero through one. Use stable sellerId as the final tie-breaker.
+4. Build matchReason only from fields that actually matched, using factual wording such as matched
+   offering title or category. Do not use qualitative labels, randomness, or AI claims.
+5. Return the single matching offering as bestMatchingOffering and an empty
+   additionalMatchingOfferings array for the M1.1 tracer.
+
+This is intentionally an incremental implementation of `postgres-text-v1`, not a separate public
+strategy. Issue #6 completes preference weighting, seller grouping, additional offerings, and final
+Milestone 1 ranking semantics before the acceptance gate.
+
+### Approved proxy
+
+Retain the existing Next.js rewrite in `next.config.js` as the Milestone 1 proxy:
+
+- Browser code calls same-origin `/api/search`.
+- The server-side rewrite forwards `/api/:path*` to `${API_URL}/api/:path*`, using
+  `http://localhost:4000` only as the local default.
+- Do not introduce a Next.js route handler or duplicate validation/business logic in the web app.
+- Playwright and proxy contract checks must exercise the rewrite and verify that success status,
+  error status/body, and request ID pass through unchanged.
+
+### Test meaning for M1.1
+
+“Browser test” means one automated Playwright Chromium happy-path tracer running against the real
+Next.js app, Express API, and disposable PostgreSQL database. It submits the search form and asserts
+the rendered seller and Active offering. It does not mock `fetch`, the API, repository, or database.
+
+Focused tests beneath that highest seam remain required:
+
+- Node test-runner service tests use an in-memory TalentSearchRepository adapter.
+- Repository integration tests use the real disposable PostgreSQL convention below.
+- Express contract tests cross the HTTP interface and shared Zod schemas.
+- Broader browser state, concurrency, retry, and unavailable-path coverage belongs to issues #7 and
+  #8.
+
+### Disposable PostgreSQL convention
+
+M1.1 establishes a repository-controlled test database that cannot collide with or destroy the
+developer database:
+
+- Add a dedicated test Compose service/configuration with PostgreSQL only, database
+  `soundhub_m1_test`, host port `5433`, and ephemeral storage rather than the developer named volume.
+- Integration and Playwright commands require `TEST_DATABASE_URL`; the database name must end in
+  `_test`, and the host must be local/Compose. A guard fails closed before reset, migration, or seed
+  when those conditions are not met.
+- The test harness maps the validated TEST_DATABASE_URL into Prisma's DATABASE_URL only for the
+  child command that runs migrations, seed, API, or tests. It never prints credentials.
+- Root scripts must provide explicit test-database up, migrate/seed/test, and down operations. Test
+  teardown removes only the isolated test service and never invokes the developer `pnpm db:down`.
+- Apply the reviewed migration from empty state, seed twice, verify idempotence, and reset test state
+  deterministically between repository tests.
+- Shared, staging, production, and the default developer database are forbidden targets.
+
 ## Work breakdown
 
-### Gate 1 — Shared foundation
+### Gate 1 / M1.1 — Shared foundation and first tracer
 
 Single integration owner:
 
