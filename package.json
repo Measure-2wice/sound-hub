@@ -22,15 +22,15 @@
     "db:down": "docker compose down -v",
     "db:test:up": "docker compose -f docker-compose.test.yml up -d",
     "db:test:down": "docker compose -f docker-compose.test.yml down -v",
-    "db:test:wait": "node scripts/wait-for-test-db.mjs",
-    "db:test:migrate": "pnpm db:test:wait && pnpm --filter @soundhub/db db:migrate:deploy",
-    "db:test:seed": "pnpm --filter @soundhub/db db:seed",
-    "db:test:reset": "pnpm db:test:wait && pnpm --filter @soundhub/db db:reset:test"
+    "db:test:wait": "apps/api/node_modules/.bin/tsx scripts/wait-for-test-db.mjs",
+    "db:test:reset": "pnpm db:test:wait && apps/api/node_modules/.bin/tsx scripts/db-test-reset.mjs",
+    "db:test:migrate": "pnpm db:test:wait && apps/api/node_modules/.bin/tsx scripts/db-test-migrate.mjs",
+    "db:test:seed": "apps/api/node_modules/.bin/tsx scripts/db-test-seed.mjs",
+    "db:test:cycle": "apps/api/node_modules/.bin/tsx scripts/db-test-cycle.mjs"
   },
   "devDependencies": {
     "@eslint/js": "^9.37.0",
     "concurrently": "^9.0.0",
-    "dotenv-cli": "^7.4.2",
     "eslint": "^9.10.0",
     "eslint-config-prettier": "^9.1.2",
     "prettier": "^3.3.3",

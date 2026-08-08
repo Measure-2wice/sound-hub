@@ -279,15 +279,3 @@ model ServiceOfferingPricing {
   @@map("offering_pricing")
 }
 
-// ---------- Seed idempotence marker ----------
-//
-// A single row whose presence records that the deterministic seed has been
-// applied. The seed upserts this row at the start; if it is already present,
-// the seed exits as a no-op so reruns do not duplicate or randomize data.
-
-model SeedMarker {
-  id       Int      @id @default(1)
-  seededAt DateTime @default(now())
-
-  @@map("seed_markers")
-}
