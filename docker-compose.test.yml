@@ -1,0 +1,31 @@
+# Disposable PostgreSQL service for Milestone 1 repository integration tests and the
+# Playwright happy-path tracer. Distinct from the developer `docker-compose.yml`
+# service (which is bound to 5432 with a named volume) and strictly isolated.
+#
+# - PostgreSQL only; Redis is not a Milestone 1 dependency.
+# - Database name must end in `_test` so the test harness guard accepts it.
+# - Ephemeral volume: data is destroyed when the test service is taken down.
+# - Healthcheck and explicit readiness gate the migrate/seed/test commands.
+services:
+  postgres_test:
+    image: postgres:16-alpine
+    container_name: soundhub_postgres_test
+    environment:
+      POSTGRES_USER: soundhub
+      POSTGRES_PASSWORD: password
+      POSTGRES_DB: soundhub_m1_test
+      POSTGRES_INITDB_ARGS: "--encoding=UTF8 --lc-collate=C --lc-ctype=C"
+    ports:
+      - "5433:5432"
+    tmpfs:
+      - /var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U soundhub -d soundhub_m1_test"]
+      interval: 3s
+      timeout: 3s
+      retries: 10
+    restart: unless-stopped
+
+networks:
+  default:
+    name: soundhub_test_network

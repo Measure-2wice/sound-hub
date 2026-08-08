@@ -1,86 +1,119 @@
-import { useState, useCallback, useRef } from "react";
-import type { IQueryResponse } from "@soundhub/types";
+"use client";
 
-interface UseSearchReturn {
-  results: IQueryResponse[];
+import { useCallback, useRef, useState } from "react";
+import {
+  apiErrorResponseV1Schema,
+  talentSearchRequestV1Schema,
+  talentSearchResponseV1Schema,
+  type TalentSearchResponseV1,
+} from "@soundhub/types";
+
+export interface UseSearchReturn {
+  results: TalentSearchResponseV1 | null;
   isLoading: boolean;
   error: string | null;
+  errorCode: string | null;
+  requestId: string | null;
   search: (query: string) => Promise<void>;
   clearResults: () => void;
 }
 
-function parseSearchResults(value: unknown): IQueryResponse[] {
-  if (typeof value !== "object" || value === null || !("results" in value)) {
-    throw new Error("Search returned an invalid response");
-  }
-
-  if (!Array.isArray(value.results)) {
-    throw new Error("Search results must be an array");
-  }
-
-  return value.results as IQueryResponse[];
-}
-
 export function useSearch(): UseSearchReturn {
-  const [results, setResults] = useState<IQueryResponse[]>([]);
+  const [results, setResults] = useState<TalentSearchResponseV1 | null>(null);
   const [isLoading, setIsLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
+  const [errorCode, setErrorCode] = useState<string | null>(null);
+  const [requestId, setRequestId] = useState<string | null>(null);
 
-  // Prevent race conditions with AbortController
-  const abortControllerRef = useRef<AbortController | null>(null);
+  // Cancellation guard to prevent stale responses from overwriting newer state.
+  const requestIdRef = useRef(0);
 
-  const search = useCallback(async (query: string) => {
-    if (!query.trim()) {
-      setResults([]);
+  const search = useCallback(async (rawQuery: string) => {
+    const trimmed = rawQuery.trim();
+    if (trimmed.length < 2) {
+      setResults(null);
+      setError("Please enter at least 2 characters of search criteria.");
+      setErrorCode("INVALID_SEARCH_CRITERIA");
       return;
     }
 
-    // Cancel previous request
-    if (abortControllerRef.current) {
-      abortControllerRef.current.abort();
+    const parsed = talentSearchRequestV1Schema.safeParse({ query: trimmed });
+    if (!parsed.success) {
+      setResults(null);
+      setError(parsed.error.issues[0]?.message ?? "Search criteria are invalid.");
+      setErrorCode("INVALID_SEARCH_CRITERIA");
+      return;
     }
 
-    // Create new abort controller
-    abortControllerRef.current = new AbortController();
-
+    const currentRequest = requestIdRef.current + 1;
+    requestIdRef.current = currentRequest;
     setIsLoading(true);
     setError(null);
+    setErrorCode(null);
 
     try {
       const response = await fetch("/api/search", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ query }),
-        signal: abortControllerRef.current.signal,
+        body: JSON.stringify(parsed.data),
       });
+      const responseRequestId = response.headers.get("x-request-id") ?? "";
 
       if (!response.ok) {
-        throw new Error(`Search failed: ${response.statusText}`);
+        const errorJson: unknown = await response.json().catch(() => null);
+        const parsedError = apiErrorResponseV1Schema.safeParse(errorJson);
+        if (parsedError.success) {
+          if (requestIdRef.current !== currentRequest) return;
+          setError(parsedError.data.error.message);
+          setErrorCode(parsedError.data.error.code);
+          setRequestId(parsedError.data.error.requestId);
+          setResults(null);
+          return;
+        }
+        if (requestIdRef.current !== currentRequest) return;
+        setError(`Search failed: ${response.statusText || "unknown error"}`);
+        setErrorCode("SEARCH_FAILED");
+        setRequestId(responseRequestId);
+        setResults(null);
+        return;
       }
 
       const data: unknown = await response.json();
-      setResults(parseSearchResults(data));
+      const validated = talentSearchResponseV1Schema.safeParse(data);
+      if (!validated.success) {
+        if (requestIdRef.current !== currentRequest) return;
+        setError("Search returned an unexpected response shape.");
+        setErrorCode("SEARCH_FAILED");
+        setRequestId(responseRequestId);
+        setResults(null);
+        return;
+      }
+      if (requestIdRef.current !== currentRequest) return;
+      setResults(validated.data);
+      setRequestId(responseRequestId);
     } catch (err) {
-      // Don't set error for aborted requests
-      if (err instanceof Error && err.name !== "AbortError") {
-        setError(err.message);
-        setResults([]);
+      if (requestIdRef.current !== currentRequest) return;
+      const message =
+        err instanceof Error ? (err.name === "AbortError" ? null : err.message) : "Network error";
+      if (message !== null) {
+        setError(message);
+        setErrorCode("SEARCH_FAILED");
+        setRequestId(null);
+        setResults(null);
       }
     } finally {
-      setIsLoading(false);
+      if (requestIdRef.current === currentRequest) {
+        setIsLoading(false);
+      }
     }
   }, []);
 
   const clearResults = useCallback(() => {
-    setResults([]);
+    setResults(null);
     setError(null);
+    setErrorCode(null);
+    setRequestId(null);
   }, []);
 
-  return {
-    results,
-    isLoading,
-    error,
-    search,
-    clearResults,
-  };
+  return { results, isLoading, error, errorCode, requestId, search, clearResults };
 }

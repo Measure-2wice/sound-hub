@@ -16,6 +16,8 @@ packages/db/src/generated/
 
 # Test output
 coverage/
+apps/web/test-results/
+apps/web/playwright-report/
 
 # Local databases
 **/prisma/*.db

@@ -1,69 +1,194 @@
-import { Router } from "express";
-import type { Request, Response } from "express";
-import type { IQueryResponse } from "@soundhub/types";
-import { RagService } from "../services/rag-service.js";
+import { Router, type Request, type Response } from "express";
+import {
+  talentSearchRequestV1Schema,
+  talentSearchResponseV1Schema,
+  type TalentSearchResponseV1,
+} from "@soundhub/types";
+import { ZodError } from "zod";
+import type { TalentSearchService } from "../services/talent-search.service.js";
+import {
+  buildFieldErrors,
+  buildSafeError,
+  generateRequestId,
+  writeSafeError,
+  type SafeErrorResponse,
+} from "../lib/errors.js";
 
-export const searchRoutes: Router = Router();
-const ragService = new RagService();
-
-interface SearchResponse {
-  results: IQueryResponse[];
-  metadata: {
-    query: string;
-    totalResults: number;
-    processingTimeMs: number;
-  };
+export interface SearchRouteDeps {
+  readonly service: TalentSearchService;
 }
 
-function isSearchRequest(value: unknown): value is { query: string } {
-  return (
-    typeof value === "object" &&
-    value !== null &&
-    "query" in value &&
-    typeof value.query === "string"
-  );
+export function createSearchRouter(deps: SearchRouteDeps): Router {
+  const router = Router();
+  router.post("/", (req, res) => {
+    void handleSearch(req, res, deps);
+  });
+  return router;
 }
 
-async function handleSearch(req: Request, res: Response): Promise<void> {
-  const startTime = Date.now();
+async function handleSearch(req: Request, res: Response, deps: SearchRouteDeps): Promise<void> {
+  const requestId = resolveRequestId(req);
+  res.setHeader("x-request-id", requestId);
 
+  const contentType = req.headers["content-type"] ?? "";
+  if (!contentType.toLowerCase().includes("application/json")) {
+    const error = buildSafeError(
+      "UNSUPPORTED_MEDIA_TYPE",
+      "Request Content-Type must be application/json.",
+      undefined,
+      requestId,
+    );
+    writeSafeError(res, error);
+    return;
+  }
+
+  let rawBody: unknown;
   try {
-    const body = req.body as unknown;
+    rawBody = await readJsonBody(req);
+  } catch (err) {
+    const error = buildSafeError(
+      "INVALID_JSON",
+      "Request body is not valid JSON.",
+      undefined,
+      requestId,
+    );
+    noteError(error, err);
+    writeSafeError(res, error);
+    return;
+  }
 
-    if (!isSearchRequest(body) || body.query.trim().length === 0) {
-      res.status(400).json({
-        error: "Invalid request",
-        message: "Query is required and must be a non-empty string",
-      });
+  let parsedRequest;
+  try {
+    parsedRequest = talentSearchRequestV1Schema.parse(rawBody);
+  } catch (err) {
+    if (err instanceof ZodError) {
+      const fields = buildFieldErrors(err.issues);
+      const error = buildSafeError(
+        "INVALID_SEARCH_CRITERIA",
+        "Request body failed schema validation.",
+        fields,
+        requestId,
+      );
+      writeSafeError(res, error);
       return;
     }
-
-    const query = body.query.trim();
-
-    console.log(`🔍 Searching for: "${query}"`);
-
-    // Use RAG service to find matching producers
-    const results = await ragService.searchProducers(query);
-
-    const response: SearchResponse = {
-      results,
-      metadata: {
-        query,
-        totalResults: results.length,
-        processingTimeMs: Date.now() - startTime,
-      },
-    };
-
-    res.json(response);
-  } catch (error) {
-    console.error("Search error:", error);
-    res.status(500).json({
-      error: "Search failed",
-      message: "Unable to process search request",
-    });
+    throw err;
   }
+
+  let response: TalentSearchResponseV1;
+  try {
+    response = await deps.service.search(parsedRequest);
+  } catch (err) {
+    const safe = isUnavailable(err)
+      ? buildSafeError(
+          "SEARCH_UNAVAILABLE",
+          "Talent search is temporarily unavailable. Please try again.",
+          undefined,
+          requestId,
+        )
+      : buildSafeError(
+          "SEARCH_FAILED",
+          "An unexpected error occurred while processing the search.",
+          undefined,
+          requestId,
+        );
+    noteError(safe, err);
+    writeSafeError(res, safe);
+    return;
+  }
+
+  const validated = talentSearchResponseV1Schema.safeParse(response);
+  if (!validated.success) {
+    const safe = buildSafeError(
+      "SEARCH_FAILED",
+      "An unexpected error occurred while processing the search.",
+      undefined,
+      requestId,
+    );
+    noteError(safe, validated.error);
+    writeSafeError(res, safe);
+    return;
+  }
+
+  res.status(200).json(validated.data);
 }
 
-searchRoutes.post("/", (req, res) => {
-  void handleSearch(req, res);
-});
+function resolveRequestId(req: Request): string {
+  const incoming = req.headers["x-request-id"];
+  if (typeof incoming === "string" && incoming.length > 0 && incoming.length <= 128) {
+    return incoming;
+  }
+  return generateRequestId();
+}
+
+async function readJsonBody(req: Request): Promise<unknown> {
+  return new Promise((resolve, reject) => {
+    let data = "";
+    req.setEncoding("utf8");
+    req.on("data", (chunk: string) => {
+      data += chunk;
+    });
+    req.on("end", () => {
+      if (data.length === 0) {
+        resolve({});
+        return;
+      }
+      try {
+        resolve(JSON.parse(data));
+      } catch (err) {
+        reject(err instanceof Error ? err : new Error(String(err)));
+      }
+    });
+    req.on("error", (err: Error) => reject(err));
+  });
+}
+
+function isUnavailable(err: unknown): boolean {
+  if (!err) return false;
+  if (typeof err !== "object") return false;
+  const code = (err as { code?: unknown }).code;
+  if (typeof code !== "string") return false;
+  // Prisma-specific connection errors.
+  if (
+    code === "P1001" ||
+    code === "P1002" ||
+    code === "P1008" ||
+    code === "P1017" ||
+    code === "P1009" ||
+    code === "P1010"
+  ) {
+    return true;
+  }
+  // PostgreSQL SQLSTATE connection errors.
+  if (
+    code === "57P01" ||
+    code === "57P02" ||
+    code === "57P03" ||
+    code === "08000" ||
+    code === "08003" ||
+    code === "08006" ||
+    code === "08001" ||
+    code === "08004" ||
+    code === "08007"
+  ) {
+    return true;
+  }
+  // Node system errors that mean "can't reach the database".
+  if (
+    code === "ECONNREFUSED" ||
+    code === "ENOTFOUND" ||
+    code === "ETIMEDOUT" ||
+    code === "EHOSTUNREACH"
+  ) {
+    return true;
+  }
+  return false;
+}
+
+function noteError(safe: SafeErrorResponse, err: unknown): void {
+  // Diagnostic only; never serialize internal details to the response.
+  console.error(
+    `[talent-search] requestId=${safe.body.error.requestId} code=${safe.body.error.code}:`,
+    err,
+  );
+}

@@ -10,6 +10,8 @@
     "db:generate": "prisma generate",
     "db:push": "prisma db push",
     "db:migrate": "prisma migrate dev",
+    "db:migrate:deploy": "prisma migrate deploy",
+    "db:reset:test": "prisma migrate reset --force --skip-seed --schema=prisma/schema.prisma",
     "db:studio": "prisma studio",
     "db:seed": "tsx prisma/seed.ts"
   },
