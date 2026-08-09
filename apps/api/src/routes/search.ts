@@ -141,12 +141,16 @@ async function readJsonBody(req: Request): Promise<unknown> {
   return new Promise((resolve, reject) => {
     let data = "";
     let settled = false;
+    let oversize = false;
     req.setEncoding("utf8");
     req.on("data", (chunk: string) => {
       if (settled) return;
+      if (oversize) return;
       if (data.length + chunk.length > MAX_REQUEST_BODY_BYTES) {
-        settled = true;
-        req.destroy();
+        oversize = true;
+        // Pause to stop accumulating, but do not destroy the connection;
+        // the safe envelope is still written to the response below.
+        req.pause();
         reject(new PayloadTooLargeError("Request body too large"));
         return;
       }
