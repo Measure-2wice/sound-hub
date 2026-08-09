@@ -278,4 +278,3 @@ model ServiceOfferingPricing {
 
   @@map("offering_pricing")
 }
-

@@ -1,12 +1,28 @@
 // Deterministic Milestone 1 seed.
 //
-// The seed runs on every invocation and converges to the approved fixture
-// state via deterministic upserts on stable unique keys (UserAccount.email,
-// Workspace.slug, ServiceCategory.key, Specialty.key, PricingUnit.key,
-// ServiceOffering.slug). It does not depend on a marker row, an
-// in-memory cache, or a previous run. After the seed completes, an
-// invariant check verifies that the canonical row counts and referenced
-// stable keys match the approved values.
+// The seed runs on every invocation and converges the canonical M1.1
+// fixture state to its approved values via deterministic upserts on
+// stable unique keys. The canonical state is the closed set of
+// 10 ServiceCategories, 5 Specialties, 6 PricingUnits, and 7 sellers
+// (with their full UserAccount / Workspace / WorkspaceMembership /
+// WorkspaceCapability / SellerProfile / CaribbeanAffiliation /
+// SellerProfileSpecialty / ServiceOffering / ServiceOfferingServiceArea
+// / ServiceOfferingPricing graph) defined by SELLERS and the
+// SERVICE_CATEGORIES / SPECIALTY_KEYS / PRICING_UNITS constants.
+//
+// Canonical relationships are restored on every run (Workspace.ownerUserId,
+// ServiceOffering.sellerProfileId, ServiceOffering.primaryCategoryId,
+// WorkspaceMembership, WorkspaceCapability, SellerProfileSpecialty,
+// CaribbeanAffiliation, ServiceOfferingServiceArea, ServiceOfferingPricing).
+// Canonical field values are restored on every run (Workspace.status,
+// SellerProfile.status, ServiceOffering.status, ServiceOffering.title, …).
+//
+// The seed does NOT delete rows that are outside the canonical state
+// (extra sellers, extra categories, etc.). Such rows are simply
+// untouched; the canonical-state snapshot proves that the closed
+// canonical set is correct.
+//
+// Re-running the seed produces an identical canonical-state snapshot.
 
 import { PrismaPg } from "@prisma/adapter-pg";
 import { PrismaClient } from "../src/generated/client.js";
@@ -35,66 +51,16 @@ type ServiceCategorySeed = {
 };
 
 const SERVICE_CATEGORIES: readonly ServiceCategorySeed[] = [
-  {
-    key: "music-production",
-    name: "Music Production",
-    description: "Original beat-making and track production.",
-    bundleOnly: false,
-  },
-  {
-    key: "songwriting",
-    name: "Songwriting",
-    description: "Original lyric and topline writing.",
-    bundleOnly: false,
-  },
-  {
-    key: "custom-composition",
-    name: "Custom Composition",
-    description: "Bespoke composition for briefs and placements.",
-    bundleOnly: false,
-  },
-  {
-    key: "session-vocals",
-    name: "Session Vocals",
-    description: "Studio vocal performance for hire.",
-    bundleOnly: false,
-  },
-  {
-    key: "session-instrument-performance",
-    name: "Session Instrument Performance",
-    description: "Studio instrumental performance for hire.",
-    bundleOnly: false,
-  },
-  {
-    key: "featured-artist-performance",
-    name: "Featured Artist Performance",
-    description: "Featured artist credit on a track.",
-    bundleOnly: false,
-  },
-  {
-    key: "mixing",
-    name: "Mixing",
-    description: "Multitrack mixdown and balance.",
-    bundleOnly: false,
-  },
-  {
-    key: "mastering",
-    name: "Mastering",
-    description: "Final loudness and tone preparation.",
-    bundleOnly: false,
-  },
-  {
-    key: "recording-engineering",
-    name: "Recording Engineering",
-    description: "Studio tracking and engineering.",
-    bundleOnly: false,
-  },
-  {
-    key: "live-performance",
-    name: "Live Performance",
-    description: "In-person and hybrid live performance.",
-    bundleOnly: false,
-  },
+  { key: "music-production", name: "Music Production", description: "Original beat-making and track production.", bundleOnly: false },
+  { key: "songwriting", name: "Songwriting", description: "Original lyric and topline writing.", bundleOnly: false },
+  { key: "custom-composition", name: "Custom Composition", description: "Bespoke composition for briefs and placements.", bundleOnly: false },
+  { key: "session-vocals", name: "Session Vocals", description: "Studio vocal performance for hire.", bundleOnly: false },
+  { key: "session-instrument-performance", name: "Session Instrument Performance", description: "Studio instrumental performance for hire.", bundleOnly: false },
+  { key: "featured-artist-performance", name: "Featured Artist Performance", description: "Featured artist credit on a track.", bundleOnly: false },
+  { key: "mixing", name: "Mixing", description: "Multitrack mixdown and balance.", bundleOnly: false },
+  { key: "mastering", name: "Mastering", description: "Final loudness and tone preparation.", bundleOnly: false },
+  { key: "recording-engineering", name: "Recording Engineering", description: "Studio tracking and engineering.", bundleOnly: false },
+  { key: "live-performance", name: "Live Performance", description: "In-person and hybrid live performance.", bundleOnly: false },
 ] as const;
 
 const SPECIALTY_KEYS = ["Artist", "Producer", "Musician", "Songwriter", "SoundEngineer"] as const;
@@ -254,8 +220,7 @@ const SELLERS: readonly SellerSeed[] = [
       {
         slug: "jrrob-dancehall-mix",
         title: "Dancehall and hip-hop mixing — remote",
-        description:
-          "Mixdown for a single, including basic corrective editing and stem organization.",
+        description: "Mixdown for a single, including basic corrective editing and stem organization.",
         status: "Active",
         serviceMode: "Remote",
         primaryCategoryKey: "mixing",
@@ -283,8 +248,7 @@ const SELLERS: readonly SellerSeed[] = [
       {
         slug: "selene-bachata-live",
         title: "Bachata and merengue live performance",
-        description:
-          "In-person 60- to 90-minute set with a four-piece band, suitable for festivals and club dates.",
+        description: "In-person 60- to 90-minute set with a four-piece band, suitable for festivals and club dates.",
         status: "Active",
         serviceMode: "InPerson",
         primaryCategoryKey: "live-performance",
@@ -340,8 +304,7 @@ const SELLERS: readonly SellerSeed[] = [
       {
         slug: "devon-live-set",
         title: "Caribbean live set and band direction",
-        description:
-          "Hybrid live set with band direction; available in-person in the Caribbean and remotely elsewhere.",
+        description: "Hybrid live set with band direction; available in-person in the Caribbean and remotely elsewhere.",
         status: "Active",
         serviceMode: "Hybrid",
         primaryCategoryKey: "live-performance",
@@ -375,16 +338,12 @@ function toOfferingId(slug: string): string {
 
 async function applySeed(): Promise<void> {
   await prisma.$transaction(async (tx) => {
-    // Controlled records: deterministic upserts by stable key.
+    // Controlled records (categorical taxonomies).
     for (const category of SERVICE_CATEGORIES) {
       await tx.serviceCategory.upsert({
         where: { key: category.key },
         create: category,
-        update: {
-          name: category.name,
-          description: category.description,
-          bundleOnly: category.bundleOnly,
-        },
+        update: { name: category.name, description: category.description, bundleOnly: category.bundleOnly },
       });
     }
     for (const key of SPECIALTY_KEYS) {
@@ -402,25 +361,36 @@ async function applySeed(): Promise<void> {
       });
     }
 
-    // Sellers: deterministic upserts by stable keys (email, slug).
+    // Sellers and their full relationship graph.
     for (const seller of SELLERS) {
+      const userId = toUserId(seller.ownerEmail);
+      const workspaceId = toWorkspaceId(seller.workspaceSlug);
+      const sellerProfileId = toSellerProfileId(seller.workspaceSlug);
+
       const owner = await tx.userAccount.upsert({
         where: { email: seller.ownerEmail },
-        create: { id: toUserId(seller.ownerEmail), email: seller.ownerEmail },
+        create: { id: userId, email: seller.ownerEmail },
         update: {},
       });
 
       const workspace = await tx.workspace.upsert({
         where: { slug: seller.workspaceSlug },
         create: {
-          id: toWorkspaceId(seller.workspaceSlug),
+          id: workspaceId,
           slug: seller.workspaceSlug,
           name: seller.workspaceName,
           type: seller.workspaceType,
           status: "Active",
           ownerUserId: owner.id,
         },
-        update: { name: seller.workspaceName, type: seller.workspaceType, status: "Active" },
+        // Restore the canonical ownerUserId and other fields on every run
+        // so a stale update cannot persist.
+        update: {
+          name: seller.workspaceName,
+          type: seller.workspaceType,
+          status: "Active",
+          ownerUserId: owner.id,
+        },
       });
 
       await tx.workspaceMembership.upsert({
@@ -440,7 +410,7 @@ async function applySeed(): Promise<void> {
       const profile = await tx.sellerProfile.upsert({
         where: { workspaceId: workspace.id },
         create: {
-          id: toSellerProfileId(seller.workspaceSlug),
+          id: sellerProfileId,
           workspaceId: workspace.id,
           professionalName: seller.professionalName,
           bio: seller.bio,
@@ -461,8 +431,8 @@ async function applySeed(): Promise<void> {
         },
       });
 
-      // Caribbean affiliations: replace with the deterministic set keyed
-      // on the (sellerProfileId, countryCode) unique constraint.
+      // Caribbean affiliations: replace the canonical set, keyed on the
+      // (sellerProfileId, countryCode) unique constraint.
       await tx.caribbeanAffiliation.deleteMany({ where: { sellerProfileId: profile.id } });
       for (const countryCode of seller.caribbeanAffiliationCodes) {
         await tx.caribbeanAffiliation.upsert({
@@ -472,7 +442,7 @@ async function applySeed(): Promise<void> {
         });
       }
 
-      // Specialties: replace with the deterministic set keyed on the
+      // Specialties: replace the canonical set, keyed on the
       // (sellerProfileId, specialtyId) composite key.
       await tx.sellerProfileSpecialty.deleteMany({ where: { sellerProfileId: profile.id } });
       for (const specialtyKey of seller.specialtyKeys) {
@@ -515,11 +485,14 @@ async function applySeed(): Promise<void> {
             primaryCategoryId: category.id,
             genreTags: [...offering.genreTags],
           },
+          // Restore the canonical sellerProfileId and primaryCategoryId on
+          // every run so a stale update cannot persist.
           update: {
             title: offering.title,
             description: offering.description,
             status: offering.status,
             serviceMode: offering.serviceMode,
+            sellerProfileId: profile.id,
             primaryCategoryId: category.id,
             genreTags: [...offering.genreTags],
           },
@@ -530,7 +503,7 @@ async function applySeed(): Promise<void> {
           throw new Error(`Failed to persist offering ${offering.slug}`);
         }
 
-        // Service areas: replace with the deterministic set.
+        // Service areas: replace the canonical set.
         await tx.serviceOfferingServiceArea.deleteMany({ where: { offeringId: persisted.id } });
         for (const area of offering.serviceAreas) {
           await tx.serviceOfferingServiceArea.create({
@@ -543,18 +516,14 @@ async function applySeed(): Promise<void> {
           });
         }
 
-        // Pricing: replace with the deterministic single-row record.
+        // Pricing: replace the canonical single-row record.
         await tx.serviceOfferingPricing.deleteMany({ where: { offeringId: persisted.id } });
         if (offering.pricing) {
           let unitId: string | null = null;
           if (offering.pricing.unitKey) {
-            const unit = await tx.pricingUnit.findUnique({
-              where: { key: offering.pricing.unitKey },
-            });
+            const unit = await tx.pricingUnit.findUnique({ where: { key: offering.pricing.unitKey } });
             if (!unit) {
-              throw new Error(
-                `PricingUnit ${offering.pricing.unitKey} missing from controlled records`,
-              );
+              throw new Error(`PricingUnit ${offering.pricing.unitKey} missing from controlled records`);
             }
             unitId = unit.id;
           }
@@ -577,104 +546,398 @@ async function applySeed(): Promise<void> {
   });
 }
 
-async function assertInvariants(): Promise<{
-  sellers: number;
-  offerings: number;
-  categories: number;
-  specialties: number;
-  pricingUnits: number;
-  categoryKeys: string[];
-  affiliationCodes: string[];
-}> {
-  const [
-    sellerCount,
-    offeringCount,
-    categoryCount,
-    specialtyCount,
-    pricingUnitCount,
-    categories,
-    affiliations,
-  ] = await Promise.all([
-    prisma.sellerProfile.count(),
-    prisma.serviceOffering.count({ where: { status: "Active" } }),
-    prisma.serviceCategory.count(),
-    prisma.specialty.count(),
-    prisma.pricingUnit.count(),
-    prisma.serviceCategory.findMany({ orderBy: { key: "asc" } }),
-    prisma.caribbeanAffiliation.findMany(),
-  ]);
+// Canonical state snapshot. Proves the closed canonical set is present
+// and correct, not that no other rows exist. The snapshot is JSON-stable
+// (keys are emitted in declaration order) so two runs produce byte-equal
+// strings for the comparison below.
+interface CanonicalSnapshot {
+  readonly categories: readonly {
+    readonly key: string;
+    readonly name: string;
+    readonly description: string;
+    readonly bundleOnly: boolean;
+  }[];
+  readonly specialties: readonly { readonly key: string; readonly name: string }[];
+  readonly pricingUnits: readonly { readonly key: string; readonly name: string }[];
+  readonly sellers: readonly {
+    readonly userEmail: string;
+    readonly workspaceSlug: string;
+    readonly workspaceName: string;
+    readonly workspaceType: string;
+    readonly workspaceStatus: string;
+    readonly ownerUserId: string;
+    readonly membershipRole: string;
+    readonly sellerCapability: string;
+    readonly sellerProfileId: string;
+    readonly professionalName: string;
+    readonly status: string;
+    readonly basedInCity: string | null;
+    readonly basedInRegion: string | null;
+    readonly basedInCountryCode: string;
+    readonly caribbeanAffiliationCodes: readonly string[];
+    readonly specialtyKeys: readonly string[];
+    readonly offerings: readonly {
+      readonly id: string;
+      readonly slug: string;
+      readonly sellerProfileId: string;
+      readonly primaryCategoryKey: string;
+      readonly title: string;
+      readonly status: string;
+      readonly serviceMode: string;
+      readonly genreTags: readonly string[];
+      readonly serviceAreas: readonly {
+        readonly city: string | null;
+        readonly region: string | null;
+        readonly countryCode: string;
+      }[];
+      readonly pricing:
+        | {
+            readonly kind: string;
+            readonly amountMinor: number | null;
+            readonly currency: string | null;
+            readonly unitKey: string | null;
+          }
+        | null;
+    }[];
+  }[];
+}
+
+async function captureCanonicalSnapshot(): Promise<CanonicalSnapshot> {
+  const categories = await prisma.serviceCategory.findMany({
+    where: { key: { in: SERVICE_CATEGORIES.map((c) => c.key) } },
+    orderBy: { key: "asc" },
+  });
+  const specialties = await prisma.specialty.findMany({
+    where: { key: { in: [...SPECIALTY_KEYS] } },
+    orderBy: { key: "asc" },
+  });
+  const pricingUnits = await prisma.pricingUnit.findMany({
+    where: { key: { in: PRICING_UNITS.map((u) => u.key) } },
+    orderBy: { key: "asc" },
+  });
+
+  const sellers: CanonicalSnapshot["sellers"] = [];
+  for (const seller of SELLERS) {
+    const user = await prisma.userAccount.findUnique({ where: { email: seller.ownerEmail } });
+    if (!user) {
+      throw new Error(`Canonical user ${seller.ownerEmail} missing after seed`);
+    }
+    const workspace = await prisma.workspace.findUnique({
+      where: { slug: seller.workspaceSlug },
+    });
+    if (!workspace) {
+      throw new Error(`Canonical workspace ${seller.workspaceSlug} missing after seed`);
+    }
+    const membership = await prisma.workspaceMembership.findUnique({
+      where: { userId_workspaceId: { userId: user.id, workspaceId: workspace.id } },
+    });
+    const capability = await prisma.workspaceCapability.findUnique({
+      where: {
+        workspaceId_capability: { workspaceId: workspace.id, capability: "Seller" },
+      },
+    });
+    const profile = await prisma.sellerProfile.findUnique({
+      where: { workspaceId: workspace.id },
+    });
+    if (!profile) {
+      throw new Error(`Canonical seller profile ${seller.workspaceSlug} missing after seed`);
+    }
+    const affiliations = await prisma.caribbeanAffiliation.findMany({
+      where: { sellerProfileId: profile.id },
+      orderBy: { countryCode: "asc" },
+    });
+    const specialtiesForProfile = await prisma.sellerProfileSpecialty.findMany({
+      where: { sellerProfileId: profile.id },
+      include: { specialty: true },
+      orderBy: { specialtyId: "asc" },
+    });
+    const offerings = await prisma.serviceOffering.findMany({
+      where: { sellerProfileId: profile.id },
+      include: {
+        primaryCategory: true,
+        serviceAreas: { orderBy: { id: "asc" } },
+        pricing: { include: { unit: true } },
+      },
+      orderBy: { slug: "asc" },
+    });
+
+    sellers.push({
+      userEmail: user.email,
+      workspaceSlug: workspace.slug,
+      workspaceName: workspace.name,
+      workspaceType: workspace.type,
+      workspaceStatus: workspace.status,
+      ownerUserId: workspace.ownerUserId,
+      membershipRole: membership?.role ?? null,
+      sellerCapability: capability?.capability ?? null,
+      sellerProfileId: profile.id,
+      professionalName: profile.professionalName,
+      status: profile.status,
+      basedInCity: profile.basedInCity,
+      basedInRegion: profile.basedInRegion,
+      basedInCountryCode: profile.basedInCountryCode,
+      caribbeanAffiliationCodes: affiliations.map((a) => a.countryCode),
+      specialtyKeys: specialtiesForProfile.map((row) => row.specialty.key),
+      offerings: offerings.map((offering) => ({
+        id: offering.id,
+        slug: offering.slug,
+        sellerProfileId: offering.sellerProfileId,
+        primaryCategoryKey: offering.primaryCategory.key,
+        title: offering.title,
+        status: offering.status,
+        serviceMode: offering.serviceMode,
+        genreTags: [...offering.genreTags],
+        serviceAreas: offering.serviceAreas.map((area) => ({
+          city: area.city,
+          region: area.region,
+          countryCode: area.countryCode,
+        })),
+        pricing: offering.pricing
+          ? {
+              kind: offering.pricing.kind,
+              amountMinor: offering.pricing.amountMinor,
+              currency: offering.pricing.currency,
+              unitKey: offering.pricing.unit?.key ?? null,
+            }
+          : null,
+      })),
+    });
+  }
+
   return {
-    sellers: sellerCount,
-    offerings: offeringCount,
-    categories: categoryCount,
-    specialties: specialtyCount,
-    pricingUnits: pricingUnitCount,
-    categoryKeys: categories.map((c) => c.key),
-    affiliationCodes: [...new Set(affiliations.map((a) => a.countryCode))].sort(),
+    categories: categories.map((c) => ({
+      key: c.key,
+      name: c.name,
+      description: c.description ?? "",
+      bundleOnly: c.bundleOnly,
+    })),
+    specialties: specialties.map((s) => ({ key: s.key, name: s.name })),
+    pricingUnits: pricingUnits.map((u) => ({ key: u.key, name: u.name })),
+    sellers,
   };
 }
 
-function assertInvariantsMatchExpected(
-  snapshot: Awaited<ReturnType<typeof assertInvariants>>,
-): void {
-  const expectedCategoryKeys = SERVICE_CATEGORIES.map((c) => c.key).sort();
-  if (
-    snapshot.sellers !== SELLERS.length ||
-    snapshot.offerings !== SELLERS.length ||
-    snapshot.categories !== SERVICE_CATEGORIES.length ||
-    snapshot.specialties !== SPECIALTY_KEYS.length ||
-    snapshot.pricingUnits !== PRICING_UNITS.length
-  ) {
+function assertCanonicalSnapshotCorrect(snapshot: CanonicalSnapshot): void {
+  // 1. Controlled taxonomies.
+  if (snapshot.categories.length !== SERVICE_CATEGORIES.length) {
     throw new Error(
-      `Seed invariants failed: sellers=${snapshot.sellers}/${SELLERS.length}, ` +
-        `offerings=${snapshot.offerings}/${SELLERS.length}, ` +
-        `categories=${snapshot.categories}/${SERVICE_CATEGORIES.length}, ` +
-        `specialties=${snapshot.specialties}/${SPECIALTY_KEYS.length}, ` +
-        `pricingUnits=${snapshot.pricingUnits}/${PRICING_UNITS.length}.`,
+      `ServiceCategory count mismatch: expected ${SERVICE_CATEGORIES.length}, got ${snapshot.categories.length}`,
     );
   }
-  const actualCategoryKeys = [...snapshot.categoryKeys].sort();
-  if (actualCategoryKeys.length !== expectedCategoryKeys.length) {
-    throw new Error(
-      `Seed category key count mismatch: expected ${expectedCategoryKeys.length}, got ${actualCategoryKeys.length}.`,
-    );
-  }
-  for (let i = 0; i < expectedCategoryKeys.length; i += 1) {
-    if (actualCategoryKeys[i] !== expectedCategoryKeys[i]) {
+  for (let i = 0; i < SERVICE_CATEGORIES.length; i += 1) {
+    const expected = SERVICE_CATEGORIES[i]!;
+    const actual = snapshot.categories.find((c) => c.key === expected.key);
+    if (!actual) {
+      throw new Error(`ServiceCategory ${expected.key} missing from canonical snapshot`);
+    }
+    if (
+      actual.name !== expected.name ||
+      actual.description !== expected.description ||
+      actual.bundleOnly !== expected.bundleOnly
+    ) {
       throw new Error(
-        `Seed category key mismatch at index ${i}: expected ${expectedCategoryKeys[i]}, got ${actualCategoryKeys[i]}.`,
+        `ServiceCategory ${expected.key} values drifted: expected ${JSON.stringify(expected)} got ${JSON.stringify(actual)}`,
       );
+    }
+  }
+
+  if (snapshot.specialties.length !== SPECIALTY_KEYS.length) {
+    throw new Error(
+      `Specialty count mismatch: expected ${SPECIALTY_KEYS.length}, got ${snapshot.specialties.length}`,
+    );
+  }
+  for (const key of SPECIALTY_KEYS) {
+    const actual = snapshot.specialties.find((s) => s.key === key);
+    if (!actual) {
+      throw new Error(`Specialty ${key} missing from canonical snapshot`);
+    }
+  }
+
+  if (snapshot.pricingUnits.length !== PRICING_UNITS.length) {
+    throw new Error(
+      `PricingUnit count mismatch: expected ${PRICING_UNITS.length}, got ${snapshot.pricingUnits.length}`,
+    );
+  }
+  for (const expected of PRICING_UNITS) {
+    const actual = snapshot.pricingUnits.find((u) => u.key === expected.key);
+    if (!actual) {
+      throw new Error(`PricingUnit ${expected.key} missing from canonical snapshot`);
+    }
+    if (actual.name !== expected.name) {
+      throw new Error(`PricingUnit ${expected.key} name drifted: ${actual.name}`);
+    }
+  }
+
+  // 2. Sellers and full relationship graph.
+  if (snapshot.sellers.length !== SELLERS.length) {
+    throw new Error(
+      `Seller count mismatch: expected ${SELLERS.length}, got ${snapshot.sellers.length}`,
+    );
+  }
+  for (const seller of SELLERS) {
+    const actual = snapshot.sellers.find((s) => s.workspaceSlug === seller.workspaceSlug);
+    if (!actual) {
+      throw new Error(`Canonical seller ${seller.workspaceSlug} missing from snapshot`);
+    }
+    // Critical relationship fields.
+    if (actual.ownerUserId !== toUserId(seller.ownerEmail)) {
+      throw new Error(
+        `Workspace ${seller.workspaceSlug}.ownerUserId drifted: expected ${toUserId(seller.ownerEmail)} got ${actual.ownerUserId}`,
+      );
+    }
+    if (actual.sellerProfileId !== toSellerProfileId(seller.workspaceSlug)) {
+      throw new Error(
+        `Workspace ${seller.workspaceSlug}.sellerProfileId drifted: expected ${toSellerProfileId(seller.workspaceSlug)} got ${actual.sellerProfileId}`,
+      );
+    }
+    if (actual.membershipRole !== "Owner") {
+      throw new Error(
+        `WorkspaceMembership for ${seller.workspaceSlug} role drifted: expected Owner got ${actual.membershipRole}`,
+      );
+    }
+    if (actual.sellerCapability !== "Seller") {
+      throw new Error(
+        `WorkspaceCapability for ${seller.workspaceSlug} drifted: expected Seller got ${actual.sellerCapability}`,
+      );
+    }
+    // Stable field values.
+    if (actual.workspaceStatus !== "Active") {
+      throw new Error(
+        `Workspace ${seller.workspaceSlug}.status drifted: expected Active got ${actual.workspaceStatus}`,
+      );
+    }
+    if (actual.status !== seller.status) {
+      throw new Error(
+        `SellerProfile ${seller.workspaceSlug}.status drifted: expected ${seller.status} got ${actual.status}`,
+      );
+    }
+    if (actual.basedInCountryCode !== seller.basedInCountryCode) {
+      throw new Error(
+        `SellerProfile ${seller.workspaceSlug}.basedInCountryCode drifted`,
+      );
+    }
+    if (
+      JSON.stringify([...actual.caribbeanAffiliationCodes].sort()) !==
+      JSON.stringify([...seller.caribbeanAffiliationCodes].sort())
+    ) {
+      throw new Error(
+        `CaribbeanAffiliations for ${seller.workspaceSlug} drifted: expected ${JSON.stringify(seller.caribbeanAffiliationCodes)} got ${JSON.stringify(actual.caribbeanAffiliationCodes)}`,
+      );
+    }
+    if (
+      JSON.stringify([...actual.specialtyKeys].sort()) !==
+      JSON.stringify([...seller.specialtyKeys].sort())
+    ) {
+      throw new Error(`Specialties for ${seller.workspaceSlug} drifted`);
+    }
+    // Offerings and their canonical fields.
+    if (actual.offerings.length !== seller.offerings.length) {
+      throw new Error(
+        `Offerings for ${seller.workspaceSlug} count drifted: expected ${seller.offerings.length} got ${actual.offerings.length}`,
+      );
+    }
+    for (const offering of seller.offerings) {
+      const actualOffering = actual.offerings.find((o) => o.slug === offering.slug);
+      if (!actualOffering) {
+        throw new Error(
+          `Offering ${offering.slug} missing from canonical snapshot for ${seller.workspaceSlug}`,
+        );
+      }
+      if (actualOffering.sellerProfileId !== toSellerProfileId(seller.workspaceSlug)) {
+        throw new Error(
+          `ServiceOffering ${offering.slug}.sellerProfileId drifted: expected ${toSellerProfileId(seller.workspaceSlug)} got ${actualOffering.sellerProfileId}`,
+        );
+      }
+      if (actualOffering.title !== offering.title) {
+        throw new Error(`ServiceOffering ${offering.slug}.title drifted`);
+      }
+      if (actualOffering.status !== offering.status) {
+        throw new Error(`ServiceOffering ${offering.slug}.status drifted`);
+      }
+      if (actualOffering.serviceMode !== offering.serviceMode) {
+        throw new Error(`ServiceOffering ${offering.slug}.serviceMode drifted`);
+      }
+      if (actualOffering.primaryCategoryKey !== offering.primaryCategoryKey) {
+        throw new Error(
+          `ServiceOffering ${offering.slug}.primaryCategoryKey drifted: expected ${offering.primaryCategoryKey} got ${actualOffering.primaryCategoryKey}`,
+        );
+      }
+      if (
+        JSON.stringify([...actualOffering.genreTags].sort()) !==
+        JSON.stringify([...offering.genreTags].sort())
+      ) {
+        throw new Error(`ServiceOffering ${offering.slug}.genreTags drifted`);
+      }
+      if (actualOffering.serviceAreas.length !== offering.serviceAreas.length) {
+        throw new Error(
+          `ServiceOffering ${offering.slug}.serviceAreas count drifted: expected ${offering.serviceAreas.length} got ${actualOffering.serviceAreas.length}`,
+        );
+      }
+      const expectedAreas = [...offering.serviceAreas]
+        .map((a) => `${a.city ?? ""}|${a.region ?? ""}|${a.countryCode}`)
+        .sort();
+      const actualAreas = actualOffering.serviceAreas
+        .map((a) => `${a.city ?? ""}|${a.region ?? ""}|${a.countryCode}`)
+        .sort();
+      if (JSON.stringify(expectedAreas) !== JSON.stringify(actualAreas)) {
+        throw new Error(
+          `ServiceOffering ${offering.slug}.serviceAreas drifted: expected ${JSON.stringify(expectedAreas)} got ${JSON.stringify(actualAreas)}`,
+        );
+      }
+      if ((offering.pricing === undefined) !== (actualOffering.pricing === null)) {
+        throw new Error(
+          `ServiceOffering ${offering.slug} pricing presence drifted: expected ${offering.pricing === undefined ? "no pricing" : "pricing row"} got ${actualOffering.pricing ? "pricing row" : "no pricing"}`,
+        );
+      }
+      if (offering.pricing && actualOffering.pricing) {
+        if (actualOffering.pricing.kind !== offering.pricing.kind) {
+          throw new Error(
+            `ServiceOffering ${offering.slug} pricing.kind drifted: expected ${offering.pricing.kind} got ${actualOffering.pricing.kind}`,
+          );
+        }
+        if (actualOffering.pricing.amountMinor !== (offering.pricing.amountMinor ?? null)) {
+          throw new Error(
+            `ServiceOffering ${offering.slug} pricing.amountMinor drifted: expected ${offering.pricing.amountMinor ?? null} got ${actualOffering.pricing.amountMinor}`,
+          );
+        }
+        if (actualOffering.pricing.currency !== (offering.pricing.currency ?? null)) {
+          throw new Error(
+            `ServiceOffering ${offering.slug} pricing.currency drifted: expected ${offering.pricing.currency ?? null} got ${actualOffering.pricing.currency}`,
+          );
+        }
+        if (actualOffering.pricing.unitKey !== (offering.pricing.unitKey ?? null)) {
+          throw new Error(
+            `ServiceOffering ${offering.slug} pricing.unitKey drifted: expected ${offering.pricing.unitKey ?? null} got ${actualOffering.pricing.unitKey}`,
+          );
+        }
+      }
     }
   }
 }
 
-async function main(): Promise<void> {
-  console.log("🌱 Applying deterministic M1.1 seed (upserts on stable unique keys)…");
-  await applySeed();
-  const firstSnapshot = await assertInvariants();
-  assertInvariantsMatchExpected(firstSnapshot);
-  console.log(
-    `✅ First pass converged: ${firstSnapshot.sellers} sellers, ${firstSnapshot.offerings} active offerings, ` +
-      `${firstSnapshot.categories} categories, ${firstSnapshot.specialties} specialties, ` +
-      `${firstSnapshot.pricingUnits} pricing units.`,
-  );
-
-  // Re-apply and assert identical state to prove the upsert path is idempotent.
-  await applySeed();
-  const secondSnapshot = await assertInvariants();
-  assertInvariantsMatchExpected(secondSnapshot);
-  if (
-    firstSnapshot.sellers !== secondSnapshot.sellers ||
-    firstSnapshot.offerings !== secondSnapshot.offerings ||
-    firstSnapshot.categories !== secondSnapshot.categories ||
-    firstSnapshot.specialties !== secondSnapshot.specialties ||
-    firstSnapshot.pricingUnits !== secondSnapshot.pricingUnits
-  ) {
+function assertSnapshotsEqual(a: CanonicalSnapshot, b: CanonicalSnapshot): void {
+  if (JSON.stringify(a) !== JSON.stringify(b)) {
     throw new Error(
-      `Idempotence check failed: first=${JSON.stringify(firstSnapshot)} second=${JSON.stringify(secondSnapshot)}`,
+      `Canonical snapshot drift between runs:\nfirst=${JSON.stringify(a, null, 2)}\nsecond=${JSON.stringify(b, null, 2)}`,
     );
   }
-  console.log("✅ Second pass produced an identical invariant snapshot.");
+}
+
+async function main(): Promise<void> {
+  console.log("🌱 Applying deterministic M1.1 seed (canonical relationships and fields)…");
+  await applySeed();
+  const first = await captureCanonicalSnapshot();
+  assertCanonicalSnapshotCorrect(first);
+  console.log(
+    `✅ First pass converged: ${first.sellers.length} sellers, ${first.sellers.reduce((n, s) => n + s.offerings.length, 0)} active offerings, ` +
+      `${first.categories.length} categories, ${first.specialties.length} specialties, ${first.pricingUnits.length} pricing units.`,
+  );
+
+  await applySeed();
+  const second = await captureCanonicalSnapshot();
+  assertCanonicalSnapshotCorrect(second);
+  assertSnapshotsEqual(first, second);
+  console.log("✅ Second pass produced an identical canonical snapshot.");
 }
 
 main()
