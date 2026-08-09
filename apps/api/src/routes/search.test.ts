@@ -11,7 +11,13 @@ import {
   InMemoryTalentSearchRepository,
   type InMemoryFixture,
 } from "../repositories/in-memory-talent-search.repository.js";
-import { SellerProfileStatus, ServiceOfferingStatus, WorkspaceStatus } from "@soundhub/db";
+import {
+  type SellerProfileStatusV1,
+  type ServiceOfferingStatusV1,
+  type WorkspaceStatusV1,
+} from "@soundhub/types";
+
+void (null as unknown as SellerProfileStatusV1 | ServiceOfferingStatusV1 | WorkspaceStatusV1);
 
 const fixture: InMemoryFixture = {
   sellers: [
@@ -20,23 +26,23 @@ const fixture: InMemoryFixture = {
       workspaceId: "w-public-remote",
       professionalName: "Marc-André Pierre",
       bio: "Brooklyn-based Haitian producer.",
-      status: SellerProfileStatus.Published,
+      status: "Published",
       basedInCity: "Brooklyn",
       basedInRegion: "NY",
       basedInCountryCode: "US",
       avatarUrl: null,
       specialtyKeys: ["Producer"],
       caribbeanAffiliationCodes: ["HT"],
-      workspaceStatus: WorkspaceStatus.Active,
+      workspaceStatus: "Active",
       workspaceHasSellerCapability: true,
       offerings: [
         {
           offeringId: "offering-public-remote",
           title: "Haitian dancehall single production — remote",
           description: "Caribbean-flavored dancehall single production for diaspora artists.",
-          status: ServiceOfferingStatus.Active,
+          status: "Active",
           serviceMode: "Remote",
-          primaryCategory: { key: "music-production", name: "Music Production" },
+          primaryCategory: { key: "music-production", name: "Music Production", bundleOnly: false },
           includedServices: [],
           genreTags: ["Dancehall", "Soca"],
           serviceAreas: [{ city: null, region: null, countryCode: "US" }],

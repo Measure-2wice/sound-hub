@@ -17,15 +17,17 @@
 //    empty `additionalMatchingOfferings` array for the M1.1 tracer.
 //
 // Required constraints exclude candidates. Preferred constraints influence
-// the candidate set through the repository for M1.1 (rank-free inclusion);
-// issue #6 will own preference weighting and grouping.
+// ranking and are owned by issue #6. Unknown Caribbean affiliation codes
+// are rejected with INVALID_SEARCH_CRITERIA at the service boundary.
 
-import type {
-  PublicOfferingSummaryV1,
-  PublicSellerSummaryV1,
-  TalentSearchRequestV1,
-  TalentSearchResponseV1,
-  TalentSearchResultV1,
+import {
+  isSupportedCaribbeanAffiliationCode,
+  type LocationFilterV1,
+  type PublicOfferingSummaryV1,
+  type PublicSellerSummaryV1,
+  type TalentSearchRequestV1,
+  type TalentSearchResponseV1,
+  type TalentSearchResultV1,
 } from "@soundhub/types";
 import type {
   RepositoryCandidateOffering,
@@ -34,6 +36,13 @@ import type {
   TalentSearchRepository,
 } from "../repositories/talent-search.repository.js";
 
+export class TalentSearchInvalidCriteriaError extends Error {
+  constructor(message: string) {
+    super(message);
+    this.name = "TalentSearchInvalidCriteriaError";
+  }
+}
+
 export class TalentSearchService {
   constructor(private readonly repository: TalentSearchRepository) {}
 
@@ -41,6 +50,8 @@ export class TalentSearchService {
     const startedAt = Date.now();
     const normalizedQuery = normalizeQuery(request.query);
     const queryTokens = tokenize(normalizedQuery);
+
+    this.assertSupportedCaribbeanCodes(request);
 
     const repositoryInput = this.buildRepositoryInput(request);
     const candidates = await this.repository.search(repositoryInput);
@@ -83,13 +94,25 @@ export class TalentSearchService {
     };
   }
 
+  private assertSupportedCaribbeanCodes(request: TalentSearchRequestV1): void {
+    const codes = request.preferred?.caribbeanAffiliationCodes ?? [];
+    const unknown = codes.filter((code) => !isSupportedCaribbeanAffiliationCode(code));
+    if (unknown.length > 0) {
+      throw new TalentSearchInvalidCriteriaError(
+        `Unsupported Caribbean affiliation code(s): ${unknown.join(", ")}`,
+      );
+    }
+  }
+
   private buildRepositoryInput(request: TalentSearchRequestV1): RepositorySearchInput {
     return {
       serviceModes: dedupe(request.required?.serviceModes ?? []),
-      basedInCountryCodes: collectCountryCodes(request.required?.basedIn),
-      serviceAreaCountryCodes: collectCountryCodes(request.required?.serviceArea),
       primaryCategoryKeys: dedupe(request.required?.primaryCategoryKeys ?? []),
-      caribbeanAffiliationCodes: dedupe(request.preferred?.caribbeanAffiliationCodes ?? []),
+      independentlyPurchasableServiceKeys: dedupe(
+        request.required?.independentlyPurchasableServiceKeys ?? [],
+      ),
+      basedIn: toRepositoryLocation(request.required?.basedIn),
+      serviceArea: toRepositoryLocation(request.required?.serviceArea),
     };
   }
 
@@ -105,8 +128,7 @@ export class TalentSearchService {
       if (!first) return null;
       return { offering: first, score: 0, reason: "eligible candidate" };
     }
-    let best: { offering: RepositoryCandidateOffering; score: number; reason: string } | null =
-      null;
+    let best: { offering: RepositoryCandidateOffering; score: number; reason: string } | null = null;
     for (const offering of seller.offerings) {
       const { matched, fields } = scoreOffering(offering, queryTokens);
       if (matched === 0) continue;
@@ -144,9 +166,15 @@ function dedupe<T>(values: readonly T[]): readonly T[] {
   return Array.from(new Set(values));
 }
 
-function collectCountryCodes(filter: { countryCode?: string } | undefined): readonly string[] {
-  if (!filter?.countryCode) return [];
-  return [filter.countryCode];
+function toRepositoryLocation(
+  filter: LocationFilterV1 | undefined,
+): RepositorySearchInput["basedIn"] {
+  if (!filter) return null;
+  return {
+    city: filter.city ?? null,
+    region: filter.region ?? null,
+    countryCode: filter.countryCode ?? null,
+  };
 }
 
 // ---------- Scoring ----------

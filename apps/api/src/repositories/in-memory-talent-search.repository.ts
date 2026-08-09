@@ -2,7 +2,11 @@
 // tests. Mirrors the eligibility rules of the Prisma adapter so the service
 // can be exercised deterministically without a database.
 
-import { SellerProfileStatus, ServiceOfferingStatus, WorkspaceStatus } from "@soundhub/db";
+import {
+  type SellerProfileStatusV1,
+  type ServiceOfferingStatusV1,
+  type WorkspaceStatusV1,
+} from "@soundhub/types";
 import type {
   RepositoryCandidateOffering,
   RepositoryCandidateSeller,
@@ -19,14 +23,14 @@ export interface InMemorySeller {
   readonly workspaceId: string;
   readonly professionalName: string;
   readonly bio: string;
-  readonly status: SellerProfileStatus;
+  readonly status: SellerProfileStatusV1;
   readonly basedInCity: string | null;
   readonly basedInRegion: string | null;
   readonly basedInCountryCode: string;
   readonly avatarUrl: string | null;
   readonly specialtyKeys: readonly string[];
   readonly caribbeanAffiliationCodes: readonly string[];
-  readonly workspaceStatus: WorkspaceStatus;
+  readonly workspaceStatus: WorkspaceStatusV1;
   readonly workspaceHasSellerCapability: boolean;
   readonly offerings: readonly InMemoryOffering[];
 }
@@ -35,16 +39,12 @@ export interface InMemoryOffering {
   readonly offeringId: string;
   readonly title: string;
   readonly description: string;
-  readonly status: ServiceOfferingStatus;
+  readonly status: ServiceOfferingStatusV1;
   readonly serviceMode: "Remote" | "InPerson" | "Hybrid";
-  readonly primaryCategory: { key: string; name: string };
+  readonly primaryCategory: { key: string; name: string; bundleOnly: boolean };
   readonly includedServices: readonly { key: string; name: string; purchaseMode: "BundleOnly" }[];
   readonly genreTags: readonly string[];
-  readonly serviceAreas: readonly {
-    city: string | null;
-    region: string | null;
-    countryCode: string;
-  }[];
+  readonly serviceAreas: readonly { city: string | null; region: string | null; countryCode: string }[];
   readonly pricing: {
     kind: "StartingAt" | "Fixed" | "ContactForQuote";
     amountMinor: number | null;
@@ -67,20 +67,21 @@ export class InMemoryTalentSearchRepository implements TalentSearchRepository {
   }
 
   private isEligible(seller: InMemorySeller, input: RepositorySearchInput): boolean {
-    if (seller.status !== SellerProfileStatus.Published) return false;
-    if (seller.workspaceStatus !== WorkspaceStatus.Active) return false;
+    if (seller.status !== "Published") return false;
+    if (seller.workspaceStatus !== "Active") return false;
     if (!seller.workspaceHasSellerCapability) return false;
+    if (input.basedIn?.countryCode && seller.basedInCountryCode !== input.basedIn.countryCode) {
+      return false;
+    }
     if (
-      input.basedInCountryCodes.length > 0 &&
-      !input.basedInCountryCodes.includes(seller.basedInCountryCode)
+      input.basedIn?.city &&
+      seller.basedInCity?.toLowerCase() !== input.basedIn.city.toLowerCase()
     ) {
       return false;
     }
     if (
-      input.caribbeanAffiliationCodes.length > 0 &&
-      !seller.caribbeanAffiliationCodes.some((code) =>
-        input.caribbeanAffiliationCodes.includes(code),
-      )
+      input.basedIn?.region &&
+      seller.basedInRegion?.toLowerCase() !== input.basedIn.region.toLowerCase()
     ) {
       return false;
     }
@@ -91,7 +92,7 @@ export class InMemoryTalentSearchRepository implements TalentSearchRepository {
   }
 
   private isOfferingEligible(offering: InMemoryOffering, input: RepositorySearchInput): boolean {
-    if (offering.status !== ServiceOfferingStatus.Active) return false;
+    if (offering.status !== "Active") return false;
     if (input.serviceModes.length > 0 && !input.serviceModes.includes(offering.serviceMode)) {
       return false;
     }
@@ -101,13 +102,32 @@ export class InMemoryTalentSearchRepository implements TalentSearchRepository {
     ) {
       return false;
     }
-    if (
-      input.serviceAreaCountryCodes.length > 0 &&
-      !offering.serviceAreas.some((area) =>
-        input.serviceAreaCountryCodes.includes(area.countryCode),
-      )
-    ) {
-      return false;
+    if (input.independentlyPurchasableServiceKeys.length > 0) {
+      if (offering.primaryCategory.bundleOnly) return false;
+      if (!input.independentlyPurchasableServiceKeys.includes(offering.primaryCategory.key)) {
+        return false;
+      }
+    }
+    if (input.serviceArea !== null) {
+      const matches = offering.serviceAreas.some((area) => {
+        if (input.serviceArea!.countryCode && area.countryCode !== input.serviceArea!.countryCode) {
+          return false;
+        }
+        if (
+          input.serviceArea!.city &&
+          area.city?.toLowerCase() !== input.serviceArea!.city.toLowerCase()
+        ) {
+          return false;
+        }
+        if (
+          input.serviceArea!.region &&
+          area.region?.toLowerCase() !== input.serviceArea!.region.toLowerCase()
+        ) {
+          return false;
+        }
+        return true;
+      });
+      if (!matches) return false;
     }
     return true;
   }
@@ -125,7 +145,7 @@ export class InMemoryTalentSearchRepository implements TalentSearchRepository {
         description: offering.description,
         status: offering.status,
         serviceMode: offering.serviceMode,
-        primaryCategory: { key: offering.primaryCategory.key, name: offering.primaryCategory.name },
+        primaryCategory: { ...offering.primaryCategory },
         includedServices: offering.includedServices.map((included) => ({ ...included })),
         genreTags: [...offering.genreTags],
         serviceAreas: offering.serviceAreas.map((area) => ({ ...area })),

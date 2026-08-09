@@ -6,6 +6,7 @@ import {
 } from "@soundhub/types";
 import { ZodError } from "zod";
 import type { TalentSearchService } from "../services/talent-search.service.js";
+import { TalentSearchInvalidCriteriaError } from "../services/talent-search.service.js";
 import {
   buildFieldErrors,
   buildSafeError,
@@ -18,6 +19,8 @@ export interface SearchRouteDeps {
   readonly service: TalentSearchService;
 }
 
+const MAX_REQUEST_BODY_BYTES = 16 * 1024;
+
 export function createSearchRouter(deps: SearchRouteDeps): Router {
   const router = Router();
   router.post("/", (req, res) => {
@@ -26,7 +29,11 @@ export function createSearchRouter(deps: SearchRouteDeps): Router {
   return router;
 }
 
-async function handleSearch(req: Request, res: Response, deps: SearchRouteDeps): Promise<void> {
+async function handleSearch(
+  req: Request,
+  res: Response,
+  deps: SearchRouteDeps,
+): Promise<void> {
   const requestId = resolveRequestId(req);
   res.setHeader("x-request-id", requestId);
 
@@ -46,12 +53,15 @@ async function handleSearch(req: Request, res: Response, deps: SearchRouteDeps):
   try {
     rawBody = await readJsonBody(req);
   } catch (err) {
-    const error = buildSafeError(
-      "INVALID_JSON",
-      "Request body is not valid JSON.",
-      undefined,
-      requestId,
-    );
+    const code =
+      err instanceof PayloadTooLargeError
+        ? "INVALID_JSON"
+        : "INVALID_JSON";
+    const message =
+      err instanceof PayloadTooLargeError
+        ? `Request body exceeds the ${MAX_REQUEST_BODY_BYTES}-byte limit.`
+        : "Request body is not valid JSON.";
+    const error = buildSafeError(code, message, undefined, requestId);
     noteError(error, err);
     writeSafeError(res, error);
     return;
@@ -79,6 +89,17 @@ async function handleSearch(req: Request, res: Response, deps: SearchRouteDeps):
   try {
     response = await deps.service.search(parsedRequest);
   } catch (err) {
+    if (err instanceof TalentSearchInvalidCriteriaError) {
+      const error = buildSafeError(
+        "INVALID_SEARCH_CRITERIA",
+        err.message,
+        undefined,
+        requestId,
+      );
+      noteError(error, err);
+      writeSafeError(res, error);
+      return;
+    }
     const safe = isUnavailable(err)
       ? buildSafeError(
           "SEARCH_UNAVAILABLE",
@@ -121,14 +142,31 @@ function resolveRequestId(req: Request): string {
   return generateRequestId();
 }
 
+class PayloadTooLargeError extends Error {
+  constructor(message: string) {
+    super(message);
+    this.name = "PayloadTooLargeError";
+  }
+}
+
 async function readJsonBody(req: Request): Promise<unknown> {
   return new Promise((resolve, reject) => {
     let data = "";
+    let settled = false;
     req.setEncoding("utf8");
     req.on("data", (chunk: string) => {
+      if (settled) return;
+      if (data.length + chunk.length > MAX_REQUEST_BODY_BYTES) {
+        settled = true;
+        req.destroy();
+        reject(new PayloadTooLargeError("Request body too large"));
+        return;
+      }
       data += chunk;
     });
     req.on("end", () => {
+      if (settled) return;
+      settled = true;
       if (data.length === 0) {
         resolve({});
         return;
@@ -139,7 +177,11 @@ async function readJsonBody(req: Request): Promise<unknown> {
         reject(err instanceof Error ? err : new Error(String(err)));
       }
     });
-    req.on("error", (err: Error) => reject(err));
+    req.on("error", (err: Error) => {
+      if (settled) return;
+      settled = true;
+      reject(err);
+    });
   });
 }
 

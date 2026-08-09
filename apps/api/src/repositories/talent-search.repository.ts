@@ -8,11 +8,11 @@
 // never returns Prisma models to the public contract.
 
 import type {
-  ServiceMode,
-  PricingKind,
-  SellerProfileStatus,
-  ServiceOfferingStatus,
-} from "@soundhub/db";
+  PricingKindV1,
+  SellerProfileStatusV1,
+  ServiceOfferingStatusV1,
+  ServiceModeV1,
+} from "@soundhub/types";
 
 export interface RepositoryLocation {
   readonly city: string | null;
@@ -20,13 +20,20 @@ export interface RepositoryLocation {
   readonly countryCode: string;
 }
 
+export interface RepositoryLocationFilter {
+  readonly city: string | null;
+  readonly region: string | null;
+  readonly countryCode: string | null;
+}
+
 export interface RepositoryPrimaryCategory {
   readonly key: string;
   readonly name: string;
+  readonly bundleOnly: boolean;
 }
 
 export interface RepositoryPricing {
-  readonly kind: PricingKind;
+  readonly kind: PricingKindV1;
   readonly amountMinor: number | null;
   readonly currency: string | null;
   readonly unitKey: string | null;
@@ -49,8 +56,8 @@ export interface RepositoryCandidateOffering {
   readonly sellerId: string;
   readonly title: string;
   readonly description: string;
-  readonly status: ServiceOfferingStatus;
-  readonly serviceMode: ServiceMode;
+  readonly status: ServiceOfferingStatusV1;
+  readonly serviceMode: ServiceModeV1;
   readonly primaryCategory: RepositoryPrimaryCategory;
   readonly includedServices: readonly RepositoryIncludedService[];
   readonly genreTags: readonly string[];
@@ -63,7 +70,7 @@ export interface RepositoryCandidateSeller {
   readonly workspaceId: string;
   readonly professionalName: string;
   readonly bio: string;
-  readonly status: SellerProfileStatus;
+  readonly status: SellerProfileStatusV1;
   readonly basedInCity: string | null;
   readonly basedInRegion: string | null;
   readonly basedInCountryCode: string;
@@ -73,15 +80,16 @@ export interface RepositoryCandidateSeller {
   readonly offerings: readonly RepositoryCandidateOffering[];
 }
 
+// RepositorySearchInput carries every required constraint that the service
+// applies. Required constraints are exclusionary; preferred constraints
+// never reach the repository and only influence ranking, which is owned
+// by issue #6.
 export interface RepositorySearchInput {
-  // Empty means "any". The service is responsible for normalizing and applying
-  // required vs preferred semantics; the repository only fetches the eligible
-  // candidate set.
-  readonly serviceModes: readonly ServiceMode[];
-  readonly basedInCountryCodes: readonly string[];
-  readonly serviceAreaCountryCodes: readonly string[];
+  readonly serviceModes: readonly ServiceModeV1[];
   readonly primaryCategoryKeys: readonly string[];
-  readonly caribbeanAffiliationCodes: readonly string[];
+  readonly independentlyPurchasableServiceKeys: readonly string[];
+  readonly basedIn: RepositoryLocationFilter | null;
+  readonly serviceArea: RepositoryLocationFilter | null;
 }
 
 export interface TalentSearchRepository {

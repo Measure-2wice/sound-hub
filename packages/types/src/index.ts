@@ -11,9 +11,12 @@ import { z } from "zod";
 
 // ---------- Helpers ----------
 
+// Bounded string array: trims, dedupes, and rejects empty/whitespace-only
+// elements. An empty input collapses to `undefined` so that downstream
+// usability checks ignore "no criteria" arrays.
 const boundedStringArray = (minLength: number, maxLength: number) =>
   z
-    .array(z.string().min(minLength).max(maxLength))
+    .array(z.string().min(1).max(maxLength))
     .max(50, "array is too long")
     .transform((values) => {
       const seen = new Set<string>();
@@ -28,9 +31,14 @@ const boundedStringArray = (minLength: number, maxLength: number) =>
       return out;
     });
 
-// ISO 3166-1 alpha-2 country code (uppercase). The contract only validates the
-// shape; whether a specific code is a supported Caribbean affiliation is an
-// application-layer concern.
+const optionalBoundedStringArray = (minLength: number, maxLength: number) =>
+  boundedStringArray(minLength, maxLength)
+    .transform((arr) => (arr.length === 0 ? undefined : arr))
+    .optional();
+
+// ISO 3166-1 alpha-2 country code (uppercase). The contract only validates
+// the shape; whether a specific code is a supported Caribbean affiliation is
+// an application-layer concern.
 const countryCodeSchema = z
   .string()
   .regex(/^[A-Z]{2}$/, "countryCode must be a 2-letter ISO alpha-2 code");
@@ -83,9 +91,13 @@ export type LocationFilterV1 = z.infer<typeof locationFilterV1Schema>;
 
 export const talentSearchRequiredCriteriaV1Schema = z
   .object({
-    primaryCategoryKeys: boundedStringArray(1, 64).optional(),
-    independentlyPurchasableServiceKeys: boundedStringArray(1, 64).optional(),
-    serviceModes: z.array(serviceModeSchema).max(8).optional(),
+    primaryCategoryKeys: optionalBoundedStringArray(1, 64),
+    independentlyPurchasableServiceKeys: optionalBoundedStringArray(1, 64),
+    serviceModes: z
+      .array(serviceModeSchema)
+      .max(8)
+      .transform((arr) => (arr.length === 0 ? undefined : arr))
+      .optional(),
     basedIn: locationFilterV1Schema.optional(),
     serviceArea: locationFilterV1Schema.optional(),
   })
@@ -96,41 +108,55 @@ export type TalentSearchRequiredCriteriaV1 = z.infer<typeof talentSearchRequired
 
 export const talentSearchPreferredCriteriaV1Schema = z
   .object({
-    categoryKeys: boundedStringArray(1, 64).optional(),
-    includedServiceKeys: boundedStringArray(1, 64).optional(),
-    specialties: boundedStringArray(1, 64).optional(),
-    genreTags: boundedStringArray(1, 64).optional(),
-    caribbeanAffiliationCodes: z.array(countryCodeSchema).max(20).optional(),
+    categoryKeys: optionalBoundedStringArray(1, 64),
+    includedServiceKeys: optionalBoundedStringArray(1, 64),
+    specialties: optionalBoundedStringArray(1, 64),
+    genreTags: optionalBoundedStringArray(1, 64),
+    caribbeanAffiliationCodes: z
+      .array(countryCodeSchema)
+      .max(20)
+      .transform((arr) => (arr.length === 0 ? undefined : arr))
+      .optional(),
     basedIn: locationFilterV1Schema.optional(),
-    serviceModes: z.array(serviceModeSchema).max(8).optional(),
+    serviceModes: z
+      .array(serviceModeSchema)
+      .max(8)
+      .transform((arr) => (arr.length === 0 ? undefined : arr))
+      .optional(),
   })
   .strict();
 export type TalentSearchPreferredCriteriaV1 = z.infer<typeof talentSearchPreferredCriteriaV1Schema>;
 
 // ---------- Request ----------
 
+// Normalized query: trimmed, internal whitespace collapsed, lowercased,
+// surrounding punctuation stripped. A purely punctuation-only string
+// collapses to the empty string and fails the usability check.
+const normalizedQuerySchema = z
+  .string()
+  .max(500, "query must be at most 500 characters")
+  .transform((value) => value.trim().replace(/\s+/g, " ").toLowerCase())
+  .transform((value) => value.replace(/^[^\p{L}\p{N}]+|[^\p{L}\p{N}]+$/gu, ""))
+  .refine((value) => /[\p{L}\p{N}]/u.test(value), {
+    message: "query must contain at least one letter or digit after normalization",
+  })
+  .refine((value) => value.length >= 2, {
+    message: "query must be at least 2 characters after normalization",
+  });
+
 // A request is usable when at least one of `query`, `required`, or `preferred`
 // has a meaningful value. The refinement enforces the contract rule.
 export const talentSearchRequestV1Schema = z
   .object({
-    query: z
-      .string()
-      .max(500, "query must be at most 500 characters")
-      .transform((value) => value.trim().replace(/\s+/g, " "))
-      .pipe(z.string().min(2, "query must be at least 2 characters"))
-      .optional(),
+    query: normalizedQuerySchema.optional(),
     required: talentSearchRequiredCriteriaV1Schema.optional(),
     preferred: talentSearchPreferredCriteriaV1Schema.optional(),
   })
   .strict()
   .superRefine((value, ctx) => {
     const hasQuery = typeof value.query === "string" && value.query.length >= 2;
-    const hasRequired = value.required
-      ? Object.values(value.required).some((field) => field !== undefined)
-      : false;
-    const hasPreferred = value.preferred
-      ? Object.values(value.preferred).some((field) => field !== undefined)
-      : false;
+    const hasRequired = value.required ? isUsable(value.required) : false;
+    const hasPreferred = value.preferred ? isUsable(value.preferred) : false;
     if (!(hasQuery || hasRequired || hasPreferred)) {
       ctx.addIssue({
         code: z.ZodIssueCode.custom,
@@ -139,6 +165,19 @@ export const talentSearchRequestV1Schema = z
     }
   });
 export type TalentSearchRequestV1 = z.infer<typeof talentSearchRequestV1Schema>;
+
+// Recursively treats a value as "usable" if it has a non-empty string,
+// a non-empty array, or a nested object that itself is usable. Empty
+// arrays, empty objects, and undefined values are not usable.
+function isUsable(value: unknown): boolean {
+  if (value === undefined || value === null) return false;
+  if (typeof value === "string") return value.length > 0;
+  if (Array.isArray(value)) return value.length > 0;
+  if (typeof value === "object") {
+    return Object.values(value as Record<string, unknown>).some(isUsable);
+  }
+  return false;
+}
 
 // ---------- Public seller summary ----------
 
@@ -269,6 +308,37 @@ export const apiErrorResponseV1Schema = z
   .strict();
 export type ApiErrorResponseV1 = z.infer<typeof apiErrorResponseV1Schema>;
 
+// ---------- Supported Caribbean affiliation codes ----------
+//
+// The application layer validates the user's `preferred` Caribbean
+// affiliation codes against this canonical set. Unknown codes return
+// INVALID_SEARCH_CRITERIA, not empty results.
+export const SUPPORTED_CARIBBEAN_AFFILIATION_CODES = [
+  "AG",
+  "BB",
+  "BS",
+  "BZ",
+  "DM",
+  "DO",
+  "GD",
+  "GY",
+  "HT",
+  "JM",
+  "KN",
+  "LC",
+  "SR",
+  "TT",
+  "VC",
+] as const;
+export type SupportedCaribbeanAffiliationCode =
+  (typeof SUPPORTED_CARIBBEAN_AFFILIATION_CODES)[number];
+
+export function isSupportedCaribbeanAffiliationCode(
+  code: string,
+): code is SupportedCaribbeanAffiliationCode {
+  return (SUPPORTED_CARIBBEAN_AFFILIATION_CODES as readonly string[]).includes(code);
+}
+
 // ---------- Closed Prisma enum surfaces (for drift testing) ----------
 //
 // These mirror the values used by the Prisma enums in packages/db/prisma/schema.prisma.
@@ -276,11 +346,20 @@ export type ApiErrorResponseV1 = z.infer<typeof apiErrorResponseV1Schema>;
 // persistence layer and the public contract diverge.
 
 export const workspaceTypeValuesV1 = ["Personal", "Organization"] as const;
+export type WorkspaceTypeV1 = (typeof workspaceTypeValuesV1)[number];
 export const workspaceStatusValuesV1 = ["Active", "Suspended"] as const;
+export type WorkspaceStatusV1 = (typeof workspaceStatusValuesV1)[number];
 export const workspaceMembershipRoleValuesV1 = ["Owner", "Admin", "Member"] as const;
+export type WorkspaceMembershipRoleV1 = (typeof workspaceMembershipRoleValuesV1)[number];
 export const marketplaceCapabilityValuesV1 = ["Buyer", "Seller"] as const;
+export type MarketplaceCapabilityV1 = (typeof marketplaceCapabilityValuesV1)[number];
 export const sellerProfileStatusValuesV1 = ["Draft", "Published", "Suspended"] as const;
+export type SellerProfileStatusV1 = (typeof sellerProfileStatusValuesV1)[number];
 export const serviceOfferingStatusValuesV1 = ["Draft", "Active", "Paused", "Archived"] as const;
+export type ServiceOfferingStatusV1 = (typeof serviceOfferingStatusValuesV1)[number];
 export const serviceModeValuesV1 = ["Remote", "InPerson", "Hybrid"] as const;
+export type ServiceModeV1 = (typeof serviceModeValuesV1)[number];
 export const pricingKindValuesV1 = ["StartingAt", "Fixed", "ContactForQuote"] as const;
+export type PricingKindV1 = (typeof pricingKindValuesV1)[number];
 export const purchaseModeValuesV1 = ["BundleOnly"] as const;
+export type PurchaseModeV1 = (typeof purchaseModeValuesV1)[number];

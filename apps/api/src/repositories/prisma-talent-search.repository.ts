@@ -5,14 +5,11 @@
 // can be exercised with the in-memory adapter for unit tests and exercised
 // end-to-end with this adapter for repository integration tests.
 //
-// Filters are applied in two stages:
-//   1. Prisma `where` clauses for hard, indexed filters (status, workspace
-//      status, capability, basedIn, Caribbean affiliation). These reduce
-//      the candidate set before any rows are materialised.
-//   2. Application-level filters in `toCandidate` for criteria that apply
-//      per-offering and that we want to evaluate uniformly with the
-//      in-memory adapter (service mode, primary category key, service area).
-//      This keeps the contract test surface symmetric across adapters.
+// Required constraints are applied via Prisma `where` clauses where they
+// reduce the candidate set before any rows are materialised. Per-offering
+// filters (primaryCategoryKeys, serviceModes, serviceArea) are also
+// applied in `toCandidate` to keep eligibility logic symmetric with the
+// in-memory adapter.
 
 import {
   type Prisma,
@@ -53,25 +50,7 @@ export class PrismaTalentSearchRepository implements TalentSearchRepository {
 
   async search(input: RepositorySearchInput): Promise<readonly RepositoryCandidateSeller[]> {
     const sellers = await this.prisma.sellerProfile.findMany({
-      where: {
-        status: SellerProfileStatus.Published,
-        workspace: {
-          is: {
-            status: WorkspaceStatus.Active,
-            capabilities: { some: { capability: MarketplaceCapability.Seller } },
-            ...(input.basedInCountryCodes.length > 0
-              ? { sellerProfile: { basedInCountryCode: { in: [...input.basedInCountryCodes] } } }
-              : {}),
-          },
-        },
-        ...(input.caribbeanAffiliationCodes.length > 0
-          ? {
-              caribbeanAffiliations: {
-                some: { countryCode: { in: [...input.caribbeanAffiliationCodes] } },
-              },
-            }
-          : {}),
-      },
+      where: this.buildSellerWhere(input),
       include: sellerProfileInclude,
       orderBy: [{ id: "asc" }],
     });
@@ -81,12 +60,44 @@ export class PrismaTalentSearchRepository implements TalentSearchRepository {
       .filter((seller) => seller.offerings.length > 0);
   }
 
+  private buildSellerWhere(input: RepositorySearchInput): Prisma.SellerProfileWhereInput {
+    const workspaceWhere: Prisma.WorkspaceWhereInput = {
+      status: WorkspaceStatus.Active,
+      capabilities: { some: { capability: MarketplaceCapability.Seller } },
+    };
+    if (input.basedIn?.countryCode) {
+      workspaceWhere.sellerProfile = {
+        basedInCountryCode: input.basedIn.countryCode,
+      };
+    }
+
+    return {
+      status: SellerProfileStatus.Published,
+      workspace: { is: workspaceWhere },
+    };
+  }
+
   private toCandidate(
     seller: SellerWithRelations,
     input: RepositorySearchInput,
   ): RepositoryCandidateSeller {
+    // Hard eligibility first: basedIn city/region must match if provided.
+    if (!matchesLocation(seller.basedInCity, seller.basedInRegion, input.basedIn)) {
+      return { ...emptyCandidate(seller), offerings: [] };
+    }
+
     const offerings = seller.offerings
       .filter((offering) => offering.status === ServiceOfferingStatus.Active)
+      // Hard eligibility: primaryCategory must be a non-bundle-only
+      // independently purchasable category, and only then is it eligible
+      // for the `independentlyPurchasableServiceKeys` filter.
+      .filter((offering) => {
+        if (input.independentlyPurchasableServiceKeys.length === 0) return true;
+        return (
+          !offering.primaryCategory.bundleOnly &&
+          input.independentlyPurchasableServiceKeys.includes(offering.primaryCategory.key)
+        );
+      })
       .filter((offering) =>
         input.primaryCategoryKeys.length === 0
           ? true
@@ -95,46 +106,39 @@ export class PrismaTalentSearchRepository implements TalentSearchRepository {
       .filter((offering) =>
         input.serviceModes.length === 0 ? true : input.serviceModes.includes(offering.serviceMode),
       )
-      .filter((offering) =>
-        input.serviceAreaCountryCodes.length === 0
-          ? true
-          : offering.serviceAreas.some((area) =>
-              input.serviceAreaCountryCodes.includes(area.countryCode),
-            ),
-      )
-      .map(
-        (offering): RepositoryCandidateOffering => ({
-          offeringId: offering.id,
-          sellerId: seller.id,
-          title: offering.title,
-          description: offering.description,
-          status: offering.status,
-          serviceMode: offering.serviceMode,
-          primaryCategory: {
-            key: offering.primaryCategory.key,
-            name: offering.primaryCategory.name,
-          },
-          includedServices: offering.includedServices.map((included) => ({
-            key: included.category.key,
-            name: included.category.name,
-            purchaseMode: "BundleOnly" as const,
-          })),
-          genreTags: offering.genreTags,
-          serviceAreas: offering.serviceAreas.map((area) => ({
-            city: area.city,
-            region: area.region,
-            countryCode: area.countryCode,
-          })),
-          pricing: offering.pricing
-            ? {
-                kind: offering.pricing.kind,
-                amountMinor: offering.pricing.amountMinor,
-                currency: offering.pricing.currency,
-                unitKey: offering.pricing.unit?.key ?? null,
-              }
-            : null,
-        }),
-      );
+      .filter((offering) => matchesAnyServiceArea(offering.serviceAreas, input.serviceArea))
+      .map((offering): RepositoryCandidateOffering => ({
+        offeringId: offering.id,
+        sellerId: seller.id,
+        title: offering.title,
+        description: offering.description,
+        status: offering.status,
+        serviceMode: offering.serviceMode,
+        primaryCategory: {
+          key: offering.primaryCategory.key,
+          name: offering.primaryCategory.name,
+          bundleOnly: offering.primaryCategory.bundleOnly,
+        },
+        includedServices: offering.includedServices.map((included) => ({
+          key: included.category.key,
+          name: included.category.name,
+          purchaseMode: "BundleOnly" as const,
+        })),
+        genreTags: offering.genreTags,
+        serviceAreas: offering.serviceAreas.map((area) => ({
+          city: area.city,
+          region: area.region,
+          countryCode: area.countryCode,
+        })),
+        pricing: offering.pricing
+          ? {
+              kind: offering.pricing.kind,
+              amountMinor: offering.pricing.amountMinor,
+              currency: offering.pricing.currency,
+              unitKey: offering.pricing.unit?.key ?? null,
+            }
+          : null,
+      }));
 
     return {
       sellerId: seller.id,
@@ -151,4 +155,72 @@ export class PrismaTalentSearchRepository implements TalentSearchRepository {
       offerings,
     };
   }
+}
+
+function emptyCandidate(seller: SellerWithRelations): Omit<RepositoryCandidateSeller, "offerings"> {
+  return {
+    sellerId: seller.id,
+    workspaceId: seller.workspaceId,
+    professionalName: seller.professionalName,
+    bio: seller.bio,
+    status: seller.status,
+    basedInCity: seller.basedInCity,
+    basedInRegion: seller.basedInRegion,
+    basedInCountryCode: seller.basedInCountryCode,
+    avatarUrl: seller.avatarUrl,
+    specialtyKeys: seller.specialties.map((row) => row.specialty.key),
+    caribbeanAffiliationCodes: seller.caribbeanAffiliations.map((row) => row.countryCode),
+  };
+}
+
+function normalize(value: string | null | undefined): string | null {
+  if (value === null || value === undefined) return null;
+  const trimmed = value.trim();
+  if (trimmed.length === 0) return null;
+  return trimmed.toLowerCase();
+}
+
+function matchesLocation(
+  city: string | null,
+  region: string | null,
+  filter: RepositorySearchInput["basedIn"],
+): boolean {
+  if (filter === null) return true;
+  if (filter.countryCode !== null) {
+    // Country code is enforced at the Prisma workspace filter; the seller
+    // must have already been filtered to the right country. Skip the
+    // string comparison.
+  } else {
+    if (filter.city === null && filter.region === null) {
+      return true;
+    }
+  }
+  if (filter.city !== null) {
+    if (normalize(city) !== filter.city.toLowerCase()) return false;
+  }
+  if (filter.region !== null) {
+    if (normalize(region) !== filter.region.toLowerCase()) return false;
+  }
+  return true;
+}
+
+function matchesAnyServiceArea(
+  areas: ReadonlyArray<{ city: string | null; region: string | null; countryCode: string }>,
+  filter: RepositorySearchInput["serviceArea"],
+): boolean {
+  if (filter === null) return true;
+  for (const area of areas) {
+    let match = true;
+    if (filter.countryCode !== null && area.countryCode !== filter.countryCode) {
+      match = false;
+    }
+    if (match && filter.city !== null && normalize(area.city) !== filter.city.toLowerCase()) {
+      match = false;
+    }
+    if (match && filter.region !== null && normalize(area.region) !== filter.region.toLowerCase()) {
+      match = false;
+    }
+    if (match) return true;
+  }
+  return false;
 }
