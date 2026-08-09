@@ -92,6 +92,17 @@ export interface RepositorySearchInput {
   readonly serviceArea: RepositoryLocationFilter | null;
 }
 
+// Controlled canonical keys resolved from the database. The PostgreSQL
+// seed is the canonical source; the repository is the only place that
+// reads the keys, and the service uses them to validate stable-key
+// fields exposed by the v1 request before executing search.
+export interface RepositoryControlledKeys {
+  readonly serviceCategoryKeys: ReadonlySet<string>;
+  readonly specialtyKeys: ReadonlySet<string>;
+  readonly pricingUnitKeys: ReadonlySet<string>;
+}
+
 export interface TalentSearchRepository {
   search(input: RepositorySearchInput): Promise<readonly RepositoryCandidateSeller[]>;
+  getControlledKeys(): Promise<RepositoryControlledKeys>;
 }

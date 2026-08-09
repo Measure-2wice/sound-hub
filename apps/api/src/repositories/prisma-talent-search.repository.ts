@@ -22,9 +22,12 @@ import {
 import type {
   RepositoryCandidateOffering,
   RepositoryCandidateSeller,
+  RepositoryControlledKeys,
   RepositorySearchInput,
   TalentSearchRepository,
 } from "./talent-search.repository.js";
+import type { SellerProfileStatusV1, ServiceOfferingStatusV1 } from "@soundhub/types";
+void (null as unknown as SellerProfileStatusV1 | ServiceOfferingStatusV1);
 
 const sellerProfileInclude = {
   workspace: true,
@@ -58,6 +61,19 @@ export class PrismaTalentSearchRepository implements TalentSearchRepository {
     return sellers
       .map((seller) => this.toCandidate(seller, input))
       .filter((seller) => seller.offerings.length > 0);
+  }
+
+  async getControlledKeys(): Promise<RepositoryControlledKeys> {
+    const [categories, specialties, pricingUnits] = await Promise.all([
+      this.prisma.serviceCategory.findMany({ select: { key: true } }),
+      this.prisma.specialty.findMany({ select: { key: true } }),
+      this.prisma.pricingUnit.findMany({ select: { key: true } }),
+    ]);
+    return {
+      serviceCategoryKeys: new Set(categories.map((c) => c.key)),
+      specialtyKeys: new Set(specialties.map((s) => s.key)),
+      pricingUnitKeys: new Set(pricingUnits.map((u) => u.key)),
+    };
   }
 
   private buildSellerWhere(input: RepositorySearchInput): Prisma.SellerProfileWhereInput {

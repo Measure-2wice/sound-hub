@@ -22,8 +22,6 @@
 
 import {
   isSupportedCaribbeanAffiliationCode,
-  isSupportedServiceCategoryKey,
-  isSupportedSpecialtyKey,
   type LocationFilterV1,
   type PublicOfferingSummaryV1,
   type PublicSellerSummaryV1,
@@ -53,7 +51,14 @@ export class TalentSearchService {
     const normalizedQuery = normalizeQuery(request.query);
     const queryTokens = tokenize(normalizedQuery);
 
-    this.assertSupportedControlledKeys(request);
+    // Resolve the canonical controlled keys from the repository (the
+    // canonical source per the M1.1 architecture) before validating
+    // any stable-key field exposed by the v1 request. The repository
+    // is the only source of truth for which service categories,
+    // specialties, and pricing units exist; the types package only
+    // validates the structural shape of those keys.
+    const controlledKeys = await this.repository.getControlledKeys();
+    this.assertSupportedControlledKeys(request, controlledKeys);
     this.assertSupportedCaribbeanCodes(request);
 
     const repositoryInput = this.buildRepositoryInput(request);
@@ -107,7 +112,14 @@ export class TalentSearchService {
     }
   }
 
-  private assertSupportedControlledKeys(request: TalentSearchRequestV1): void {
+  private assertSupportedControlledKeys(
+    request: TalentSearchRequestV1,
+    controlledKeys: {
+      serviceCategoryKeys: ReadonlySet<string>;
+      specialtyKeys: ReadonlySet<string>;
+      pricingUnitKeys: ReadonlySet<string>;
+    },
+  ): void {
     const requiredCategoryKeys = request.required?.primaryCategoryKeys ?? [];
     const requiredServiceKeys = request.required?.independentlyPurchasableServiceKeys ?? [];
     const preferredCategoryKeys = request.preferred?.categoryKeys ?? [];
@@ -120,7 +132,9 @@ export class TalentSearchService {
       ...preferredCategoryKeys,
       ...preferredIncludedServiceKeys,
     ];
-    const unknownCategories = allCategoryKeys.filter((key) => !isSupportedServiceCategoryKey(key));
+    const unknownCategories = allCategoryKeys.filter(
+      (key) => !controlledKeys.serviceCategoryKeys.has(key),
+    );
     if (unknownCategories.length > 0) {
       throw new TalentSearchInvalidCriteriaError(
         `Unsupported service category key(s): ${[...new Set(unknownCategories)].join(", ")}`,
@@ -128,7 +142,7 @@ export class TalentSearchService {
     }
 
     const unknownSpecialties = preferredSpecialtyKeys.filter(
-      (key) => !isSupportedSpecialtyKey(key),
+      (key) => !controlledKeys.specialtyKeys.has(key),
     );
     if (unknownSpecialties.length > 0) {
       throw new TalentSearchInvalidCriteriaError(

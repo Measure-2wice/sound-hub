@@ -10,12 +10,25 @@ import {
 import type {
   RepositoryCandidateOffering,
   RepositoryCandidateSeller,
+  RepositoryControlledKeys,
   RepositorySearchInput,
   TalentSearchRepository,
 } from "./talent-search.repository.js";
 
 export interface InMemoryFixture {
   sellers: InMemorySeller[];
+  /**
+   * The canonical set of controlled keys this in-memory adapter
+   * considers valid. In production these come from the PostgreSQL
+   * seed via the Prisma adapter; the in-memory adapter accepts an
+   * explicit set so the service can validate against the same
+   * controlled-key surface in unit tests.
+   */
+  readonly controlledKeys?: {
+    readonly serviceCategoryKeys: readonly string[];
+    readonly specialtyKeys: readonly string[];
+    readonly pricingUnitKeys: readonly string[];
+  };
 }
 
 export interface InMemorySeller {
@@ -68,6 +81,21 @@ export class InMemoryTalentSearchRepository implements TalentSearchRepository {
       .filter((seller) => this.isEligible(seller, input))
       .map((seller) => this.toCandidate(seller, input))
       .sort((a, b) => a.sellerId.localeCompare(b.sellerId));
+  }
+
+  async getControlledKeys(): Promise<RepositoryControlledKeys> {
+    await Promise.resolve();
+    const controlled = this.fixture.controlledKeys;
+    if (!controlled) {
+      throw new Error(
+        "InMemoryTalentSearchRepository requires fixture.controlledKeys to be set",
+      );
+    }
+    return {
+      serviceCategoryKeys: new Set(controlled.serviceCategoryKeys),
+      specialtyKeys: new Set(controlled.specialtyKeys),
+      pricingUnitKeys: new Set(controlled.pricingUnitKeys),
+    };
   }
 
   private isEligible(seller: InMemorySeller, input: RepositorySearchInput): boolean {

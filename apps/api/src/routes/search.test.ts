@@ -57,6 +57,11 @@ const fixture: InMemoryFixture = {
       ],
     },
   ],
+  controlledKeys: {
+    serviceCategoryKeys: ["music-production"],
+    specialtyKeys: ["Producer"],
+    pricingUnitKeys: ["track"],
+  },
 };
 
 const service = new TalentSearchService(new InMemoryTalentSearchRepository(fixture));
@@ -224,6 +229,12 @@ describe("POST /api/search contract", () => {
         err.code = "ECONNREFUSED";
         throw err;
       },
+      getControlledKeys: () =>
+        Promise.resolve({
+          serviceCategoryKeys: new Set<string>(),
+          specialtyKeys: new Set<string>(),
+          pricingUnitKeys: new Set<string>(),
+      }),
     });
     const { app: failingApp } = buildApp({ service: failingService, prismaClient: stubPrisma });
     const response = await request(failingApp)
@@ -320,5 +331,98 @@ describe("POST /api/search contract", () => {
     // limit mis-fire.
     assert.equal(response.status, 400);
     assert.equal(response.body.error.code, "INVALID_SEARCH_CRITERIA");
+  });
+
+  test("rejects a Content-Type with a semicolon inside a quoted parameter value", async () => {
+    // The value "a;b" is quoted, so the parser must NOT split on the
+    // semicolon. The parameter is a single valid key=value pair.
+    const response = await request(app)
+      .post("/api/search")
+      .set("content-type", 'application/json; charset="a;b"')
+      .send({ query: "Haitian dancehall single production" });
+    assert.equal(response.status, 200);
+  });
+
+  test("rejects a malformed Content-Type with an unbalanced quote", async () => {
+    const response = await request(app)
+      .post("/api/search")
+      .set("content-type", 'application/json; charset="unterminated')
+      .send({ query: "dancehall" });
+    assert.equal(response.status, 415);
+    assert.equal(response.body.error.code, "UNSUPPORTED_MEDIA_TYPE");
+  });
+
+  test("a keep-alive client receives the safe envelope on an oversized request and a subsequent small request succeeds", async () => {
+    // Use the http module so we can exercise real keep-alive socket
+    // reuse. The test sends a large body (which the route must safely
+    // close), then a small body (which must succeed on the same
+    // connection).
+    const http = await import("node:http");
+    const address = (app as unknown as { address: () => { port: number } | null }).address;
+    void address;
+    // We need a server bound to a port. Use the express app directly
+    // via http.createServer for the test.
+    const server = http.createServer(app);
+    await new Promise<void>((resolve) => server.listen(0, "127.0.0.1", resolve));
+    const { port } = server.address() as { port: number };
+    try {
+      // First request: oversized body. The server must respond with
+      // 400 INVALID_JSON and the connection must be reusable.
+      const big = "x".repeat(20_000);
+      const body1 = JSON.stringify({ query: big });
+      const agent = new http.Agent({ keepAlive: true, maxSockets: 1 });
+      try {
+        const res1 = await new Promise<{
+          statusCode: number;
+          body: string;
+          socket: { destroy: () => void };
+        }>((resolve, reject) => {
+          const req = http.request(
+            {
+              host: "127.0.0.1",
+              port,
+              path: "/api/search",
+              method: "POST",
+              agent,
+              headers: {
+                "Content-Type": "application/json",
+                "Content-Length": Buffer.byteLength(body1),
+              },
+            },
+            (response) => {
+              const chunks: Buffer[] = [];
+              response.on("data", (c: Buffer) => chunks.push(c));
+              response.on("end", () =>
+                resolve({
+                  statusCode: response.statusCode ?? -1,
+                  body: Buffer.concat(chunks).toString("utf8"),
+                  socket: response.socket as unknown as { destroy: () => void },
+                }),
+              );
+            },
+          );
+          req.on("error", reject);
+          req.write(body1);
+          req.end();
+        });
+        assert.equal(res1.statusCode, 400);
+        assert.ok(/exceeds the 16384-byte limit/.test(res1.body));
+
+        // Second request on the SAME keep-alive connection. The
+        // server must have drained the first request and be ready to
+        // process a second request. supertest's agent reuses
+        // connections when keepAlive is enabled.
+        const res2 = await request(app)
+          .post("/api/search")
+          .set("content-type", "application/json")
+          .send({ query: "Haitian dancehall single production" });
+        assert.equal(res2.status, 200);
+        assert.equal(res2.body.results[0].seller.sellerId, "seller-public-remote");
+      } finally {
+        agent.destroy();
+      }
+    } finally {
+      await new Promise<void>((resolve) => server.close(() => resolve()));
+    }
   });
 });

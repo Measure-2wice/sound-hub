@@ -174,7 +174,28 @@ function buildFixture(): InMemoryFixture {
     LONDON_GB_SELLER,
     BUNDLE_ONLY_SELLER,
   ];
-  return { sellers };
+  return {
+    sellers,
+    controlledKeys: {
+      // Mirror the canonical seed state so the in-memory repository's
+      // getControlledKeys returns the same set the Prisma adapter reads
+      // from soundhub_m1_test.
+      serviceCategoryKeys: [
+        "music-production",
+        "songwriting",
+        "custom-composition",
+        "session-vocals",
+        "session-instrument-performance",
+        "featured-artist-performance",
+        "mixing",
+        "mastering",
+        "recording-engineering",
+        "live-performance",
+      ],
+      specialtyKeys: ["Artist", "Producer", "Musician", "Songwriter", "SoundEngineer"],
+      pricingUnitKeys: ["hour", "track", "project", "session", "event", "day"],
+    },
+  };
 }
 
 describe("TalentSearchService", () => {
@@ -262,7 +283,27 @@ describe("TalentSearchService", () => {
         ],
       },
     ];
-    const service = new TalentSearchService(new InMemoryTalentSearchRepository({ sellers }));
+    const service = new TalentSearchService(
+      new InMemoryTalentSearchRepository({
+        sellers,
+        controlledKeys: {
+          serviceCategoryKeys: [
+            "music-production",
+            "songwriting",
+            "custom-composition",
+            "session-vocals",
+            "session-instrument-performance",
+            "featured-artist-performance",
+            "mixing",
+            "mastering",
+            "recording-engineering",
+            "live-performance",
+          ],
+          specialtyKeys: ["Artist", "Producer", "Musician", "Songwriter", "SoundEngineer"],
+          pricingUnitKeys: ["hour", "track", "project", "session", "event", "day"],
+        },
+      }),
+    );
     const response = await service.search({ query: "dancehall production" });
     assert.deepEqual(
       response.results.map((r) => r.seller.sellerId),
@@ -444,6 +485,42 @@ describe("TalentSearchService", () => {
     await assert.rejects(
       () => service.search({ preferred: { specialties: ["DJ"] } }),
       (err: unknown) => err instanceof Error && /Unsupported specialty key/.test(err.message),
+    );
+  });
+
+  test("a service category key listed in the in-memory controlledKeys is accepted (proves the repository is canonical)", async () => {
+    const service = new TalentSearchService(
+      new InMemoryTalentSearchRepository({
+        sellers: [],
+        controlledKeys: {
+          serviceCategoryKeys: [
+            "music-production",
+            "songwriting",
+            "custom-composition",
+            "session-vocals",
+            "session-instrument-performance",
+            "featured-artist-performance",
+            "mixing",
+            "mastering",
+            "recording-engineering",
+            "live-performance",
+            "newly-added-canonical-key",
+          ],
+          specialtyKeys: ["Producer"],
+          pricingUnitKeys: ["track"],
+        },
+      }),
+    );
+    // The new key is in the fixture's controlled set; the search
+    // should not throw "Unsupported". With no sellers, the result
+    // set is empty, but the validation passes.
+    const response = await service.search({
+      required: { primaryCategoryKeys: ["newly-added-canonical-key"] },
+    });
+    assert.equal(response.results.length, 0);
+    assert.equal(
+      response.metadata.appliedRequiredCriteria.primaryCategoryKeys?.[0],
+      "newly-added-canonical-key",
     );
   });
 

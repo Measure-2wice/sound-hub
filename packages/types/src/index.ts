@@ -392,40 +392,14 @@ export function isSupportedCaribbeanAffiliationCode(
 }
 
 // ---------- Stable controlled keys exposed for runtime validation ----------
-
-const SERVICE_CATEGORIES_FOR_KEYS = [
-  { key: "music-production" },
-  { key: "songwriting" },
-  { key: "custom-composition" },
-  { key: "session-vocals" },
-  { key: "session-instrument-performance" },
-  { key: "featured-artist-performance" },
-  { key: "mixing" },
-  { key: "mastering" },
-  { key: "recording-engineering" },
-  { key: "live-performance" },
-] as const;
-
-export const SUPPORTED_SERVICE_CATEGORY_KEYS = SERVICE_CATEGORIES_FOR_KEYS.map((c) => c.key);
-
-export const SUPPORTED_SPECIALTY_KEYS = [
-  "Artist",
-  "Producer",
-  "Musician",
-  "Songwriter",
-  "SoundEngineer",
-] as const;
-export type SupportedSpecialtyKey = (typeof SUPPORTED_SPECIALTY_KEYS)[number];
-
-export const SUPPORTED_PRICING_UNIT_KEYS = [
-  "hour",
-  "track",
-  "project",
-  "session",
-  "event",
-  "day",
-] as const;
-export type SupportedPricingUnitKey = (typeof SUPPORTED_PRICING_UNIT_KEYS)[number];
+//
+// The canonical service categories, specialties, and pricing units
+// live in PostgreSQL (seeded by packages/db/prisma/seed.ts). The
+// @soundhub/types package does NOT maintain a parallel list of those
+// keys. Closed behavioral enums (the next block) remain shared
+// Zod/Prisma values per the accepted architecture, but the canonical
+// catalog of which categories, specialties, and pricing units exist
+// is resolved by the application-layer repository from PostgreSQL.
 
 // ---------- Closed Prisma enum surfaces (for drift testing) ----------
 //
@@ -451,24 +425,3 @@ export const pricingKindValuesV1 = ["StartingAt", "Fixed", "ContactForQuote"] as
 export type PricingKindV1 = (typeof pricingKindValuesV1)[number];
 export const purchaseModeValuesV1 = ["BundleOnly"] as const;
 export type PurchaseModeV1 = (typeof purchaseModeValuesV1)[number];
-
-// ---------- Stable-controlled-key classification ----------
-
-/**
- * Stable-controlled keys the application layer validates against the
- * canonical seeded records. Unknown keys in any of these lists produce
- * INVALID_SEARCH_CRITERIA rather than empty results.
- */
-export type SupportedServiceCategoryKey = (typeof SUPPORTED_SERVICE_CATEGORY_KEYS)[number];
-
-export function isSupportedServiceCategoryKey(key: string): key is SupportedServiceCategoryKey {
-  return (SUPPORTED_SERVICE_CATEGORY_KEYS as readonly string[]).includes(key);
-}
-
-export function isSupportedSpecialtyKey(key: string): key is SupportedSpecialtyKey {
-  return (SUPPORTED_SPECIALTY_KEYS as readonly string[]).includes(key);
-}
-
-export function isSupportedPricingUnitKey(key: string): key is SupportedPricingUnitKey {
-  return (SUPPORTED_PRICING_UNIT_KEYS as readonly string[]).includes(key);
-}
