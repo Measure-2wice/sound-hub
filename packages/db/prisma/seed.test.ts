@@ -355,4 +355,111 @@ describe("M1.1 seed regression coverage", () => {
     assert.equal(after.id, nonCanonical.id);
     await prisma.serviceCategory.delete({ where: { id: nonCanonical.id } });
   });
+
+  test("restores SellerProfile.bio after a stale update", async () => {
+    await runSeed();
+    const target = await prisma.sellerProfile.findFirst({
+      where: { professionalName: "Marc-André Pierre" },
+    });
+    assert.ok(target);
+    const original = target.bio;
+    await prisma.sellerProfile.update({
+      where: { id: target.id },
+      data: { bio: "stale bio value that must be restored" },
+    });
+    await runSeed();
+    const restored = await prisma.sellerProfile.findUnique({ where: { id: target.id } });
+    assert.equal(restored?.bio, original);
+  });
+
+  test("restores SellerProfile.avatarUrl after a stale update (or null canonical value)", async () => {
+    await runSeed();
+    const target = await prisma.sellerProfile.findFirst({
+      where: { professionalName: "Marc-André Pierre" },
+    });
+    assert.ok(target);
+    const original = target.avatarUrl;
+    // Set to a stale value.
+    await prisma.sellerProfile.update({
+      where: { id: target.id },
+      data: { avatarUrl: "https://stale.example.com/avatar.jpg" },
+    });
+    await runSeed();
+    const restored = await prisma.sellerProfile.findUnique({ where: { id: target.id } });
+    assert.equal(restored?.avatarUrl, original);
+  });
+
+  test("restores ServiceOffering.description after a stale update", async () => {
+    await runSeed();
+    const target = await prisma.serviceOffering.findUnique({
+      where: { slug: "creole-beats-dancehall-single-remote" },
+    });
+    assert.ok(target);
+    const original = target.description;
+    await prisma.serviceOffering.update({
+      where: { id: target.id },
+      data: { description: "stale description that must be restored" },
+    });
+    await runSeed();
+    const restored = await prisma.serviceOffering.findUnique({ where: { id: target.id } });
+    assert.equal(restored?.description, original);
+  });
+
+  test("restores ServiceOffering.primaryCategoryName and bundleOnly after a stale update", async () => {
+    await runSeed();
+    const target = await prisma.serviceOffering.findUnique({
+      where: { slug: "creole-beats-dancehall-single-remote" },
+      include: { primaryCategory: true },
+    });
+    assert.ok(target);
+    const originalKey = target.primaryCategory.key;
+    const originalName = target.primaryCategory.name;
+    const originalBundleOnly = target.primaryCategory.bundleOnly;
+    // Move the offering to a different category then reset.
+    const other = await prisma.serviceCategory.findFirst({
+      where: { key: { not: originalKey } },
+    });
+    assert.ok(other);
+    await prisma.serviceOffering.update({
+      where: { id: target.id },
+      data: { primaryCategoryId: other.id },
+    });
+    await runSeed();
+    const restored = await prisma.serviceOffering.findUnique({
+      where: { id: target.id },
+      include: { primaryCategory: true },
+    });
+    assert.equal(restored?.primaryCategory.key, originalKey);
+    assert.equal(restored?.primaryCategory.name, originalName);
+    assert.equal(restored?.primaryCategory.bundleOnly, originalBundleOnly);
+  });
+
+  test("restores ServiceOffering.serviceAreas (city, region, country) after a stale update", async () => {
+    await runSeed();
+    const target = await prisma.serviceOffering.findUnique({
+      where: { slug: "creole-beats-dancehall-single-remote" },
+      include: { serviceAreas: true },
+    });
+    assert.ok(target);
+    const originalAreas = target.serviceAreas
+      .map((a) => `${a.city ?? ""}|${a.region ?? ""}|${a.countryCode}`)
+      .sort();
+    // Wipe the service areas and re-seed.
+    await prisma.serviceOfferingServiceArea.deleteMany({
+      where: { offeringId: target.id },
+    });
+    await prisma.serviceOfferingServiceArea.create({
+      data: { offeringId: target.id, countryCode: "ZZ" },
+    });
+    await runSeed();
+    const restored = await prisma.serviceOffering.findUnique({
+      where: { id: target.id },
+      include: { serviceAreas: true },
+    });
+    assert.ok(restored);
+    const restoredAreas = restored.serviceAreas
+      .map((a) => `${a.city ?? ""}|${a.region ?? ""}|${a.countryCode}`)
+      .sort();
+    assert.deepEqual(restoredAreas, originalAreas);
+  });
 });

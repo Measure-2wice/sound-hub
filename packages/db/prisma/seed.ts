@@ -611,6 +611,11 @@ async function applySeed(): Promise<void> {
 // and correct, not that no other rows exist. The snapshot is JSON-stable
 // (keys are emitted in declaration order) so two runs produce byte-equal
 // strings for the comparison below.
+//
+// Every material field the seed owns is captured here. The seed does
+// not own fields outside this set (e.g., random user data, audit
+// fields, etc.); those are intentionally outside the convergence
+// contract.
 interface CanonicalSnapshot {
   readonly categories: readonly {
     readonly key: string;
@@ -622,7 +627,9 @@ interface CanonicalSnapshot {
   readonly pricingUnits: readonly { readonly key: string; readonly name: string }[];
   readonly sellers: readonly {
     readonly userEmail: string;
+    readonly userId: string;
     readonly workspaceSlug: string;
+    readonly workspaceId: string;
     readonly workspaceName: string;
     readonly workspaceType: string;
     readonly workspaceStatus: string;
@@ -631,6 +638,8 @@ interface CanonicalSnapshot {
     readonly sellerCapability: string;
     readonly sellerProfileId: string;
     readonly professionalName: string;
+    readonly bio: string;
+    readonly avatarUrl: string | null;
     readonly status: string;
     readonly basedInCity: string | null;
     readonly basedInRegion: string | null;
@@ -642,7 +651,10 @@ interface CanonicalSnapshot {
       readonly slug: string;
       readonly sellerProfileId: string;
       readonly primaryCategoryKey: string;
+      readonly primaryCategoryName: string;
+      readonly primaryCategoryBundleOnly: boolean;
       readonly title: string;
+      readonly description: string;
       readonly status: string;
       readonly serviceMode: string;
       readonly genreTags: readonly string[];
@@ -722,7 +734,9 @@ async function captureCanonicalSnapshot(): Promise<CanonicalSnapshot> {
 
     sellers.push({
       userEmail: user.email,
+      userId: user.id,
       workspaceSlug: workspace.slug,
+      workspaceId: workspace.id,
       workspaceName: workspace.name,
       workspaceType: workspace.type,
       workspaceStatus: workspace.status,
@@ -731,6 +745,8 @@ async function captureCanonicalSnapshot(): Promise<CanonicalSnapshot> {
       sellerCapability: capability?.capability ?? null,
       sellerProfileId: profile.id,
       professionalName: profile.professionalName,
+      bio: profile.bio,
+      avatarUrl: profile.avatarUrl,
       status: profile.status,
       basedInCity: profile.basedInCity,
       basedInRegion: profile.basedInRegion,
@@ -742,7 +758,10 @@ async function captureCanonicalSnapshot(): Promise<CanonicalSnapshot> {
         slug: offering.slug,
         sellerProfileId: offering.sellerProfileId,
         primaryCategoryKey: offering.primaryCategory.key,
+        primaryCategoryName: offering.primaryCategory.name,
+        primaryCategoryBundleOnly: offering.primaryCategory.bundleOnly,
         title: offering.title,
+        description: offering.description,
         status: offering.status,
         serviceMode: offering.serviceMode,
         genreTags: [...offering.genreTags],

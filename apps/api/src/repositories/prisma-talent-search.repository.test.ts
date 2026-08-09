@@ -33,32 +33,32 @@ const repository = new PrismaTalentSearchRepository(createTestPrismaClient());
 
 function resetViaSeed(): Promise<void> {
   return new Promise((resolve, reject) => {
+    // Delegate to the fail-closed guarded seed wrapper at
+    // scripts/db-test-seed.mjs. The wrapper validates that
+    // TEST_DATABASE_URL matches the exact approved disposable test
+    // target (localhost:5433/soundhub_m1_test) and refuses to run
+    // otherwise. The seed process inherits the validated URL as
+    // DATABASE_URL; this path cannot be pointed at any other database.
     const databaseUrl = process.env.TEST_DATABASE_URL;
     if (!databaseUrl) {
       reject(new Error("TEST_DATABASE_URL is required"));
       return;
     }
-    // Spawn the seed as a child process so it owns its own Prisma
-    // client and DATABASE_URL contract cleanly. We invoke the seed
-    // through the same node binary that runs this test, with
-    // `--import tsx` to load the TypeScript source. This avoids
-    // spawning a shell wrapper, which the test sandbox blocks.
     const testFile = new URL(import.meta.url);
-    const dbDir = new URL("../../../../packages/db/", testFile).pathname;
-    const seedPath = `${dbDir}prisma/seed.ts`;
-    const child = spawn(process.execPath, ["--import", "tsx/esm", seedPath], {
-      cwd: dbDir,
+    const repoRoot = new URL("../../../../", testFile).pathname;
+    const tsxBin = new URL("../../node_modules/.bin/tsx", testFile).pathname;
+    const child = spawn(tsxBin, [`${repoRoot}scripts/db-test-seed.mjs`], {
+      cwd: repoRoot,
       stdio: "inherit",
       env: {
         ...process.env,
-        DATABASE_URL: databaseUrl,
         TEST_DATABASE_URL: databaseUrl,
       },
     });
     child.on("error", reject);
     child.on("exit", (code) => {
       if (code === 0) resolve();
-      else reject(new Error(`seed exited with code ${code}`));
+      else reject(new Error(`seed wrapper exited with code ${code}`));
     });
   });
 }
@@ -329,12 +329,73 @@ describe("PrismaTalentSearchRepository", () => {
     assert.deepEqual(ids, sorted);
   });
 
+  test("the repository reset path uses the guarded seed wrapper and cannot be pointed at another DATABASE_URL", async () => {
+    // Spawn the guarded wrapper directly with a non-approved URL. The
+    // wrapper must fail closed.
+    const testFile = new URL(import.meta.url);
+    const repoRoot = new URL("../../../../", testFile).pathname;
+    const tsxBin = new URL("../../node_modules/.bin/tsx", testFile).pathname;
+    const exitCode: number = await new Promise((resolve, reject) => {
+      const child = spawn(
+        tsxBin,
+        [`${repoRoot}scripts/db-test-seed.mjs`],
+        {
+          cwd: repoRoot,
+          stdio: ["ignore", "pipe", "pipe"],
+          env: {
+            ...process.env,
+            TEST_DATABASE_URL: "postgresql://attacker:bad@localhost:5432/soundhub_db",
+          },
+        },
+      );
+      child.on("error", reject);
+      child.on("exit", (code) => resolve(code ?? -1));
+    });
+    assert.notEqual(
+      exitCode,
+      0,
+      "the guarded seed wrapper must reject a non-approved DATABASE_URL",
+    );
+  });
+
   test("deterministic seed state: every run returns the same sellerIds in the same order", async () => {
     const first = await repository.search(EMPTY_INPUT);
     const second = await repository.search(EMPTY_INPUT);
     assert.deepEqual(
       first.map((s) => s.sellerId),
       second.map((s) => s.sellerId),
+    );
+  });
+
+  test("getControlledKeys returns the canonical service category keys from the database", async () => {
+    const keys = await repository.getControlledKeys();
+    assert.ok(keys.serviceCategoryKeys.size >= 10, "expected at least 10 canonical categories");
+    assert.ok(keys.serviceCategoryKeys.has("music-production"));
+    assert.ok(keys.serviceCategoryKeys.has("live-performance"));
+    assert.ok(keys.specialtyKeys.has("Producer"));
+    assert.ok(keys.pricingUnitKeys.has("track"));
+  });
+
+  test("getControlledKeys picks up a newly inserted canonical category without code changes (proves PostgreSQL is canonical)", async () => {
+    // Insert a new ServiceCategory and assert the repository's
+    // getControlledKeys returns it. This proves the application does
+    // not need a hard-coded list of canonical keys; the database is
+    // the source of truth.
+    const prisma = createTestPrismaClient();
+    const newKey = `test-category-${Date.now()}`;
+    try {
+      await prisma.serviceCategory.upsert({
+        where: { key: newKey },
+        create: { key: newKey, name: "Test category", bundleOnly: false },
+        update: {},
+      });
+    } finally {
+      await prisma.$disconnect();
+    }
+    const keys = await repository.getControlledKeys();
+    assert.ok(
+      keys.serviceCategoryKeys.has(newKey),
+      "newly inserted canonical category must be visible via getControlledKeys",
     );
   });
 
