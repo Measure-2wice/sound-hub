@@ -1,3 +1,5 @@
+import contentType from "content-type";
+import type { IncomingMessage, ServerResponse } from "node:http";
 import { Router, type Request, type Response } from "express";
 import {
   talentSearchRequestV1Schema,
@@ -146,48 +148,45 @@ function parseApplicationJsonMediaType(header: string | string[] | undefined): M
   if (header === undefined || header.trim() === "") {
     return { ok: false, message: "Request is missing the Content-Type header." };
   }
-  const segments = header
-    .split(";")
-    .map((s) => s.trim())
-    .filter((s) => s.length > 0);
-  if (segments.length === 0) {
-    return { ok: false, message: "Content-Type is empty." };
-  }
-  const mediaType = segments[0]!.toLowerCase();
-  if (mediaType !== "application/json") {
+  let parsed: { type: string; parameters: Record<string, string> };
+  try {
+    parsed = contentType.parse(header);
+  } catch (err) {
     return {
       ok: false,
-      message: `Request Content-Type must be application/json (got ${mediaType}).`,
+      message: `Malformed Content-Type header: ${err instanceof Error ? err.message : String(err)}`,
     };
   }
-  // Optional parameters such as `charset=utf-8` are accepted. The
-  // parser only validates well-formedness; charset decoding is the
-  // runtime's responsibility.
-  for (let i = 1; i < segments.length; i += 1) {
-    const parameter = segments[i]!;
-    if (!parameter.includes("=")) {
-      return { ok: false, message: `Malformed Content-Type parameter: ${parameter}` };
-    }
+  if (parsed.type.toLowerCase() !== "application/json") {
+    return {
+      ok: false,
+      message: `Request Content-Type must be application/json (got ${parsed.type}).`,
+    };
   }
   return { ok: true };
 }
 
 // Drain the request stream so the underlying socket is reusable for
-// keep-alive, then end the response. Used after sending an error
-// response that has already terminated the handler.
-function drainAndEnd(req: Request, res: Response): void {
-  if (res.writableEnded) return;
+// keep-alive. Used after sending an error response that has already
+// terminated the handler. The previous implementation short-circuited
+// when the response was already ended, which left unread request bytes
+// on a keep-alive connection. This implementation unconditionally
+// drains the request and is a no-op once the response is already
+// finished.
+function drainAndEnd(req: IncomingMessage, res: ServerResponse): void {
+  // Replace the 'data' handler with a no-op so any incoming bytes are
+  // discarded without being processed.
   req.on("data", () => {
     /* discard */
   });
   req.on("end", () => {
-    if (res.writableEnded) return;
-    res.end();
+    if (!res.writableEnded) {
+      res.end();
+    }
   });
-  // If the client has already closed the request side, end the
-  // response immediately.
-  if (req.readableEnded) {
-    if (!res.writableEnded) res.end();
+  // If the request has already finished, end the response now.
+  if (req.readableEnded && !res.writableEnded) {
+    res.end();
   }
 }
 
