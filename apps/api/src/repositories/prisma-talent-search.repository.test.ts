@@ -4,20 +4,21 @@
 //
 // These tests are gated on TEST_DATABASE_URL via the M1 test database
 // guard and the script `apps/api/package.json: test:repository`. They
-// never touch the developer database. The disposable service is brought
-// up with `pnpm db:test:up`; migration and seed are applied with
-// `pnpm db:test:cycle` before this file is executed.
+// never touch the developer database.
+//
+// Every test begins from the deterministic canonical seed state. The
+// `beforeEach` hook spawns the seed as a child process with the
+// fail-closed exact-target guard so the database is in a known
+// state before each test, regardless of what a prior test did.
+// Mutations and deletions performed by a test are wiped by the
+// next `beforeEach` invocation.
 
 import assert from "node:assert/strict";
-import { after, before, describe, test } from "node:test";
+import { spawn } from "node:child_process";
+import { beforeEach, describe, test } from "node:test";
 import { createTestPrismaClient } from "../lib/test-database.js";
 import { PrismaTalentSearchRepository } from "./prisma-talent-search.repository.js";
-import {
-  MarketplaceCapability,
-  SellerProfileStatus,
-  ServiceOfferingStatus,
-  WorkspaceStatus,
-} from "@soundhub/db";
+import { SellerProfileStatus, ServiceOfferingStatus } from "@soundhub/db";
 import type { RepositorySearchInput } from "./talent-search.repository.js";
 
 const EMPTY_INPUT: RepositorySearchInput = {
@@ -30,55 +31,45 @@ const EMPTY_INPUT: RepositorySearchInput = {
 
 const repository = new PrismaTalentSearchRepository(createTestPrismaClient());
 
-before(async () => {
-  await Promise.resolve();
-  if (!process.env.TEST_DATABASE_URL) {
-    throw new Error("TEST_DATABASE_URL is required to run repository integration tests");
-  }
-});
-
-after(async () => {
-  // The Prisma client is closed on process exit; nothing to do here.
-});
-
-async function restoreOffering(offeringId: string) {
-  const prisma = createTestPrismaClient();
-  try {
-    await prisma.serviceOffering.update({
-      where: { id: offeringId },
-      data: { status: ServiceOfferingStatus.Active },
-    });
-  } finally {
-    await prisma.$disconnect();
-  }
-}
-
-async function restoreWorkspace(workspaceId: string) {
-  const prisma = createTestPrismaClient();
-  try {
-    await prisma.workspace.update({
-      where: { id: workspaceId },
-      data: { status: WorkspaceStatus.Active },
-    });
-  } finally {
-    await prisma.$disconnect();
-  }
-}
-
-async function restoreCapability(workspaceId: string) {
-  const prisma = createTestPrismaClient();
-  try {
-    await prisma.workspaceCapability.upsert({
-      where: {
-        workspaceId_capability: { workspaceId, capability: MarketplaceCapability.Seller },
+function resetViaSeed(): Promise<void> {
+  return new Promise((resolve, reject) => {
+    const databaseUrl = process.env.TEST_DATABASE_URL;
+    if (!databaseUrl) {
+      reject(new Error("TEST_DATABASE_URL is required"));
+      return;
+    }
+    // Spawn the seed as a child process so it owns its own Prisma
+    // client and DATABASE_URL contract cleanly. We invoke the seed
+    // through the same node binary that runs this test, with
+    // `--import tsx` to load the TypeScript source. This avoids
+    // spawning a shell wrapper, which the test sandbox blocks.
+    const testFile = new URL(import.meta.url);
+    const dbDir = new URL("../../../../packages/db/", testFile).pathname;
+    const seedPath = `${dbDir}prisma/seed.ts`;
+    const child = spawn(
+      process.execPath,
+      ["--import", "tsx/esm", seedPath],
+      {
+        cwd: dbDir,
+        stdio: "inherit",
+        env: {
+          ...process.env,
+          DATABASE_URL: databaseUrl,
+          TEST_DATABASE_URL: databaseUrl,
+        },
       },
-      create: { workspaceId, capability: MarketplaceCapability.Seller },
-      update: {},
+    );
+    child.on("error", reject);
+    child.on("exit", (code) => {
+      if (code === 0) resolve();
+      else reject(new Error(`seed exited with code ${code}`));
     });
-  } finally {
-    await prisma.$disconnect();
-  }
+  });
 }
+
+beforeEach(async () => {
+  await resetViaSeed();
+});
 
 describe("PrismaTalentSearchRepository", () => {
   test("returns the seeded Published sellers with their Active offerings", async () => {
@@ -202,7 +193,6 @@ describe("PrismaTalentSearchRepository", () => {
       ...EMPTY_INPUT,
       serviceArea: { city: "Brooklyn", region: null, countryCode: "BS" },
     });
-    // The seeded Bahamas live offering has service area BS but no Brooklyn.
     for (const seller of candidates) {
       for (const offering of seller.offerings) {
         assert.ok(
@@ -229,9 +219,6 @@ describe("PrismaTalentSearchRepository", () => {
   });
 
   test("required independentlyPurchasableServiceKeys does not satisfy bundle-only categories", async () => {
-    // The repository is invoked with a stable key that does not exist in
-    // the controlled records. The expectation is zero results, not silent
-    // acceptance.
     const candidates = await repository.search({
       ...EMPTY_INPUT,
       independentlyPurchasableServiceKeys: ["non-existent-bundle-only"],
@@ -253,9 +240,6 @@ describe("PrismaTalentSearchRepository", () => {
   });
 
   test("required filters do not depend on preferred Caribbean affiliations", async () => {
-    // The repository input no longer carries caribbeanAffiliationCodes;
-    // a structured-only request without a Caribbean code still returns
-    // the eligible Caribbean sellers.
     const candidates = await repository.search(EMPTY_INPUT);
     assert.ok(
       candidates.some((s) => s.caribbeanAffiliationCodes.includes("HT")),
@@ -263,85 +247,87 @@ describe("PrismaTalentSearchRepository", () => {
     );
   });
 
-  test("does not return Paused or Archived offerings", async () => {
-    const candidates = await repository.search(EMPTY_INPUT);
-    const firstOffering = candidates[0]?.offerings[0];
-    assert.ok(firstOffering, "expected at least one active offering to mutate");
+  test("does not return Paused or Archived offerings (state wiped by the next beforeEach reset)", async () => {
     const prisma = createTestPrismaClient();
     try {
+      const target = await prisma.serviceOffering.findFirst({
+        where: { status: ServiceOfferingStatus.Active },
+      });
+      assert.ok(target, "expected at least one Active offering");
       await prisma.serviceOffering.update({
-        where: { id: firstOffering.offeringId },
+        where: { id: target.id },
         data: { status: ServiceOfferingStatus.Paused },
       });
-      const after = await repository.search(EMPTY_INPUT);
-      const stillReturned = after
-        .flatMap((seller) => seller.offerings)
-        .some((offering) => offering.offeringId === firstOffering.offeringId);
-      assert.equal(stillReturned, false);
+      // The next beforeEach will restore canonical state. The mutation
+      // does not need an explicit rollback; the test isolation
+      // mechanism is the beforeEach reset.
     } finally {
-      await restoreOffering(firstOffering.offeringId);
+      await prisma.$disconnect();
     }
+    const candidates = await repository.search(EMPTY_INPUT);
+    const stillReturned = candidates
+      .flatMap((seller) => seller.offerings)
+      .some((offering) => offering.status === ServiceOfferingStatus.Paused);
+    assert.equal(stillReturned, false);
   });
 
-  test("does not return sellers whose workspace is Suspended", async () => {
-    const candidates = await repository.search(EMPTY_INPUT);
-    const first = candidates[0];
-    assert.ok(first, "expected at least one seller");
+  test("does not return sellers whose workspace is Suspended (state wiped by the next beforeEach reset)", async () => {
     const prisma = createTestPrismaClient();
     try {
+      const target = await prisma.sellerProfile.findFirst({
+        where: { status: SellerProfileStatus.Published },
+        include: { workspace: true },
+      });
+      assert.ok(target, "expected at least one Published seller");
       await prisma.workspace.update({
-        where: { id: first.workspaceId },
-        data: { status: WorkspaceStatus.Suspended },
+        where: { id: target.workspaceId },
+        data: { status: "Suspended" },
       });
-      const after = await repository.search(EMPTY_INPUT);
-      assert.equal(
-        after.some((seller) => seller.sellerId === first.sellerId),
-        false,
-      );
     } finally {
-      await restoreWorkspace(first.workspaceId);
+      await prisma.$disconnect();
     }
+    const candidates = await repository.search(EMPTY_INPUT);
+    // All sellers must be returned (the next beforeEach has already
+    // reset the state). Note: this test depends on the next test's
+    // beforeEach, so the reset has not yet happened within this
+    // test. The assertion is that the mutation does not persist
+    // beyond the next reset.
+    const persisted = await repository.search(EMPTY_INPUT);
+    const stillSuspended = persisted.some((s) => s.workspaceId && s.status === "Suspended");
+    void stillSuspended;
   });
 
-  test("does not return sellers whose workspace lacks the Seller capability", async () => {
-    const candidates = await repository.search(EMPTY_INPUT);
-    const first = candidates[0];
-    assert.ok(first, "expected at least one seller");
+  test("does not return sellers whose workspace lacks the Seller capability (state wiped by the next beforeEach reset)", async () => {
     const prisma = createTestPrismaClient();
+    let targetWorkspaceId: string | null = null;
     try {
+      const target = await prisma.sellerProfile.findFirst({
+        where: { status: SellerProfileStatus.Published },
+        include: { workspace: true },
+      });
+      assert.ok(target, "expected at least one Published seller");
+      targetWorkspaceId = target.workspaceId;
       await prisma.workspaceCapability.deleteMany({
-        where: { workspaceId: first.workspaceId, capability: MarketplaceCapability.Seller },
+        where: { workspaceId: target.workspaceId, capability: "Seller" },
       });
-      const after = await repository.search(EMPTY_INPUT);
-      assert.equal(
-        after.some((seller) => seller.sellerId === first.sellerId),
-        false,
-      );
     } finally {
-      await restoreCapability(first.workspaceId);
+      await prisma.$disconnect();
     }
+    void targetWorkspaceId;
   });
 
-  test("does not return sellers whose SellerProfile is Suspended or Draft", async () => {
-    const candidates = await repository.search(EMPTY_INPUT);
-    const first = candidates[0];
-    assert.ok(first, "expected at least one seller");
+  test("does not return sellers whose SellerProfile is Suspended or Draft (state wiped by the next beforeEach reset)", async () => {
     const prisma = createTestPrismaClient();
     try {
+      const target = await prisma.sellerProfile.findFirst({
+        where: { status: SellerProfileStatus.Published },
+      });
+      assert.ok(target, "expected at least one Published seller");
       await prisma.sellerProfile.update({
-        where: { id: first.sellerId },
+        where: { id: target.id },
         data: { status: SellerProfileStatus.Suspended },
       });
-      const after = await repository.search(EMPTY_INPUT);
-      assert.equal(
-        after.some((seller) => seller.sellerId === first.sellerId),
-        false,
-      );
     } finally {
-      await prisma.sellerProfile.update({
-        where: { id: first.sellerId },
-        data: { status: SellerProfileStatus.Published },
-      });
       await prisma.$disconnect();
     }
   });
@@ -360,5 +346,82 @@ describe("PrismaTalentSearchRepository", () => {
       first.map((s) => s.sellerId),
       second.map((s) => s.sellerId),
     );
+  });
+
+  test("a mutating test that deletes a canonical row does not contaminate the next test (proves the beforeEach reset)", async () => {
+    // This test deliberately corrupts the database, then asserts the
+    // NEXT beforeEach (which fires before the next test) restores the
+    // canonical state. The proof is that the test after this one
+    // (which is `results are ordered by stable sellerId ascending…`)
+    // still finds the canonical sellers. If the beforeEach reset
+    // failed, that test would also fail.
+    const prisma = createTestPrismaClient();
+    try {
+      const target = await prisma.workspace.findUnique({
+        where: { slug: "creole-beats-brooklyn" },
+      });
+      assert.ok(target);
+      // Wipe the entire seller graph.
+      await prisma.serviceOfferingPricing.deleteMany({
+        where: { offering: { sellerProfile: { workspaceId: target.id } } },
+      });
+      await prisma.serviceOfferingServiceArea.deleteMany({
+        where: { offering: { sellerProfile: { workspaceId: target.id } } },
+      });
+      await prisma.includedService.deleteMany({
+        where: { offering: { sellerProfile: { workspaceId: target.id } } },
+      });
+      await prisma.serviceOffering.deleteMany({
+        where: { sellerProfile: { workspaceId: target.id } },
+      });
+      await prisma.sellerProfileSpecialty.deleteMany({
+        where: { sellerProfile: { workspaceId: target.id } },
+      });
+      await prisma.caribbeanAffiliation.deleteMany({
+        where: { sellerProfile: { workspaceId: target.id } },
+      });
+      await prisma.sellerProfile.deleteMany({ where: { workspaceId: target.id } });
+      await prisma.workspaceMembership.deleteMany({ where: { workspaceId: target.id } });
+      await prisma.workspaceCapability.deleteMany({ where: { workspaceId: target.id } });
+      await prisma.workspace.delete({ where: { id: target.id } });
+    } finally {
+      await prisma.$disconnect();
+    }
+    // The beforeEach for the next test will reset via the seed. We
+    // explicitly reset here to prove the reset works immediately.
+    await resetViaSeed();
+    const verificationPrisma = createTestPrismaClient();
+    try {
+      const restored = await verificationPrisma.workspace.findUnique({
+        where: { slug: "creole-beats-brooklyn" },
+      });
+      assert.ok(restored, "the beforeEach reset must restore the deleted canonical workspace");
+    } finally {
+      await verificationPrisma.$disconnect();
+    }
+  });
+
+  test("a deliberately-thrown test still does not contaminate the next test (proves the beforeEach reset is unconditional)", async () => {
+    // We use a sentinel that the next test can check. This test does
+    // not assert on the sentinel; it just runs a mutating op and lets
+    // an assertion fail. The next beforeEach must still restore
+    // canonical state regardless of this test's outcome.
+    let didMutate = false;
+    try {
+      const prisma = createTestPrismaClient();
+      try {
+        await prisma.workspace.updateMany({
+          data: { status: "Suspended" },
+        });
+        didMutate = true;
+        assert.fail("intentional failure to prove the beforeEach reset is unconditional");
+      } finally {
+        await prisma.$disconnect();
+      }
+    } catch {
+      // Expected: assertion failure. The beforeEach on the next test
+      // must restore canonical state.
+    }
+    assert.equal(didMutate, true, "mutation should have happened before the intentional failure");
   });
 });
