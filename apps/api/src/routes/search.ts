@@ -33,30 +33,35 @@ async function handleSearch(req: Request, res: Response, deps: SearchRouteDeps):
   const requestId = resolveRequestId(req);
   res.setHeader("x-request-id", requestId);
 
-  const contentType = req.headers["content-type"] ?? "";
-  if (!contentType.toLowerCase().includes("application/json")) {
+  const mediaType = parseApplicationJsonMediaType(req.headers["content-type"]);
+  if (!mediaType.ok) {
     const error = buildSafeError(
       "UNSUPPORTED_MEDIA_TYPE",
-      "Request Content-Type must be application/json.",
+      mediaType.message,
       undefined,
       requestId,
     );
     writeSafeError(res, error);
+    drainAndEnd(req, res);
     return;
   }
 
   let rawBody: unknown;
   try {
-    rawBody = await readJsonBody(req);
+    rawBody = await readJsonBodyWithByteLimit(req);
   } catch (err) {
-    const code = err instanceof PayloadTooLargeError ? "INVALID_JSON" : "INVALID_JSON";
-    const message =
-      err instanceof PayloadTooLargeError
+    const isOversize = err instanceof PayloadTooLargeError;
+    const error = buildSafeError(
+      "INVALID_JSON",
+      isOversize
         ? `Request body exceeds the ${MAX_REQUEST_BODY_BYTES}-byte limit.`
-        : "Request body is not valid JSON.";
-    const error = buildSafeError(code, message, undefined, requestId);
+        : "Request body is not valid JSON.",
+      undefined,
+      requestId,
+    );
     noteError(error, err);
     writeSafeError(res, error);
+    drainAndEnd(req, res);
     return;
   }
 
@@ -130,6 +135,64 @@ function resolveRequestId(req: Request): string {
   return generateRequestId();
 }
 
+// Parse the Content-Type header for `application/json` (with optional
+// parameters such as `charset=utf-8`). Returns an ok/error result so the
+// caller can write the safe envelope without leaking parser internals.
+//
+// Per the v1 contract, only `application/json` is supported. The
+// `+json` suffix (e.g. `application/vnd.api+json`) is NOT broadened
+// here because authoritative docs do not list it as supported.
+type MediaTypeResult = { readonly ok: true } | { readonly ok: false; readonly message: string };
+
+function parseApplicationJsonMediaType(header: string | string[] | undefined): MediaTypeResult {
+  if (Array.isArray(header)) {
+    return { ok: false, message: "Multiple Content-Type headers are not supported." };
+  }
+  if (header === undefined || header.trim() === "") {
+    return { ok: false, message: "Request is missing the Content-Type header." };
+  }
+  const segments = header.split(";").map((s) => s.trim()).filter((s) => s.length > 0);
+  if (segments.length === 0) {
+    return { ok: false, message: "Content-Type is empty." };
+  }
+  const mediaType = segments[0]!.toLowerCase();
+  if (mediaType !== "application/json") {
+    return {
+      ok: false,
+      message: `Request Content-Type must be application/json (got ${mediaType}).`,
+    };
+  }
+  // Optional parameters such as `charset=utf-8` are accepted. The
+  // parser only validates well-formedness; charset decoding is the
+  // runtime's responsibility.
+  for (let i = 1; i < segments.length; i += 1) {
+    const parameter = segments[i]!;
+    if (!parameter.includes("=")) {
+      return { ok: false, message: `Malformed Content-Type parameter: ${parameter}` };
+    }
+  }
+  return { ok: true };
+}
+
+// Drain the request stream so the underlying socket is reusable for
+// keep-alive, then end the response. Used after sending an error
+// response that has already terminated the handler.
+function drainAndEnd(req: Request, res: Response): void {
+  if (res.writableEnded) return;
+  req.on("data", () => {
+    /* discard */
+  });
+  req.on("end", () => {
+    if (res.writableEnded) return;
+    res.end();
+  });
+  // If the client has already closed the request side, end the
+  // response immediately.
+  if (req.readableEnded) {
+    if (!res.writableEnded) res.end();
+  }
+}
+
 class PayloadTooLargeError extends Error {
   constructor(message: string) {
     super(message);
@@ -137,42 +200,53 @@ class PayloadTooLargeError extends Error {
   }
 }
 
-async function readJsonBody(req: Request): Promise<unknown> {
+// Read the request body as a UTF-8 string and enforce the 16 KiB
+// limit by actual request bytes, not by JavaScript string length. The
+// pause + reject pattern drains the rest of the stream in the
+// background after overflow so the connection is not stuck mid-body.
+async function readJsonBodyWithByteLimit(req: Request): Promise<unknown> {
   return new Promise((resolve, reject) => {
-    let data = "";
+    const chunks: Buffer[] = [];
+    let totalBytes = 0;
     let settled = false;
     let oversize = false;
-    req.setEncoding("utf8");
-    req.on("data", (chunk: string) => {
+
+    const fail = (err: Error) => {
       if (settled) return;
-      if (oversize) return;
-      if (data.length + chunk.length > MAX_REQUEST_BODY_BYTES) {
+      settled = true;
+      reject(err);
+    };
+
+    req.on("data", (chunk: Buffer) => {
+      if (settled || oversize) return;
+      totalBytes += chunk.length;
+      if (totalBytes > MAX_REQUEST_BODY_BYTES) {
         oversize = true;
-        // Pause to stop accumulating, but do not destroy the connection;
-        // the safe envelope is still written to the response below.
+        // Pause so the rest of the body is not accumulated into
+        // memory. The `end` handler below will finish draining and
+        // resolve, but we resolve with an error to the caller.
         req.pause();
-        reject(new PayloadTooLargeError("Request body too large"));
+        fail(new PayloadTooLargeError("Request body too large"));
         return;
       }
-      data += chunk;
+      chunks.push(chunk);
     });
     req.on("end", () => {
       if (settled) return;
       settled = true;
-      if (data.length === 0) {
+      if (chunks.length === 0) {
         resolve({});
         return;
       }
       try {
-        resolve(JSON.parse(data));
+        const text = Buffer.concat(chunks).toString("utf8");
+        resolve(JSON.parse(text));
       } catch (err) {
         reject(err instanceof Error ? err : new Error(String(err)));
       }
     });
     req.on("error", (err: Error) => {
-      if (settled) return;
-      settled = true;
-      reject(err);
+      fail(err);
     });
   });
 }
@@ -226,3 +300,4 @@ function noteError(safe: SafeErrorResponse, err: unknown): void {
     err,
   );
 }
+

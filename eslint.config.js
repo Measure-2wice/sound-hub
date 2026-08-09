@@ -41,7 +41,10 @@ export default [
     languageOptions: {
       parserOptions: {
         projectService: {
-          allowDefaultProject: ["packages/db/prisma.config.ts"]
+          allowDefaultProject: [
+            "packages/db/prisma.config.ts",
+            "packages/db/prisma/seed.test.ts",
+          ]
         },
         tsconfigRootDir: import.meta.dirname,
       },
