@@ -239,7 +239,12 @@ describe("PrismaTalentSearchRepository", () => {
     assert.equal(candidates.length, 0);
   });
 
-  test("unknown stable keys in required filters yield zero results, not silent acceptance", async () => {
+  test("unknown stable keys in required filters yield zero repository results (canonical validation is the service layer's job)", async () => {
+    // The repository itself does not know about canonical keys. It
+    // returns zero results when the requested key matches no primary
+    // category. Canonical validation that rejects unknown keys with
+    // INVALID_SEARCH_CRITERIA is the service layer's responsibility
+    // (see apps/api/src/services/talent-search.service.test.ts).
     const candidates = await repository.search({
       ...EMPTY_INPUT,
       primaryCategoryKeys: ["not-a-real-category"],

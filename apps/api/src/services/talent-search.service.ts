@@ -22,6 +22,8 @@
 
 import {
   isSupportedCaribbeanAffiliationCode,
+  isSupportedServiceCategoryKey,
+  isSupportedSpecialtyKey,
   type LocationFilterV1,
   type PublicOfferingSummaryV1,
   type PublicSellerSummaryV1,
@@ -51,6 +53,7 @@ export class TalentSearchService {
     const normalizedQuery = normalizeQuery(request.query);
     const queryTokens = tokenize(normalizedQuery);
 
+    this.assertSupportedControlledKeys(request);
     this.assertSupportedCaribbeanCodes(request);
 
     const repositoryInput = this.buildRepositoryInput(request);
@@ -100,6 +103,38 @@ export class TalentSearchService {
     if (unknown.length > 0) {
       throw new TalentSearchInvalidCriteriaError(
         `Unsupported Caribbean affiliation code(s): ${unknown.join(", ")}`,
+      );
+    }
+  }
+
+  private assertSupportedControlledKeys(request: TalentSearchRequestV1): void {
+    const requiredCategoryKeys = request.required?.primaryCategoryKeys ?? [];
+    const requiredServiceKeys = request.required?.independentlyPurchasableServiceKeys ?? [];
+    const preferredCategoryKeys = request.preferred?.categoryKeys ?? [];
+    const preferredIncludedServiceKeys = request.preferred?.includedServiceKeys ?? [];
+    const preferredSpecialtyKeys = request.preferred?.specialties ?? [];
+
+    const allCategoryKeys = [
+      ...requiredCategoryKeys,
+      ...requiredServiceKeys,
+      ...preferredCategoryKeys,
+      ...preferredIncludedServiceKeys,
+    ];
+    const unknownCategories = allCategoryKeys.filter(
+      (key) => !isSupportedServiceCategoryKey(key),
+    );
+    if (unknownCategories.length > 0) {
+      throw new TalentSearchInvalidCriteriaError(
+        `Unsupported service category key(s): ${[...new Set(unknownCategories)].join(", ")}`,
+      );
+    }
+
+    const unknownSpecialties = preferredSpecialtyKeys.filter(
+      (key) => !isSupportedSpecialtyKey(key),
+    );
+    if (unknownSpecialties.length > 0) {
+      throw new TalentSearchInvalidCriteriaError(
+        `Unsupported specialty key(s): ${[...new Set(unknownSpecialties)].join(", ")}`,
       );
     }
   }

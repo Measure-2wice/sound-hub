@@ -50,11 +50,11 @@ const INPERSON_LIVE: InMemoryOffering = {
 
 const BUNDLE_ONLY: InMemoryOffering = {
   offeringId: "offering-bundle-only",
-  title: "Add-on stem delivery",
-  description: "Bundle-only stem delivery that is not independently purchasable.",
+  title: "Add-on songwriting deliverable",
+  description: "Bundle-only songwriting add-on that is not independently purchasable.",
   status: "Active",
   serviceMode: "Remote",
-  primaryCategory: { key: "stem-delivery", name: "Stem Delivery", bundleOnly: true },
+  primaryCategory: { key: "songwriting", name: "Songwriting", bundleOnly: true },
   includedServices: [],
   genreTags: [],
   serviceAreas: [{ city: null, region: null, countryCode: "US" }],
@@ -337,13 +337,18 @@ describe("TalentSearchService", () => {
 
   test("required independentlyPurchasableServiceKeys excludes bundle-only offerings", async () => {
     const service = new TalentSearchService(new InMemoryTalentSearchRepository(buildFixture()));
-    // The bundle-only seller's primary category is "stem-delivery" with
+    // The bundle-only seller's primary category is "songwriting" with
     // bundleOnly=true. Even if the user lists it in
-    // independentlyPurchasableServiceKeys, the service must reject it.
+    // independentlyPurchasableServiceKeys, the service must reject the
+    // bundle-only offering.
     const response = await service.search({
-      required: { independentlyPurchasableServiceKeys: ["stem-delivery"] },
+      required: { independentlyPurchasableServiceKeys: ["songwriting"] },
     });
-    assert.equal(response.results.length, 0);
+    assert.equal(
+      response.results.find((r) => r.seller.sellerId === "seller-bundle-only"),
+      undefined,
+      "bundle-only seller must be excluded from independentlyPurchasableServiceKeys",
+    );
   });
 
   test("required independentlyPurchasableServiceKeys accepts the matching independently-purchasable category", async () => {
@@ -396,6 +401,137 @@ describe("TalentSearchService", () => {
       () => service.search({ preferred: { caribbeanAffiliationCodes: ["ZZ"] } }),
       (err: unknown) => err instanceof Error && /Unsupported Caribbean/.test(err.message),
     );
+  });
+
+  test("unknown service category key in required.primaryCategoryKeys returns INVALID_SEARCH_CRITERIA", async () => {
+    const service = new TalentSearchService(new InMemoryTalentSearchRepository(buildFixture()));
+    await assert.rejects(
+      () => service.search({ required: { primaryCategoryKeys: ["non-existent-category"] } }),
+      (err: unknown) =>
+        err instanceof Error && /Unsupported service category key/.test(err.message),
+    );
+  });
+
+  test("unknown service category key in required.independentlyPurchasableServiceKeys returns INVALID_SEARCH_CRITERIA", async () => {
+    const service = new TalentSearchService(new InMemoryTalentSearchRepository(buildFixture()));
+    await assert.rejects(
+      () => service.search({ required: { independentlyPurchasableServiceKeys: ["non-existent"] } }),
+      (err: unknown) =>
+        err instanceof Error && /Unsupported service category key/.test(err.message),
+    );
+  });
+
+  test("unknown service category key in preferred.categoryKeys returns INVALID_SEARCH_CRITERIA", async () => {
+    const service = new TalentSearchService(new InMemoryTalentSearchRepository(buildFixture()));
+    await assert.rejects(
+      () => service.search({ preferred: { categoryKeys: ["nope"] } }),
+      (err: unknown) =>
+        err instanceof Error && /Unsupported service category key/.test(err.message),
+    );
+  });
+
+  test("unknown service category key in preferred.includedServiceKeys returns INVALID_SEARCH_CRITERIA", async () => {
+    const service = new TalentSearchService(new InMemoryTalentSearchRepository(buildFixture()));
+    await assert.rejects(
+      () => service.search({ preferred: { includedServiceKeys: ["nope"] } }),
+      (err: unknown) =>
+        err instanceof Error && /Unsupported service category key/.test(err.message),
+    );
+  });
+
+  test("unknown specialty key in preferred.specialties returns INVALID_SEARCH_CRITERIA", async () => {
+    const service = new TalentSearchService(new InMemoryTalentSearchRepository(buildFixture()));
+    await assert.rejects(
+      () => service.search({ preferred: { specialties: ["DJ"] } }),
+      (err: unknown) =>
+        err instanceof Error && /Unsupported specialty key/.test(err.message),
+    );
+  });
+
+  test("a whitespace-only array element is rejected as INVALID_SEARCH_CRITERIA", () => {
+    const result = talentSearchRequestV1Schema.safeParse({
+      required: { primaryCategoryKeys: ["music-production", " "] },
+    });
+    assert.equal(result.success, false);
+    if (!result.success) {
+      assert.ok(
+        result.error.issues.some((issue) =>
+          /shorter than 1 non-whitespace character/.test(issue.message),
+        ),
+      );
+    }
+  });
+
+  test("a whitespace-only preferred.basedIn.city is rejected at the schema layer", () => {
+    const result = talentSearchRequestV1Schema.safeParse({
+      required: { basedIn: { city: "Brooklyn" } },
+      preferred: { basedIn: { city: "   " } },
+    });
+    // The required.basedIn.city is meaningful, so the request is usable
+    // overall. The preferred.basedIn.city field must still fail the
+    // schema layer (whitespace-only is rejected).
+    assert.equal(result.success, false);
+    if (!result.success) {
+      assert.ok(
+        result.error.issues.some((issue) => /city/.test(issue.message)),
+      );
+    }
+  });
+
+  test("a whitespace-only required.basedIn.city is rejected at the schema layer", () => {
+    const result = talentSearchRequestV1Schema.safeParse({
+      required: { basedIn: { city: "   " } },
+    });
+    assert.equal(result.success, false);
+  });
+
+  test("a whitespace-only required.basedIn.region is rejected at the schema layer", () => {
+    const result = talentSearchRequestV1Schema.safeParse({
+      required: { basedIn: { region: "   " } },
+    });
+    assert.equal(result.success, false);
+  });
+
+  test("a whitespace-only required.basedIn.countryCode is rejected at the schema layer", () => {
+    const result = talentSearchRequestV1Schema.safeParse({
+      required: { basedIn: { countryCode: "  " } },
+    });
+    assert.equal(result.success, false);
+  });
+
+  test("a required location filter with all whitespace fields is unusable and the request is rejected", () => {
+    const result = talentSearchRequestV1Schema.safeParse({
+      required: { basedIn: { city: "   ", region: "   ", countryCode: "  " } },
+    });
+    assert.equal(result.success, false);
+  });
+
+  test("a mixed valid+invalid array element is rejected at the schema layer", () => {
+    const result = talentSearchRequestV1Schema.safeParse({
+      required: { primaryCategoryKeys: ["music-production", "\t"] },
+    });
+    assert.equal(result.success, false);
+  });
+
+  test("a structured request whose only apparent criterion normalizes to empty is rejected", () => {
+    // The required primaryCategoryKeys is whitespace-only; after
+    // normalization it is empty, the array collapses to undefined, and
+    // the request has no usable criteria.
+    const result = talentSearchRequestV1Schema.safeParse({
+      required: { primaryCategoryKeys: [" "] },
+    });
+    assert.equal(result.success, false);
+  });
+
+  test("a required basedIn whose all fields are whitespace normalizes to no usable criteria", () => {
+    const result = talentSearchRequestV1Schema.safeParse({
+      required: { basedIn: { city: "   " } },
+      preferred: { basedIn: { city: "   " } },
+    });
+    // The required.basedIn.city is whitespace, so the location filter
+    // fails the schema layer; the request has no usable required or
+    // preferred criteria, so the usability check fails too.
+    assert.equal(result.success, false);
   });
 
   test("normalized query is exposed in metadata and trimmed/lower-cased", async () => {

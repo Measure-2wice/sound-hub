@@ -11,34 +11,63 @@ import { z } from "zod";
 
 // ---------- Helpers ----------
 
-// Bounded string array: trims, dedupes, and rejects empty/whitespace-only
-// elements. An empty input collapses to `undefined` so that downstream
-// usability checks ignore "no criteria" arrays.
-const boundedStringArray = (minLength: number, maxLength: number) =>
+// Trim a string and reject it if it is empty after trimming. Used to
+// normalize location fields and array elements before length validation.
+const trimmedNonEmptyString = (minLength: number, maxLength: number, label: string) =>
   z
-    .array(z.string().min(1).max(maxLength))
-    .max(50, "array is too long")
+    .string()
+    .max(maxLength, `${label} must be at most ${maxLength} characters`)
+    .transform((value, ctx) => {
+      const trimmed = value.trim();
+      if (trimmed.length < minLength) {
+        ctx.addIssue({
+          code: z.ZodIssueCode.custom,
+          message: `${label} must be at least ${minLength} non-whitespace character(s) after normalization`,
+        });
+        return z.NEVER;
+      }
+      return trimmed;
+    });
+
+// Bounded string array. Each element is trimmed, deduped, and
+// rejected (ZodError) if it does not meet `minLength` after trimming.
+// An empty input collapses to `undefined` so downstream usability
+// checks ignore "no criteria" arrays.
+const optionalBoundedStringArray = (minLength: number, maxLength: number, label: string) =>
+  z
+    .array(
+      z
+        .string()
+        .max(maxLength, `${label} elements must be at most ${maxLength} characters`)
+        .transform((value, ctx) => {
+          const trimmed = value.trim();
+          if (trimmed.length < minLength) {
+            ctx.addIssue({
+              code: z.ZodIssueCode.custom,
+              message: `${label} contains an element shorter than ${minLength} non-whitespace character(s) after normalization`,
+            });
+            return z.NEVER;
+          }
+          return trimmed;
+        }),
+    )
+    .max(50, `${label} must contain at most 50 elements`)
     .transform((values) => {
       const seen = new Set<string>();
       const out: string[] = [];
       for (const value of values) {
-        const trimmed = value.trim();
-        if (trimmed.length < minLength) continue;
-        if (seen.has(trimmed)) continue;
-        seen.add(trimmed);
-        out.push(trimmed);
+        if (seen.has(value)) continue;
+        seen.add(value);
+        out.push(value);
       }
       return out;
-    });
-
-const optionalBoundedStringArray = (minLength: number, maxLength: number) =>
-  boundedStringArray(minLength, maxLength)
+    })
     .transform((arr) => (arr.length === 0 ? undefined : arr))
     .optional();
 
-// ISO 3166-1 alpha-2 country code (uppercase). The contract only validates
-// the shape; whether a specific code is a supported Caribbean affiliation is
-// an application-layer concern.
+// ISO 3166-1 alpha-2 country code (uppercase). The contract only
+// validates the shape; whether a specific code is a supported Caribbean
+// affiliation is an application-layer concern.
 const countryCodeSchema = z
   .string()
   .regex(/^[A-Z]{2}$/, "countryCode must be a 2-letter ISO alpha-2 code");
@@ -78,21 +107,44 @@ export type PricingSummaryV1 = z.infer<typeof pricingSummaryV1Schema>;
 
 // ---------- Location filter ----------
 
+// Location fields are normalized (trimmed) before min-length validation
+// and rejected if they are empty after normalization. The location
+// filter as a whole is also rejected if all three fields normalize to
+// empty/missing values.
+const trimmedCitySchema = trimmedNonEmptyString(1, 120, "city");
+const trimmedRegionSchema = trimmedNonEmptyString(1, 120, "region");
+const trimmedCountryCodeSchema = trimmedNonEmptyString(2, 2, "countryCode").refine(
+  (value) => /^[A-Z]{2}$/.test(value),
+  { message: "countryCode must be a 2-letter ISO alpha-2 code" },
+);
+
 const locationFilterV1Schema = z
   .object({
-    city: z.string().min(1).max(120).optional(),
-    region: z.string().min(1).max(120).optional(),
-    countryCode: countryCodeSchema.optional(),
+    city: trimmedCitySchema.optional(),
+    region: trimmedRegionSchema.optional(),
+    countryCode: trimmedCountryCodeSchema.optional(),
   })
-  .strict();
+  .strict()
+  .superRefine((value, ctx) => {
+    if (value.city === undefined && value.region === undefined && value.countryCode === undefined) {
+      ctx.addIssue({
+        code: z.ZodIssueCode.custom,
+        message: "location filter must contain at least one of city, region, countryCode",
+      });
+    }
+  });
 export type LocationFilterV1 = z.infer<typeof locationFilterV1Schema>;
 
 // ---------- Required criteria ----------
 
 export const talentSearchRequiredCriteriaV1Schema = z
   .object({
-    primaryCategoryKeys: optionalBoundedStringArray(1, 64),
-    independentlyPurchasableServiceKeys: optionalBoundedStringArray(1, 64),
+    primaryCategoryKeys: optionalBoundedStringArray(1, 64, "primaryCategoryKeys"),
+    independentlyPurchasableServiceKeys: optionalBoundedStringArray(
+      1,
+      64,
+      "independentlyPurchasableServiceKeys",
+    ),
     serviceModes: z
       .array(serviceModeSchema)
       .max(8)
@@ -108,10 +160,10 @@ export type TalentSearchRequiredCriteriaV1 = z.infer<typeof talentSearchRequired
 
 export const talentSearchPreferredCriteriaV1Schema = z
   .object({
-    categoryKeys: optionalBoundedStringArray(1, 64),
-    includedServiceKeys: optionalBoundedStringArray(1, 64),
-    specialties: optionalBoundedStringArray(1, 64),
-    genreTags: optionalBoundedStringArray(1, 64),
+    categoryKeys: optionalBoundedStringArray(1, 64, "categoryKeys"),
+    includedServiceKeys: optionalBoundedStringArray(1, 64, "includedServiceKeys"),
+    specialties: optionalBoundedStringArray(1, 64, "specialties"),
+    genreTags: optionalBoundedStringArray(1, 64, "genreTags"),
     caribbeanAffiliationCodes: z
       .array(countryCodeSchema)
       .max(20)
@@ -339,6 +391,42 @@ export function isSupportedCaribbeanAffiliationCode(
   return (SUPPORTED_CARIBBEAN_AFFILIATION_CODES as readonly string[]).includes(code);
 }
 
+// ---------- Stable controlled keys exposed for runtime validation ----------
+
+const SERVICE_CATEGORIES_FOR_KEYS = [
+  { key: "music-production" },
+  { key: "songwriting" },
+  { key: "custom-composition" },
+  { key: "session-vocals" },
+  { key: "session-instrument-performance" },
+  { key: "featured-artist-performance" },
+  { key: "mixing" },
+  { key: "mastering" },
+  { key: "recording-engineering" },
+  { key: "live-performance" },
+] as const;
+
+export const SUPPORTED_SERVICE_CATEGORY_KEYS = SERVICE_CATEGORIES_FOR_KEYS.map((c) => c.key);
+
+export const SUPPORTED_SPECIALTY_KEYS = [
+  "Artist",
+  "Producer",
+  "Musician",
+  "Songwriter",
+  "SoundEngineer",
+] as const;
+export type SupportedSpecialtyKey = (typeof SUPPORTED_SPECIALTY_KEYS)[number];
+
+export const SUPPORTED_PRICING_UNIT_KEYS = [
+  "hour",
+  "track",
+  "project",
+  "session",
+  "event",
+  "day",
+] as const;
+export type SupportedPricingUnitKey = (typeof SUPPORTED_PRICING_UNIT_KEYS)[number];
+
 // ---------- Closed Prisma enum surfaces (for drift testing) ----------
 //
 // These mirror the values used by the Prisma enums in packages/db/prisma/schema.prisma.
@@ -363,3 +451,26 @@ export const pricingKindValuesV1 = ["StartingAt", "Fixed", "ContactForQuote"] as
 export type PricingKindV1 = (typeof pricingKindValuesV1)[number];
 export const purchaseModeValuesV1 = ["BundleOnly"] as const;
 export type PurchaseModeV1 = (typeof purchaseModeValuesV1)[number];
+
+// ---------- Stable-controlled-key classification ----------
+
+/**
+ * Stable-controlled keys the application layer validates against the
+ * canonical seeded records. Unknown keys in any of these lists produce
+ * INVALID_SEARCH_CRITERIA rather than empty results.
+ */
+export type SupportedServiceCategoryKey = (typeof SUPPORTED_SERVICE_CATEGORY_KEYS)[number];
+
+export function isSupportedServiceCategoryKey(
+  key: string,
+): key is SupportedServiceCategoryKey {
+  return (SUPPORTED_SERVICE_CATEGORY_KEYS as readonly string[]).includes(key);
+}
+
+export function isSupportedSpecialtyKey(key: string): key is SupportedSpecialtyKey {
+  return (SUPPORTED_SPECIALTY_KEYS as readonly string[]).includes(key);
+}
+
+export function isSupportedPricingUnitKey(key: string): key is SupportedPricingUnitKey {
+  return (SUPPORTED_PRICING_UNIT_KEYS as readonly string[]).includes(key);
+}
