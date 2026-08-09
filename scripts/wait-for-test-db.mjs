@@ -25,7 +25,10 @@ try {
   throw err;
 }
 
-if (target.port !== APPROVED_TEST_DATABASE_PORT || target.database !== APPROVED_TEST_DATABASE_NAME) {
+if (
+  target.port !== APPROVED_TEST_DATABASE_PORT ||
+  target.database !== APPROVED_TEST_DATABASE_NAME
+) {
   console.error(
     `❌ Refusing to wait: target ${target.host}:${target.port}/${target.database} is not the approved disposable test target.`,
   );
@@ -37,13 +40,10 @@ let attempt = 0;
 while (Date.now() < deadline) {
   attempt += 1;
   const ok = await new Promise((resolve) => {
-    const socket = net.createConnection(
-      { host: target.host, port: target.port },
-      () => {
-        socket.end();
-        resolve(true);
-      },
-    );
+    const socket = net.createConnection({ host: target.host, port: target.port }, () => {
+      socket.end();
+      resolve(true);
+    });
     socket.on("error", () => {
       socket.destroy();
       resolve(false);
@@ -54,10 +54,14 @@ while (Date.now() < deadline) {
     });
   });
   if (ok) {
-    console.log(`✅ Disposable test database is ready on ${target.host}:${target.port} (attempt ${attempt})`);
+    console.log(
+      `✅ Disposable test database is ready on ${target.host}:${target.port} (attempt ${attempt})`,
+    );
     process.exit(0);
   }
   await sleep(1_000);
 }
-console.error(`❌ Disposable test database at ${target.host}:${target.port} did not become ready in 60s`);
+console.error(
+  `❌ Disposable test database at ${target.host}:${target.port} did not become ready in 60s`,
+);
 process.exit(1);

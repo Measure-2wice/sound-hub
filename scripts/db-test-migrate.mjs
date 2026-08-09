@@ -27,19 +27,15 @@ async function main() {
   );
 
   await new Promise((resolve, reject) => {
-    const child = spawn(
-      "npx",
-      ["prisma", "migrate", "deploy", "--schema=prisma/schema.prisma"],
-      {
-        cwd: packagesDbDir,
-        stdio: "inherit",
-        env: {
-          ...process.env,
-          DATABASE_URL: target.url,
-          TEST_DATABASE_URL: target.url,
-        },
+    const child = spawn("npx", ["prisma", "migrate", "deploy", "--schema=prisma/schema.prisma"], {
+      cwd: packagesDbDir,
+      stdio: "inherit",
+      env: {
+        ...process.env,
+        DATABASE_URL: target.url,
+        TEST_DATABASE_URL: target.url,
       },
-    );
+    });
     child.on("error", reject);
     child.on("exit", (code) => {
       if (code === 0) resolve();

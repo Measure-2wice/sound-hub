@@ -29,11 +29,7 @@ export function createSearchRouter(deps: SearchRouteDeps): Router {
   return router;
 }
 
-async function handleSearch(
-  req: Request,
-  res: Response,
-  deps: SearchRouteDeps,
-): Promise<void> {
+async function handleSearch(req: Request, res: Response, deps: SearchRouteDeps): Promise<void> {
   const requestId = resolveRequestId(req);
   res.setHeader("x-request-id", requestId);
 
@@ -53,10 +49,7 @@ async function handleSearch(
   try {
     rawBody = await readJsonBody(req);
   } catch (err) {
-    const code =
-      err instanceof PayloadTooLargeError
-        ? "INVALID_JSON"
-        : "INVALID_JSON";
+    const code = err instanceof PayloadTooLargeError ? "INVALID_JSON" : "INVALID_JSON";
     const message =
       err instanceof PayloadTooLargeError
         ? `Request body exceeds the ${MAX_REQUEST_BODY_BYTES}-byte limit.`
@@ -90,12 +83,7 @@ async function handleSearch(
     response = await deps.service.search(parsedRequest);
   } catch (err) {
     if (err instanceof TalentSearchInvalidCriteriaError) {
-      const error = buildSafeError(
-        "INVALID_SEARCH_CRITERIA",
-        err.message,
-        undefined,
-        requestId,
-      );
+      const error = buildSafeError("INVALID_SEARCH_CRITERIA", err.message, undefined, requestId);
       noteError(error, err);
       writeSafeError(res, error);
       return;

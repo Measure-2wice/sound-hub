@@ -44,7 +44,11 @@ export interface InMemoryOffering {
   readonly primaryCategory: { key: string; name: string; bundleOnly: boolean };
   readonly includedServices: readonly { key: string; name: string; purchaseMode: "BundleOnly" }[];
   readonly genreTags: readonly string[];
-  readonly serviceAreas: readonly { city: string | null; region: string | null; countryCode: string }[];
+  readonly serviceAreas: readonly {
+    city: string | null;
+    region: string | null;
+    countryCode: string;
+  }[];
   readonly pricing: {
     kind: "StartingAt" | "Fixed" | "ContactForQuote";
     amountMinor: number | null;

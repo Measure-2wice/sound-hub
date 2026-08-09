@@ -352,9 +352,7 @@ describe("TalentSearchService", () => {
       required: { independentlyPurchasableServiceKeys: ["music-production"] },
     });
     assert.ok(response.results.some((r) => r.seller.sellerId === "seller-haitian-brooklyn"));
-    assert.ok(
-      !response.results.some((r) => r.seller.sellerId === "seller-bundle-only"),
-    );
+    assert.ok(!response.results.some((r) => r.seller.sellerId === "seller-bundle-only"));
   });
 
   test("required constraints on the same offering compound (AND, not OR)", async () => {
@@ -411,9 +409,7 @@ describe("TalentSearchService", () => {
     assert.equal(result.success, false);
     if (!result.success) {
       assert.ok(
-        result.error.issues.some(
-          (issue) => /at least one letter or digit/.test(issue.message),
-        ),
+        result.error.issues.some((issue) => /at least one letter or digit/.test(issue.message)),
       );
     }
   });
@@ -443,8 +439,7 @@ describe("TalentSearchService", () => {
         service.search({
           preferred: { caribbeanAffiliationCodes: ["ZZ"] as string[] },
         }),
-      (err: unknown) =>
-        err instanceof Error && /Unsupported Caribbean/.test(err.message),
+      (err: unknown) => err instanceof Error && /Unsupported Caribbean/.test(err.message),
     );
   });
 

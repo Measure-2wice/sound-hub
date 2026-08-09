@@ -107,38 +107,40 @@ export class PrismaTalentSearchRepository implements TalentSearchRepository {
         input.serviceModes.length === 0 ? true : input.serviceModes.includes(offering.serviceMode),
       )
       .filter((offering) => matchesAnyServiceArea(offering.serviceAreas, input.serviceArea))
-      .map((offering): RepositoryCandidateOffering => ({
-        offeringId: offering.id,
-        sellerId: seller.id,
-        title: offering.title,
-        description: offering.description,
-        status: offering.status,
-        serviceMode: offering.serviceMode,
-        primaryCategory: {
-          key: offering.primaryCategory.key,
-          name: offering.primaryCategory.name,
-          bundleOnly: offering.primaryCategory.bundleOnly,
-        },
-        includedServices: offering.includedServices.map((included) => ({
-          key: included.category.key,
-          name: included.category.name,
-          purchaseMode: "BundleOnly" as const,
-        })),
-        genreTags: offering.genreTags,
-        serviceAreas: offering.serviceAreas.map((area) => ({
-          city: area.city,
-          region: area.region,
-          countryCode: area.countryCode,
-        })),
-        pricing: offering.pricing
-          ? {
-              kind: offering.pricing.kind,
-              amountMinor: offering.pricing.amountMinor,
-              currency: offering.pricing.currency,
-              unitKey: offering.pricing.unit?.key ?? null,
-            }
-          : null,
-      }));
+      .map(
+        (offering): RepositoryCandidateOffering => ({
+          offeringId: offering.id,
+          sellerId: seller.id,
+          title: offering.title,
+          description: offering.description,
+          status: offering.status,
+          serviceMode: offering.serviceMode,
+          primaryCategory: {
+            key: offering.primaryCategory.key,
+            name: offering.primaryCategory.name,
+            bundleOnly: offering.primaryCategory.bundleOnly,
+          },
+          includedServices: offering.includedServices.map((included) => ({
+            key: included.category.key,
+            name: included.category.name,
+            purchaseMode: "BundleOnly" as const,
+          })),
+          genreTags: offering.genreTags,
+          serviceAreas: offering.serviceAreas.map((area) => ({
+            city: area.city,
+            region: area.region,
+            countryCode: area.countryCode,
+          })),
+          pricing: offering.pricing
+            ? {
+                kind: offering.pricing.kind,
+                amountMinor: offering.pricing.amountMinor,
+                currency: offering.pricing.currency,
+                unitKey: offering.pricing.unit?.key ?? null,
+              }
+            : null,
+        }),
+      );
 
     return {
       sellerId: seller.id,

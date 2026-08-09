@@ -48,7 +48,11 @@ function runStep(label: string, command: string, env: Record<string, string>): v
   execSync(command, {
     cwd: "../..",
     stdio: "inherit",
-    env: { ...process.env, ...env, NODE_ENV: (env.NODE_ENV ?? "test") as "test" | "development" | "production" },
+    env: {
+      ...process.env,
+      ...env,
+      NODE_ENV: (env.NODE_ENV ?? "test") as "test" | "development" | "production",
+    },
   });
 }
 

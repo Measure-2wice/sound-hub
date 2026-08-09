@@ -14,9 +14,7 @@ import {
 } from "../apps/api/src/lib/test-database.js";
 import { loadTestDatabaseEnv, packagesDbDir } from "./db-test-env.mjs";
 
-const require = createRequire(
-  new URL("../packages/db/package.json", import.meta.url).pathname,
-);
+const require = createRequire(new URL("../packages/db/package.json", import.meta.url).pathname);
 const { Client } = require("pg");
 
 loadTestDatabaseEnv();
@@ -25,9 +23,7 @@ async function dropPublicSchema(url) {
   const client = new Client({ connectionString: url });
   await client.connect();
   try {
-    await client.query(
-      'DROP SCHEMA IF EXISTS "public" CASCADE; CREATE SCHEMA "public";',
-    );
+    await client.query('DROP SCHEMA IF EXISTS "public" CASCADE; CREATE SCHEMA "public";');
   } finally {
     await client.end();
   }
@@ -35,19 +31,15 @@ async function dropPublicSchema(url) {
 
 async function runPrismaDeploy(url) {
   await new Promise((resolve, reject) => {
-    const child = spawn(
-      "npx",
-      ["prisma", "migrate", "deploy", "--schema=prisma/schema.prisma"],
-      {
-        cwd: packagesDbDir,
-        stdio: "inherit",
-        env: {
-          ...process.env,
-          DATABASE_URL: url,
-          TEST_DATABASE_URL: url,
-        },
+    const child = spawn("npx", ["prisma", "migrate", "deploy", "--schema=prisma/schema.prisma"], {
+      cwd: packagesDbDir,
+      stdio: "inherit",
+      env: {
+        ...process.env,
+        DATABASE_URL: url,
+        TEST_DATABASE_URL: url,
       },
-    );
+    });
     child.on("error", reject);
     child.on("exit", (code) => {
       if (code === 0) resolve();

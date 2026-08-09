@@ -207,8 +207,7 @@ describe("PrismaTalentSearchRepository", () => {
       for (const offering of seller.offerings) {
         assert.ok(
           offering.serviceAreas.some(
-            (a) => (a.city === "Brooklyn" && a.countryCode === "BS") ||
-              a.countryCode !== "BS",
+            (a) => (a.city === "Brooklyn" && a.countryCode === "BS") || a.countryCode !== "BS",
           ),
         );
       }

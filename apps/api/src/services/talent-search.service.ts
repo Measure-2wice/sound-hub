@@ -128,7 +128,8 @@ export class TalentSearchService {
       if (!first) return null;
       return { offering: first, score: 0, reason: "eligible candidate" };
     }
-    let best: { offering: RepositoryCandidateOffering; score: number; reason: string } | null = null;
+    let best: { offering: RepositoryCandidateOffering; score: number; reason: string } | null =
+      null;
     for (const offering of seller.offerings) {
       const { matched, fields } = scoreOffering(offering, queryTokens);
       if (matched === 0) continue;
