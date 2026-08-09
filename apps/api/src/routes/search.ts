@@ -35,12 +35,7 @@ async function handleSearch(req: Request, res: Response, deps: SearchRouteDeps):
 
   const mediaType = parseApplicationJsonMediaType(req.headers["content-type"]);
   if (!mediaType.ok) {
-    const error = buildSafeError(
-      "UNSUPPORTED_MEDIA_TYPE",
-      mediaType.message,
-      undefined,
-      requestId,
-    );
+    const error = buildSafeError("UNSUPPORTED_MEDIA_TYPE", mediaType.message, undefined, requestId);
     writeSafeError(res, error);
     drainAndEnd(req, res);
     return;
@@ -151,7 +146,10 @@ function parseApplicationJsonMediaType(header: string | string[] | undefined): M
   if (header === undefined || header.trim() === "") {
     return { ok: false, message: "Request is missing the Content-Type header." };
   }
-  const segments = header.split(";").map((s) => s.trim()).filter((s) => s.length > 0);
+  const segments = header
+    .split(";")
+    .map((s) => s.trim())
+    .filter((s) => s.length > 0);
   if (segments.length === 0) {
     return { ok: false, message: "Content-Type is empty." };
   }
@@ -300,4 +298,3 @@ function noteError(safe: SafeErrorResponse, err: unknown): void {
     err,
   );
 }
-

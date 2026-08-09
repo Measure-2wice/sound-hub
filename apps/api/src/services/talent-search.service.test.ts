@@ -443,8 +443,7 @@ describe("TalentSearchService", () => {
     const service = new TalentSearchService(new InMemoryTalentSearchRepository(buildFixture()));
     await assert.rejects(
       () => service.search({ preferred: { specialties: ["DJ"] } }),
-      (err: unknown) =>
-        err instanceof Error && /Unsupported specialty key/.test(err.message),
+      (err: unknown) => err instanceof Error && /Unsupported specialty key/.test(err.message),
     );
   });
 
@@ -472,9 +471,7 @@ describe("TalentSearchService", () => {
     // schema layer (whitespace-only is rejected).
     assert.equal(result.success, false);
     if (!result.success) {
-      assert.ok(
-        result.error.issues.some((issue) => /city/.test(issue.message)),
-      );
+      assert.ok(result.error.issues.some((issue) => /city/.test(issue.message)));
     }
   });
 

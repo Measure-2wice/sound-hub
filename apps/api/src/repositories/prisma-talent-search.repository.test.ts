@@ -46,19 +46,15 @@ function resetViaSeed(): Promise<void> {
     const testFile = new URL(import.meta.url);
     const dbDir = new URL("../../../../packages/db/", testFile).pathname;
     const seedPath = `${dbDir}prisma/seed.ts`;
-    const child = spawn(
-      process.execPath,
-      ["--import", "tsx/esm", seedPath],
-      {
-        cwd: dbDir,
-        stdio: "inherit",
-        env: {
-          ...process.env,
-          DATABASE_URL: databaseUrl,
-          TEST_DATABASE_URL: databaseUrl,
-        },
+    const child = spawn(process.execPath, ["--import", "tsx/esm", seedPath], {
+      cwd: dbDir,
+      stdio: "inherit",
+      env: {
+        ...process.env,
+        DATABASE_URL: databaseUrl,
+        TEST_DATABASE_URL: databaseUrl,
       },
-    );
+    });
     child.on("error", reject);
     child.on("exit", (code) => {
       if (code === 0) resolve();
@@ -286,12 +282,6 @@ describe("PrismaTalentSearchRepository", () => {
     } finally {
       await prisma.$disconnect();
     }
-    const candidates = await repository.search(EMPTY_INPUT);
-    // All sellers must be returned (the next beforeEach has already
-    // reset the state). Note: this test depends on the next test's
-    // beforeEach, so the reset has not yet happened within this
-    // test. The assertion is that the mutation does not persist
-    // beyond the next reset.
     const persisted = await repository.search(EMPTY_INPUT);
     const stillSuspended = persisted.some((s) => s.workspaceId && s.status === "Suspended");
     void stillSuspended;

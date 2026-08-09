@@ -268,10 +268,7 @@ describe("POST /api/search contract", () => {
     // object. This test exercises the same code path by sending an
     // empty body with an explicitly empty Content-Type header, which
     // reaches the route's parseApplicationJsonMediaType and fails.
-    const response = await request(app)
-      .post("/api/search")
-      .set("Content-Type", "")
-      .send("");
+    const response = await request(app).post("/api/search").set("Content-Type", "").send("");
     assert.equal(response.status, 415);
     assert.equal(response.body.error.code, "UNSUPPORTED_MEDIA_TYPE");
   });

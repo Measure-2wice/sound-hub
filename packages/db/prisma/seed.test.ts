@@ -1,3 +1,8 @@
+/* eslint-disable @typescript-eslint/no-floating-promises */
+/* eslint-disable @typescript-eslint/no-unsafe-member-access */
+/* eslint-disable @typescript-eslint/no-unsafe-call */
+/* eslint-disable @typescript-eslint/no-unnecessary-type-assertion */
+
 // Regression coverage for the M1.1 deterministic seed.
 //
 // These tests run against the disposable test database (TEST_DATABASE_URL)
@@ -68,19 +73,15 @@ after(async () => {
 
 function runSeed(): Promise<void> {
   return new Promise((resolve, reject) => {
-    const child = spawn(
-      "npx",
-      ["tsx", "prisma/seed.ts"],
-      {
-        cwd: new URL("..", import.meta.url).pathname,
-        stdio: "inherit",
-        env: {
-          ...process.env,
-          DATABASE_URL: databaseUrl,
-          TEST_DATABASE_URL: databaseUrl,
-        },
+    const child = spawn("npx", ["tsx", "prisma/seed.ts"], {
+      cwd: new URL("..", import.meta.url).pathname,
+      stdio: "inherit",
+      env: {
+        ...process.env,
+        DATABASE_URL: databaseUrl,
+        TEST_DATABASE_URL: databaseUrl,
       },
-    );
+    });
     child.on("error", reject);
     child.on("exit", (code) => {
       if (code === 0) resolve();
@@ -127,7 +128,11 @@ describe("M1.1 seed regression coverage", () => {
       where: { slug: "creole-beats-dancehall-single-remote" },
     });
     const canonicalSeller = await prisma.sellerProfile.findUnique({
-      where: { workspaceId: (await prisma.workspace.findUnique({ where: { slug: "creole-beats-brooklyn" } }))!.id },
+      where: {
+        workspaceId: (await prisma.workspace.findUnique({
+          where: { slug: "creole-beats-brooklyn" },
+        }))!.id,
+      },
     });
     assert.ok(offering);
     assert.ok(canonicalSeller);
@@ -223,7 +228,9 @@ describe("M1.1 seed regression coverage", () => {
     const workspace = await prisma.workspace.findUnique({
       where: { slug: "creole-beats-brooklyn" },
       include: {
-        sellerProfile: { include: { offerings: true, caribbeanAffiliations: true, specialties: true } },
+        sellerProfile: {
+          include: { offerings: true, caribbeanAffiliations: true, specialties: true },
+        },
         memberships: true,
         capabilities: true,
       },
@@ -260,7 +267,9 @@ describe("M1.1 seed regression coverage", () => {
     const restored = await prisma.workspace.findUnique({
       where: { slug: "creole-beats-brooklyn" },
       include: {
-        sellerProfile: { include: { offerings: true, caribbeanAffiliations: true, specialties: true } },
+        sellerProfile: {
+          include: { offerings: true, caribbeanAffiliations: true, specialties: true },
+        },
         memberships: true,
         capabilities: true,
       },
@@ -277,7 +286,9 @@ describe("M1.1 seed regression coverage", () => {
 
   test("recreates a deleted canonical ServiceCategory referenced by an offering", async () => {
     await runSeed();
-    const category = await prisma.serviceCategory.findUnique({ where: { key: "music-production" } });
+    const category = await prisma.serviceCategory.findUnique({
+      where: { key: "music-production" },
+    });
     assert.ok(category);
     const offering = await prisma.serviceOffering.findUnique({
       where: { slug: "creole-beats-dancehall-single-remote" },
@@ -295,7 +306,9 @@ describe("M1.1 seed regression coverage", () => {
     await prisma.serviceCategory.delete({ where: { key: "music-production" } });
 
     await runSeed();
-    const restored = await prisma.serviceCategory.findUnique({ where: { key: "music-production" } });
+    const restored = await prisma.serviceCategory.findUnique({
+      where: { key: "music-production" },
+    });
     assert.ok(restored);
     const restoredOffering = await prisma.serviceOffering.findUnique({
       where: { id: offering.id },

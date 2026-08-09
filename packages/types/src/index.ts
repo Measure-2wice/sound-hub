@@ -461,9 +461,7 @@ export type PurchaseModeV1 = (typeof purchaseModeValuesV1)[number];
  */
 export type SupportedServiceCategoryKey = (typeof SUPPORTED_SERVICE_CATEGORY_KEYS)[number];
 
-export function isSupportedServiceCategoryKey(
-  key: string,
-): key is SupportedServiceCategoryKey {
+export function isSupportedServiceCategoryKey(key: string): key is SupportedServiceCategoryKey {
   return (SUPPORTED_SERVICE_CATEGORY_KEYS as readonly string[]).includes(key);
 }
 

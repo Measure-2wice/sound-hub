@@ -51,16 +51,66 @@ type ServiceCategorySeed = {
 };
 
 const SERVICE_CATEGORIES: readonly ServiceCategorySeed[] = [
-  { key: "music-production", name: "Music Production", description: "Original beat-making and track production.", bundleOnly: false },
-  { key: "songwriting", name: "Songwriting", description: "Original lyric and topline writing.", bundleOnly: false },
-  { key: "custom-composition", name: "Custom Composition", description: "Bespoke composition for briefs and placements.", bundleOnly: false },
-  { key: "session-vocals", name: "Session Vocals", description: "Studio vocal performance for hire.", bundleOnly: false },
-  { key: "session-instrument-performance", name: "Session Instrument Performance", description: "Studio instrumental performance for hire.", bundleOnly: false },
-  { key: "featured-artist-performance", name: "Featured Artist Performance", description: "Featured artist credit on a track.", bundleOnly: false },
-  { key: "mixing", name: "Mixing", description: "Multitrack mixdown and balance.", bundleOnly: false },
-  { key: "mastering", name: "Mastering", description: "Final loudness and tone preparation.", bundleOnly: false },
-  { key: "recording-engineering", name: "Recording Engineering", description: "Studio tracking and engineering.", bundleOnly: false },
-  { key: "live-performance", name: "Live Performance", description: "In-person and hybrid live performance.", bundleOnly: false },
+  {
+    key: "music-production",
+    name: "Music Production",
+    description: "Original beat-making and track production.",
+    bundleOnly: false,
+  },
+  {
+    key: "songwriting",
+    name: "Songwriting",
+    description: "Original lyric and topline writing.",
+    bundleOnly: false,
+  },
+  {
+    key: "custom-composition",
+    name: "Custom Composition",
+    description: "Bespoke composition for briefs and placements.",
+    bundleOnly: false,
+  },
+  {
+    key: "session-vocals",
+    name: "Session Vocals",
+    description: "Studio vocal performance for hire.",
+    bundleOnly: false,
+  },
+  {
+    key: "session-instrument-performance",
+    name: "Session Instrument Performance",
+    description: "Studio instrumental performance for hire.",
+    bundleOnly: false,
+  },
+  {
+    key: "featured-artist-performance",
+    name: "Featured Artist Performance",
+    description: "Featured artist credit on a track.",
+    bundleOnly: false,
+  },
+  {
+    key: "mixing",
+    name: "Mixing",
+    description: "Multitrack mixdown and balance.",
+    bundleOnly: false,
+  },
+  {
+    key: "mastering",
+    name: "Mastering",
+    description: "Final loudness and tone preparation.",
+    bundleOnly: false,
+  },
+  {
+    key: "recording-engineering",
+    name: "Recording Engineering",
+    description: "Studio tracking and engineering.",
+    bundleOnly: false,
+  },
+  {
+    key: "live-performance",
+    name: "Live Performance",
+    description: "In-person and hybrid live performance.",
+    bundleOnly: false,
+  },
 ] as const;
 
 const SPECIALTY_KEYS = ["Artist", "Producer", "Musician", "Songwriter", "SoundEngineer"] as const;
@@ -220,7 +270,8 @@ const SELLERS: readonly SellerSeed[] = [
       {
         slug: "jrrob-dancehall-mix",
         title: "Dancehall and hip-hop mixing — remote",
-        description: "Mixdown for a single, including basic corrective editing and stem organization.",
+        description:
+          "Mixdown for a single, including basic corrective editing and stem organization.",
         status: "Active",
         serviceMode: "Remote",
         primaryCategoryKey: "mixing",
@@ -248,7 +299,8 @@ const SELLERS: readonly SellerSeed[] = [
       {
         slug: "selene-bachata-live",
         title: "Bachata and merengue live performance",
-        description: "In-person 60- to 90-minute set with a four-piece band, suitable for festivals and club dates.",
+        description:
+          "In-person 60- to 90-minute set with a four-piece band, suitable for festivals and club dates.",
         status: "Active",
         serviceMode: "InPerson",
         primaryCategoryKey: "live-performance",
@@ -304,7 +356,8 @@ const SELLERS: readonly SellerSeed[] = [
       {
         slug: "devon-live-set",
         title: "Caribbean live set and band direction",
-        description: "Hybrid live set with band direction; available in-person in the Caribbean and remotely elsewhere.",
+        description:
+          "Hybrid live set with band direction; available in-person in the Caribbean and remotely elsewhere.",
         status: "Active",
         serviceMode: "Hybrid",
         primaryCategoryKey: "live-performance",
@@ -343,7 +396,11 @@ async function applySeed(): Promise<void> {
       await tx.serviceCategory.upsert({
         where: { key: category.key },
         create: category,
-        update: { name: category.name, description: category.description, bundleOnly: category.bundleOnly },
+        update: {
+          name: category.name,
+          description: category.description,
+          bundleOnly: category.bundleOnly,
+        },
       });
     }
     for (const key of SPECIALTY_KEYS) {
@@ -521,9 +578,13 @@ async function applySeed(): Promise<void> {
         if (offering.pricing) {
           let unitId: string | null = null;
           if (offering.pricing.unitKey) {
-            const unit = await tx.pricingUnit.findUnique({ where: { key: offering.pricing.unitKey } });
+            const unit = await tx.pricingUnit.findUnique({
+              where: { key: offering.pricing.unitKey },
+            });
             if (!unit) {
-              throw new Error(`PricingUnit ${offering.pricing.unitKey} missing from controlled records`);
+              throw new Error(
+                `PricingUnit ${offering.pricing.unitKey} missing from controlled records`,
+              );
             }
             unitId = unit.id;
           }
@@ -590,14 +651,12 @@ interface CanonicalSnapshot {
         readonly region: string | null;
         readonly countryCode: string;
       }[];
-      readonly pricing:
-        | {
-            readonly kind: string;
-            readonly amountMinor: number | null;
-            readonly currency: string | null;
-            readonly unitKey: string | null;
-          }
-        | null;
+      readonly pricing: {
+        readonly kind: string;
+        readonly amountMinor: number | null;
+        readonly currency: string | null;
+        readonly unitKey: string | null;
+      } | null;
     }[];
   }[];
 }
@@ -616,7 +675,7 @@ async function captureCanonicalSnapshot(): Promise<CanonicalSnapshot> {
     orderBy: { key: "asc" },
   });
 
-  const sellers: CanonicalSnapshot["sellers"] = [];
+  const sellers: CanonicalSnapshot["sellers"][number][] = [];
   for (const seller of SELLERS) {
     const user = await prisma.userAccount.findUnique({ where: { email: seller.ownerEmail } });
     if (!user) {
@@ -713,7 +772,7 @@ async function captureCanonicalSnapshot(): Promise<CanonicalSnapshot> {
     })),
     specialties: specialties.map((s) => ({ key: s.key, name: s.name })),
     pricingUnits: pricingUnits.map((u) => ({ key: u.key, name: u.name })),
-    sellers,
+    sellers: sellers as unknown as CanonicalSnapshot["sellers"],
   };
 }
 
@@ -812,9 +871,7 @@ function assertCanonicalSnapshotCorrect(snapshot: CanonicalSnapshot): void {
       );
     }
     if (actual.basedInCountryCode !== seller.basedInCountryCode) {
-      throw new Error(
-        `SellerProfile ${seller.workspaceSlug}.basedInCountryCode drifted`,
-      );
+      throw new Error(`SellerProfile ${seller.workspaceSlug}.basedInCountryCode drifted`);
     }
     if (
       JSON.stringify([...actual.caribbeanAffiliationCodes].sort()) !==

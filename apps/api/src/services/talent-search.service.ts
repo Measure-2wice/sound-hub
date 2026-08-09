@@ -120,9 +120,7 @@ export class TalentSearchService {
       ...preferredCategoryKeys,
       ...preferredIncludedServiceKeys,
     ];
-    const unknownCategories = allCategoryKeys.filter(
-      (key) => !isSupportedServiceCategoryKey(key),
-    );
+    const unknownCategories = allCategoryKeys.filter((key) => !isSupportedServiceCategoryKey(key));
     if (unknownCategories.length > 0) {
       throw new TalentSearchInvalidCriteriaError(
         `Unsupported service category key(s): ${[...new Set(unknownCategories)].join(", ")}`,
