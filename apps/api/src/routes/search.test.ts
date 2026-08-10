@@ -234,7 +234,7 @@ describe("POST /api/search contract", () => {
           serviceCategoryKeys: new Set<string>(),
           specialtyKeys: new Set<string>(),
           pricingUnitKeys: new Set<string>(),
-      }),
+        }),
     });
     const { app: failingApp } = buildApp({ service: failingService, prismaClient: stubPrisma });
     const response = await request(failingApp)

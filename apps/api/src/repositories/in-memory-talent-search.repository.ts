@@ -87,9 +87,7 @@ export class InMemoryTalentSearchRepository implements TalentSearchRepository {
     await Promise.resolve();
     const controlled = this.fixture.controlledKeys;
     if (!controlled) {
-      throw new Error(
-        "InMemoryTalentSearchRepository requires fixture.controlledKeys to be set",
-      );
+      throw new Error("InMemoryTalentSearchRepository requires fixture.controlledKeys to be set");
     }
     return {
       serviceCategoryKeys: new Set(controlled.serviceCategoryKeys),

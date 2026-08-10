@@ -336,18 +336,14 @@ describe("PrismaTalentSearchRepository", () => {
     const repoRoot = new URL("../../../../", testFile).pathname;
     const tsxBin = new URL("../../node_modules/.bin/tsx", testFile).pathname;
     const exitCode: number = await new Promise((resolve, reject) => {
-      const child = spawn(
-        tsxBin,
-        [`${repoRoot}scripts/db-test-seed.mjs`],
-        {
-          cwd: repoRoot,
-          stdio: ["ignore", "pipe", "pipe"],
-          env: {
-            ...process.env,
-            TEST_DATABASE_URL: "postgresql://attacker:bad@localhost:5432/soundhub_db",
-          },
+      const child = spawn(tsxBin, [`${repoRoot}scripts/db-test-seed.mjs`], {
+        cwd: repoRoot,
+        stdio: ["ignore", "pipe", "pipe"],
+        env: {
+          ...process.env,
+          TEST_DATABASE_URL: "postgresql://attacker:bad@localhost:5432/soundhub_db",
         },
-      );
+      });
       child.on("error", reject);
       child.on("exit", (code) => resolve(code ?? -1));
     });
