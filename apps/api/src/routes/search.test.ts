@@ -585,7 +585,7 @@ describe("POST /api/search contract", () => {
       // First request: chunked body. The route's streaming reader
       // must observe the overflow and reject the promise
       // atomically; the route handler must write the safe
-      // envelope and destroy the request.
+      // envelope and close the connection after flushing it.
       const res1 = await sendChunked();
       assert.equal(res1.statusCode, 400);
       assert.ok(/exceeds the 16384-byte limit/.test(res1.body));

@@ -697,20 +697,37 @@ describe("M1.1 seed regression coverage", () => {
       );
     });
     // The probe writes the canonical invariant-failure marker
-    // (`ASSERTION_FAILED: <message>`) to stderr and exits with
-    // code 1 when the canonical assertion throws. Require the
-    // marker explicitly so any other failure mode (missing
-    // entry module, runtime crash, etc.) fails the test with a
+    // (`INVARIANT_FAILED: <message>`) to stderr ONLY when the
+    // canonical assertion itself throws. Infrastructure/runtime
+    // failures emit a distinct `PROBE_ERROR:` marker so they
+    // cannot masquerade as a successful invariant detection.
+    // Require the invariant marker AND the specific drift
+    // message identifying this offering and the nonempty
+    // IncludedService relation, so any other failure mode
+    // (missing entry module, runtime crash, bad database URL,
+    // query failure, disconnect error) fails the test with a
     // clear signal rather than passing for the wrong reason.
     assert.ok(
-      stderr.includes("ASSERTION_FAILED:"),
+      stderr.includes("INVARIANT_FAILED:"),
       `snapshot probe must report the canonical invariant-failure marker; ` +
         `got exit=${exitCode} stderr=${JSON.stringify(stderr)}`,
     );
-    assert.notEqual(
+    assert.ok(
+      stderr.includes(
+        "ServiceOffering creole-beats-dancehall-single-remote.includedServices must be empty in the M1.1 fixture",
+      ),
+      `snapshot probe must report the exact IncludedService drift message; ` +
+        `got exit=${exitCode} stderr=${JSON.stringify(stderr)}`,
+    );
+    assert.ok(
+      !stderr.includes("PROBE_ERROR:"),
+      `snapshot probe must NOT emit PROBE_ERROR when the canonical assertion itself fired; ` +
+        `got exit=${exitCode} stderr=${JSON.stringify(stderr)}`,
+    );
+    assert.equal(
       exitCode,
-      0,
-      `snapshot probe must exit nonzero when a stale IncludedService row exists; ` +
+      1,
+      `snapshot probe must exit with code 1 when a stale IncludedService row exists; ` +
         `got exit=${exitCode} stderr=${JSON.stringify(stderr)}`,
     );
     // Clean up the stale row so subsequent tests start from
@@ -718,5 +735,66 @@ describe("M1.1 seed regression coverage", () => {
     await prisma.includedService.deleteMany({
       where: { offeringId: target.id },
     });
+  });
+
+  test("snapshot probe emits PROBE_ERROR (not INVARIANT_FAILED) when the database is unreachable (regression for review 6 P1)", async () => {
+    // Reviewer verification: prove that an invalid database
+    // connection fails the regression rather than passing it.
+    // The probe must distinguish invariant failures from
+    // infrastructure/runtime failures so this test — and any
+    // future caller — can rely on `INVARIANT_FAILED:` meaning
+    // "the canonical assertion itself threw". With the
+    // unreachable URL, the probe should fail to connect
+    // (captureCanonicalSnapshot throws) and emit PROBE_ERROR.
+    const probePath = new URL("./snapshot-probe.ts", import.meta.url).pathname;
+    const repoRoot = new URL("../../../", import.meta.url).pathname;
+    const appsApiTsx = `${repoRoot}apps/api/node_modules/.bin/tsx`;
+    assert.ok(
+      existsSync(probePath),
+      `snapshot probe not found at resolved path ${probePath}; invariant regression cannot run`,
+    );
+    const unreachableUrl =
+      "postgresql://soundhub:invalid@127.0.0.1:5433/soundhub_m1_test?connect_timeout=1";
+    const { exitCode, stderr } = await new Promise<{
+      exitCode: number;
+      stderr: string;
+    }>((resolve, reject) => {
+      const stderrChunks: Buffer[] = [];
+      const child = spawn(appsApiTsx, [probePath, unreachableUrl], {
+        stdio: ["ignore", "pipe", "pipe"],
+        env: {
+          ...process.env,
+          DATABASE_URL: unreachableUrl,
+          TEST_DATABASE_URL: unreachableUrl,
+        },
+      });
+      child.stderr.on("data", (chunk: Buffer) => {
+        stderrChunks.push(chunk);
+      });
+      child.on("error", reject);
+      child.on("exit", (code) =>
+        resolve({ exitCode: code ?? -1, stderr: Buffer.concat(stderrChunks).toString("utf8") }),
+      );
+    });
+    // The probe must NOT emit INVARIANT_FAILED when the
+    // failure is an infrastructure error. Emitting it would
+    // let the stale-row regression above pass for the wrong
+    // reason (any infrastructure failure would satisfy the
+    // marker check).
+    assert.ok(
+      !stderr.includes("INVARIANT_FAILED:"),
+      `snapshot probe must not report INVARIANT_FAILED for infrastructure failures; ` +
+        `got exit=${exitCode} stderr=${JSON.stringify(stderr)}`,
+    );
+    // Either PROBE_ERROR (probe caught the failure) or a
+    // module-load/top-level error (unreachable URL surfaces
+    // before the try block) is acceptable — both prove the
+    // probe did not mistake an infrastructure failure for an
+    // invariant failure.
+    assert.ok(
+      stderr.includes("PROBE_ERROR:") || exitCode !== 0,
+      `snapshot probe must report a non-invariant failure for an unreachable database; ` +
+        `got exit=${exitCode} stderr=${JSON.stringify(stderr)}`,
+    );
   });
 });
