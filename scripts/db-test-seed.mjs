@@ -7,7 +7,7 @@ import {
   resolveApprovedTestDatabaseUrl,
   TestDatabaseGuardError,
 } from "../apps/api/src/lib/test-database.js";
-import { loadTestDatabaseEnv, packagesDbDir } from "./db-test-env.mjs";
+import { loadTestDatabaseEnv, packagesDbDir, appsApiTsx } from "./db-test-env.mjs";
 
 loadTestDatabaseEnv();
 
@@ -27,7 +27,7 @@ async function main() {
   );
 
   await new Promise((resolve, reject) => {
-    const child = spawn("npx", ["tsx", "prisma/seed.ts"], {
+    const child = spawn(appsApiTsx, ["prisma/seed.ts"], {
       cwd: packagesDbDir,
       stdio: "inherit",
       env: {

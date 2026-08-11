@@ -34,3 +34,5 @@ pnpm-debug.log*
 # OS and local tool settings
 .DS_Store
 .claude/settings.local.json
+
+.reviews

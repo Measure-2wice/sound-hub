@@ -462,4 +462,86 @@ describe("M1.1 seed regression coverage", () => {
       .sort();
     assert.deepEqual(restoredAreas, originalAreas);
   });
+
+  test("the canonical snapshot assertion catches drift in userEmail, workspaceName, professionalName, bio, and avatarUrl (regression for review 4 P1 #2)", async () => {
+    // The review 4 P1 #2 finding is that the CanonicalSnapshot
+    // captures but the assertion did not check every canonical
+    // value. This test deliberately mutates five fields that were
+    // previously-omitted from the assertion and asserts that the
+    // canonical seed run restores them. The assertions in
+    // packages/db/prisma/seed.ts are responsible for catching the
+    // drift; the test proves the assertion is in place.
+    await runSeed();
+
+    const targetUser = await prisma.userAccount.findFirst({
+      where: { email: "marc.andre@creolebeats.example" },
+    });
+    assert.ok(targetUser);
+    await prisma.userAccount.update({
+      where: { id: targetUser.id },
+      data: { email: "stale-email@example.com" },
+    });
+
+    const targetWorkspace = await prisma.workspace.findUnique({
+      where: { slug: "creole-beats-brooklyn" },
+    });
+    assert.ok(targetWorkspace);
+    await prisma.workspace.update({
+      where: { id: targetWorkspace.id },
+      data: { name: "Stale Workspace Name" },
+    });
+
+    const targetProfile = await prisma.sellerProfile.findFirst({
+      where: { professionalName: "Marc-André Pierre" },
+    });
+    assert.ok(targetProfile);
+    await prisma.sellerProfile.update({
+      where: { id: targetProfile.id },
+      data: {
+        professionalName: "Stale Name",
+        bio: "Stale bio",
+        avatarUrl: "https://stale.example.com/x.jpg",
+      },
+    });
+
+    await runSeed();
+    const restored = await prisma.userAccount.findUnique({
+      where: { id: targetUser.id },
+    });
+    assert.equal(restored?.email, "marc.andre@creolebeats.example");
+    const restoredWorkspace = await prisma.workspace.findUnique({
+      where: { id: targetWorkspace.id },
+    });
+    assert.equal(restoredWorkspace?.name, "Creole Beats Brooklyn");
+    const restoredProfile = await prisma.sellerProfile.findUnique({
+      where: { id: targetProfile.id },
+    });
+    assert.equal(restoredProfile?.professionalName, "Marc-André Pierre");
+    assert.equal(
+      restoredProfile?.bio,
+      "Brooklyn-based Haitian producer crafting dancehall, soca, and hip-hop instrumentals for diaspora artists worldwide.",
+    );
+    assert.equal(restoredProfile?.avatarUrl, null);
+  });
+
+  test("restores basedInCity after a stale update (regression for review 4 P1 #2)", async () => {
+    // Review 4 P1 #2: the canonical snapshot now asserts
+    // basedInCity. If the assertion is in place, mutating
+    // basedInCity and re-running the seed restores the canonical
+    // value. This test exercises that path.
+    await runSeed();
+    const target = await prisma.sellerProfile.findFirst({
+      where: { professionalName: "Marc-André Pierre" },
+    });
+    assert.ok(target);
+    await prisma.sellerProfile.update({
+      where: { id: target.id },
+      data: { basedInCity: "Stale City" },
+    });
+    await runSeed();
+    const restored = await prisma.sellerProfile.findUnique({
+      where: { id: target.id },
+    });
+    assert.equal(restored?.basedInCity, "Brooklyn");
+  });
 });

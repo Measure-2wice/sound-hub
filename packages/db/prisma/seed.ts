@@ -425,9 +425,11 @@ async function applySeed(): Promise<void> {
       const sellerProfileId = toSellerProfileId(seller.workspaceSlug);
 
       const owner = await tx.userAccount.upsert({
-        where: { email: seller.ownerEmail },
+        where: { id: userId },
         create: { id: userId, email: seller.ownerEmail },
-        update: {},
+        // Restore the canonical email on every run so a stale email
+        // mutation is restored.
+        update: { email: seller.ownerEmail },
       });
 
       const workspace = await tx.workspace.upsert({
@@ -658,6 +660,7 @@ interface CanonicalSnapshot {
       readonly status: string;
       readonly serviceMode: string;
       readonly genreTags: readonly string[];
+      readonly includedServiceKeys: readonly string[];
       readonly serviceAreas: readonly {
         readonly city: string | null;
         readonly region: string | null;
@@ -765,6 +768,7 @@ async function captureCanonicalSnapshot(): Promise<CanonicalSnapshot> {
         status: offering.status,
         serviceMode: offering.serviceMode,
         genreTags: [...offering.genreTags],
+        includedServiceKeys: [], // M1.1 ships with no bundles
         serviceAreas: offering.serviceAreas.map((area) => ({
           city: area.city,
           region: area.region,
@@ -879,14 +883,67 @@ function assertCanonicalSnapshotCorrect(snapshot: CanonicalSnapshot): void {
       );
     }
     // Stable field values.
+    if (actual.userEmail !== seller.ownerEmail) {
+      throw new Error(
+        `UserAccount email drifted for ${seller.workspaceSlug}: expected ${seller.ownerEmail} got ${actual.userEmail}`,
+      );
+    }
+    if (actual.userId !== toUserId(seller.ownerEmail)) {
+      throw new Error(
+        `UserAccount id drifted for ${seller.workspaceSlug}: expected ${toUserId(seller.ownerEmail)} got ${actual.userId}`,
+      );
+    }
+    if (actual.workspaceSlug !== seller.workspaceSlug) {
+      throw new Error(
+        `Workspace slug drifted: expected ${seller.workspaceSlug} got ${actual.workspaceSlug}`,
+      );
+    }
+    if (actual.workspaceId !== toWorkspaceId(seller.workspaceSlug)) {
+      throw new Error(
+        `Workspace id drifted: expected ${toWorkspaceId(seller.workspaceSlug)} got ${actual.workspaceId}`,
+      );
+    }
+    if (actual.workspaceName !== seller.workspaceName) {
+      throw new Error(
+        `Workspace name drifted: expected ${seller.workspaceName} got ${actual.workspaceName}`,
+      );
+    }
+    if (actual.workspaceType !== seller.workspaceType) {
+      throw new Error(
+        `Workspace type drifted: expected ${seller.workspaceType} got ${actual.workspaceType}`,
+      );
+    }
     if (actual.workspaceStatus !== "Active") {
       throw new Error(
         `Workspace ${seller.workspaceSlug}.status drifted: expected Active got ${actual.workspaceStatus}`,
       );
     }
+    if (actual.professionalName !== seller.professionalName) {
+      throw new Error(
+        `SellerProfile.professionalName drifted: expected ${seller.professionalName} got ${actual.professionalName}`,
+      );
+    }
+    if (actual.bio !== seller.bio) {
+      throw new Error(`SellerProfile.bio drifted for ${seller.workspaceSlug}`);
+    }
+    if (actual.avatarUrl !== seller.avatarUrl) {
+      throw new Error(
+        `SellerProfile.avatarUrl drifted for ${seller.workspaceSlug}: expected ${JSON.stringify(seller.avatarUrl)} got ${JSON.stringify(actual.avatarUrl)}`,
+      );
+    }
     if (actual.status !== seller.status) {
       throw new Error(
         `SellerProfile ${seller.workspaceSlug}.status drifted: expected ${seller.status} got ${actual.status}`,
+      );
+    }
+    if (actual.basedInCity !== seller.basedInCity) {
+      throw new Error(
+        `SellerProfile ${seller.workspaceSlug}.basedInCity drifted: expected ${JSON.stringify(seller.basedInCity)} got ${JSON.stringify(actual.basedInCity)}`,
+      );
+    }
+    if (actual.basedInRegion !== seller.basedInRegion) {
+      throw new Error(
+        `SellerProfile ${seller.workspaceSlug}.basedInRegion drifted: expected ${JSON.stringify(seller.basedInRegion)} got ${JSON.stringify(actual.basedInRegion)}`,
       );
     }
     if (actual.basedInCountryCode !== seller.basedInCountryCode) {
@@ -919,6 +976,16 @@ function assertCanonicalSnapshotCorrect(snapshot: CanonicalSnapshot): void {
           `Offering ${offering.slug} missing from canonical snapshot for ${seller.workspaceSlug}`,
         );
       }
+      if (actualOffering.id !== toOfferingId(offering.slug)) {
+        throw new Error(
+          `ServiceOffering ${offering.slug}.id drifted: expected ${toOfferingId(offering.slug)} got ${actualOffering.id}`,
+        );
+      }
+      if (actualOffering.slug !== offering.slug) {
+        throw new Error(
+          `ServiceOffering ${offering.slug}.slug drifted: expected ${offering.slug} got ${actualOffering.slug}`,
+        );
+      }
       if (actualOffering.sellerProfileId !== toSellerProfileId(seller.workspaceSlug)) {
         throw new Error(
           `ServiceOffering ${offering.slug}.sellerProfileId drifted: expected ${toSellerProfileId(seller.workspaceSlug)} got ${actualOffering.sellerProfileId}`,
@@ -927,15 +994,48 @@ function assertCanonicalSnapshotCorrect(snapshot: CanonicalSnapshot): void {
       if (actualOffering.title !== offering.title) {
         throw new Error(`ServiceOffering ${offering.slug}.title drifted`);
       }
+      if (actualOffering.description !== offering.description) {
+        throw new Error(`ServiceOffering ${offering.slug}.description drifted`);
+      }
       if (actualOffering.status !== offering.status) {
         throw new Error(`ServiceOffering ${offering.slug}.status drifted`);
       }
       if (actualOffering.serviceMode !== offering.serviceMode) {
         throw new Error(`ServiceOffering ${offering.slug}.serviceMode drifted`);
       }
+      // Primary category: the M1 fixture has no `bundleOnly: true`
+      // categories in the canonical SELLERS data, so we assert
+      // `false` and also verify the M1.1 contract that there are no
+      // canonical bundle-only categories.
       if (actualOffering.primaryCategoryKey !== offering.primaryCategoryKey) {
         throw new Error(
           `ServiceOffering ${offering.slug}.primaryCategoryKey drifted: expected ${offering.primaryCategoryKey} got ${actualOffering.primaryCategoryKey}`,
+        );
+      }
+      const expectedCategory = SERVICE_CATEGORIES.find(
+        (c) => c.key === offering.primaryCategoryKey,
+      );
+      if (!expectedCategory) {
+        throw new Error(
+          `ServiceOffering ${offering.slug} references unknown category ${offering.primaryCategoryKey}`,
+        );
+      }
+      if (actualOffering.primaryCategoryName !== expectedCategory.name) {
+        throw new Error(
+          `ServiceOffering ${offering.slug}.primaryCategoryName drifted: expected ${expectedCategory.name} got ${actualOffering.primaryCategoryName}`,
+        );
+      }
+      if (actualOffering.primaryCategoryBundleOnly !== false) {
+        throw new Error(
+          `ServiceOffering ${offering.slug}.primaryCategory.bundleOnly must be false in the M1.1 fixture but is ${actualOffering.primaryCategoryBundleOnly}`,
+        );
+      }
+      // The M1.1 canonical seed owns zero bundle-only IncludedService
+      // rows. Future tickets that add bundles must extend the seed
+      // and update this assertion accordingly.
+      if (actualOffering.includedServiceKeys.length !== 0) {
+        throw new Error(
+          `ServiceOffering ${offering.slug}.includedServices must be empty in the M1.1 fixture but has ${actualOffering.includedServiceKeys.length} rows`,
         );
       }
       if (

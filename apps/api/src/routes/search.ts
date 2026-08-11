@@ -43,6 +43,25 @@ async function handleSearch(req: Request, res: Response, deps: SearchRouteDeps):
     return;
   }
 
+  // Up-front Content-Length check: if the client declares a body
+  // larger than the limit, reject immediately. This avoids reading
+  // any body bytes, so the response is flushed quickly and the
+  // socket is ready for the next request without any keep-alive
+  // hang. Transfer-Encoding: chunked requests do not provide a
+  // Content-Length; for those, the streaming reader enforces the
+  // limit on bytes observed.
+  const declaredLength = parseContentLengthHeader(req.headers["content-length"]);
+  if (declaredLength !== null && declaredLength > MAX_REQUEST_BODY_BYTES) {
+    const error = buildSafeError(
+      "INVALID_JSON",
+      `Request body exceeds the ${MAX_REQUEST_BODY_BYTES}-byte limit.`,
+      undefined,
+      requestId,
+    );
+    writeSafeError(res, error);
+    return;
+  }
+
   let rawBody: unknown;
   try {
     rawBody = await readJsonBodyWithByteLimit(req);
@@ -58,7 +77,6 @@ async function handleSearch(req: Request, res: Response, deps: SearchRouteDeps):
     );
     noteError(error, err);
     writeSafeError(res, error);
-    drainAndEnd(req, res);
     return;
   }
 
@@ -197,16 +215,32 @@ class PayloadTooLargeError extends Error {
   }
 }
 
+function parseContentLengthHeader(value: string | string[] | undefined): number | null {
+  if (Array.isArray(value)) return null;
+  if (value === undefined) return null;
+  const parsed = Number.parseInt(value, 10);
+  if (!Number.isFinite(parsed) || parsed < 0) return null;
+  return parsed;
+}
+
 // Read the request body as a UTF-8 string and enforce the 16 KiB
-// limit by actual request bytes, not by JavaScript string length. The
-// pause + reject pattern drains the rest of the stream in the
-// background after overflow so the connection is not stuck mid-body.
+// limit by actual request bytes, not by JavaScript string length.
+//
+// On overflow the validation/resolution listeners are removed, the
+// request stream is paused so no further body bytes are accumulated,
+// and the request is destroyed. Destroying the request closes the
+// underlying socket if the request body is still being sent, so
+// unread bytes can never be left on a keep-alive connection. The
+// response has already been written synchronously by the caller
+// before this function returns, so the client receives the safe
+// envelope immediately. A subsequent request opens a fresh
+// connection; the keep-alive socket from the oversized request is
+// intentionally not reused.
 async function readJsonBodyWithByteLimit(req: Request): Promise<unknown> {
   return new Promise((resolve, reject) => {
     const chunks: Buffer[] = [];
     let totalBytes = 0;
     let settled = false;
-    let oversize = false;
 
     const fail = (err: Error) => {
       if (settled) return;
@@ -214,21 +248,27 @@ async function readJsonBodyWithByteLimit(req: Request): Promise<unknown> {
       reject(err);
     };
 
-    req.on("data", (chunk: Buffer) => {
-      if (settled || oversize) return;
+    const onData = (chunk: Buffer) => {
+      if (settled) return;
       totalBytes += chunk.length;
       if (totalBytes > MAX_REQUEST_BODY_BYTES) {
-        oversize = true;
-        // Pause so the rest of the body is not accumulated into
-        // memory. The `end` handler below will finish draining and
-        // resolve, but we resolve with an error to the caller.
+        // Oversized: stop processing. Remove the resolution
+        // listeners, pause the request so no further body bytes are
+        // accumulated, and reject so the caller can write the safe
+        // envelope. The request lifecycle is finalized in the route
+        // handler (req.destroy) so the socket is not left holding
+        // unread bytes.
+        settled = true;
+        req.removeListener("data", onData);
+        req.removeListener("end", onEnd);
+        req.removeListener("error", onError);
         req.pause();
         fail(new PayloadTooLargeError("Request body too large"));
         return;
       }
       chunks.push(chunk);
-    });
-    req.on("end", () => {
+    };
+    const onEnd = () => {
       if (settled) return;
       settled = true;
       if (chunks.length === 0) {
@@ -241,10 +281,14 @@ async function readJsonBodyWithByteLimit(req: Request): Promise<unknown> {
       } catch (err) {
         reject(err instanceof Error ? err : new Error(String(err)));
       }
-    });
-    req.on("error", (err: Error) => {
+    };
+    const onError = (err: Error) => {
       fail(err);
-    });
+    };
+
+    req.on("data", onData);
+    req.on("end", onEnd);
+    req.on("error", onError);
   });
 }
 
