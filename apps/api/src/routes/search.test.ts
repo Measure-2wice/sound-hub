@@ -476,4 +476,133 @@ describe("POST /api/search contract", () => {
       setTimeout(() => server.close(), 0).unref();
     }
   });
+
+  test("an oversized Transfer-Encoding: chunked body settles within a bounded time and a subsequent small request succeeds on a fresh socket", async () => {
+    // The streaming oversize path is exercised only when the
+    // client does not declare Content-Length. Node's http.request
+    // uses Transfer-Encoding: chunked automatically when no
+    // Content-Length is supplied. This test proves the bounded-
+    // completion contract on the streaming branch (which is the
+    // path the up-front Content-Length shortcut bypasses) and
+    // verifies the server is still usable on a fresh socket.
+    const http = await import("node:http");
+    const server = http.createServer(app);
+    await new Promise<void>((resolve) => server.listen(0, "127.0.0.1", resolve));
+    const { port } = server.address() as { port: number };
+    const timeout = (ms: number) =>
+      new Promise<never>((_, reject) => setTimeout(() => reject(new Error(`timeout ${ms}ms`)), ms));
+
+    function sendChunked(): Promise<{ statusCode: number; body: string }> {
+      return Promise.race([
+        new Promise<{ statusCode: number; body: string }>((resolve) => {
+          const chunks: Buffer[] = [];
+          let settled = false;
+          const req = http.request(
+            {
+              host: "127.0.0.1",
+              port,
+              path: "/api/search",
+              method: "POST",
+              headers: {
+                "Content-Type": "application/json",
+                // No Content-Length → Node uses Transfer-Encoding: chunked.
+                "Transfer-Encoding": "chunked",
+              },
+            },
+            (response) => {
+              response.on("data", (c: Buffer) => chunks.push(c));
+              response.on("end", () => {
+                if (settled) return;
+                settled = true;
+                resolve({
+                  statusCode: response.statusCode ?? -1,
+                  body: Buffer.concat(chunks).toString("utf8"),
+                });
+              });
+              response.on("error", () => {
+                if (settled) return;
+                settled = true;
+                resolve({
+                  statusCode: response.statusCode ?? -1,
+                  body: Buffer.concat(chunks).toString("utf8"),
+                });
+              });
+            },
+          );
+          req.on("error", () => {
+            /* drain */
+          });
+          req.on("socket", (socket) => {
+            socket.on("error", () => {
+              /* drain */
+            });
+          });
+          const big = "x".repeat(20_000);
+          const envelope = JSON.stringify({ query: big });
+          req.write(Buffer.from(envelope.slice(0, 8_000), "utf8"));
+          req.write(Buffer.from(envelope.slice(8_000, 16_000), "utf8"));
+          req.write(Buffer.from(envelope.slice(16_000), "utf8"));
+          req.end();
+        }),
+        timeout(5_000),
+      ]);
+    }
+
+    function sendFreshSocket(body: Buffer): Promise<{ statusCode: number; body: string }> {
+      return Promise.race([
+        new Promise<{ statusCode: number; body: string }>((resolve, reject) => {
+          const chunks: Buffer[] = [];
+          const req = http.request(
+            {
+              host: "127.0.0.1",
+              port,
+              path: "/api/search",
+              method: "POST",
+              headers: {
+                "Content-Type": "application/json",
+                "Content-Length": String(body.length),
+              },
+            },
+            (response) => {
+              response.on("data", (c: Buffer) => chunks.push(c));
+              response.on("end", () =>
+                resolve({
+                  statusCode: response.statusCode ?? -1,
+                  body: Buffer.concat(chunks).toString("utf8"),
+                }),
+              );
+            },
+          );
+          req.on("error", reject);
+          req.write(body);
+          req.end();
+        }),
+        timeout(5_000),
+      ]);
+    }
+
+    try {
+      // First request: chunked body. The route's streaming reader
+      // must observe the overflow and reject the promise
+      // atomically; the route handler must write the safe
+      // envelope and destroy the request.
+      const res1 = await sendChunked();
+      assert.equal(res1.statusCode, 400);
+      assert.ok(/exceeds the 16384-byte limit/.test(res1.body));
+
+      // Second request on a fresh socket. The server must still
+      // be in a usable state. The chunked request's socket was
+      // intentionally torn down by the route handler; this fresh
+      // socket is unrelated.
+      const body2 = JSON.stringify({ query: "Haitian dancehall single production" });
+      const res2 = await sendFreshSocket(Buffer.from(body2, "utf8"));
+      assert.equal(res2.statusCode, 200);
+      const parsed = JSON.parse(res2.body) as {
+        results: Array<{ seller: { sellerId: string } }>;
+      };
+      assert.equal(parsed.results[0]?.seller.sellerId, "seller-public-remote");
+    } finally {
+      await new Promise<void>((resolve) => server.close(() => resolve()));
+    }
+  });
 });

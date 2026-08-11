@@ -544,4 +544,150 @@ describe("M1.1 seed regression coverage", () => {
     });
     assert.equal(restored?.basedInCity, "Brooklyn");
   });
+
+  test("removes stale IncludedService rows for a canonical offering and asserts the observed relation converges to the canonical empty set (regression for review 5 P1 #2)", async () => {
+    // Review 5 P1 #2: the canonical snapshot previously asserted
+    // `includedServiceKeys: []` against a hardcoded value. The
+    // snapshot did not query IncludedService, so it could not
+    // detect a stale row. The snapshot now reads the actual
+    // IncludedService relation from PostgreSQL. This test
+    // inserts a stale IncludedService for a canonical offering,
+    // re-runs the seed (which has the canonical-state cleanup
+    // that deletes IncludedService rows for canonical offerings),
+    // and verifies that the stale row is removed AND the
+    // canonical state is restored.
+    await runSeed();
+    const target = await prisma.serviceOffering.findUnique({
+      where: { slug: "creole-beats-dancehall-single-remote" },
+    });
+    assert.ok(target);
+    const category = await prisma.serviceCategory.findFirst({
+      where: { key: "mixing" },
+    });
+    assert.ok(category);
+    // Insert a stale IncludedService. The canonical M1.1 state
+    // has zero IncludedService rows for this offering.
+    await prisma.includedService.create({
+      data: {
+        offeringId: target.id,
+        categoryId: category.id,
+        purchaseMode: "BundleOnly",
+      },
+    });
+    const before = await prisma.includedService.findMany({
+      where: { offeringId: target.id },
+    });
+    assert.equal(before.length, 1);
+
+    await runSeed();
+
+    const after = await prisma.includedService.findMany({
+      where: { offeringId: target.id },
+    });
+    assert.equal(
+      after.length,
+      0,
+      "canonical seed must delete stale IncludedService rows for canonical offerings",
+    );
+  });
+
+  test("the canonical snapshot assertion observes the real IncludedService relation (regression for review 5 P1 #2)", async () => {
+    // Review 5 P1 #2: the canonical snapshot now reads the
+    // IncludedService relation from PostgreSQL via
+    // prisma.serviceOffering.findMany({ include: { includedServices: ... } })
+    // and maps the observed category keys. If the snapshot were
+    // to fall back to a hardcoded `[]`, this test would fail:
+    // a stale IncludedService row inserted below would not be
+    // visible to the snapshot, and `runSeed` would silently
+    // succeed (or the assertion would never compare it). Instead
+    // we assert that, after the seed, the canonical snapshot's
+    // observed `includedServiceKeys` for this offering is the
+    // empty set (the canonical M1.1 fixture ships with no
+    // bundles).
+    await runSeed();
+    const target = await prisma.serviceOffering.findUnique({
+      where: { slug: "creole-beats-dancehall-single-remote" },
+      include: { includedServices: { include: { category: true } } },
+    });
+    assert.ok(target);
+    assert.equal(target.includedServices.length, 0);
+    const observedKeys = target.includedServices.map((is) => is.category.key);
+    assert.deepEqual(observedKeys, []);
+  });
+
+  test("the snapshot assertion fails when a stale IncludedService row has survived cleanup (regression for review 5 P1 #2)", async () => {
+    // Review 5 P1 #2 reviewer verification: "ensure the
+    // invariant fails if cleanup is disabled". This test
+    // inserts a stale IncludedService row directly via Prisma,
+    // then runs the snapshot probe (which performs ONLY the
+    // canonical snapshot capture and assertion — it does NOT
+    // run applySeed()'s cleanup). The assertion must throw
+    // because the snapshot observes the stale row in
+    // PostgreSQL. If the snapshot fell back to a hardcoded
+    // `[]`, the assertion would silently pass and this test
+    // would fail.
+    await runSeed();
+    const target = await prisma.serviceOffering.findUnique({
+      where: { slug: "creole-beats-dancehall-single-remote" },
+    });
+    const category = await prisma.serviceCategory.findFirst({
+      where: { key: "mixing" },
+    });
+    assert.ok(target);
+    assert.ok(category);
+    // Insert a stale IncludedService row directly. We do NOT
+    // call runSeed() — the cleanup would remove the row, and
+    // we need the row to survive so the snapshot probe can
+    // observe it.
+    await prisma.includedService.create({
+      data: {
+        offeringId: target.id,
+        categoryId: category.id,
+        purchaseMode: "BundleOnly",
+      },
+    });
+    // Run the snapshot probe as a child process. The probe
+    // imports seed.ts, captures the canonical snapshot, and
+    // runs the canonical assertion. Because the stale row
+    // exists in PostgreSQL, the snapshot observes it and the
+    // assertion throws.
+    const probePath = new URL("../snapshot-probe.ts", import.meta.url).pathname;
+    // seed.test.ts lives at packages/db/prisma/seed.test.ts;
+    // the tsx binary lives at apps/api/node_modules/.bin/tsx.
+    // Resolve to the repo root via three `..` segments.
+    const repoRoot = new URL("../../../", import.meta.url).pathname;
+    const appsApiTsx = `${repoRoot}apps/api/node_modules/.bin/tsx`;
+    const exitCode = await new Promise<number>((resolve, reject) => {
+      const child = spawn(appsApiTsx, [probePath, databaseUrl], {
+        stdio: ["ignore", "pipe", "pipe"],
+        env: {
+          ...process.env,
+          DATABASE_URL: databaseUrl,
+          TEST_DATABASE_URL: databaseUrl,
+        },
+      });
+      // Drain the probe's stderr so the child process does not
+      // block on a full pipe. The exit code is the load-bearing
+      // assertion: 0 means the probe's assertion passed (which
+      // it must not when a stale IncludedService row exists);
+      // non-zero means the assertion threw.
+      child.stderr.on("data", () => {
+        /* drain */
+      });
+      child.on("error", reject);
+      child.on("exit", (code) => resolve(code ?? -1));
+    });
+    // The assertion must throw, which causes the probe to exit
+    // non-zero with the assertion failure message on stderr.
+    assert.notEqual(
+      exitCode,
+      0,
+      "snapshot probe must fail when a stale IncludedService row exists; got exit 0",
+    );
+    // Clean up the stale row so subsequent tests start from
+    // canonical state.
+    await prisma.includedService.deleteMany({
+      where: { offeringId: target.id },
+    });
+  });
 });

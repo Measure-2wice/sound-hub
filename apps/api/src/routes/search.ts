@@ -67,6 +67,20 @@ async function handleSearch(req: Request, res: Response, deps: SearchRouteDeps):
     rawBody = await readJsonBodyWithByteLimit(req);
   } catch (err) {
     const isOversize = err instanceof PayloadTooLargeError;
+    if (isOversize) {
+      // Set Connection: close BEFORE writing the response so
+      // Node's HTTP server tears down the socket after the
+      // safe envelope is flushed. The body reader paused `req`
+      // to stop accumulating bytes, but the underlying socket
+      // may still hold an in-flight chunked body; tearing down
+      // the connection after the response ensures the client
+      // is notified not to send further requests on this
+      // socket. We intentionally do NOT call req.destroy()
+      // before the response is flushed: doing so would race
+      // with the TCP write and could close the socket before
+      // the client receives the safe envelope.
+      res.setHeader("Connection", "close");
+    }
     const error = buildSafeError(
       "INVALID_JSON",
       isOversize
@@ -226,16 +240,20 @@ function parseContentLengthHeader(value: string | string[] | undefined): number 
 // Read the request body as a UTF-8 string and enforce the 16 KiB
 // limit by actual request bytes, not by JavaScript string length.
 //
-// On overflow the validation/resolution listeners are removed, the
-// request stream is paused so no further body bytes are accumulated,
-// and the request is destroyed. Destroying the request closes the
-// underlying socket if the request body is still being sent, so
-// unread bytes can never be left on a keep-alive connection. The
-// response has already been written synchronously by the caller
+// On overflow the data/end/error listeners are removed, the
+// request stream is paused so no further body bytes are
+// accumulated, and the Promise is rejected atomically through
+// `fail()` (which sets the settled flag and calls reject in one
+// step). The route handler then writes the safe envelope and
+// destroys the request so the socket is closed deterministically.
+// Because the body reader pauses the request, the underlying
+// socket can still hold an in-flight chunked body; destroying
+// the request ensures that unread bytes cannot be left on a
+// keep-alive connection. The response is written synchronously
 // before this function returns, so the client receives the safe
 // envelope immediately. A subsequent request opens a fresh
-// connection; the keep-alive socket from the oversized request is
-// intentionally not reused.
+// connection; the keep-alive socket from the oversized request
+// is intentionally not reused.
 async function readJsonBodyWithByteLimit(req: Request): Promise<unknown> {
   return new Promise((resolve, reject) => {
     const chunks: Buffer[] = [];
@@ -254,11 +272,12 @@ async function readJsonBodyWithByteLimit(req: Request): Promise<unknown> {
       if (totalBytes > MAX_REQUEST_BODY_BYTES) {
         // Oversized: stop processing. Remove the resolution
         // listeners, pause the request so no further body bytes are
-        // accumulated, and reject so the caller can write the safe
-        // envelope. The request lifecycle is finalized in the route
-        // handler (req.destroy) so the socket is not left holding
-        // unread bytes.
-        settled = true;
+        // accumulated, then atomically reject through `fail()`. The
+        // settlement (settled flag + reject) MUST be a single
+        // operation through `fail()` so the Promise cannot be left
+        // pending. The route handler destroys the request after
+        // writing the safe envelope so the socket is closed
+        // deterministically and cannot be reused while paused.
         req.removeListener("data", onData);
         req.removeListener("end", onEnd);
         req.removeListener("error", onError);

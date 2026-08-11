@@ -43,6 +43,14 @@ const prisma = new PrismaClient({
   adapter: new PrismaPg({ connectionString }),
 });
 
+// Exported for the snapshot-probe regression test (see
+// captureCanonicalSnapshot above). Disconnects the shared
+// PrismaClient so the probe's child process can exit cleanly
+// without leaving the connection pool open.
+export async function disconnectPrisma(): Promise<void> {
+  await prisma.$disconnect();
+}
+
 type ServiceCategorySeed = {
   key: string;
   name: string;
@@ -676,7 +684,12 @@ interface CanonicalSnapshot {
   }[];
 }
 
-async function captureCanonicalSnapshot(): Promise<CanonicalSnapshot> {
+// Exported for the snapshot-probe regression test
+// (packages/db/prisma/snapshot-probe.ts). The probe runs only
+// the snapshot capture and the canonical assertion, without
+// running applySeed()'s canonical-state cleanup, so the
+// assertion's strictness can be verified directly.
+export async function captureCanonicalSnapshot(): Promise<CanonicalSnapshot> {
   const categories = await prisma.serviceCategory.findMany({
     where: { key: { in: SERVICE_CATEGORIES.map((c) => c.key) } },
     orderBy: { key: "asc" },
@@ -731,6 +744,12 @@ async function captureCanonicalSnapshot(): Promise<CanonicalSnapshot> {
         primaryCategory: true,
         serviceAreas: { orderBy: { id: "asc" } },
         pricing: { include: { unit: true } },
+        // Observe the actual IncludedService relation from
+        // PostgreSQL. The canonical snapshot must read this
+        // relationship so the assertion can verify it is the
+        // empty set, instead of asserting against a fabricated
+        // hardcoded value.
+        includedServices: { include: { category: true }, orderBy: { id: "asc" } },
       },
       orderBy: { slug: "asc" },
     });
@@ -768,7 +787,13 @@ async function captureCanonicalSnapshot(): Promise<CanonicalSnapshot> {
         status: offering.status,
         serviceMode: offering.serviceMode,
         genreTags: [...offering.genreTags],
-        includedServiceKeys: [], // M1.1 ships with no bundles
+        // M1.1 ships with no bundles: every canonical offering's
+        // includedServices relation must be the empty set in
+        // PostgreSQL. The keys are derived from the observed
+        // relationship (category.key per row) rather than from a
+        // hardcoded array; the assertion compares the observed
+        // keys with the canonical expected empty set.
+        includedServiceKeys: offering.includedServices.map((is) => is.category.key),
         serviceAreas: offering.serviceAreas.map((area) => ({
           city: area.city,
           region: area.region,
@@ -799,7 +824,9 @@ async function captureCanonicalSnapshot(): Promise<CanonicalSnapshot> {
   };
 }
 
-function assertCanonicalSnapshotCorrect(snapshot: CanonicalSnapshot): void {
+// Exported for the snapshot-probe regression test (see
+// captureCanonicalSnapshot above).
+export function assertCanonicalSnapshotCorrect(snapshot: CanonicalSnapshot): void {
   // 1. Controlled taxonomies.
   if (snapshot.categories.length !== SERVICE_CATEGORIES.length) {
     throw new Error(
@@ -1116,11 +1143,24 @@ async function main(): Promise<void> {
   console.log("✅ Second pass produced an identical canonical snapshot.");
 }
 
-main()
-  .catch((err) => {
-    console.error("❌ Error seeding database:", err);
-    process.exit(1);
-  })
-  .finally(async () => {
-    await prisma.$disconnect();
-  });
+// Only run the seed main() when this file is invoked directly,
+// not when it is imported by another module (e.g. the
+// snapshot-probe regression test). When the entry point is the
+// seed file itself, process.argv[1] ends with `seed.ts`.
+const isDirectInvocation = (() => {
+  if (typeof process === "undefined") return false;
+  const entry = process.argv[1];
+  if (!entry) return false;
+  return entry.endsWith("/seed.ts") || entry.endsWith("/seed.js");
+})();
+
+if (isDirectInvocation) {
+  main()
+    .catch((err) => {
+      console.error("❌ Error seeding database:", err);
+      process.exit(1);
+    })
+    .finally(async () => {
+      await prisma.$disconnect();
+    });
+}
