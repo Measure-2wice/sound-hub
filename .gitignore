@@ -10,6 +10,7 @@ node_modules/
 # Build and framework output
 dist/
 .next/
+.next-dev/
 *.tsbuildinfo
 .turbo/
 packages/db/src/generated/
