@@ -15,6 +15,7 @@
 
 import assert from "node:assert/strict";
 import { spawn } from "node:child_process";
+import { existsSync } from "node:fs";
 import { after, before, describe, test } from "node:test";
 import { PrismaPg } from "@prisma/adapter-pg";
 import { PrismaClient } from "../src/generated/client.js";
@@ -651,13 +652,30 @@ describe("M1.1 seed regression coverage", () => {
     // runs the canonical assertion. Because the stale row
     // exists in PostgreSQL, the snapshot observes it and the
     // assertion throws.
-    const probePath = new URL("../snapshot-probe.ts", import.meta.url).pathname;
+    //
+    // The probe and this test file share the same directory
+    // (packages/db/prisma/), so the probe path resolves as a
+    // sibling, not a parent-relative path.
+    const probePath = new URL("./snapshot-probe.ts", import.meta.url).pathname;
     // seed.test.ts lives at packages/db/prisma/seed.test.ts;
     // the tsx binary lives at apps/api/node_modules/.bin/tsx.
     // Resolve to the repo root via three `..` segments.
     const repoRoot = new URL("../../../", import.meta.url).pathname;
     const appsApiTsx = `${repoRoot}apps/api/node_modules/.bin/tsx`;
-    const exitCode = await new Promise<number>((resolve, reject) => {
+    // Sanity-check the resolved probe path so a future
+    // restructure cannot silently turn this regression into a
+    // false positive (where the child exits nonzero because
+    // its entry module is missing, not because the canonical
+    // invariant detected the surviving drift).
+    assert.ok(
+      existsSync(probePath),
+      `snapshot probe not found at resolved path ${probePath}; invariant regression cannot run`,
+    );
+    const { exitCode, stderr } = await new Promise<{
+      exitCode: number;
+      stderr: string;
+    }>((resolve, reject) => {
+      const stderrChunks: Buffer[] = [];
       const child = spawn(appsApiTsx, [probePath, databaseUrl], {
         stdio: ["ignore", "pipe", "pipe"],
         env: {
@@ -666,23 +684,34 @@ describe("M1.1 seed regression coverage", () => {
           TEST_DATABASE_URL: databaseUrl,
         },
       });
-      // Drain the probe's stderr so the child process does not
-      // block on a full pipe. The exit code is the load-bearing
-      // assertion: 0 means the probe's assertion passed (which
-      // it must not when a stale IncludedService row exists);
-      // non-zero means the assertion threw.
-      child.stderr.on("data", () => {
-        /* drain */
+      // Retain stderr so the test can assert on the canonical
+      // invariant-failure marker. Discarding it would let an
+      // arbitrary child failure (for example, a missing entry
+      // module) masquerade as the expected invariant failure.
+      child.stderr.on("data", (chunk: Buffer) => {
+        stderrChunks.push(chunk);
       });
       child.on("error", reject);
-      child.on("exit", (code) => resolve(code ?? -1));
+      child.on("exit", (code) =>
+        resolve({ exitCode: code ?? -1, stderr: Buffer.concat(stderrChunks).toString("utf8") }),
+      );
     });
-    // The assertion must throw, which causes the probe to exit
-    // non-zero with the assertion failure message on stderr.
+    // The probe writes the canonical invariant-failure marker
+    // (`ASSERTION_FAILED: <message>`) to stderr and exits with
+    // code 1 when the canonical assertion throws. Require the
+    // marker explicitly so any other failure mode (missing
+    // entry module, runtime crash, etc.) fails the test with a
+    // clear signal rather than passing for the wrong reason.
+    assert.ok(
+      stderr.includes("ASSERTION_FAILED:"),
+      `snapshot probe must report the canonical invariant-failure marker; ` +
+        `got exit=${exitCode} stderr=${JSON.stringify(stderr)}`,
+    );
     assert.notEqual(
       exitCode,
       0,
-      "snapshot probe must fail when a stale IncludedService row exists; got exit 0",
+      `snapshot probe must exit nonzero when a stale IncludedService row exists; ` +
+        `got exit=${exitCode} stderr=${JSON.stringify(stderr)}`,
     );
     // Clean up the stale row so subsequent tests start from
     // canonical state.

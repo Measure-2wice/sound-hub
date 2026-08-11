@@ -245,11 +245,12 @@ function parseContentLengthHeader(value: string | string[] | undefined): number 
 // accumulated, and the Promise is rejected atomically through
 // `fail()` (which sets the settled flag and calls reject in one
 // step). The route handler then writes the safe envelope and
-// destroys the request so the socket is closed deterministically.
-// Because the body reader pauses the request, the underlying
-// socket can still hold an in-flight chunked body; destroying
-// the request ensures that unread bytes cannot be left on a
-// keep-alive connection. The response is written synchronously
+// sets `Connection: close` so Node's HTTP server tears down the
+// socket deterministically after the response flushes. Because
+// the body reader pauses the request, the underlying socket may
+// still hold an in-flight chunked body; closing the connection
+// after the response ensures that unread bytes cannot be left on
+// a keep-alive connection. The response is written synchronously
 // before this function returns, so the client receives the safe
 // envelope immediately. A subsequent request opens a fresh
 // connection; the keep-alive socket from the oversized request
@@ -275,8 +276,8 @@ async function readJsonBodyWithByteLimit(req: Request): Promise<unknown> {
         // accumulated, then atomically reject through `fail()`. The
         // settlement (settled flag + reject) MUST be a single
         // operation through `fail()` so the Promise cannot be left
-        // pending. The route handler destroys the request after
-        // writing the safe envelope so the socket is closed
+        // pending. The route handler sets `Connection: close` after
+        // writing the safe envelope so the socket is torn down
         // deterministically and cannot be reused while paused.
         req.removeListener("data", onData);
         req.removeListener("end", onEnd);
