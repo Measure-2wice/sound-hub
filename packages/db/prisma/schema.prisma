@@ -1,5 +1,11 @@
-// This is your Prisma schema file,
-// learn more about it in the docs: https://pris.ly/d/prisma-schema
+// SoundHub Milestone 1 foundation schema.
+//
+// This is the complete structural foundation for issues #2 through #8. It
+// replaces the pre-release Role/ProducerProfile/MusicTrack scaffold. The
+// closed behavior states are modeled as Prisma enums (see `enum` declarations
+// below); the extensible taxonomies (ServiceCategory, Specialty, PricingUnit)
+// are seeded records with stable `key` columns and are not enums. Public DTOs
+// never expose raw Prisma models.
 
 generator client {
   provider = "prisma-client"
@@ -10,54 +16,265 @@ datasource db {
   provider = "postgresql"
 }
 
-enum Role {
-  Artist
-  Producer
+// ---------- Closed behavior states (Prisma enums) ----------
+
+enum WorkspaceType {
+  Personal
+  Organization
 }
 
-model User {
+enum WorkspaceStatus {
+  Active
+  Suspended
+}
+
+enum WorkspaceMembershipRole {
+  Owner
+  Admin
+  Member
+}
+
+enum MarketplaceCapability {
+  Buyer
+  Seller
+}
+
+enum SellerProfileStatus {
+  Draft
+  Published
+  Suspended
+}
+
+enum ServiceOfferingStatus {
+  Draft
+  Active
+  Paused
+  Archived
+}
+
+enum ServiceMode {
+  Remote
+  InPerson
+  Hybrid
+}
+
+enum PricingKind {
+  StartingAt
+  Fixed
+  ContactForQuote
+}
+
+enum PurchaseMode {
+  BundleOnly
+}
+
+// ---------- Identity and authority ----------
+
+model UserAccount {
+  id        String   @id @default(cuid())
+  email     String   @unique
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  memberships         WorkspaceMembership[]
+  ownedWorkspaces     Workspace[]            @relation("WorkspaceOwner")
+
+  @@map("user_accounts")
+}
+
+model Workspace {
+  id          String          @id @default(cuid())
+  slug        String          @unique
+  name        String
+  type        WorkspaceType
+  status      WorkspaceStatus @default(Active)
+  ownerUserId String
+  createdAt   DateTime        @default(now())
+  updatedAt   DateTime        @updatedAt
+
+  owner         UserAccount           @relation("WorkspaceOwner", fields: [ownerUserId], references: [id], onDelete: Restrict)
+  memberships   WorkspaceMembership[]
+  capabilities  WorkspaceCapability[]
+  sellerProfile SellerProfile?
+
+  @@map("workspaces")
+}
+
+model WorkspaceMembership {
+  id          String                  @id @default(cuid())
+  userId      String
+  workspaceId String
+  role        WorkspaceMembershipRole
+  createdAt   DateTime                @default(now())
+
+  user      UserAccount @relation(fields: [userId], references: [id], onDelete: Cascade)
+  workspace Workspace   @relation(fields: [workspaceId], references: [id], onDelete: Cascade)
+
+  @@unique([userId, workspaceId])
+  @@map("workspace_memberships")
+}
+
+model WorkspaceCapability {
+  id          String               @id @default(cuid())
+  workspaceId String
+  capability  MarketplaceCapability
+
+  workspace Workspace @relation(fields: [workspaceId], references: [id], onDelete: Cascade)
+
+  @@unique([workspaceId, capability])
+  @@map("workspace_capabilities")
+}
+
+// ---------- Seller discovery ----------
+
+model SellerProfile {
+  id                 String              @id @default(cuid())
+  workspaceId        String              @unique
+  professionalName   String
+  bio                String
+  status             SellerProfileStatus @default(Draft)
+  basedInCity        String?
+  basedInRegion      String?
+  basedInCountryCode String
+  avatarUrl          String?
+  createdAt          DateTime            @default(now())
+  updatedAt          DateTime            @updatedAt
+
+  workspace              Workspace                   @relation(fields: [workspaceId], references: [id], onDelete: Cascade)
+  specialties            SellerProfileSpecialty[]
+  caribbeanAffiliations  CaribbeanAffiliation[]
+  offerings              ServiceOffering[]
+
+  @@map("seller_profiles")
+}
+
+model Specialty {
+  id   String @id @default(cuid())
+  key  String @unique
+  name String
+
+  profiles SellerProfileSpecialty[]
+
+  @@map("specialties")
+}
+
+model SellerProfileSpecialty {
+  sellerProfileId String
+  specialtyId     String
+
+  sellerProfile SellerProfile @relation(fields: [sellerProfileId], references: [id], onDelete: Cascade)
+  specialty     Specialty     @relation(fields: [specialtyId], references: [id], onDelete: Restrict)
+
+  @@id([sellerProfileId, specialtyId])
+  @@map("seller_profile_specialties")
+}
+
+model CaribbeanAffiliation {
+  id              String @id @default(cuid())
+  sellerProfileId String
+  countryCode     String
+
+  sellerProfile SellerProfile @relation(fields: [sellerProfileId], references: [id], onDelete: Cascade)
+
+  @@unique([sellerProfileId, countryCode])
+  @@index([countryCode])
+  @@map("caribbean_affiliations")
+}
+
+// ---------- Extensible taxonomies ----------
+
+model ServiceCategory {
   id          String   @id @default(cuid())
-  email       String   @unique
-  displayName String
-  role        Role
+  key         String   @unique
+  name        String
+  description String?
+  // `bundleOnly` is reserved for categories that are only purchasable as part
+  // of an offering bundle. The 10 initial approved categories are all
+  // independently purchasable (bundleOnly = false).
+  bundleOnly  Boolean  @default(false)
   createdAt   DateTime @default(now())
-  updatedAt   DateTime @updatedAt
-  isVerified  Boolean  @default(false)
-  avatarUrl   String?
 
-  // Relations
-  producerProfile ProducerProfile?
+  primaryOfferings            ServiceOffering[]      @relation("PrimaryCategory")
+  includedServiceOfferings    IncludedService[]
 
-  @@map("users")
+  @@map("service_categories")
 }
 
-model ProducerProfile {
-  id                  String   @id @default(cuid())
-  userId              String   @unique
-  rateAmountMinor     Int // Store cents/pence
-  rateCurrency        String   @default("USD")
-  bio                 String
-  genreTags           String[]
-  vibeEmbeddingVector Float[] // PostgreSQL supports arrays
+model PricingUnit {
+  id        String   @id @default(cuid())
+  key       String   @unique
+  name      String
+  createdAt DateTime @default(now())
 
-  // Relations
-  user        User         @relation(fields: [userId], references: [id], onDelete: Cascade)
-  musicTracks MusicTrack[]
+  pricingOptions ServiceOfferingPricing[]
 
-  @@map("producer_profiles")
+  @@map("pricing_units")
 }
 
-model MusicTrack {
-  id              String   @id @default(cuid())
-  producerId      String
-  title           String
-  s3Key           String
-  durationSeconds Int
-  createdAt       DateTime @default(now())
-  updatedAt       DateTime @updatedAt
+// ---------- Service offerings ----------
 
-  // Relations
-  producer ProducerProfile @relation(fields: [producerId], references: [id], onDelete: Cascade)
+model ServiceOffering {
+  id                String                @id @default(cuid())
+  slug              String                @unique
+  sellerProfileId   String
+  title             String
+  description       String
+  status            ServiceOfferingStatus @default(Draft)
+  serviceMode       ServiceMode
+  primaryCategoryId String
+  genreTags         String[]
+  createdAt         DateTime              @default(now())
+  updatedAt         DateTime              @updatedAt
 
-  @@map("music_tracks")
+  sellerProfile   SellerProfile              @relation(fields: [sellerProfileId], references: [id], onDelete: Cascade)
+  primaryCategory ServiceCategory            @relation("PrimaryCategory", fields: [primaryCategoryId], references: [id], onDelete: Restrict)
+  includedServices IncludedService[]
+  serviceAreas     ServiceOfferingServiceArea[]
+  pricing          ServiceOfferingPricing?
+
+  @@index([sellerProfileId])
+  @@index([primaryCategoryId])
+  @@index([status])
+  @@map("service_offerings")
+}
+
+model IncludedService {
+  id           String       @id @default(cuid())
+  offeringId   String
+  categoryId   String
+  purchaseMode PurchaseMode
+
+  offering ServiceOffering @relation(fields: [offeringId], references: [id], onDelete: Cascade)
+  category ServiceCategory @relation(fields: [categoryId], references: [id], onDelete: Restrict)
+
+  @@unique([offeringId, categoryId])
+  @@map("included_services")
+}
+
+model ServiceOfferingServiceArea {
+  id          String  @id @default(cuid())
+  offeringId  String
+  city        String?
+  region      String?
+  countryCode String
+
+  offering ServiceOffering @relation(fields: [offeringId], references: [id], onDelete: Cascade)
+
+  @@index([offeringId])
+  @@index([countryCode])
+  @@map("offering_service_areas")
+}
+
+model ServiceOfferingPricing {
+  id          String      @id @default(cuid())
+  offeringId  String      @unique
+  kind        PricingKind
+  amountMinor Int?
+  currency    String?
+  unitId      String?
+
+  offering ServiceOffering @relation(fields: [offeringId], references: [id], onDelete: Cascade)
+  unit     PricingUnit?    @relation(fields: [unitId], references: [id], onDelete: Restrict)
+
+  @@map("offering_pricing")
 }

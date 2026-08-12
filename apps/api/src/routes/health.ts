@@ -8,19 +8,19 @@ healthRoutes.get("/", (req, res) => {
     timestamp: new Date().toISOString(),
     service: "SoundHub API",
     version: "0.1.0",
-    environment: process.env.NODE_ENV || "development",
+    environment: process.env.NODE_ENV ?? "development",
   });
 });
 
 healthRoutes.get("/ready", (req, res) => {
-  // In a real app, you'd check database connectivity, etc.
+  // Milestone 1 has no external runtime dependencies beyond PostgreSQL.
+  // The readiness probe reports the bare service state; deeper dependency
+  // probes belong to a later observability milestone.
   res.json({
     status: "ready",
     timestamp: new Date().toISOString(),
-    checks: {
-      database: "ok", // Would check actual DB connection
-      ai_service: "ok", // Would check OpenAI API
-      vector_db: "ok", // Would check Pinecone connection
-    },
+    service: "SoundHub API",
+    version: "0.1.0",
+    environment: process.env.NODE_ENV ?? "development",
   });
 });

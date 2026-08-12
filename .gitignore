@@ -10,12 +10,15 @@ node_modules/
 # Build and framework output
 dist/
 .next/
+.next-dev/
 *.tsbuildinfo
 .turbo/
 packages/db/src/generated/
 
 # Test output
 coverage/
+apps/web/test-results/
+apps/web/playwright-report/
 
 # Local databases
 **/prisma/*.db
@@ -32,3 +35,5 @@ pnpm-debug.log*
 # OS and local tool settings
 .DS_Store
 .claude/settings.local.json
+
+.reviews
