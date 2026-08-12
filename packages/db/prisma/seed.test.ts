@@ -390,6 +390,26 @@ describe("M1.1 seed regression coverage", () => {
     assert.equal(restored?.avatarUrl, original);
   });
 
+  test("seeds and restores a non-null canonical SellerProfile.avatarUrl", async () => {
+    // `avatarUrl` is an approved optional public seller field. Keisha
+    // Williams is the canonical non-null fixture so the rendered-avatar
+    // path is exercised end to end rather than only in unit fixtures.
+    await runSeed();
+    const target = await prisma.sellerProfile.findFirst({
+      where: { professionalName: "Keisha Williams" },
+    });
+    assert.ok(target);
+    assert.equal(target.avatarUrl, "https://cdn.example.com/sellers/keisha-williams/avatar.jpg");
+
+    await prisma.sellerProfile.update({
+      where: { id: target.id },
+      data: { avatarUrl: null },
+    });
+    await runSeed();
+    const restored = await prisma.sellerProfile.findUnique({ where: { id: target.id } });
+    assert.equal(restored?.avatarUrl, "https://cdn.example.com/sellers/keisha-williams/avatar.jpg");
+  });
+
   test("restores ServiceOffering.description after a stale update", async () => {
     await runSeed();
     const target = await prisma.serviceOffering.findUnique({

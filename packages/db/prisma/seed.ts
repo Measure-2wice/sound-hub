@@ -210,7 +210,11 @@ const SELLERS: readonly SellerSeed[] = [
     basedInCity: "Toronto",
     basedInRegion: "ON",
     basedInCountryCode: "CA",
-    avatarUrl: null,
+    // Edge fixture: `avatarUrl` is an approved optional field of the public
+    // seller contract, so the non-null case is a distinct public
+    // professional-identity presentation. Every other seeded seller leaves it
+    // null, which kept the rendered-avatar path unproven end to end.
+    avatarUrl: "https://cdn.example.com/sellers/keisha-williams/avatar.jpg",
     caribbeanAffiliationCodes: ["JM"],
     specialtyKeys: ["Songwriter", "Artist"],
     offerings: [

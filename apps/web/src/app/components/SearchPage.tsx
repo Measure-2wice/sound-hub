@@ -4,6 +4,7 @@ import { useState, type FormEvent } from "react";
 import { useSearch } from "../hooks/useSearch";
 import { Card } from "./ui/Card";
 import { SearchForm } from "./SearchForm";
+import { formatPricing } from "../lib/pricing";
 import type { TalentSearchResultV1 } from "@soundhub/types";
 
 export function SearchPage() {
@@ -106,7 +107,30 @@ function ResultCard({ result }: { result: TalentSearchResultV1 }) {
       data-testid="result-card"
     >
       <Card.Header>
-        <Card.Title data-testid="result-seller-name">{seller.professionalName}</Card.Title>
+        {/* `avatarUrl` is an approved optional field of the public seller
+            contract, so it is part of the seller's public professional
+            identity. It is rendered only when present, carries the
+            professional name as its accessible label, and exposes no
+            account, membership, or storage internals. */}
+        <div className="flex items-center gap-3">
+          {seller.avatarUrl && (
+            /* eslint-disable-next-line @next/next/no-img-element -- the
+               contract returns an arbitrary approved absolute URL, which the
+               Next image loader would require host allow-listing for. */
+            <img
+              src={seller.avatarUrl}
+              alt={`${seller.professionalName} profile image`}
+              className="h-12 w-12 rounded-full object-cover bg-gray-100"
+              width={48}
+              height={48}
+              loading="lazy"
+              referrerPolicy="no-referrer"
+              data-testid="result-seller-avatar"
+            />
+          )}
+          <Card.Title data-testid="result-seller-name">{seller.professionalName}</Card.Title>
+        </div>
+
         {seller.specialties.length > 0 && (
           <div className="mt-2" data-testid="result-specialties">
             <span className="text-xs font-medium text-gray-500">Specialties</span>
@@ -190,14 +214,18 @@ function ResultCard({ result }: { result: TalentSearchResultV1 }) {
           </dl>
 
           {/* Pricing is non-binding until it is incorporated into an approved
-              TermsVersion. The disclaimer is always shown so no pricing
-              presentation reads as a quote or commitment, but its wording
-              follows the state: disclaiming "advertised pricing" on an
-              offering that advertises none would imply a price is present. */}
+              TermsVersion (ADR 0002, CONTEXT.md). Buyer-facing wording names
+              that approved-terms boundary rather than a weaker informal
+              milestone such as "agreed terms", which could imply an informal
+              agreement is sufficient to bind either party. The disclaimer is
+              always shown so no pricing presentation reads as a quote or
+              commitment, but its wording follows the state: disclaiming
+              "advertised pricing" on an offering that advertises none would
+              imply a price is present. */}
           <p className="text-xs text-gray-500 mt-2 italic" data-testid="result-pricing-disclaimer">
             {pricingLabel === null
-              ? "This seller has not advertised pricing. Any pricing discussed later is non-binding until agreed terms."
-              : "Advertised pricing is non-binding and not a quote."}
+              ? "This seller has not advertised pricing. Any pricing discussed later is non-binding until it is incorporated into approved terms."
+              : "Advertised pricing is non-binding and not a quote. It binds no one until it is incorporated into approved terms."}
           </p>
 
           {bestMatchingOffering.includedServices.length > 0 && (
@@ -234,14 +262,4 @@ function formatSpecialty(key: string): string {
 function formatServiceMode(mode: TalentSearchResultV1["bestMatchingOffering"]["serviceMode"]) {
   if (mode === "InPerson") return "In person";
   return mode;
-}
-
-function formatPricing(
-  pricing: TalentSearchResultV1["bestMatchingOffering"]["pricing"],
-): string | null {
-  if (!pricing) return null;
-  if (pricing.kind === "ContactForQuote") return "Contact for quote";
-  const amount = pricing.amount.amountMinor / 100;
-  const formatted = `${amount.toFixed(2)} ${pricing.amount.currency}/${pricing.unit}`;
-  return pricing.kind === "StartingAt" ? `Starting at ${formatted}` : `Fixed ${formatted}`;
 }

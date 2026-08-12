@@ -69,9 +69,9 @@ test("renders real sellers and Active offerings for the M1.1 happy path", async 
   expect(cardText).toMatch(/Service area:/);
 
   // Structured, non-binding pricing.
-  await expect(top.getByTestId("result-pricing")).toContainText("Starting at");
-  await expect(top.getByTestId("result-pricing")).toContainText("USD");
+  await expect(top.getByTestId("result-pricing")).toHaveText("Starting at 600.00 USD/track");
   await expect(top.getByTestId("result-pricing-disclaimer")).toContainText("non-binding");
+  await expect(top.getByTestId("result-pricing-disclaimer")).toContainText("approved terms");
 });
 
 test("presents every pricing presentation as non-binding, including offerings with no advertised price", async ({
@@ -92,6 +92,7 @@ test("presents every pricing presentation as non-binding, including offerings wi
   await expect(mastering).toBeVisible();
   await expect(mastering.getByTestId("result-pricing")).toHaveText("Not advertised");
   await expect(mastering.getByTestId("result-pricing-disclaimer")).toContainText("non-binding");
+  await expect(mastering.getByTestId("result-pricing-disclaimer")).toContainText("approved terms");
   await expect(mastering.getByTestId("result-category")).toHaveText("Mastering");
 
   // relevanceScore still never surfaces as buyer-facing confidence.
@@ -99,4 +100,60 @@ test("presents every pricing presentation as non-binding, including offerings wi
   expect(bodyText).not.toMatch(/Match Score:\s*\d+%/);
   expect(bodyText).not.toMatch(/relevanceScore/i);
   expect(bodyText).not.toMatch(/\b\d{1,3}%\s*(match|confidence)/i);
+});
+
+test("presents Fixed pricing and the approved optional seller avatar", async ({ page }) => {
+  await page.goto("/");
+
+  // The seeded topline fixture is the canonical Fixed-pricing offering and
+  // the canonical non-null `avatarUrl` seller.
+  await page.getByTestId("search-input").fill("topline");
+  await page.getByTestId("search-submit").click();
+
+  const cards = page.getByTestId("result-card");
+  await expect(cards.first()).toBeVisible({ timeout: 15_000 });
+
+  const topline = cards.filter({ hasText: "Afrobeats and R&B topline writing" }).first();
+  await expect(topline).toBeVisible();
+  await expect(topline.getByTestId("result-seller-name")).toHaveText("Keisha Williams");
+
+  // Fixed pricing renders with the currency's own minor-unit exponent
+  // (USD has two), and is still framed as non-binding.
+  await expect(topline.getByTestId("result-pricing")).toHaveText("Fixed 1200.00 USD/track");
+  await expect(topline.getByTestId("result-pricing-disclaimer")).toContainText("non-binding");
+  await expect(topline.getByTestId("result-pricing-disclaimer")).toContainText("approved terms");
+
+  // The approved optional public professional identity includes the avatar.
+  const avatar = topline.getByTestId("result-seller-avatar");
+  await expect(avatar).toBeVisible();
+  await expect(avatar).toHaveAttribute(
+    "src",
+    "https://cdn.example.com/sellers/keisha-williams/avatar.jpg",
+  );
+  await expect(avatar).toHaveAttribute("alt", "Keisha Williams profile image");
+
+  // The avatar must not leak private identity data alongside it.
+  const cardText = (await topline.textContent()) ?? "";
+  expect(cardText).not.toMatch(/@|workspace|wallet|embedding/i);
+});
+
+test("presents ContactForQuote pricing as non-binding", async ({ page }) => {
+  await page.goto("/");
+
+  // The seeded bachata fixture advertises ContactForQuote rather than an
+  // amount. It must read as an invitation to discuss, never as a quote.
+  await page.getByTestId("search-input").fill("bachata");
+  await page.getByTestId("search-submit").click();
+
+  const cards = page.getByTestId("result-card");
+  await expect(cards.first()).toBeVisible({ timeout: 15_000 });
+
+  const live = cards.filter({ hasText: "Bachata and merengue live performance" }).first();
+  await expect(live).toBeVisible();
+  await expect(live.getByTestId("result-pricing")).toHaveText("Contact for quote");
+  await expect(live.getByTestId("result-pricing-disclaimer")).toContainText("non-binding");
+  await expect(live.getByTestId("result-pricing-disclaimer")).toContainText("approved terms");
+
+  // Sellers with no avatar render no image rather than a broken one.
+  await expect(live.getByTestId("result-seller-avatar")).toHaveCount(0);
 });
