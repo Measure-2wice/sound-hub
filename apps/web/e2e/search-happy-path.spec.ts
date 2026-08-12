@@ -48,4 +48,55 @@ test("renders real sellers and Active offerings for the M1.1 happy path", async 
 
   // Caribbean affiliation is rendered.
   await expect(top.getByTestId("result-affiliations")).toContainText("HT");
+
+  // M1.2: the approved public seller and offering fields are presented as
+  // distinct concepts. Specialty, ServiceCategory, current location, service
+  // area, and service mode must each be separately legible rather than
+  // collapsed into one line.
+  await expect(top.getByTestId("result-specialties")).toContainText("Producer");
+  await expect(top.getByTestId("result-category")).toHaveText("Music Production");
+  await expect(top.getByTestId("result-service-mode")).toHaveText("Remote");
+  await expect(top.getByTestId("result-based-in")).toContainText("Brooklyn");
+  await expect(top.getByTestId("result-based-in")).toContainText("US");
+  await expect(top.getByTestId("result-service-areas")).toContainText("US");
+  await expect(top.getByTestId("result-genres")).toContainText("Dancehall");
+
+  // Current location and Caribbean affiliation are labeled distinctly so that
+  // residence is never presented as regional connection.
+  const cardText = (await top.textContent()) ?? "";
+  expect(cardText).toMatch(/Based in:/);
+  expect(cardText).toMatch(/Caribbean affiliation:/);
+  expect(cardText).toMatch(/Service area:/);
+
+  // Structured, non-binding pricing.
+  await expect(top.getByTestId("result-pricing")).toContainText("Starting at");
+  await expect(top.getByTestId("result-pricing")).toContainText("USD");
+  await expect(top.getByTestId("result-pricing-disclaimer")).toContainText("non-binding");
+});
+
+test("presents every pricing presentation as non-binding, including offerings with no advertised price", async ({
+  page,
+}) => {
+  await page.goto("/");
+
+  // The seeded mastering fixture advertises no pricing at all. The absent case
+  // is a distinct presentation and must still carry the non-binding framing
+  // rather than silently rendering nothing.
+  await page.getByTestId("search-input").fill("mastering");
+  await page.getByTestId("search-submit").click();
+
+  const cards = page.getByTestId("result-card");
+  await expect(cards.first()).toBeVisible({ timeout: 15_000 });
+
+  const mastering = cards.filter({ hasText: "Streaming-ready mastering" }).first();
+  await expect(mastering).toBeVisible();
+  await expect(mastering.getByTestId("result-pricing")).toHaveText("Not advertised");
+  await expect(mastering.getByTestId("result-pricing-disclaimer")).toContainText("non-binding");
+  await expect(mastering.getByTestId("result-category")).toHaveText("Mastering");
+
+  // relevanceScore still never surfaces as buyer-facing confidence.
+  const bodyText = (await page.textContent("body")) ?? "";
+  expect(bodyText).not.toMatch(/Match Score:\s*\d+%/);
+  expect(bodyText).not.toMatch(/relevanceScore/i);
+  expect(bodyText).not.toMatch(/\b\d{1,3}%\s*(match|confidence)/i);
 });

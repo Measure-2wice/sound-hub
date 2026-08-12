@@ -375,6 +375,39 @@ const SELLERS: readonly SellerSeed[] = [
       },
     ],
   },
+  {
+    // Edge fixture: an Active, fully eligible offering that advertises no
+    // pricing at all. The public contract makes `pricing` optional, so the
+    // absent case is a distinct buyer-facing presentation alongside
+    // StartingAt, Fixed, and ContactForQuote. Seeding it keeps that path
+    // exercised end to end instead of only in unit fixtures.
+    ownerEmail: "anika@anikacharles.example",
+    workspaceSlug: "anika-charles-mastering",
+    workspaceName: "Anika Charles Mastering",
+    workspaceType: "Personal",
+    professionalName: "Anika Charles",
+    bio: "Grenadian mastering engineer preparing streaming-ready masters for independent Caribbean labels.",
+    status: "Published",
+    basedInCity: "St. George's",
+    basedInRegion: null,
+    basedInCountryCode: "GD",
+    avatarUrl: null,
+    caribbeanAffiliationCodes: ["GD"],
+    specialtyKeys: ["SoundEngineer"],
+    offerings: [
+      {
+        slug: "anika-streaming-master",
+        title: "Streaming-ready mastering for Caribbean releases",
+        description:
+          "Loudness-matched masters delivered for streaming platforms; pricing is discussed per release.",
+        status: "Active",
+        serviceMode: "Remote",
+        primaryCategoryKey: "mastering",
+        genreTags: ["Soca", "Calypso", "Reggae"],
+        serviceAreas: [{ countryCode: "GD" }, { countryCode: "TT" }],
+      },
+    ],
+  },
 ];
 
 // Deterministic ID helpers so repository tests can rely on stable IDs

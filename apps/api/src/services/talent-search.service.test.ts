@@ -673,18 +673,137 @@ describe("TalentSearchService", () => {
     assert.doesNotMatch(reason, /ai|artificial|intelligence|confidence|guarantee|quality/i);
   });
 
-  test("public DTO excludes private fields", async () => {
+  // The public DTO boundary is an allow-list, not a deny-list. Asserting that a
+  // handful of guessed private names are `undefined` passes vacuously for any
+  // field nobody thought to guess. These tests instead pin the exact key sets
+  // and prove that private data present on the internal candidate cannot reach
+  // the response even when the repository supplies it.
+
+  const PUBLIC_SELLER_KEYS = [
+    "basedIn",
+    "bio",
+    "caribbeanAffiliationCodes",
+    "professionalName",
+    "sellerId",
+    "specialties",
+  ] as const;
+
+  const PUBLIC_OFFERING_KEYS = [
+    "description",
+    "genreTags",
+    "includedServices",
+    "offeringId",
+    "pricing",
+    "primaryCategory",
+    "serviceAreas",
+    "serviceMode",
+    "title",
+  ] as const;
+
+  test("public seller DTO exposes exactly the allow-listed keys", async () => {
     const service = new TalentSearchService(new InMemoryTalentSearchRepository(buildFixture()));
     const response = await service.search({ query: "Haitian dancehall single production" });
-    const result = response.results[0]!;
-    const seller = result.seller as unknown as Record<string, unknown>;
-    assert.equal(seller["email"], undefined);
-    assert.equal(seller["workspaceId"], undefined);
-    assert.equal(seller["vibeEmbeddingVector"], undefined);
-    assert.equal(seller["password"], undefined);
-    const offering = result.bestMatchingOffering as unknown as Record<string, unknown>;
-    assert.equal(offering["s3Key"], undefined);
-    assert.equal(offering["embedding"], undefined);
+    const seller = response.results[0]!.seller;
+    // `avatarUrl` is optional and omitted for this fixture, so the expected set
+    // is the required keys only. Any newly serialized field fails this.
+    assert.deepEqual(Object.keys(seller).sort(), [...PUBLIC_SELLER_KEYS]);
+    assert.deepEqual(Object.keys(seller.basedIn).sort(), ["city", "countryCode", "region"]);
+  });
+
+  test("public offering DTO exposes exactly the allow-listed keys", async () => {
+    const service = new TalentSearchService(new InMemoryTalentSearchRepository(buildFixture()));
+    const response = await service.search({ query: "Haitian dancehall single production" });
+    const offering = response.results[0]!.bestMatchingOffering;
+    assert.deepEqual(Object.keys(offering).sort(), [...PUBLIC_OFFERING_KEYS]);
+  });
+
+  test("account, membership, wallet, embedding, storage, and private timestamp fields cannot leak", async () => {
+    // Poison the internal candidate with every private field class named by the
+    // contract's privacy boundary. The repository type does not declare these,
+    // so the cast models a persistence layer that over-selects.
+    const fixture = buildFixture();
+    const poisoned = {
+      ...fixture.sellers[0]!,
+      email: "private@example.com",
+      passwordHash: "hashed-secret",
+      ownerUserId: "user-private",
+      memberships: [{ userId: "user-private", role: "Owner" }],
+      walletAddress: "0xdeadbeef",
+      walletAuthorization: { challenge: "nonce" },
+      embedding: [0.1, 0.2, 0.3],
+      vectorMetadata: { namespace: "sellers" },
+      s3Key: "private/bucket/key.wav",
+      storageLocation: "s3://private/key",
+      createdAt: new Date("2020-01-01T00:00:00.000Z"),
+      updatedAt: new Date("2020-01-02T00:00:00.000Z"),
+      offerings: fixture.sellers[0]!.offerings.map((offering) => ({
+        ...offering,
+        embedding: [0.4, 0.5],
+        s3Key: "private/offering.wav",
+        createdAt: new Date("2020-01-03T00:00:00.000Z"),
+        updatedAt: new Date("2020-01-04T00:00:00.000Z"),
+        internalCostMinor: 1234,
+      })),
+    } as unknown as InMemorySeller;
+
+    const service = new TalentSearchService(
+      new InMemoryTalentSearchRepository({
+        ...fixture,
+        sellers: [poisoned, ...fixture.sellers.slice(1)],
+      }),
+    );
+    const response = await service.search({ query: "Haitian dancehall single production" });
+    assert.ok(response.results.length > 0);
+
+    // Serializing the whole response is the real leak surface: it catches a
+    // private value nested anywhere, not just at the top level.
+    const serialized = JSON.stringify(response);
+    for (const secret of [
+      "private@example.com",
+      "hashed-secret",
+      "user-private",
+      "0xdeadbeef",
+      "nonce",
+      "vectorMetadata",
+      "private/bucket/key.wav",
+      "s3://private/key",
+      "private/offering.wav",
+      "internalCostMinor",
+      "2020-01-01",
+      "2020-01-03",
+    ]) {
+      assert.equal(
+        serialized.includes(secret),
+        false,
+        `private value ${secret} leaked into the public response`,
+      );
+    }
+
+    // Key-level proof for the field classes the contract names explicitly.
+    const seller = response.results[0]!.seller as unknown as Record<string, unknown>;
+    const offering = response.results[0]!.bestMatchingOffering as unknown as Record<
+      string,
+      unknown
+    >;
+    for (const key of [
+      "email",
+      "passwordHash",
+      "ownerUserId",
+      "workspaceId",
+      "memberships",
+      "walletAddress",
+      "walletAuthorization",
+      "embedding",
+      "vectorMetadata",
+      "s3Key",
+      "storageLocation",
+      "createdAt",
+      "updatedAt",
+      "status",
+    ]) {
+      assert.equal(key in seller, false, `seller DTO exposed private key ${key}`);
+      assert.equal(key in offering, false, `offering DTO exposed private key ${key}`);
+    }
   });
 
   test("empty results return 200 with empty array and do not relax constraints", async () => {
