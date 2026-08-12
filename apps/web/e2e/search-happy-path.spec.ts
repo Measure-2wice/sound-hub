@@ -124,13 +124,19 @@ test("presents Fixed pricing and the approved optional seller avatar", async ({ 
   await expect(topline.getByTestId("result-pricing-disclaimer")).toContainText("approved terms");
 
   // The approved optional public professional identity includes the avatar.
+  // The fixture URL points to a deterministic SVG served from the web app's
+  // public/ directory so the browser actually loads it; the naturalWidth
+  // check proves the image completed loading rather than rendering as a
+  // broken-image placeholder (an attribute-only check would pass even when
+  // the browser could not resolve the src).
   const avatar = topline.getByTestId("result-seller-avatar");
   await expect(avatar).toBeVisible();
-  await expect(avatar).toHaveAttribute(
-    "src",
-    "https://cdn.example.com/sellers/keisha-williams/avatar.jpg",
-  );
+  await expect(avatar).toHaveAttribute("src", "/fixtures/sellers/keisha-williams/avatar.svg");
   await expect(avatar).toHaveAttribute("alt", "Keisha Williams profile image");
+  const naturalWidth = await avatar.evaluate((img) =>
+    img instanceof HTMLImageElement ? img.naturalWidth : 0,
+  );
+  expect(naturalWidth).toBeGreaterThan(0);
 
   // The avatar must not leak private identity data alongside it.
   const cardText = (await topline.textContent()) ?? "";

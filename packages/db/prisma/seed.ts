@@ -213,8 +213,11 @@ const SELLERS: readonly SellerSeed[] = [
     // Edge fixture: `avatarUrl` is an approved optional field of the public
     // seller contract, so the non-null case is a distinct public
     // professional-identity presentation. Every other seeded seller leaves it
-    // null, which kept the rendered-avatar path unproven end to end.
-    avatarUrl: "https://cdn.example.com/sellers/keisha-williams/avatar.jpg",
+    // null, which kept the rendered-avatar path unproven end to end. The URL
+    // points to a deterministic SVG fixture that is served from the web
+    // app's `public/` directory so the browser actually loads the image
+    // rather than rendering a broken-image placeholder.
+    avatarUrl: "/fixtures/sellers/keisha-williams/avatar.svg",
     caribbeanAffiliationCodes: ["JM"],
     specialtyKeys: ["Songwriter", "Artist"],
     offerings: [

@@ -399,7 +399,7 @@ describe("M1.1 seed regression coverage", () => {
       where: { professionalName: "Keisha Williams" },
     });
     assert.ok(target);
-    assert.equal(target.avatarUrl, "https://cdn.example.com/sellers/keisha-williams/avatar.jpg");
+    assert.equal(target.avatarUrl, "/fixtures/sellers/keisha-williams/avatar.svg");
 
     await prisma.sellerProfile.update({
       where: { id: target.id },
@@ -407,7 +407,7 @@ describe("M1.1 seed regression coverage", () => {
     });
     await runSeed();
     const restored = await prisma.sellerProfile.findUnique({ where: { id: target.id } });
-    assert.equal(restored?.avatarUrl, "https://cdn.example.com/sellers/keisha-williams/avatar.jpg");
+    assert.equal(restored?.avatarUrl, "/fixtures/sellers/keisha-williams/avatar.svg");
   });
 
   test("restores ServiceOffering.description after a stale update", async () => {
