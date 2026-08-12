@@ -39,6 +39,37 @@ if (!connectionString) {
   throw new Error("DATABASE_URL is required to run the seed");
 }
 
+// The public seller contract (packages/types/src/index.ts) requires
+// `avatarUrl` to be a parseable absolute URL (`z.string().url()`). The
+// canonical non-null avatar fixture is therefore seeded as an absolute
+// URL composed from a configurable fixture origin plus the path under
+// `apps/web/public/fixtures/...` that the Next.js static handler serves.
+//
+// The default origin matches the local Next.js dev server (`pnpm dev`)
+// and the FRONTEND_URL that the M1 Playwright harness passes to both the
+// API and the browser, so the seeded URL resolves end to end in the
+// smoke-test environment. Operators and CI override it by exporting
+// PUBLIC_FIXTURE_ORIGIN.
+function resolveFixtureOrigin(): string {
+  const raw = process.env.PUBLIC_FIXTURE_ORIGIN ?? "http://localhost:3000";
+  let parsed: URL;
+  try {
+    parsed = new URL(raw);
+  } catch (err) {
+    throw new Error(
+      `PUBLIC_FIXTURE_ORIGIN is not a valid absolute URL: ${raw} (${
+        err instanceof Error ? err.message : String(err)
+      })`,
+    );
+  }
+  if (parsed.protocol !== "http:" && parsed.protocol !== "https:") {
+    throw new Error(`PUBLIC_FIXTURE_ORIGIN must use http(s): got protocol ${parsed.protocol}`);
+  }
+  return parsed.origin;
+}
+
+const FIXTURE_ORIGIN = resolveFixtureOrigin();
+
 const prisma = new PrismaClient({
   adapter: new PrismaPg({ connectionString }),
 });
@@ -214,10 +245,14 @@ const SELLERS: readonly SellerSeed[] = [
     // seller contract, so the non-null case is a distinct public
     // professional-identity presentation. Every other seeded seller leaves it
     // null, which kept the rendered-avatar path unproven end to end. The URL
-    // points to a deterministic SVG fixture that is served from the web
-    // app's `public/` directory so the browser actually loads the image
-    // rather than rendering a broken-image placeholder.
-    avatarUrl: "/fixtures/sellers/keisha-williams/avatar.svg",
+    // is stored as an absolute URL (contract: `z.string().url()`) composed
+    // from a configurable fixture origin plus the path under
+    // `apps/web/public/fixtures/...` that the Next.js static handler
+    // serves. The default origin matches the local Next.js dev server and
+    // the FRONTEND_URL that the M1 Playwright harness passes to both the
+    // API and the browser, so the seeded URL resolves end to end in the
+    // smoke-test environment.
+    avatarUrl: `${FIXTURE_ORIGIN}/fixtures/sellers/keisha-williams/avatar.svg`,
     caribbeanAffiliationCodes: ["JM"],
     specialtyKeys: ["Songwriter", "Artist"],
     offerings: [

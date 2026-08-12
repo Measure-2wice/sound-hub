@@ -10,6 +10,7 @@ import {
 } from "../repositories/in-memory-talent-search.repository.js";
 import {
   talentSearchRequestV1Schema,
+  talentSearchResponseV1Schema,
   type SellerProfileStatusV1,
   type ServiceOfferingStatusV1,
   type WorkspaceStatusV1,
@@ -886,5 +887,139 @@ describe("TalentSearchService", () => {
     const service = new TalentSearchService(new InMemoryTalentSearchRepository(buildFixture()));
     const response = await service.search({ query: "obscure-thing" });
     assert.equal(response.results.length, 0);
+  });
+
+  // M1.2 regression: `avatarUrl` is an approved optional field of the public
+  // seller contract, and the schema requires `z.string().url()` (an absolute
+  // URL). The deterministic seed stores the canonical non-null avatar
+  // fixture as an absolute URL composed from PUBLIC_FIXTURE_ORIGIN plus the
+  // path under `apps/web/public/fixtures/...`. This test pins the public
+  // DTO boundary end to end: a non-null absolute avatar URL passes through
+  // the service and the entire response validates against the strict
+  // public schema.
+  test("a non-null absolute avatarUrl survives the public DTO mapping and validates against the schema", async () => {
+    const absoluteAvatarUrl = "http://localhost:3000/fixtures/sellers/keisha-williams/avatar.svg";
+    const keishaOffering: InMemoryOffering = {
+      offeringId: "offering-keisha-topline",
+      title: "Afrobeats and R&B topline writing — remote",
+      description: "Original topline writing for a single.",
+      status: "Active",
+      serviceMode: "Remote",
+      primaryCategory: { key: "songwriting", name: "Songwriting", bundleOnly: false },
+      includedServices: [],
+      genreTags: ["R&B", "Afrobeats", "Pop"],
+      serviceAreas: [{ city: null, region: null, countryCode: "CA" }],
+      pricing: {
+        kind: "Fixed",
+        amountMinor: 120000,
+        currency: "USD",
+        unitKey: "track",
+      },
+    };
+    const keisha: InMemorySeller = {
+      sellerId: "seller-keisha-toronto",
+      workspaceId: "workspace-keisha",
+      professionalName: "Keisha Williams",
+      bio: "Toronto-based Jamaican songwriter.",
+      status: "Published",
+      basedInCity: "Toronto",
+      basedInRegion: "ON",
+      basedInCountryCode: "CA",
+      avatarUrl: absoluteAvatarUrl,
+      specialtyKeys: ["Songwriter", "Artist"],
+      caribbeanAffiliationCodes: ["JM"],
+      workspaceStatus: "Active",
+      workspaceHasSellerCapability: true,
+      offerings: [keishaOffering],
+    };
+    const service = new TalentSearchService(
+      new InMemoryTalentSearchRepository({
+        sellers: [keisha],
+        controlledKeys: {
+          serviceCategoryKeys: ["songwriting"],
+          specialtyKeys: ["Songwriter", "Artist"],
+          pricingUnitKeys: ["track"],
+        },
+      }),
+    );
+
+    const response = await service.search({ query: "Afrobeats topline writing" });
+    assert.equal(response.results.length, 1);
+    const [result] = response.results;
+    assert.ok(result);
+    assert.equal(result.seller.avatarUrl, absoluteAvatarUrl);
+
+    // The whole response (including the non-null avatar) must parse
+    // against the strict public schema. Without an absolute URL, this
+    // safeParse would fail with a `z.string().url()` issue and the
+    // route would return SEARCH_FAILED 500.
+    const parsed = talentSearchResponseV1Schema.safeParse(response);
+    assert.equal(
+      parsed.success,
+      true,
+      `public response failed schema validation: ${parsed.success ? "" : JSON.stringify(parsed.error.issues)}`,
+    );
+    if (parsed.success) {
+      const seller = parsed.data.results[0]?.seller;
+      assert.ok(seller);
+      // Schema is `.strict()`, so the avatarUrl must round-trip exactly.
+      assert.equal(seller.avatarUrl, absoluteAvatarUrl);
+    }
+
+    // Independent URL parse check: the seeded value is an absolute URL,
+    // not a relative path like `/fixtures/sellers/...`.
+    const url = new URL(absoluteAvatarUrl);
+    assert.equal(url.protocol, "http:");
+    assert.equal(url.pathname, "/fixtures/sellers/keisha-williams/avatar.svg");
+  });
+
+  // M1.2 negative regression: if a seller ever leaks a relative URL
+  // through to the public DTO, the strict `z.string().url()` schema must
+  // reject it. Pinning this contract prevents the canonical non-null
+  // avatar fixture from silently regressing back to a relative path.
+  test("a relative avatarUrl is rejected by the strict public schema", () => {
+    const relativeAvatar = "/fixtures/sellers/keisha-williams/avatar.svg";
+    const parsed = talentSearchResponseV1Schema.safeParse({
+      results: [
+        {
+          seller: {
+            sellerId: "seller-x",
+            professionalName: "Test Seller",
+            specialties: ["Songwriter"],
+            bio: "",
+            basedIn: { countryCode: "CA" },
+            caribbeanAffiliationCodes: ["JM"],
+            avatarUrl: relativeAvatar,
+          },
+          bestMatchingOffering: {
+            offeringId: "of-x",
+            title: "X",
+            description: "",
+            primaryCategory: { key: "songwriting", name: "Songwriting" },
+            includedServices: [],
+            genreTags: [],
+            serviceMode: "Remote",
+            serviceAreas: [{ countryCode: "CA" }],
+          },
+          additionalMatchingOfferings: [],
+          relevanceScore: 1,
+          matchReason: "matched",
+        },
+      ],
+      metadata: {
+        totalResults: 1,
+        processingTimeMs: 0,
+        strategy: "postgres-text-v1",
+        appliedRequiredCriteria: {},
+        appliedPreferredCriteria: {},
+      },
+    });
+    assert.equal(parsed.success, false);
+    if (!parsed.success) {
+      assert.ok(
+        parsed.error.issues.some((issue) => issue.path.join(".") === "results.0.seller.avatarUrl"),
+        `expected avatarUrl rejection, got ${JSON.stringify(parsed.error.issues)}`,
+      );
+    }
   });
 });

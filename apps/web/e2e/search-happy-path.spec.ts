@@ -1,5 +1,13 @@
 import { test, expect } from "@playwright/test";
 
+// The seeded non-null avatar URL is composed from a configurable fixture
+// origin (PUBLIC_FIXTURE_ORIGIN) plus the path under
+// `apps/web/public/fixtures/...`. Playwright passes the same origin to
+// both the seed process and the browser, so the absolute URL the
+// browser sees matches what the test asserts below.
+const FIXTURE_ORIGIN = process.env.E2E_BASE_URL ?? "http://localhost:3000";
+const KEISHA_AVATAR_URL = `${FIXTURE_ORIGIN}/fixtures/sellers/keisha-williams/avatar.svg`;
+
 // The single Milestone 1 happy-path tracer. It does not mock fetch, the
 // API, the repository, or the database. It exercises the real Next.js
 // proxy, the real Express route, the real TalentSearchService, the real
@@ -131,7 +139,7 @@ test("presents Fixed pricing and the approved optional seller avatar", async ({ 
   // the browser could not resolve the src).
   const avatar = topline.getByTestId("result-seller-avatar");
   await expect(avatar).toBeVisible();
-  await expect(avatar).toHaveAttribute("src", "/fixtures/sellers/keisha-williams/avatar.svg");
+  await expect(avatar).toHaveAttribute("src", KEISHA_AVATAR_URL);
   await expect(avatar).toHaveAttribute("alt", "Keisha Williams profile image");
   const naturalWidth = await avatar.evaluate((img) =>
     img instanceof HTMLImageElement ? img.naturalWidth : 0,
