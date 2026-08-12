@@ -189,11 +189,15 @@ function ResultCard({ result }: { result: TalentSearchResultV1 }) {
             </div>
           </dl>
 
-          {/* Advertised pricing is non-binding until it is incorporated into an
-              approved TermsVersion. The disclaimer is always shown so no
-              pricing presentation reads as a quote or commitment. */}
+          {/* Pricing is non-binding until it is incorporated into an approved
+              TermsVersion. The disclaimer is always shown so no pricing
+              presentation reads as a quote or commitment, but its wording
+              follows the state: disclaiming "advertised pricing" on an
+              offering that advertises none would imply a price is present. */}
           <p className="text-xs text-gray-500 mt-2 italic" data-testid="result-pricing-disclaimer">
-            Advertised pricing is non-binding and not a quote.
+            {pricingLabel === null
+              ? "This seller has not advertised pricing. Any pricing discussed later is non-binding until agreed terms."
+              : "Advertised pricing is non-binding and not a quote."}
           </p>
 
           {bestMatchingOffering.includedServices.length > 0 && (

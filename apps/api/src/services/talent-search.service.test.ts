@@ -675,11 +675,18 @@ describe("TalentSearchService", () => {
 
   // The public DTO boundary is an allow-list, not a deny-list. Asserting that a
   // handful of guessed private names are `undefined` passes vacuously for any
-  // field nobody thought to guess. These tests instead pin the exact key sets
-  // and prove that private data present on the internal candidate cannot reach
-  // the response even when the repository supplies it.
+  // field nobody thought to guess. These tests instead pin the key sets and
+  // prove that private data present on the internal candidate cannot reach the
+  // response even when the repository supplies it.
+  //
+  // The invariant is "no key outside the allow-list, and every required key
+  // present" rather than one exact key list, because optional fields
+  // (avatarUrl, pricing, basedIn.city/region) are legitimately absent for some
+  // fixtures. Pinning one exact list would couple these tests to whichever
+  // seller happens to rank first and would break when issue #6 changes ranking,
+  // without that failure meaning anything leaked.
 
-  const PUBLIC_SELLER_KEYS = [
+  const REQUIRED_SELLER_KEYS = [
     "basedIn",
     "bio",
     "caribbeanAffiliationCodes",
@@ -687,34 +694,73 @@ describe("TalentSearchService", () => {
     "sellerId",
     "specialties",
   ] as const;
+  const OPTIONAL_SELLER_KEYS = ["avatarUrl"] as const;
 
-  const PUBLIC_OFFERING_KEYS = [
+  const REQUIRED_OFFERING_KEYS = [
     "description",
     "genreTags",
     "includedServices",
     "offeringId",
-    "pricing",
     "primaryCategory",
     "serviceAreas",
     "serviceMode",
     "title",
   ] as const;
+  const OPTIONAL_OFFERING_KEYS = ["pricing"] as const;
 
-  test("public seller DTO exposes exactly the allow-listed keys", async () => {
+  function assertKeysWithinAllowList(
+    actual: object,
+    required: readonly string[],
+    optional: readonly string[],
+    label: string,
+  ): void {
+    const keys = Object.keys(actual);
+    const allowed = new Set<string>([...required, ...optional]);
+    for (const key of keys) {
+      assert.ok(allowed.has(key), `${label} exposed non-allow-listed key ${key}`);
+    }
+    for (const key of required) {
+      assert.ok(keys.includes(key), `${label} is missing required public key ${key}`);
+    }
+  }
+
+  test("every public seller DTO exposes only allow-listed keys", async () => {
     const service = new TalentSearchService(new InMemoryTalentSearchRepository(buildFixture()));
     const response = await service.search({ query: "Haitian dancehall single production" });
-    const seller = response.results[0]!.seller;
-    // `avatarUrl` is optional and omitted for this fixture, so the expected set
-    // is the required keys only. Any newly serialized field fails this.
-    assert.deepEqual(Object.keys(seller).sort(), [...PUBLIC_SELLER_KEYS]);
-    assert.deepEqual(Object.keys(seller.basedIn).sort(), ["city", "countryCode", "region"]);
+    assert.ok(response.results.length > 0);
+    for (const result of response.results) {
+      assertKeysWithinAllowList(
+        result.seller,
+        REQUIRED_SELLER_KEYS,
+        OPTIONAL_SELLER_KEYS,
+        "seller DTO",
+      );
+      assertKeysWithinAllowList(
+        result.seller.basedIn,
+        ["countryCode"],
+        ["city", "region"],
+        "seller basedIn",
+      );
+    }
   });
 
-  test("public offering DTO exposes exactly the allow-listed keys", async () => {
+  test("every public offering DTO exposes only allow-listed keys", async () => {
     const service = new TalentSearchService(new InMemoryTalentSearchRepository(buildFixture()));
     const response = await service.search({ query: "Haitian dancehall single production" });
-    const offering = response.results[0]!.bestMatchingOffering;
-    assert.deepEqual(Object.keys(offering).sort(), [...PUBLIC_OFFERING_KEYS]);
+    assert.ok(response.results.length > 0);
+    for (const result of response.results) {
+      for (const offering of [result.bestMatchingOffering, ...result.additionalMatchingOfferings]) {
+        assertKeysWithinAllowList(
+          offering,
+          REQUIRED_OFFERING_KEYS,
+          OPTIONAL_OFFERING_KEYS,
+          "offering DTO",
+        );
+        for (const area of offering.serviceAreas) {
+          assertKeysWithinAllowList(area, ["countryCode"], ["city", "region"], "serviceArea");
+        }
+      }
+    }
   });
 
   test("account, membership, wallet, embedding, storage, and private timestamp fields cannot leak", async () => {

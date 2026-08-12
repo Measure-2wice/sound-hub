@@ -3,7 +3,7 @@
 // The seed runs on every invocation and converges the canonical M1.1
 // fixture state to its approved values via deterministic upserts on
 // stable unique keys. The canonical state is the closed set of
-// 10 ServiceCategories, 5 Specialties, 6 PricingUnits, and 7 sellers
+// 10 ServiceCategories, 5 Specialties, 6 PricingUnits, and 8 sellers
 // (with their full UserAccount / Workspace / WorkspaceMembership /
 // WorkspaceCapability / SellerProfile / CaribbeanAffiliation /
 // SellerProfileSpecialty / ServiceOffering / ServiceOfferingServiceArea
