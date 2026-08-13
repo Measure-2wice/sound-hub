@@ -17,6 +17,14 @@
 // Canonical field values are restored on every run (Workspace.status,
 // SellerProfile.status, ServiceOffering.status, ServiceOffering.title, …).
 //
+// M1.3 adds NEGATIVE_FIXTURES: deterministic excluded-state fixtures
+// (Draft profile, Suspended profile, Suspended workspace, Buyer-only
+// workspace, Draft/Paused/Archived-only offerings, and sellers with
+// mixed lifecycle offerings) seeded outside the canonical SELLERS
+// array. The canonical snapshot assertion only checks the closed
+// canonical SELLERS set; the repository integration tests reference
+// the negative fixtures by stable ID.
+//
 // The seed does NOT delete rows that are outside the canonical state
 // (extra sellers, extra categories, etc.). Such rows are simply
 // untouched; the canonical-state snapshot proves that the closed
@@ -26,11 +34,14 @@
 
 import { PrismaPg } from "@prisma/adapter-pg";
 import { PrismaClient } from "../src/generated/client.js";
+import type { Prisma } from "../src/generated/client.js";
 import type {
+  MarketplaceCapability,
   PricingKind,
   ServiceMode,
   ServiceOfferingStatus,
   SellerProfileStatus,
+  WorkspaceStatus,
   WorkspaceType,
 } from "../src/generated/enums.js";
 
@@ -163,14 +174,22 @@ const PRICING_UNITS = [
   { key: "day", name: "Day" },
 ] as const;
 
-type SellerSeed = {
+// Shared seller-graph shape used by both the canonical SELLERS array
+// and the M1.3 negative eligibility fixtures. The canonical sellers
+// always supply `workspaceStatus: "Active"` and
+// `workspaceCapabilities: ["Seller"]`; the negative fixtures supply
+// the excluded state values. The same persistence flow applies to
+// both, so `applySellerGraph` (below) is the single source of truth.
+type SellerGraphSeed = {
   readonly ownerEmail: string;
   readonly workspaceSlug: string;
   readonly workspaceName: string;
   readonly workspaceType: WorkspaceType;
+  readonly workspaceStatus: WorkspaceStatus;
+  readonly workspaceCapabilities: readonly MarketplaceCapability[];
   readonly professionalName: string;
   readonly bio: string;
-  readonly status: SellerProfileStatus;
+  readonly profileStatus: SellerProfileStatus;
   readonly basedInCity: string | null;
   readonly basedInRegion: string | null;
   readonly basedInCountryCode: string;
@@ -179,6 +198,8 @@ type SellerSeed = {
   readonly specialtyKeys: readonly (typeof SPECIALTY_KEYS)[number][];
   readonly offerings: readonly OfferingSeed[];
 };
+
+type SellerSeed = SellerGraphSeed;
 
 type OfferingSeed = {
   readonly slug: string;
@@ -203,9 +224,11 @@ const SELLERS: readonly SellerSeed[] = [
     workspaceSlug: "creole-beats-brooklyn",
     workspaceName: "Creole Beats Brooklyn",
     workspaceType: "Personal",
+    workspaceStatus: "Active",
+    workspaceCapabilities: ["Seller"],
     professionalName: "Marc-André Pierre",
     bio: "Brooklyn-based Haitian producer crafting dancehall, soca, and hip-hop instrumentals for diaspora artists worldwide.",
-    status: "Published",
+    profileStatus: "Published",
     basedInCity: "Brooklyn",
     basedInRegion: "NY",
     basedInCountryCode: "US",
@@ -235,9 +258,11 @@ const SELLERS: readonly SellerSeed[] = [
     workspaceSlug: "kingson-to-songs",
     workspaceName: "Kingson TO Songs",
     workspaceType: "Personal",
+    workspaceStatus: "Active",
+    workspaceCapabilities: ["Seller"],
     professionalName: "Keisha Williams",
     bio: "Toronto-based Jamaican songwriter specializing in R&B and afrobeats toplines for global artists.",
-    status: "Published",
+    profileStatus: "Published",
     basedInCity: "Toronto",
     basedInRegion: "ON",
     basedInCountryCode: "CA",
@@ -274,9 +299,11 @@ const SELLERS: readonly SellerSeed[] = [
     workspaceSlug: "aisha-london-sessions",
     workspaceName: "Aisha London Sessions",
     workspaceType: "Personal",
+    workspaceStatus: "Active",
+    workspaceCapabilities: ["Seller"],
     professionalName: "Aisha Mohammed",
     bio: "Trinidadian session vocalist based in London, recording lead and harmony vocals for dancehall, soca, and afrobeats releases.",
-    status: "Published",
+    profileStatus: "Published",
     basedInCity: "London",
     basedInRegion: null,
     basedInCountryCode: "GB",
@@ -307,9 +334,11 @@ const SELLERS: readonly SellerSeed[] = [
     workspaceSlug: "junior-roberts-mix",
     workspaceName: "Junior Roberts Mix",
     workspaceType: "Personal",
+    workspaceStatus: "Active",
+    workspaceCapabilities: ["Seller"],
     professionalName: "Junior Roberts",
     bio: "Barbadian mix engineer in Brooklyn, mixing dancehall, hip-hop, and R&B records with a focus on loud, clean masters.",
-    status: "Published",
+    profileStatus: "Published",
     basedInCity: "Brooklyn",
     basedInRegion: "NY",
     basedInCountryCode: "US",
@@ -336,9 +365,11 @@ const SELLERS: readonly SellerSeed[] = [
     workspaceSlug: "selene-dominicana-live",
     workspaceName: "Selene Dominicana Live",
     workspaceType: "Personal",
+    workspaceStatus: "Active",
+    workspaceCapabilities: ["Seller"],
     professionalName: "Selene García",
     bio: "Dominican bachata and merengue artist available for in-person festival and club performances across the Caribbean and Latin America.",
-    status: "Published",
+    profileStatus: "Published",
     basedInCity: "Santo Domingo",
     basedInRegion: null,
     basedInCountryCode: "DO",
@@ -365,9 +396,11 @@ const SELLERS: readonly SellerSeed[] = [
     workspaceSlug: "marina-joseph-compositions",
     workspaceName: "Marina Joseph Compositions",
     workspaceType: "Personal",
+    workspaceStatus: "Active",
+    workspaceCapabilities: ["Seller"],
     professionalName: "Marina Joseph",
     bio: "Saint Lucian composer producing original scores for short films, branded content, and sync placements.",
-    status: "Published",
+    profileStatus: "Published",
     basedInCity: "Castries",
     basedInRegion: null,
     basedInCountryCode: "LC",
@@ -393,9 +426,11 @@ const SELLERS: readonly SellerSeed[] = [
     workspaceSlug: "devon-king-bahamas-live",
     workspaceName: "Devon King Bahamas Live",
     workspaceType: "Personal",
+    workspaceStatus: "Active",
+    workspaceCapabilities: ["Seller"],
     professionalName: "Devon King",
     bio: "Bahamian live performer and music director hosting resort and festival sets across the Caribbean and the US East Coast.",
-    status: "Published",
+    profileStatus: "Published",
     basedInCity: "Nassau",
     basedInRegion: null,
     basedInCountryCode: "BS",
@@ -427,9 +462,11 @@ const SELLERS: readonly SellerSeed[] = [
     workspaceSlug: "anika-charles-mastering",
     workspaceName: "Anika Charles Mastering",
     workspaceType: "Personal",
+    workspaceStatus: "Active",
+    workspaceCapabilities: ["Seller"],
     professionalName: "Anika Charles",
     bio: "Grenadian mastering engineer preparing streaming-ready masters for independent Caribbean labels.",
-    status: "Published",
+    profileStatus: "Published",
     basedInCity: "St. George's",
     basedInRegion: null,
     basedInCountryCode: "GD",
@@ -447,6 +484,335 @@ const SELLERS: readonly SellerSeed[] = [
         primaryCategoryKey: "mastering",
         genreTags: ["Soca", "Calypso", "Reggae"],
         serviceAreas: [{ countryCode: "GD" }, { countryCode: "TT" }],
+      },
+    ],
+  },
+];
+
+// Negative eligibility fixtures (M1.3).
+//
+// These fixtures intentionally cover every excluded state called out by
+// issue #4 ("Exclude ineligible sellers and unavailable offerings"):
+//
+//   - SellerProfile.status = Draft and Suspended
+//   - Workspace.status = Suspended
+//   - Workspace without the Seller capability (Buyer-only)
+//   - ServiceOffering.status = Draft, Paused, and Archived
+//   - A seller with mixed Active + Paused offerings (only Active surfaces)
+//   - A seller with mixed Active + Archived offerings (only Active surfaces)
+//   - A seller with only Paused offerings (entire seller excluded)
+//   - A seller with only Archived offerings (entire seller excluded)
+//
+// They are seeded by `applySeed` outside the canonical `SELLERS` array so
+// the canonical snapshot assertion remains unchanged. The canonical-state
+// snapshot proves the closed canonical SELLERS set is correct, and these
+// fixtures add rows that prove the eligibility filters work; the
+// repository integration tests assert the latter.
+type NegativeFixture = SellerGraphSeed;
+
+const NEGATIVE_FIXTURES: readonly NegativeFixture[] = [
+  {
+    // Draft SellerProfile: the seller has never published, so even though
+    // the workspace is eligible and the offering is Active, the profile
+    // must not surface in search results.
+    ownerEmail: "draft.profile@ineligible.example",
+    workspaceSlug: "negative-draft-profile",
+    workspaceName: "Negative Draft Profile",
+    workspaceType: "Personal",
+    workspaceStatus: "Active",
+    workspaceCapabilities: ["Seller"],
+    professionalName: "Draft Profile Seller",
+    bio: "Seller profile that has never been published.",
+    profileStatus: "Draft",
+    basedInCity: "Kingston",
+    basedInRegion: null,
+    basedInCountryCode: "JM",
+    avatarUrl: null,
+    caribbeanAffiliationCodes: ["JM"],
+    specialtyKeys: ["Producer"],
+    offerings: [
+      {
+        slug: "negative-draft-profile-active-offering",
+        title: "Hidden active offering behind draft profile",
+        description: "Active offering whose seller profile is still in Draft.",
+        status: "Active",
+        serviceMode: "Remote",
+        primaryCategoryKey: "music-production",
+        genreTags: ["Dancehall"],
+        serviceAreas: [{ countryCode: "JM" }],
+      },
+    ],
+  },
+  {
+    // Suspended SellerProfile: the workspace is Active and Seller-capable,
+    // but the profile is suspended. The seller must not surface.
+    ownerEmail: "suspended.profile@ineligible.example",
+    workspaceSlug: "negative-suspended-profile",
+    workspaceName: "Negative Suspended Profile",
+    workspaceType: "Personal",
+    workspaceStatus: "Active",
+    workspaceCapabilities: ["Seller"],
+    professionalName: "Suspended Profile Seller",
+    bio: "Seller profile that has been suspended by moderation.",
+    profileStatus: "Suspended",
+    basedInCity: "Port of Spain",
+    basedInRegion: null,
+    basedInCountryCode: "TT",
+    avatarUrl: null,
+    caribbeanAffiliationCodes: ["TT"],
+    specialtyKeys: ["Artist"],
+    offerings: [
+      {
+        slug: "negative-suspended-profile-active-offering",
+        title: "Active offering behind suspended profile",
+        description: "Active offering that must be hidden by profile status.",
+        status: "Active",
+        serviceMode: "Hybrid",
+        primaryCategoryKey: "live-performance",
+        genreTags: ["Soca"],
+        serviceAreas: [{ countryCode: "TT" }],
+      },
+    ],
+  },
+  {
+    // Suspended Workspace: the workspace has been suspended. Even though
+    // the profile is Published and the offering is Active, the workspace
+    // status excludes the seller.
+    ownerEmail: "suspended.workspace@ineligible.example",
+    workspaceSlug: "negative-suspended-workspace",
+    workspaceName: "Negative Suspended Workspace",
+    workspaceType: "Personal",
+    workspaceStatus: "Suspended",
+    workspaceCapabilities: ["Seller"],
+    professionalName: "Suspended Workspace Seller",
+    bio: "Seller whose workspace has been suspended.",
+    profileStatus: "Published",
+    basedInCity: "Bridgetown",
+    basedInRegion: null,
+    basedInCountryCode: "BB",
+    avatarUrl: null,
+    caribbeanAffiliationCodes: ["BB"],
+    specialtyKeys: ["Musician"],
+    offerings: [
+      {
+        slug: "negative-suspended-workspace-active-offering",
+        title: "Active offering under a suspended workspace",
+        description: "Active offering that must be hidden by workspace status.",
+        status: "Active",
+        serviceMode: "Remote",
+        primaryCategoryKey: "mixing",
+        genreTags: ["Soca"],
+        serviceAreas: [{ countryCode: "BB" }],
+      },
+    ],
+  },
+  {
+    // Buyer-only workspace: no Seller capability. The profile is
+    // Published and the offering is Active, but the seller cannot sell.
+    ownerEmail: "buyer.only@ineligible.example",
+    workspaceSlug: "negative-buyer-only",
+    workspaceName: "Negative Buyer-Only Workspace",
+    workspaceType: "Organization",
+    workspaceStatus: "Active",
+    workspaceCapabilities: ["Buyer"],
+    professionalName: "Buyer-Only Seller Profile",
+    bio: "Seller profile on a buyer-only workspace.",
+    profileStatus: "Published",
+    basedInCity: "Georgetown",
+    basedInRegion: null,
+    basedInCountryCode: "GY",
+    avatarUrl: null,
+    caribbeanAffiliationCodes: ["GY"],
+    specialtyKeys: ["Producer"],
+    offerings: [
+      {
+        slug: "negative-buyer-only-active-offering",
+        title: "Active offering on a buyer-only workspace",
+        description: "Active offering that must be hidden by missing Seller capability.",
+        status: "Active",
+        serviceMode: "Remote",
+        primaryCategoryKey: "music-production",
+        genreTags: ["Reggae"],
+        serviceAreas: [{ countryCode: "GY" }],
+      },
+    ],
+  },
+  {
+    // Draft-only offerings: the seller is fully eligible, but every
+    // offering is still in Draft. The seller must not surface.
+    ownerEmail: "draft.offerings@ineligible.example",
+    workspaceSlug: "negative-draft-offerings",
+    workspaceName: "Negative Draft Offerings",
+    workspaceType: "Personal",
+    workspaceStatus: "Active",
+    workspaceCapabilities: ["Seller"],
+    professionalName: "Draft-Only Offerings Seller",
+    bio: "Seller whose offerings are all in Draft.",
+    profileStatus: "Published",
+    basedInCity: "Roseau",
+    basedInRegion: null,
+    basedInCountryCode: "DM",
+    avatarUrl: null,
+    caribbeanAffiliationCodes: ["DM"],
+    specialtyKeys: ["Songwriter"],
+    offerings: [
+      {
+        slug: "negative-draft-offerings-offering-a",
+        title: "Draft writing offering",
+        description: "Draft offering that must be hidden by lifecycle status.",
+        status: "Draft",
+        serviceMode: "Remote",
+        primaryCategoryKey: "songwriting",
+        genreTags: ["Reggae"],
+        serviceAreas: [{ countryCode: "DM" }],
+      },
+    ],
+  },
+  {
+    // Paused-only offerings: every offering is Paused. The seller is
+    // eligible, but no offering is Active; the seller must not surface.
+    ownerEmail: "paused.offerings@ineligible.example",
+    workspaceSlug: "negative-paused-offerings",
+    workspaceName: "Negative Paused Offerings",
+    workspaceType: "Personal",
+    workspaceStatus: "Active",
+    workspaceCapabilities: ["Seller"],
+    professionalName: "Paused-Only Offerings Seller",
+    bio: "Seller whose offerings are all Paused.",
+    profileStatus: "Published",
+    basedInCity: "Saint John's",
+    basedInRegion: null,
+    basedInCountryCode: "AG",
+    avatarUrl: null,
+    caribbeanAffiliationCodes: ["AG"],
+    specialtyKeys: ["Producer"],
+    offerings: [
+      {
+        slug: "negative-paused-offerings-offering-a",
+        title: "Paused production offering",
+        description: "Paused offering that must be hidden by lifecycle status.",
+        status: "Paused",
+        serviceMode: "Remote",
+        primaryCategoryKey: "music-production",
+        genreTags: ["Dancehall"],
+        serviceAreas: [{ countryCode: "AG" }],
+      },
+    ],
+  },
+  {
+    // Archived-only offerings: every offering is Archived. The seller
+    // is eligible, but no offering is Active; the seller must not surface.
+    ownerEmail: "archived.offerings@ineligible.example",
+    workspaceSlug: "negative-archived-offerings",
+    workspaceName: "Negative Archived Offerings",
+    workspaceType: "Personal",
+    workspaceStatus: "Active",
+    workspaceCapabilities: ["Seller"],
+    professionalName: "Archived-Only Offerings Seller",
+    bio: "Seller whose offerings are all Archived.",
+    profileStatus: "Published",
+    basedInCity: "Castries",
+    basedInRegion: null,
+    basedInCountryCode: "LC",
+    avatarUrl: null,
+    caribbeanAffiliationCodes: ["LC"],
+    specialtyKeys: ["SoundEngineer"],
+    offerings: [
+      {
+        slug: "negative-archived-offerings-offering-a",
+        title: "Archived mixing offering",
+        description: "Archived offering that must be hidden by lifecycle status.",
+        status: "Archived",
+        serviceMode: "Remote",
+        primaryCategoryKey: "mixing",
+        genreTags: ["Calypso"],
+        serviceAreas: [{ countryCode: "LC" }],
+      },
+    ],
+  },
+  {
+    // Mixed lifecycle: one Active offering and one Paused offering. Only
+    // the Active offering must surface; the Paused offering is hidden but
+    // the seller remains discoverable. The Paused offering's lifecycle
+    // proves the distinction between Paused (recoverable) and Archived
+    // (terminal).
+    ownerEmail: "mixed.paused@ineligible.example",
+    workspaceSlug: "negative-mixed-paused-offerings",
+    workspaceName: "Negative Mixed Paused Offerings",
+    workspaceType: "Personal",
+    workspaceStatus: "Active",
+    workspaceCapabilities: ["Seller"],
+    professionalName: "Mixed Paused Seller",
+    bio: "Seller with both Active and Paused offerings.",
+    profileStatus: "Published",
+    basedInCity: "Basseterre",
+    basedInRegion: null,
+    basedInCountryCode: "KN",
+    avatarUrl: null,
+    caribbeanAffiliationCodes: ["KN"],
+    specialtyKeys: ["Artist", "Musician"],
+    offerings: [
+      {
+        slug: "negative-mixed-paused-offering-active",
+        title: "Active session vocals for Caribbean releases",
+        description: "Active offering that must surface.",
+        status: "Active",
+        serviceMode: "Remote",
+        primaryCategoryKey: "session-vocals",
+        genreTags: ["Dancehall", "Soca"],
+        serviceAreas: [{ countryCode: "KN" }],
+      },
+      {
+        slug: "negative-mixed-paused-offering-paused",
+        title: "Paused songwriting add-on",
+        description: "Paused offering that must be hidden but the seller stays discoverable.",
+        status: "Paused",
+        serviceMode: "Remote",
+        primaryCategoryKey: "songwriting",
+        genreTags: ["Dancehall"],
+        serviceAreas: [{ countryCode: "KN" }],
+      },
+    ],
+  },
+  {
+    // Mixed lifecycle: one Active offering and one Archived offering.
+    // Only the Active offering must surface; the Archived offering is
+    // hidden and the seller remains discoverable.
+    ownerEmail: "mixed.archived@ineligible.example",
+    workspaceSlug: "negative-mixed-archived-offerings",
+    workspaceName: "Negative Mixed Archived Offerings",
+    workspaceType: "Personal",
+    workspaceStatus: "Active",
+    workspaceCapabilities: ["Seller"],
+    professionalName: "Mixed Archived Seller",
+    bio: "Seller with both Active and Archived offerings.",
+    profileStatus: "Published",
+    basedInCity: "Kingstown",
+    basedInRegion: null,
+    basedInCountryCode: "VC",
+    avatarUrl: null,
+    caribbeanAffiliationCodes: ["VC"],
+    specialtyKeys: ["Songwriter"],
+    offerings: [
+      {
+        slug: "negative-mixed-archived-offering-active",
+        title: "Active custom composition for releases",
+        description: "Active offering that must surface.",
+        status: "Active",
+        serviceMode: "Remote",
+        primaryCategoryKey: "custom-composition",
+        genreTags: ["Calypso"],
+        serviceAreas: [{ countryCode: "VC" }],
+      },
+      {
+        slug: "negative-mixed-archived-offering-archived",
+        title: "Archived production offering",
+        description: "Archived offering that must be hidden but the seller stays discoverable.",
+        status: "Archived",
+        serviceMode: "Remote",
+        primaryCategoryKey: "music-production",
+        genreTags: ["Calypso"],
+        serviceAreas: [{ countryCode: "VC" }],
       },
     ],
   },
@@ -470,6 +836,216 @@ function toSellerProfileId(slug: string): string {
 
 function toOfferingId(slug: string): string {
   return `of-${slug}`;
+}
+
+// applySellerGraph: the single source of truth for persisting a full
+// seller graph (UserAccount → Workspace → WorkspaceMembership →
+// WorkspaceCapability → SellerProfile → CaribbeanAffiliation →
+// SellerProfileSpecialty → ServiceOffering → ServiceOfferingServiceArea
+// → ServiceOfferingPricing; includedService rows are reset to empty
+// to match the M1.1 fixture).
+//
+// Both the canonical SELLERS (workspaceStatus "Active" + Seller
+// capability) and the M1.3 negative eligibility fixtures (deliberately
+// excluded states) flow through this helper. The differences are
+// captured by the `workspaceStatus` and `workspaceCapabilities` fields
+// on the seed plus the `profileStatus` field on the profile.
+//
+// The capability set is replaced (deleteMany + recreate) on every run
+// so a stale capability mutation from a previous fixture does not
+// persist. The same idempotent upsert pattern applies to the
+// CaribbeanAffiliation and SellerProfileSpecialty join rows.
+async function applySellerGraph(
+  tx: Prisma.TransactionClient,
+  seller: SellerGraphSeed,
+): Promise<void> {
+  const userId = toUserId(seller.ownerEmail);
+  const workspaceId = toWorkspaceId(seller.workspaceSlug);
+  const sellerProfileId = toSellerProfileId(seller.workspaceSlug);
+
+  const owner = await tx.userAccount.upsert({
+    where: { id: userId },
+    create: { id: userId, email: seller.ownerEmail },
+    // Restore the canonical email on every run so a stale email
+    // mutation is restored.
+    update: { email: seller.ownerEmail },
+  });
+
+  const workspace = await tx.workspace.upsert({
+    where: { slug: seller.workspaceSlug },
+    create: {
+      id: workspaceId,
+      slug: seller.workspaceSlug,
+      name: seller.workspaceName,
+      type: seller.workspaceType,
+      status: seller.workspaceStatus,
+      ownerUserId: owner.id,
+    },
+    // Restore the canonical ownerUserId and other fields on every run
+    // so a stale update cannot persist.
+    update: {
+      name: seller.workspaceName,
+      type: seller.workspaceType,
+      status: seller.workspaceStatus,
+      ownerUserId: owner.id,
+    },
+  });
+
+  await tx.workspaceMembership.upsert({
+    where: { userId_workspaceId: { userId: owner.id, workspaceId: workspace.id } },
+    create: { userId: owner.id, workspaceId: workspace.id, role: "Owner" },
+    update: { role: "Owner" },
+  });
+
+  // Replace the canonical capability set so re-running the seed
+  // converges on the approved capability set (canonical: ["Seller"];
+  // negative fixtures: ["Buyer"] or whatever the excluded state needs).
+  await tx.workspaceCapability.deleteMany({ where: { workspaceId: workspace.id } });
+  for (const capability of seller.workspaceCapabilities) {
+    await tx.workspaceCapability.create({
+      data: { workspaceId: workspace.id, capability },
+    });
+  }
+
+  const profile = await tx.sellerProfile.upsert({
+    where: { workspaceId: workspace.id },
+    create: {
+      id: sellerProfileId,
+      workspaceId: workspace.id,
+      professionalName: seller.professionalName,
+      bio: seller.bio,
+      status: seller.profileStatus,
+      basedInCity: seller.basedInCity,
+      basedInRegion: seller.basedInRegion,
+      basedInCountryCode: seller.basedInCountryCode,
+      avatarUrl: seller.avatarUrl,
+    },
+    update: {
+      professionalName: seller.professionalName,
+      bio: seller.bio,
+      status: seller.profileStatus,
+      basedInCity: seller.basedInCity,
+      basedInRegion: seller.basedInRegion,
+      basedInCountryCode: seller.basedInCountryCode,
+      avatarUrl: seller.avatarUrl,
+    },
+  });
+
+  // Caribbean affiliations: replace the canonical set, keyed on the
+  // (sellerProfileId, countryCode) unique constraint.
+  await tx.caribbeanAffiliation.deleteMany({ where: { sellerProfileId: profile.id } });
+  for (const countryCode of seller.caribbeanAffiliationCodes) {
+    await tx.caribbeanAffiliation.upsert({
+      where: { sellerProfileId_countryCode: { sellerProfileId: profile.id, countryCode } },
+      create: { sellerProfileId: profile.id, countryCode },
+      update: {},
+    });
+  }
+
+  // Specialties: replace the canonical set, keyed on the
+  // (sellerProfileId, specialtyId) composite key.
+  await tx.sellerProfileSpecialty.deleteMany({ where: { sellerProfileId: profile.id } });
+  for (const specialtyKey of seller.specialtyKeys) {
+    const specialty = await tx.specialty.findUnique({ where: { key: specialtyKey } });
+    if (!specialty) {
+      throw new Error(`Specialty ${specialtyKey} missing from controlled records`);
+    }
+    await tx.sellerProfileSpecialty.upsert({
+      where: {
+        sellerProfileId_specialtyId: {
+          sellerProfileId: profile.id,
+          specialtyId: specialty.id,
+        },
+      },
+      create: { sellerProfileId: profile.id, specialtyId: specialty.id },
+      update: {},
+    });
+  }
+
+  for (const offering of seller.offerings) {
+    const category = await tx.serviceCategory.findUnique({
+      where: { key: offering.primaryCategoryKey },
+    });
+    if (!category) {
+      throw new Error(
+        `ServiceCategory ${offering.primaryCategoryKey} missing from controlled records`,
+      );
+    }
+
+    await tx.serviceOffering.upsert({
+      where: { slug: offering.slug },
+      create: {
+        id: toOfferingId(offering.slug),
+        slug: offering.slug,
+        sellerProfileId: profile.id,
+        title: offering.title,
+        description: offering.description,
+        status: offering.status,
+        serviceMode: offering.serviceMode,
+        primaryCategoryId: category.id,
+        genreTags: [...offering.genreTags],
+      },
+      // Restore the canonical sellerProfileId and primaryCategoryId on
+      // every run so a stale update cannot persist.
+      update: {
+        title: offering.title,
+        description: offering.description,
+        status: offering.status,
+        serviceMode: offering.serviceMode,
+        sellerProfileId: profile.id,
+        primaryCategoryId: category.id,
+        genreTags: [...offering.genreTags],
+      },
+    });
+
+    const persisted = await tx.serviceOffering.findUnique({ where: { slug: offering.slug } });
+    if (!persisted) {
+      throw new Error(`Failed to persist offering ${offering.slug}`);
+    }
+
+    // Service areas: replace the canonical set.
+    await tx.serviceOfferingServiceArea.deleteMany({ where: { offeringId: persisted.id } });
+    for (const area of offering.serviceAreas) {
+      await tx.serviceOfferingServiceArea.create({
+        data: {
+          offeringId: persisted.id,
+          city: area.city ?? null,
+          region: area.region ?? null,
+          countryCode: area.countryCode,
+        },
+      });
+    }
+
+    // Pricing: replace the canonical single-row record.
+    await tx.serviceOfferingPricing.deleteMany({ where: { offeringId: persisted.id } });
+    if (offering.pricing) {
+      let unitId: string | null = null;
+      if (offering.pricing.unitKey) {
+        const unit = await tx.pricingUnit.findUnique({
+          where: { key: offering.pricing.unitKey },
+        });
+        if (!unit) {
+          throw new Error(
+            `PricingUnit ${offering.pricing.unitKey} missing from controlled records`,
+          );
+        }
+        unitId = unit.id;
+      }
+      await tx.serviceOfferingPricing.create({
+        data: {
+          offeringId: persisted.id,
+          kind: offering.pricing.kind,
+          amountMinor: offering.pricing.amountMinor ?? null,
+          currency: offering.pricing.currency ?? null,
+          unitId,
+        },
+      });
+    }
+
+    // Reset bundle-only IncludedServices (M1.1 ships with no bundles;
+    // future tickets will add them).
+    await tx.includedService.deleteMany({ where: { offeringId: persisted.id } });
+  }
 }
 
 async function applySeed(): Promise<void> {
@@ -501,193 +1077,24 @@ async function applySeed(): Promise<void> {
       });
     }
 
-    // Sellers and their full relationship graph.
+    // Sellers and their full relationship graph. The canonical SELLERS
+    // and the M1.3 negative fixtures share the same persistence flow;
+    // `applySellerGraph` (below) is the single source of truth and
+    // handles both sets.
     for (const seller of SELLERS) {
-      const userId = toUserId(seller.ownerEmail);
-      const workspaceId = toWorkspaceId(seller.workspaceSlug);
-      const sellerProfileId = toSellerProfileId(seller.workspaceSlug);
+      await applySellerGraph(tx, seller);
+    }
 
-      const owner = await tx.userAccount.upsert({
-        where: { id: userId },
-        create: { id: userId, email: seller.ownerEmail },
-        // Restore the canonical email on every run so a stale email
-        // mutation is restored.
-        update: { email: seller.ownerEmail },
-      });
-
-      const workspace = await tx.workspace.upsert({
-        where: { slug: seller.workspaceSlug },
-        create: {
-          id: workspaceId,
-          slug: seller.workspaceSlug,
-          name: seller.workspaceName,
-          type: seller.workspaceType,
-          status: "Active",
-          ownerUserId: owner.id,
-        },
-        // Restore the canonical ownerUserId and other fields on every run
-        // so a stale update cannot persist.
-        update: {
-          name: seller.workspaceName,
-          type: seller.workspaceType,
-          status: "Active",
-          ownerUserId: owner.id,
-        },
-      });
-
-      await tx.workspaceMembership.upsert({
-        where: { userId_workspaceId: { userId: owner.id, workspaceId: workspace.id } },
-        create: { userId: owner.id, workspaceId: workspace.id, role: "Owner" },
-        update: { role: "Owner" },
-      });
-
-      await tx.workspaceCapability.upsert({
-        where: {
-          workspaceId_capability: { workspaceId: workspace.id, capability: "Seller" },
-        },
-        create: { workspaceId: workspace.id, capability: "Seller" },
-        update: {},
-      });
-
-      const profile = await tx.sellerProfile.upsert({
-        where: { workspaceId: workspace.id },
-        create: {
-          id: sellerProfileId,
-          workspaceId: workspace.id,
-          professionalName: seller.professionalName,
-          bio: seller.bio,
-          status: seller.status,
-          basedInCity: seller.basedInCity,
-          basedInRegion: seller.basedInRegion,
-          basedInCountryCode: seller.basedInCountryCode,
-          avatarUrl: seller.avatarUrl,
-        },
-        update: {
-          professionalName: seller.professionalName,
-          bio: seller.bio,
-          status: seller.status,
-          basedInCity: seller.basedInCity,
-          basedInRegion: seller.basedInRegion,
-          basedInCountryCode: seller.basedInCountryCode,
-          avatarUrl: seller.avatarUrl,
-        },
-      });
-
-      // Caribbean affiliations: replace the canonical set, keyed on the
-      // (sellerProfileId, countryCode) unique constraint.
-      await tx.caribbeanAffiliation.deleteMany({ where: { sellerProfileId: profile.id } });
-      for (const countryCode of seller.caribbeanAffiliationCodes) {
-        await tx.caribbeanAffiliation.upsert({
-          where: { sellerProfileId_countryCode: { sellerProfileId: profile.id, countryCode } },
-          create: { sellerProfileId: profile.id, countryCode },
-          update: {},
-        });
-      }
-
-      // Specialties: replace the canonical set, keyed on the
-      // (sellerProfileId, specialtyId) composite key.
-      await tx.sellerProfileSpecialty.deleteMany({ where: { sellerProfileId: profile.id } });
-      for (const specialtyKey of seller.specialtyKeys) {
-        const specialty = await tx.specialty.findUnique({ where: { key: specialtyKey } });
-        if (!specialty) {
-          throw new Error(`Specialty ${specialtyKey} missing from controlled records`);
-        }
-        await tx.sellerProfileSpecialty.upsert({
-          where: {
-            sellerProfileId_specialtyId: {
-              sellerProfileId: profile.id,
-              specialtyId: specialty.id,
-            },
-          },
-          create: { sellerProfileId: profile.id, specialtyId: specialty.id },
-          update: {},
-        });
-      }
-
-      for (const offering of seller.offerings) {
-        const category = await tx.serviceCategory.findUnique({
-          where: { key: offering.primaryCategoryKey },
-        });
-        if (!category) {
-          throw new Error(
-            `ServiceCategory ${offering.primaryCategoryKey} missing from controlled records`,
-          );
-        }
-
-        await tx.serviceOffering.upsert({
-          where: { slug: offering.slug },
-          create: {
-            id: toOfferingId(offering.slug),
-            slug: offering.slug,
-            sellerProfileId: profile.id,
-            title: offering.title,
-            description: offering.description,
-            status: offering.status,
-            serviceMode: offering.serviceMode,
-            primaryCategoryId: category.id,
-            genreTags: [...offering.genreTags],
-          },
-          // Restore the canonical sellerProfileId and primaryCategoryId on
-          // every run so a stale update cannot persist.
-          update: {
-            title: offering.title,
-            description: offering.description,
-            status: offering.status,
-            serviceMode: offering.serviceMode,
-            sellerProfileId: profile.id,
-            primaryCategoryId: category.id,
-            genreTags: [...offering.genreTags],
-          },
-        });
-
-        const persisted = await tx.serviceOffering.findUnique({ where: { slug: offering.slug } });
-        if (!persisted) {
-          throw new Error(`Failed to persist offering ${offering.slug}`);
-        }
-
-        // Service areas: replace the canonical set.
-        await tx.serviceOfferingServiceArea.deleteMany({ where: { offeringId: persisted.id } });
-        for (const area of offering.serviceAreas) {
-          await tx.serviceOfferingServiceArea.create({
-            data: {
-              offeringId: persisted.id,
-              city: area.city ?? null,
-              region: area.region ?? null,
-              countryCode: area.countryCode,
-            },
-          });
-        }
-
-        // Pricing: replace the canonical single-row record.
-        await tx.serviceOfferingPricing.deleteMany({ where: { offeringId: persisted.id } });
-        if (offering.pricing) {
-          let unitId: string | null = null;
-          if (offering.pricing.unitKey) {
-            const unit = await tx.pricingUnit.findUnique({
-              where: { key: offering.pricing.unitKey },
-            });
-            if (!unit) {
-              throw new Error(
-                `PricingUnit ${offering.pricing.unitKey} missing from controlled records`,
-              );
-            }
-            unitId = unit.id;
-          }
-          await tx.serviceOfferingPricing.create({
-            data: {
-              offeringId: persisted.id,
-              kind: offering.pricing.kind,
-              amountMinor: offering.pricing.amountMinor ?? null,
-              currency: offering.pricing.currency ?? null,
-              unitId,
-            },
-          });
-        }
-
-        // Reset bundle-only IncludedServices (M1.1 ships with no bundles;
-        // future tickets will add them).
-        await tx.includedService.deleteMany({ where: { offeringId: persisted.id } });
-      }
+    // M1.3 negative eligibility fixtures. These deliberately cover every
+    // excluded state called out by issue #4 and are seeded with stable
+    // IDs so repository integration tests can reference them by primary
+    // M1.3 negative eligibility fixtures. These deliberately cover every
+    // excluded state called out by issue #4 and are seeded with stable
+    // IDs so repository integration tests can reference them by primary
+    // key. They are NOT included in the canonical SELLERS array, so the
+    // canonical snapshot assertion is unchanged.
+    for (const fixture of NEGATIVE_FIXTURES) {
+      await applySellerGraph(tx, fixture);
     }
   });
 }
@@ -1033,9 +1440,9 @@ export function assertCanonicalSnapshotCorrect(snapshot: CanonicalSnapshot): voi
         `SellerProfile.avatarUrl drifted for ${seller.workspaceSlug}: expected ${JSON.stringify(seller.avatarUrl)} got ${JSON.stringify(actual.avatarUrl)}`,
       );
     }
-    if (actual.status !== seller.status) {
+    if (actual.status !== seller.profileStatus) {
       throw new Error(
-        `SellerProfile ${seller.workspaceSlug}.status drifted: expected ${seller.status} got ${actual.status}`,
+        `SellerProfile ${seller.workspaceSlug}.status drifted: expected ${seller.profileStatus} got ${actual.status}`,
       );
     }
     if (actual.basedInCity !== seller.basedInCity) {

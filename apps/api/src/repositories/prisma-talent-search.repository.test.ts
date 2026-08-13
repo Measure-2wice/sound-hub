@@ -472,3 +472,186 @@ describe("PrismaTalentSearchRepository", () => {
     assert.equal(didMutate, true, "mutation should have happened before the intentional failure");
   });
 });
+
+// M1.3 negative eligibility fixtures.
+//
+// The seed's NEGATIVE_FIXTURES array adds deterministic excluded-state
+// rows (Draft/Suspended profiles, Suspended workspaces, Buyer-only
+// workspaces, Draft/Paused/Archived-only offerings, and sellers with
+// mixed lifecycle offerings) with stable IDs. These tests reference
+// those IDs directly instead of mutating canonical state, so the
+// excluded-state assertions are stable across runs.
+//
+// The negative fixture IDs follow the prefix `sp-negative-*` and
+// `of-negative-*` so a reader can grep from the seed file directly.
+describe("PrismaTalentSearchRepository M1.3 negative eligibility fixtures", () => {
+  const NEGATIVE_SELLER_IDS = [
+    "sp-negative-draft-profile",
+    "sp-negative-suspended-profile",
+    "sp-negative-suspended-workspace",
+    "sp-negative-buyer-only",
+    "sp-negative-draft-offerings",
+    "sp-negative-paused-offerings",
+    "sp-negative-archived-offerings",
+    "sp-negative-mixed-paused-offerings",
+    "sp-negative-mixed-archived-offerings",
+  ];
+
+  test("the M1.3 negative fixtures are seeded with stable IDs", async () => {
+    const prisma = createTestPrismaClient();
+    try {
+      for (const sellerProfileId of NEGATIVE_SELLER_IDS) {
+        const found = await prisma.sellerProfile.findUnique({ where: { id: sellerProfileId } });
+        assert.ok(found, `expected negative fixture seller profile ${sellerProfileId}`);
+      }
+    } finally {
+      await prisma.$disconnect();
+    }
+  });
+
+  test("a Draft SellerProfile is excluded even when the workspace and offering are eligible", async () => {
+    const candidates = await repository.search(EMPTY_INPUT);
+    const sellerIds = candidates.map((s) => s.sellerId);
+    assert.ok(
+      !sellerIds.includes("sp-negative-draft-profile"),
+      "Draft profile must not surface regardless of workspace status or offering status",
+    );
+  });
+
+  test("a Suspended SellerProfile is excluded", async () => {
+    const candidates = await repository.search(EMPTY_INPUT);
+    const sellerIds = candidates.map((s) => s.sellerId);
+    assert.ok(!sellerIds.includes("sp-negative-suspended-profile"));
+  });
+
+  test("a SellerProfile under a Suspended Workspace is excluded", async () => {
+    const candidates = await repository.search(EMPTY_INPUT);
+    const sellerIds = candidates.map((s) => s.sellerId);
+    assert.ok(!sellerIds.includes("sp-negative-suspended-workspace"));
+  });
+
+  test("a SellerProfile whose Workspace lacks the Seller capability is excluded", async () => {
+    const candidates = await repository.search(EMPTY_INPUT);
+    const sellerIds = candidates.map((s) => s.sellerId);
+    assert.ok(!sellerIds.includes("sp-negative-buyer-only"));
+  });
+
+  test("a Seller whose only offerings are Draft is excluded", async () => {
+    const candidates = await repository.search(EMPTY_INPUT);
+    const sellerIds = candidates.map((s) => s.sellerId);
+    assert.ok(!sellerIds.includes("sp-negative-draft-offerings"));
+  });
+
+  test("a Seller whose only offerings are Paused is excluded", async () => {
+    const candidates = await repository.search(EMPTY_INPUT);
+    const sellerIds = candidates.map((s) => s.sellerId);
+    assert.ok(!sellerIds.includes("sp-negative-paused-offerings"));
+  });
+
+  test("a Seller whose only offerings are Archived is excluded", async () => {
+    const candidates = await repository.search(EMPTY_INPUT);
+    const sellerIds = candidates.map((s) => s.sellerId);
+    assert.ok(!sellerIds.includes("sp-negative-archived-offerings"));
+  });
+
+  test("Paused and Archived offerings are excluded from the public candidate set even when the seller is otherwise eligible", async () => {
+    const candidates = await repository.search(EMPTY_INPUT);
+    const allOfferingIds = candidates.flatMap((s) => s.offerings.map((o) => o.offeringId));
+    assert.ok(
+      !allOfferingIds.includes("of-negative-mixed-paused-offering-paused"),
+      "Paused offering must not surface in the public candidate set",
+    );
+    assert.ok(
+      !allOfferingIds.includes("of-negative-mixed-archived-offering-archived"),
+      "Archived offering must not surface in the public candidate set",
+    );
+  });
+
+  test("a seller with mixed Active and Paused offerings surfaces only the Active offering (Paused is hidden but the seller is discoverable)", async () => {
+    const candidates = await repository.search(EMPTY_INPUT);
+    const seller = candidates.find((s) => s.sellerId === "sp-negative-mixed-paused-offerings");
+    assert.ok(seller, "a seller with at least one Active offering must remain discoverable");
+    const offeringIds = seller.offerings.map((o) => o.offeringId);
+    assert.deepEqual(offeringIds, ["of-negative-mixed-paused-offering-active"]);
+  });
+
+  test("a seller with mixed Active and Archived offerings surfaces only the Active offering (Archived is hidden but the seller is discoverable)", async () => {
+    const candidates = await repository.search(EMPTY_INPUT);
+    const seller = candidates.find((s) => s.sellerId === "sp-negative-mixed-archived-offerings");
+    assert.ok(seller, "a seller with at least one Active offering must remain discoverable");
+    const offeringIds = seller.offerings.map((o) => o.offeringId);
+    assert.deepEqual(offeringIds, ["of-negative-mixed-archived-offering-active"]);
+  });
+
+  test("Paused and Archived offerings are distinguishable by status on the underlying row (Paused is recoverable, Archived is terminal)", async () => {
+    // Paused and Archived both surface as non-Active, but the data model
+    // preserves the distinction so the seller can recover a Paused
+    // offering without confusing it with a terminal Archived record.
+    // The repository hides both from search; the persistence layer
+    // keeps the lifecycle value so other consumers (and the seed) can
+    // observe it.
+    const prisma = createTestPrismaClient();
+    try {
+      const paused = await prisma.serviceOffering.findUnique({
+        where: { id: "of-negative-mixed-paused-offering-paused" },
+      });
+      const archived = await prisma.serviceOffering.findUnique({
+        where: { id: "of-negative-mixed-archived-offering-archived" },
+      });
+      assert.ok(paused);
+      assert.ok(archived);
+      assert.equal(paused.status, ServiceOfferingStatus.Paused);
+      assert.equal(archived.status, ServiceOfferingStatus.Archived);
+      assert.notEqual(paused.status, archived.status);
+    } finally {
+      await prisma.$disconnect();
+    }
+  });
+
+  test("an Active offering under a Suspended profile is never returned (status chain)", async () => {
+    // Even a query that explicitly requires music-production must not
+    // surface the Draft-profile seller. The eligibility chain
+    // (Workspace → Profile → Offering) is enforced even when an
+    // offering-level filter would otherwise match.
+    const candidates = await repository.search({
+      ...EMPTY_INPUT,
+      primaryCategoryKeys: ["music-production"],
+    });
+    const sellerIds = candidates.map((s) => s.sellerId);
+    assert.ok(!sellerIds.includes("sp-negative-draft-profile"));
+    assert.ok(!sellerIds.includes("sp-negative-suspended-profile"));
+    assert.ok(!sellerIds.includes("sp-negative-buyer-only"));
+  });
+
+  test("an Active offering under a Suspended workspace is never returned", async () => {
+    const candidates = await repository.search({
+      ...EMPTY_INPUT,
+      primaryCategoryKeys: ["mixing"],
+    });
+    const sellerIds = candidates.map((s) => s.sellerId);
+    assert.ok(!sellerIds.includes("sp-negative-suspended-workspace"));
+  });
+
+  test("eligibility is consistent across all 9 negative fixture IDs (none surface, none leak partial state)", async () => {
+    const candidates = await repository.search(EMPTY_INPUT);
+    const surfacedNegative = candidates.filter((s) => NEGATIVE_SELLER_IDS.includes(s.sellerId));
+    // Only the two mixed-lifecycle sellers may surface, and only with
+    // their Active offering. All other negative fixtures must be
+    // entirely absent.
+    const allowedNegativeIds = new Set([
+      "sp-negative-mixed-paused-offerings",
+      "sp-negative-mixed-archived-offerings",
+    ]);
+    for (const seller of surfacedNegative) {
+      assert.ok(
+        allowedNegativeIds.has(seller.sellerId),
+        `unexpected negative fixture surfaced: ${seller.sellerId}`,
+      );
+    }
+    for (const allowedId of allowedNegativeIds) {
+      const seller = surfacedNegative.find((s) => s.sellerId === allowedId);
+      assert.ok(seller, `expected mixed-lifecycle seller ${allowedId} to be discoverable`);
+      assert.equal(seller.offerings.length, 1, "only the Active offering must surface");
+    }
+  });
+});
