@@ -55,6 +55,11 @@ export default defineConfig({
         "postgresql://soundhub:password@localhost:5433/soundhub_m1_test",
       NODE_ENV: "test",
       FRONTEND_URL: BASE_URL,
+      // The deterministic seed stores the canonical non-null avatar
+      // fixture as an absolute URL composed from PUBLIC_FIXTURE_ORIGIN.
+      // Match the origin the browser will actually request from so the
+      // seeded URL resolves end to end (contract requires `z.string().url()`).
+      PUBLIC_FIXTURE_ORIGIN: BASE_URL,
       PORT_WEB: String(PORT_WEB),
     },
   },

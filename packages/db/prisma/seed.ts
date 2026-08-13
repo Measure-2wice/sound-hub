@@ -3,7 +3,7 @@
 // The seed runs on every invocation and converges the canonical M1.1
 // fixture state to its approved values via deterministic upserts on
 // stable unique keys. The canonical state is the closed set of
-// 10 ServiceCategories, 5 Specialties, 6 PricingUnits, and 7 sellers
+// 10 ServiceCategories, 5 Specialties, 6 PricingUnits, and 8 sellers
 // (with their full UserAccount / Workspace / WorkspaceMembership /
 // WorkspaceCapability / SellerProfile / CaribbeanAffiliation /
 // SellerProfileSpecialty / ServiceOffering / ServiceOfferingServiceArea
@@ -38,6 +38,37 @@ const connectionString = process.env.DATABASE_URL;
 if (!connectionString) {
   throw new Error("DATABASE_URL is required to run the seed");
 }
+
+// The public seller contract (packages/types/src/index.ts) requires
+// `avatarUrl` to be a parseable absolute URL (`z.string().url()`). The
+// canonical non-null avatar fixture is therefore seeded as an absolute
+// URL composed from a configurable fixture origin plus the path under
+// `apps/web/public/fixtures/...` that the Next.js static handler serves.
+//
+// The default origin matches the local Next.js dev server (`pnpm dev`)
+// and the FRONTEND_URL that the M1 Playwright harness passes to both the
+// API and the browser, so the seeded URL resolves end to end in the
+// smoke-test environment. Operators and CI override it by exporting
+// PUBLIC_FIXTURE_ORIGIN.
+function resolveFixtureOrigin(): string {
+  const raw = process.env.PUBLIC_FIXTURE_ORIGIN ?? "http://localhost:3000";
+  let parsed: URL;
+  try {
+    parsed = new URL(raw);
+  } catch (err) {
+    throw new Error(
+      `PUBLIC_FIXTURE_ORIGIN is not a valid absolute URL: ${raw} (${
+        err instanceof Error ? err.message : String(err)
+      })`,
+    );
+  }
+  if (parsed.protocol !== "http:" && parsed.protocol !== "https:") {
+    throw new Error(`PUBLIC_FIXTURE_ORIGIN must use http(s): got protocol ${parsed.protocol}`);
+  }
+  return parsed.origin;
+}
+
+const FIXTURE_ORIGIN = resolveFixtureOrigin();
 
 const prisma = new PrismaClient({
   adapter: new PrismaPg({ connectionString }),
@@ -210,7 +241,18 @@ const SELLERS: readonly SellerSeed[] = [
     basedInCity: "Toronto",
     basedInRegion: "ON",
     basedInCountryCode: "CA",
-    avatarUrl: null,
+    // Edge fixture: `avatarUrl` is an approved optional field of the public
+    // seller contract, so the non-null case is a distinct public
+    // professional-identity presentation. Every other seeded seller leaves it
+    // null, which kept the rendered-avatar path unproven end to end. The URL
+    // is stored as an absolute URL (contract: `z.string().url()`) composed
+    // from a configurable fixture origin plus the path under
+    // `apps/web/public/fixtures/...` that the Next.js static handler
+    // serves. The default origin matches the local Next.js dev server and
+    // the FRONTEND_URL that the M1 Playwright harness passes to both the
+    // API and the browser, so the seeded URL resolves end to end in the
+    // smoke-test environment.
+    avatarUrl: `${FIXTURE_ORIGIN}/fixtures/sellers/keisha-williams/avatar.svg`,
     caribbeanAffiliationCodes: ["JM"],
     specialtyKeys: ["Songwriter", "Artist"],
     offerings: [
@@ -372,6 +414,39 @@ const SELLERS: readonly SellerSeed[] = [
         genreTags: ["Junkanoo", "Dancehall", "Calypso"],
         pricing: { kind: "ContactForQuote" },
         serviceAreas: [{ countryCode: "BS" }, { countryCode: "US" }],
+      },
+    ],
+  },
+  {
+    // Edge fixture: an Active, fully eligible offering that advertises no
+    // pricing at all. The public contract makes `pricing` optional, so the
+    // absent case is a distinct buyer-facing presentation alongside
+    // StartingAt, Fixed, and ContactForQuote. Seeding it keeps that path
+    // exercised end to end instead of only in unit fixtures.
+    ownerEmail: "anika@anikacharles.example",
+    workspaceSlug: "anika-charles-mastering",
+    workspaceName: "Anika Charles Mastering",
+    workspaceType: "Personal",
+    professionalName: "Anika Charles",
+    bio: "Grenadian mastering engineer preparing streaming-ready masters for independent Caribbean labels.",
+    status: "Published",
+    basedInCity: "St. George's",
+    basedInRegion: null,
+    basedInCountryCode: "GD",
+    avatarUrl: null,
+    caribbeanAffiliationCodes: ["GD"],
+    specialtyKeys: ["SoundEngineer"],
+    offerings: [
+      {
+        slug: "anika-streaming-master",
+        title: "Streaming-ready mastering for Caribbean releases",
+        description:
+          "Loudness-matched masters delivered for streaming platforms; pricing is discussed per release.",
+        status: "Active",
+        serviceMode: "Remote",
+        primaryCategoryKey: "mastering",
+        genreTags: ["Soca", "Calypso", "Reggae"],
+        serviceAreas: [{ countryCode: "GD" }, { countryCode: "TT" }],
       },
     ],
   },

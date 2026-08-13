@@ -8,6 +8,9 @@ export default [
     ignores: [
       "**/dist/**",
       "**/.next/**",
+      // The web app builds dev output into `.next-dev` to keep it isolated
+      // from `.next` build output. Both are generated and gitignored.
+      "**/.next-dev/**",
       "**/node_modules/**",
       "packages/db/src/generated/**",
       "apps/web/next-env.d.ts",

@@ -10,6 +10,7 @@ import {
 } from "../repositories/in-memory-talent-search.repository.js";
 import {
   talentSearchRequestV1Schema,
+  talentSearchResponseV1Schema,
   type SellerProfileStatusV1,
   type ServiceOfferingStatusV1,
   type WorkspaceStatusV1,
@@ -673,18 +674,183 @@ describe("TalentSearchService", () => {
     assert.doesNotMatch(reason, /ai|artificial|intelligence|confidence|guarantee|quality/i);
   });
 
-  test("public DTO excludes private fields", async () => {
+  // The public DTO boundary is an allow-list, not a deny-list. Asserting that a
+  // handful of guessed private names are `undefined` passes vacuously for any
+  // field nobody thought to guess. These tests instead pin the key sets and
+  // prove that private data present on the internal candidate cannot reach the
+  // response even when the repository supplies it.
+  //
+  // The invariant is "no key outside the allow-list, and every required key
+  // present" rather than one exact key list, because optional fields
+  // (avatarUrl, pricing, basedIn.city/region) are legitimately absent for some
+  // fixtures. Pinning one exact list would couple these tests to whichever
+  // seller happens to rank first and would break when issue #6 changes ranking,
+  // without that failure meaning anything leaked.
+
+  const REQUIRED_SELLER_KEYS = [
+    "basedIn",
+    "bio",
+    "caribbeanAffiliationCodes",
+    "professionalName",
+    "sellerId",
+    "specialties",
+  ] as const;
+  const OPTIONAL_SELLER_KEYS = ["avatarUrl"] as const;
+
+  const REQUIRED_OFFERING_KEYS = [
+    "description",
+    "genreTags",
+    "includedServices",
+    "offeringId",
+    "primaryCategory",
+    "serviceAreas",
+    "serviceMode",
+    "title",
+  ] as const;
+  const OPTIONAL_OFFERING_KEYS = ["pricing"] as const;
+
+  function assertKeysWithinAllowList(
+    actual: object,
+    required: readonly string[],
+    optional: readonly string[],
+    label: string,
+  ): void {
+    const keys = Object.keys(actual);
+    const allowed = new Set<string>([...required, ...optional]);
+    for (const key of keys) {
+      assert.ok(allowed.has(key), `${label} exposed non-allow-listed key ${key}`);
+    }
+    for (const key of required) {
+      assert.ok(keys.includes(key), `${label} is missing required public key ${key}`);
+    }
+  }
+
+  test("every public seller DTO exposes only allow-listed keys", async () => {
     const service = new TalentSearchService(new InMemoryTalentSearchRepository(buildFixture()));
     const response = await service.search({ query: "Haitian dancehall single production" });
-    const result = response.results[0]!;
-    const seller = result.seller as unknown as Record<string, unknown>;
-    assert.equal(seller["email"], undefined);
-    assert.equal(seller["workspaceId"], undefined);
-    assert.equal(seller["vibeEmbeddingVector"], undefined);
-    assert.equal(seller["password"], undefined);
-    const offering = result.bestMatchingOffering as unknown as Record<string, unknown>;
-    assert.equal(offering["s3Key"], undefined);
-    assert.equal(offering["embedding"], undefined);
+    assert.ok(response.results.length > 0);
+    for (const result of response.results) {
+      assertKeysWithinAllowList(
+        result.seller,
+        REQUIRED_SELLER_KEYS,
+        OPTIONAL_SELLER_KEYS,
+        "seller DTO",
+      );
+      assertKeysWithinAllowList(
+        result.seller.basedIn,
+        ["countryCode"],
+        ["city", "region"],
+        "seller basedIn",
+      );
+    }
+  });
+
+  test("every public offering DTO exposes only allow-listed keys", async () => {
+    const service = new TalentSearchService(new InMemoryTalentSearchRepository(buildFixture()));
+    const response = await service.search({ query: "Haitian dancehall single production" });
+    assert.ok(response.results.length > 0);
+    for (const result of response.results) {
+      for (const offering of [result.bestMatchingOffering, ...result.additionalMatchingOfferings]) {
+        assertKeysWithinAllowList(
+          offering,
+          REQUIRED_OFFERING_KEYS,
+          OPTIONAL_OFFERING_KEYS,
+          "offering DTO",
+        );
+        for (const area of offering.serviceAreas) {
+          assertKeysWithinAllowList(area, ["countryCode"], ["city", "region"], "serviceArea");
+        }
+      }
+    }
+  });
+
+  test("account, membership, wallet, embedding, storage, and private timestamp fields cannot leak", async () => {
+    // Poison the internal candidate with every private field class named by the
+    // contract's privacy boundary. The repository type does not declare these,
+    // so the cast models a persistence layer that over-selects.
+    const fixture = buildFixture();
+    const poisoned = {
+      ...fixture.sellers[0]!,
+      email: "private@example.com",
+      passwordHash: "hashed-secret",
+      ownerUserId: "user-private",
+      memberships: [{ userId: "user-private", role: "Owner" }],
+      walletAddress: "0xdeadbeef",
+      walletAuthorization: { challenge: "nonce" },
+      embedding: [0.1, 0.2, 0.3],
+      vectorMetadata: { namespace: "sellers" },
+      s3Key: "private/bucket/key.wav",
+      storageLocation: "s3://private/key",
+      createdAt: new Date("2020-01-01T00:00:00.000Z"),
+      updatedAt: new Date("2020-01-02T00:00:00.000Z"),
+      offerings: fixture.sellers[0]!.offerings.map((offering) => ({
+        ...offering,
+        embedding: [0.4, 0.5],
+        s3Key: "private/offering.wav",
+        createdAt: new Date("2020-01-03T00:00:00.000Z"),
+        updatedAt: new Date("2020-01-04T00:00:00.000Z"),
+        internalCostMinor: 1234,
+      })),
+    } as unknown as InMemorySeller;
+
+    const service = new TalentSearchService(
+      new InMemoryTalentSearchRepository({
+        ...fixture,
+        sellers: [poisoned, ...fixture.sellers.slice(1)],
+      }),
+    );
+    const response = await service.search({ query: "Haitian dancehall single production" });
+    assert.ok(response.results.length > 0);
+
+    // Serializing the whole response is the real leak surface: it catches a
+    // private value nested anywhere, not just at the top level.
+    const serialized = JSON.stringify(response);
+    for (const secret of [
+      "private@example.com",
+      "hashed-secret",
+      "user-private",
+      "0xdeadbeef",
+      "nonce",
+      "vectorMetadata",
+      "private/bucket/key.wav",
+      "s3://private/key",
+      "private/offering.wav",
+      "internalCostMinor",
+      "2020-01-01",
+      "2020-01-03",
+    ]) {
+      assert.equal(
+        serialized.includes(secret),
+        false,
+        `private value ${secret} leaked into the public response`,
+      );
+    }
+
+    // Key-level proof for the field classes the contract names explicitly.
+    const seller = response.results[0]!.seller as unknown as Record<string, unknown>;
+    const offering = response.results[0]!.bestMatchingOffering as unknown as Record<
+      string,
+      unknown
+    >;
+    for (const key of [
+      "email",
+      "passwordHash",
+      "ownerUserId",
+      "workspaceId",
+      "memberships",
+      "walletAddress",
+      "walletAuthorization",
+      "embedding",
+      "vectorMetadata",
+      "s3Key",
+      "storageLocation",
+      "createdAt",
+      "updatedAt",
+      "status",
+    ]) {
+      assert.equal(key in seller, false, `seller DTO exposed private key ${key}`);
+      assert.equal(key in offering, false, `offering DTO exposed private key ${key}`);
+    }
   });
 
   test("empty results return 200 with empty array and do not relax constraints", async () => {
@@ -721,5 +887,139 @@ describe("TalentSearchService", () => {
     const service = new TalentSearchService(new InMemoryTalentSearchRepository(buildFixture()));
     const response = await service.search({ query: "obscure-thing" });
     assert.equal(response.results.length, 0);
+  });
+
+  // M1.2 regression: `avatarUrl` is an approved optional field of the public
+  // seller contract, and the schema requires `z.string().url()` (an absolute
+  // URL). The deterministic seed stores the canonical non-null avatar
+  // fixture as an absolute URL composed from PUBLIC_FIXTURE_ORIGIN plus the
+  // path under `apps/web/public/fixtures/...`. This test pins the public
+  // DTO boundary end to end: a non-null absolute avatar URL passes through
+  // the service and the entire response validates against the strict
+  // public schema.
+  test("a non-null absolute avatarUrl survives the public DTO mapping and validates against the schema", async () => {
+    const absoluteAvatarUrl = "http://localhost:3000/fixtures/sellers/keisha-williams/avatar.svg";
+    const keishaOffering: InMemoryOffering = {
+      offeringId: "offering-keisha-topline",
+      title: "Afrobeats and R&B topline writing — remote",
+      description: "Original topline writing for a single.",
+      status: "Active",
+      serviceMode: "Remote",
+      primaryCategory: { key: "songwriting", name: "Songwriting", bundleOnly: false },
+      includedServices: [],
+      genreTags: ["R&B", "Afrobeats", "Pop"],
+      serviceAreas: [{ city: null, region: null, countryCode: "CA" }],
+      pricing: {
+        kind: "Fixed",
+        amountMinor: 120000,
+        currency: "USD",
+        unitKey: "track",
+      },
+    };
+    const keisha: InMemorySeller = {
+      sellerId: "seller-keisha-toronto",
+      workspaceId: "workspace-keisha",
+      professionalName: "Keisha Williams",
+      bio: "Toronto-based Jamaican songwriter.",
+      status: "Published",
+      basedInCity: "Toronto",
+      basedInRegion: "ON",
+      basedInCountryCode: "CA",
+      avatarUrl: absoluteAvatarUrl,
+      specialtyKeys: ["Songwriter", "Artist"],
+      caribbeanAffiliationCodes: ["JM"],
+      workspaceStatus: "Active",
+      workspaceHasSellerCapability: true,
+      offerings: [keishaOffering],
+    };
+    const service = new TalentSearchService(
+      new InMemoryTalentSearchRepository({
+        sellers: [keisha],
+        controlledKeys: {
+          serviceCategoryKeys: ["songwriting"],
+          specialtyKeys: ["Songwriter", "Artist"],
+          pricingUnitKeys: ["track"],
+        },
+      }),
+    );
+
+    const response = await service.search({ query: "Afrobeats topline writing" });
+    assert.equal(response.results.length, 1);
+    const [result] = response.results;
+    assert.ok(result);
+    assert.equal(result.seller.avatarUrl, absoluteAvatarUrl);
+
+    // The whole response (including the non-null avatar) must parse
+    // against the strict public schema. Without an absolute URL, this
+    // safeParse would fail with a `z.string().url()` issue and the
+    // route would return SEARCH_FAILED 500.
+    const parsed = talentSearchResponseV1Schema.safeParse(response);
+    assert.equal(
+      parsed.success,
+      true,
+      `public response failed schema validation: ${parsed.success ? "" : JSON.stringify(parsed.error.issues)}`,
+    );
+    if (parsed.success) {
+      const seller = parsed.data.results[0]?.seller;
+      assert.ok(seller);
+      // Schema is `.strict()`, so the avatarUrl must round-trip exactly.
+      assert.equal(seller.avatarUrl, absoluteAvatarUrl);
+    }
+
+    // Independent URL parse check: the seeded value is an absolute URL,
+    // not a relative path like `/fixtures/sellers/...`.
+    const url = new URL(absoluteAvatarUrl);
+    assert.equal(url.protocol, "http:");
+    assert.equal(url.pathname, "/fixtures/sellers/keisha-williams/avatar.svg");
+  });
+
+  // M1.2 negative regression: if a seller ever leaks a relative URL
+  // through to the public DTO, the strict `z.string().url()` schema must
+  // reject it. Pinning this contract prevents the canonical non-null
+  // avatar fixture from silently regressing back to a relative path.
+  test("a relative avatarUrl is rejected by the strict public schema", () => {
+    const relativeAvatar = "/fixtures/sellers/keisha-williams/avatar.svg";
+    const parsed = talentSearchResponseV1Schema.safeParse({
+      results: [
+        {
+          seller: {
+            sellerId: "seller-x",
+            professionalName: "Test Seller",
+            specialties: ["Songwriter"],
+            bio: "",
+            basedIn: { countryCode: "CA" },
+            caribbeanAffiliationCodes: ["JM"],
+            avatarUrl: relativeAvatar,
+          },
+          bestMatchingOffering: {
+            offeringId: "of-x",
+            title: "X",
+            description: "",
+            primaryCategory: { key: "songwriting", name: "Songwriting" },
+            includedServices: [],
+            genreTags: [],
+            serviceMode: "Remote",
+            serviceAreas: [{ countryCode: "CA" }],
+          },
+          additionalMatchingOfferings: [],
+          relevanceScore: 1,
+          matchReason: "matched",
+        },
+      ],
+      metadata: {
+        totalResults: 1,
+        processingTimeMs: 0,
+        strategy: "postgres-text-v1",
+        appliedRequiredCriteria: {},
+        appliedPreferredCriteria: {},
+      },
+    });
+    assert.equal(parsed.success, false);
+    if (!parsed.success) {
+      assert.ok(
+        parsed.error.issues.some((issue) => issue.path.join(".") === "results.0.seller.avatarUrl"),
+        `expected avatarUrl rejection, got ${JSON.stringify(parsed.error.issues)}`,
+      );
+    }
   });
 });

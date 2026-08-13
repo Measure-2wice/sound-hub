@@ -4,6 +4,7 @@ import { useState, type FormEvent } from "react";
 import { useSearch } from "../hooks/useSearch";
 import { Card } from "./ui/Card";
 import { SearchForm } from "./SearchForm";
+import { formatPricing } from "../lib/pricing";
 import type { TalentSearchResultV1 } from "@soundhub/types";
 
 export function SearchPage() {
@@ -106,49 +107,130 @@ function ResultCard({ result }: { result: TalentSearchResultV1 }) {
       data-testid="result-card"
     >
       <Card.Header>
-        <Card.Title data-testid="result-seller-name">{seller.professionalName}</Card.Title>
+        {/* `avatarUrl` is an approved optional field of the public seller
+            contract, so it is part of the seller's public professional
+            identity. It is rendered only when present, carries the
+            professional name as its accessible label, and exposes no
+            account, membership, or storage internals. */}
+        <div className="flex items-center gap-3">
+          {seller.avatarUrl && (
+            /* eslint-disable-next-line @next/next/no-img-element -- the
+               contract returns an arbitrary approved absolute URL, which the
+               Next image loader would require host allow-listing for. */
+            <img
+              src={seller.avatarUrl}
+              alt={`${seller.professionalName} profile image`}
+              className="h-12 w-12 rounded-full object-cover bg-gray-100"
+              width={48}
+              height={48}
+              loading="lazy"
+              referrerPolicy="no-referrer"
+              data-testid="result-seller-avatar"
+            />
+          )}
+          <Card.Title data-testid="result-seller-name">{seller.professionalName}</Card.Title>
+        </div>
+
         {seller.specialties.length > 0 && (
-          <div className="flex flex-wrap gap-2 mt-2">
-            {seller.specialties.map((specialty) => (
-              <span
-                key={specialty}
-                className="px-2 py-1 bg-blue-100 text-blue-800 text-xs rounded-full"
-              >
-                {specialty}
-              </span>
-            ))}
+          <div className="mt-2" data-testid="result-specialties">
+            <span className="text-xs font-medium text-gray-500">Specialties</span>
+            <div className="flex flex-wrap gap-2 mt-1">
+              {seller.specialties.map((specialty) => (
+                <span
+                  key={specialty}
+                  className="px-2 py-1 bg-blue-100 text-blue-800 text-xs rounded-full"
+                >
+                  {formatSpecialty(specialty)}
+                </span>
+              ))}
+            </div>
           </div>
         )}
       </Card.Header>
       <Card.Content>
         <p className="text-gray-600 text-sm mb-3">{seller.bio}</p>
-        <p className="text-xs text-gray-500 mb-3">
-          {seller.basedIn.city ?? ""}
-          {seller.basedIn.city && seller.basedIn.region ? ", " : ""}
-          {seller.basedIn.region ?? ""}
-          {seller.basedIn.city || seller.basedIn.region ? " · " : ""}
-          {seller.basedIn.countryCode}
+
+        {/* Current location, Caribbean affiliation, and service area are
+            distinct concepts and are labeled separately so a seller's
+            residence is never read as their regional connection. */}
+        <dl className="text-xs text-gray-600 mb-3 space-y-1">
+          <div>
+            <dt className="inline font-medium text-gray-500">Based in: </dt>
+            <dd className="inline" data-testid="result-based-in">
+              {formatLocation(seller.basedIn)}
+            </dd>
+          </div>
           {seller.caribbeanAffiliationCodes.length > 0 && (
-            <>
-              {" · "}
-              <span data-testid="result-affiliations">
-                Affiliations: {seller.caribbeanAffiliationCodes.join(", ")}
-              </span>
-            </>
+            <div>
+              <dt className="inline font-medium text-gray-500">Caribbean affiliation: </dt>
+              <dd className="inline" data-testid="result-affiliations">
+                {seller.caribbeanAffiliationCodes.join(", ")}
+              </dd>
+            </div>
           )}
-        </p>
+        </dl>
 
         <div className="bg-gray-50 p-3 rounded-lg mb-3">
           <p className="text-sm font-medium text-gray-900" data-testid="result-offering-title">
             {bestMatchingOffering.title}
           </p>
-          <p className="text-xs text-gray-700 mt-1">
-            {bestMatchingOffering.primaryCategory.name} · {bestMatchingOffering.serviceMode}
-            {pricingLabel && <> · {pricingLabel}</>}
+          <p className="text-xs text-gray-600 mt-1">{bestMatchingOffering.description}</p>
+
+          <dl className="text-xs text-gray-700 mt-2 space-y-1">
+            <div>
+              <dt className="inline font-medium text-gray-500">Service category: </dt>
+              <dd className="inline" data-testid="result-category">
+                {bestMatchingOffering.primaryCategory.name}
+              </dd>
+            </div>
+            <div>
+              <dt className="inline font-medium text-gray-500">Service mode: </dt>
+              <dd className="inline" data-testid="result-service-mode">
+                {formatServiceMode(bestMatchingOffering.serviceMode)}
+              </dd>
+            </div>
+            {bestMatchingOffering.serviceAreas.length > 0 && (
+              <div>
+                <dt className="inline font-medium text-gray-500">Service area: </dt>
+                <dd className="inline" data-testid="result-service-areas">
+                  {bestMatchingOffering.serviceAreas.map(formatLocation).join(" · ")}
+                </dd>
+              </div>
+            )}
+            {bestMatchingOffering.genreTags.length > 0 && (
+              <div>
+                <dt className="inline font-medium text-gray-500">Genres: </dt>
+                <dd className="inline" data-testid="result-genres">
+                  {bestMatchingOffering.genreTags.join(", ")}
+                </dd>
+              </div>
+            )}
+            <div>
+              <dt className="inline font-medium text-gray-500">Pricing: </dt>
+              <dd className="inline" data-testid="result-pricing">
+                {pricingLabel ?? "Not advertised"}
+              </dd>
+            </div>
+          </dl>
+
+          {/* Pricing is non-binding until it is incorporated into an approved
+              TermsVersion (ADR 0002, CONTEXT.md). Buyer-facing wording names
+              that approved-terms boundary rather than a weaker informal
+              milestone such as "agreed terms", which could imply an informal
+              agreement is sufficient to bind either party. The disclaimer is
+              always shown so no pricing presentation reads as a quote or
+              commitment, but its wording follows the state: disclaiming
+              "advertised pricing" on an offering that advertises none would
+              imply a price is present. */}
+          <p className="text-xs text-gray-500 mt-2 italic" data-testid="result-pricing-disclaimer">
+            {pricingLabel === null
+              ? "This seller has not advertised pricing. Any pricing discussed later is non-binding until it is incorporated into approved terms."
+              : "Advertised pricing is non-binding and not a quote. It binds no one until it is incorporated into approved terms."}
           </p>
+
           {bestMatchingOffering.includedServices.length > 0 && (
-            <p className="text-xs text-gray-700 mt-1">
-              Bundle includes:{" "}
+            <p className="text-xs text-gray-700 mt-2" data-testid="result-included-services">
+              <span className="font-medium text-gray-500">Bundle includes: </span>
               {bestMatchingOffering.includedServices
                 .map((included) => `${included.name} (bundle only)`)
                 .join(", ")}
@@ -165,11 +247,19 @@ function ResultCard({ result }: { result: TalentSearchResultV1 }) {
   );
 }
 
-function formatPricing(
-  pricing: TalentSearchResultV1["bestMatchingOffering"]["pricing"],
-): string | null {
-  if (!pricing) return null;
-  if (pricing.kind === "ContactForQuote") return "Contact for quote";
-  const amount = pricing.amount.amountMinor / 100;
-  return `${pricing.kind === "StartingAt" ? "From " : ""}${amount.toFixed(2)} ${pricing.amount.currency}/${pricing.unit}`;
+// Renders "City, Region · CC" while tolerating the optional city/region fields.
+function formatLocation(location: { city?: string; region?: string; countryCode: string }): string {
+  const locality = [location.city, location.region].filter(Boolean).join(", ");
+  return locality ? `${locality} · ${location.countryCode}` : location.countryCode;
+}
+
+// Specialty keys are stable controlled records (for example `SoundEngineer`).
+// Presentation-only humanization; the contract value is unchanged.
+function formatSpecialty(key: string): string {
+  return key.replace(/([a-z0-9])([A-Z])/g, "$1 $2");
+}
+
+function formatServiceMode(mode: TalentSearchResultV1["bestMatchingOffering"]["serviceMode"]) {
+  if (mode === "InPerson") return "In person";
+  return mode;
 }

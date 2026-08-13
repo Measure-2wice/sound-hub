@@ -390,6 +390,45 @@ describe("M1.1 seed regression coverage", () => {
     assert.equal(restored?.avatarUrl, original);
   });
 
+  test("seeds and restores a non-null canonical SellerProfile.avatarUrl", async () => {
+    // `avatarUrl` is an approved optional public seller field. Keisha
+    // Williams is the canonical non-null fixture so the rendered-avatar
+    // path is exercised end to end rather than only in unit fixtures.
+    //
+    // The canonical value is an absolute URL composed from
+    // PUBLIC_FIXTURE_ORIGIN (default `http://localhost:3000`) plus the
+    // path under `apps/web/public/fixtures/...`. The public seller
+    // contract requires `z.string().url()`; storing a relative path
+    // would break the search response schema. Operators and CI
+    // override the origin via PUBLIC_FIXTURE_ORIGIN; this test mirrors
+    // whatever the child seed process used so the assertion is robust
+    // against origin overrides.
+    const origin =
+      process.env.PUBLIC_FIXTURE_ORIGIN ??
+      (() => {
+        try {
+          return new URL(process.env.FRONTEND_URL ?? "http://localhost:3000").origin;
+        } catch {
+          return "http://localhost:3000";
+        }
+      })();
+    const canonicalAvatarUrl = `${origin}/fixtures/sellers/keisha-williams/avatar.svg`;
+    await runSeed();
+    const target = await prisma.sellerProfile.findFirst({
+      where: { professionalName: "Keisha Williams" },
+    });
+    assert.ok(target);
+    assert.equal(target.avatarUrl, canonicalAvatarUrl);
+
+    await prisma.sellerProfile.update({
+      where: { id: target.id },
+      data: { avatarUrl: null },
+    });
+    await runSeed();
+    const restored = await prisma.sellerProfile.findUnique({ where: { id: target.id } });
+    assert.equal(restored?.avatarUrl, canonicalAvatarUrl);
+  });
+
   test("restores ServiceOffering.description after a stale update", async () => {
     await runSeed();
     const target = await prisma.serviceOffering.findUnique({
