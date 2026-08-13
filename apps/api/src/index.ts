@@ -5,6 +5,7 @@ import helmet from "helmet";
 import { createPrismaClient, type PrismaClient } from "@soundhub/db";
 import { healthRoutes } from "./routes/health.js";
 import { createSearchRouter } from "./routes/search.js";
+import { createMetadataRouter } from "./routes/metadata.js";
 import { TalentSearchService } from "./services/talent-search.service.js";
 import { PrismaTalentSearchRepository } from "./repositories/prisma-talent-search.repository.js";
 import { buildSafeError, generateRequestId, writeSafeError } from "./lib/errors.js";
@@ -48,6 +49,7 @@ export function buildApp(options: AppOptions = {}): BuiltApp {
 
   app.use("/api/health", healthRoutes);
   app.use("/api/search", createSearchRouter({ service }));
+  app.use("/api/metadata", createMetadataRouter({ prisma }));
 
   // 404 fallback
   app.use((req: Request, res: Response) => {

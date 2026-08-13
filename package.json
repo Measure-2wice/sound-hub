@@ -9,7 +9,7 @@
     "dev": "concurrently -n web,api -c blue,magenta \"pnpm dev:web\" \"pnpm dev:api\"",
     "build": "pnpm prisma:generate && pnpm --filter @soundhub/types build && pnpm --filter @soundhub/db build && pnpm --filter @soundhub/api build && pnpm --filter @soundhub/web build",
     "type-check": "pnpm prisma:generate && pnpm --filter @soundhub/types build && pnpm --filter @soundhub/db build && pnpm --filter @soundhub/api type-check && pnpm --filter @soundhub/web type-check",
-    "test": "pnpm --filter @soundhub/api test && pnpm test:repository",
+    "test": "pnpm --filter @soundhub/api test && pnpm --filter @soundhub/web test && pnpm test:repository",
     "test:repository": "pnpm --filter @soundhub/api test:full",
     "test:e2e": "pnpm --filter @soundhub/web test:e2e",
     "lint": "eslint .",

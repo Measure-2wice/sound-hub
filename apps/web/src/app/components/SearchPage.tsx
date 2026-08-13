@@ -1,36 +1,43 @@
 "use client";
 
-import { useMemo, useState, type FormEvent } from "react";
-import { useSearch } from "../hooks/useSearch";
+import { useEffect, useMemo, useState, type FormEvent } from "react";
+import { useSearch, hasUsableCriteria, type RequiredFiltersValue } from "../hooks/useSearch";
 import { Card } from "./ui/Card";
 import { SearchForm } from "./SearchForm";
-import { RequiredFilters, type CategoryOption, type RequiredFiltersValue } from "./RequiredFilters";
+import { RequiredFilters, type CategoryOption } from "./RequiredFilters";
 import { formatPricing } from "../lib/pricing";
 import type { ApiFieldErrorV1, TalentSearchResultV1 } from "@soundhub/types";
 
-// Canonical list of service categories rendered in the structured filter
-// dropdown. The category names mirror the canonical names seeded in
-// PostgreSQL (the API is the source of truth for category existence).
-// Future tickets may resolve these from a metadata endpoint; for M1.4
-// the canonical 10 categories are the only ones the buyer can require.
-const CANONICAL_CATEGORIES: readonly CategoryOption[] = [
-  { key: "music-production", name: "Music Production" },
-  { key: "songwriting", name: "Songwriting" },
-  { key: "custom-composition", name: "Custom Composition" },
-  { key: "session-vocals", name: "Session Vocals" },
-  { key: "session-instrument-performance", name: "Session Instrument Performance" },
-  { key: "featured-artist-performance", name: "Featured Artist Performance" },
-  { key: "mixing", name: "Mixing" },
-  { key: "mastering", name: "Mastering" },
-  { key: "recording-engineering", name: "Recording Engineering" },
-  { key: "live-performance", name: "Live Performance" },
-];
+// Path prefixes that the `RequiredFilters` panel claims. Errors that
+// target one of these paths are rendered beside the relevant control,
+// so the global panel must NOT re-render them (P2-003). Everything
+// else is "unmatched" from the page's perspective and is rendered
+// once in the global error panel.
+const CONTROLLED_PATHS = [
+  "required.primaryCategoryKeys",
+  "required.independentlyPurchasableServiceKeys",
+  "required.serviceModes",
+  "required.basedIn",
+  "required.serviceArea",
+  "required",
+] as const;
+
+function isControlledPath(path: string): boolean {
+  return CONTROLLED_PATHS.some((prefix) => path === prefix || path.startsWith(`${prefix}.`));
+}
+
+// Response shape of the public metadata endpoint. The endpoint is
+// server-only and returns the canonical list from PostgreSQL via the
+// TalentSearchService repository — there is no second handheld list
+// of category keys in the browser.
+interface CategoryMetadataResponse {
+  readonly categories: readonly CategoryOption[];
+}
 
 export function SearchPage() {
   const [query, setQuery] = useState("");
   const [filters, setFilters] = useState<RequiredFiltersValue>({
     primaryCategoryKey: "",
-    customPrimaryCategoryKey: "",
     independentlyPurchasableServiceKey: "",
     serviceModes: [],
     basedInCountryCode: "",
@@ -38,40 +45,73 @@ export function SearchPage() {
   });
   const { results, isLoading, error, errorCode, fieldErrors, requestId, search } = useSearch();
 
-  // Field errors whose path is not rendered inside the RequiredFilters
-  // panel (e.g. errors targeting `query` or `preferred.*`) are
-  // forwarded here by the panel via `onUnmatchedErrors`. We render
-  // them in the global error panel so the buyer always sees actionable
-  // feedback for any rejection, even when the path is outside the
-  // structured filters.
-  const [unmatchedFieldErrors, setUnmatchedFieldErrors] = useState<readonly ApiFieldErrorV1[]>([]);
+  // Canonical categories are fetched from the public metadata seam
+  // (`GET /api/metadata/categories`) so the browser never holds a
+  // second, independently deployable list of category keys. The
+  // browser consumes the rendered list; PostgreSQL (via the API) is
+  // the only source of truth.
+  const [categories, setCategories] = useState<readonly CategoryOption[]>([]);
+  const [categoriesError, setCategoriesError] = useState<string | null>(null);
+
+  useEffect(() => {
+    let cancelled = false;
+    void (async () => {
+      try {
+        const response = await fetch("/api/metadata/categories", {
+          method: "GET",
+          headers: { Accept: "application/json" },
+        });
+        if (!response.ok) {
+          throw new Error(`Metadata request failed (${response.status}).`);
+        }
+        const body: unknown = await response.json();
+        // Defensive parse: the browser rejects the response if it
+        // does not match the expected shape.
+        if (
+          !body ||
+          typeof body !== "object" ||
+          !Array.isArray((body as CategoryMetadataResponse).categories)
+        ) {
+          throw new Error("Metadata response is missing the categories array.");
+        }
+        const parsed = body as CategoryMetadataResponse;
+        if (cancelled) return;
+        setCategories(parsed.categories);
+        setCategoriesError(null);
+      } catch (err) {
+        if (cancelled) return;
+        setCategoriesError(
+          err instanceof Error ? err.message : "Could not load the canonical category catalog.",
+        );
+      }
+    })();
+    return () => {
+      cancelled = true;
+    };
+  }, []);
 
   const handleSubmit = (e: FormEvent) => {
     e.preventDefault();
     void search(query, filters);
   };
 
-  // Effective field errors: those returned by the API plus those
-  // emitted by the filter panel for paths it does not render.
-  const visibleFieldErrors = useMemo(() => {
-    return [...fieldErrors, ...unmatchedFieldErrors];
-  }, [fieldErrors, unmatchedFieldErrors]);
+  // Errors whose path the `RequiredFilters` panel does not render
+  // are shown in the global panel. The full `fieldErrors` array is
+  // already passed down to the panel, so the global list shows ONLY
+  // the unmatched entries — controlled errors render exactly once,
+  // beside their control.
+  const unmatchedFieldErrors = useMemo<readonly ApiFieldErrorV1[]>(
+    () => fieldErrors.filter((err) => !isControlledPath(err.path)),
+    [fieldErrors],
+  );
 
   // The empty state renders whenever the most recent completed search
   // returned no results. The buyer's request is meaningful if it has
   // either a usable query OR a usable structured filter, so both
   // paths qualify the page to show actionable feedback rather than
   // letting a no-result response read as a system error.
-  const hasUsableCriteria =
-    query.trim().length >= 2 ||
-    filters.primaryCategoryKey.length > 0 ||
-    filters.customPrimaryCategoryKey.length > 0 ||
-    filters.independentlyPurchasableServiceKey.length > 0 ||
-    filters.serviceModes.length > 0 ||
-    filters.basedInCountryCode.trim().length > 0 ||
-    filters.serviceAreaCountryCode.trim().length > 0;
-  const showEmptyState =
-    !isLoading && results !== null && results.results.length === 0 && hasUsableCriteria;
+  const usable = hasUsableCriteria(query, filters);
+  const showEmptyState = !isLoading && results !== null && results.results.length === 0 && usable;
 
   return (
     <div className="max-w-4xl mx-auto px-6 py-8">
@@ -90,9 +130,8 @@ export function SearchPage() {
               value={filters}
               onChange={setFilters}
               fieldErrors={fieldErrors}
-              onUnmatchedErrors={setUnmatchedFieldErrors}
-              categories={CANONICAL_CATEGORIES}
-              disabled={isLoading}
+              categories={categories}
+              disabled={isLoading || categories.length === 0}
             />
             <button
               type="submit"
@@ -105,6 +144,23 @@ export function SearchPage() {
           </form>
         </Card.Content>
       </Card>
+
+      {categoriesError && (
+        <Card
+          variant="outlined"
+          className="mb-6 border-amber-200 bg-amber-50"
+          data-testid="catalog-error"
+        >
+          <Card.Content>
+            <p className="text-amber-800" data-testid="catalog-error-message">
+              The canonical category catalog is unavailable. {categoriesError}
+            </p>
+            <p className="mt-2 text-sm text-amber-700">
+              Strict filters are disabled until the catalog loads. Retry by refreshing the page.
+            </p>
+          </Card.Content>
+        </Card>
+      )}
 
       {error && (
         <Card
@@ -121,9 +177,9 @@ export function SearchPage() {
                 The brief is preserved. You can retry without retyping it.
               </p>
             )}
-            {visibleFieldErrors.length > 0 && (
+            {unmatchedFieldErrors.length > 0 && (
               <ul className="mt-3 space-y-1" data-testid="search-error-fields">
-                {visibleFieldErrors.map((err) => (
+                {unmatchedFieldErrors.map((err) => (
                   <li key={`${err.path}-${err.code}`} className="text-sm text-red-700">
                     <span className="font-mono text-xs mr-1">{err.path}</span>
                     {err.message}

@@ -1,32 +1,24 @@
 "use client";
 
 // The structured required filters component. Each filter is a controlled
-// input wired to the parent's `RequiredFiltersValue` shape. The component
-// is intentionally dumb: it surfaces the canonical list of categories
-// (from the v1 metadata) and the closed service-mode enum, and it
-// emits change events upward so the page owns the state.
+// input wired to the parent's `RequiredFiltersValue` shape, which lives
+// in `useSearch.ts` so the rendered controls and the serialised request
+// cannot diverge. The component is intentionally dumb: it surfaces
+// canonical categories (passed in by the page) and the closed service-mode
+// enum, and it emits change events upward so the page owns the state.
 //
 // The `fieldErrors` prop is an array of `ApiFieldErrorV1` objects
 // returned by the safe error envelope. Each error names a JSON path
 // (for example `required.basedIn.countryCode`); the component renders
-// the error message beside the matching control. Errors that name a
-// path that is not part of this form (for example
-// `required.independentlyPurchasableServiceKeys.0` when there is no
-// per-element UI, or `query`/`preferred.*`) are forwarded to the parent
-// via the `onUnmatchedErrors` callback so the SearchPage can render
-// them in a global error panel without losing any issue.
+// the error message beside the matching control. The page owns the
+// partition of field errors into "rendered beside a control" vs
+// "rendered globally as an unmatched field error" so the global panel
+// never duplicates errors that already appear next to a control.
 
-import { useMemo } from "react";
-import type { ApiFieldErrorV1, ServiceModeV1 } from "@soundhub/types";
+import { type ApiFieldErrorV1, type ServiceModeV1 } from "@soundhub/types";
+import { type RequiredFiltersValue } from "../hooks/useSearch";
 
-export interface RequiredFiltersValue {
-  readonly primaryCategoryKey: string;
-  readonly customPrimaryCategoryKey: string;
-  readonly independentlyPurchasableServiceKey: string;
-  readonly serviceModes: readonly ServiceModeV1[];
-  readonly basedInCountryCode: string;
-  readonly serviceAreaCountryCode: string;
-}
+export type { RequiredFiltersValue } from "../hooks/useSearch";
 
 export interface CategoryOption {
   readonly key: string;
@@ -37,7 +29,6 @@ export interface RequiredFiltersProps {
   readonly value: RequiredFiltersValue;
   readonly onChange: (next: RequiredFiltersValue) => void;
   readonly fieldErrors: readonly ApiFieldErrorV1[];
-  readonly onUnmatchedErrors?: (unmatched: readonly ApiFieldErrorV1[]) => void;
   readonly categories: readonly CategoryOption[];
   readonly disabled?: boolean;
 }
@@ -66,31 +57,14 @@ export function RequiredFilters({
   value,
   onChange,
   fieldErrors,
-  onUnmatchedErrors,
   categories,
   disabled,
 }: RequiredFiltersProps) {
-  // Field errors that target a path the component renders get
-  // distributed below; anything else is reported upward so the page
-  // can render a global panel without losing any issue.
-  const { visibleErrors, unmatchedErrors } = useMemo(() => {
-    const visible: ApiFieldErrorV1[] = [];
-    const unmatched: ApiFieldErrorV1[] = [];
-    for (const err of fieldErrors) {
-      if (isControlledPath(err.path)) visible.push(err);
-      else unmatched.push(err);
-    }
-    return { visibleErrors: visible, unmatchedErrors: unmatched };
-  }, [fieldErrors]);
-
-  // Notify the parent of unmatched errors so it can render them in a
-  // global panel. The notification is a useMemo side effect, not a
-  // per-render side effect, so the parent is not re-rendered on
-  // unrelated state changes.
-  useMemo(() => {
-    if (onUnmatchedErrors) onUnmatchedErrors(unmatchedErrors);
-    return null;
-  }, [onUnmatchedErrors, unmatchedErrors]);
+  // Errors that target a path this component renders. Errors whose
+  // path is outside this list are treated as "unmatched" by the
+  // parent (the page) so the global panel can show them without
+  // duplicating anything that already appears next to a control.
+  const visibleErrors = fieldErrors.filter((err) => isControlledPath(err.path));
 
   function update<K extends keyof RequiredFiltersValue>(
     key: K,
@@ -138,16 +112,9 @@ export function RequiredFilters({
           ))}
         </select>
         <p className="text-xs text-gray-500 mt-1">
-          Or enter a category key not in the list (for testing unknown keys).
+          Categories are fetched from the canonical SoundHub catalog. Unknown keys produce a
+          field-level error.
         </p>
-        <input
-          data-testid="required-category-custom"
-          value={value.customPrimaryCategoryKey}
-          onChange={(e) => update("customPrimaryCategoryKey", e.target.value)}
-          disabled={disabled}
-          placeholder="e.g. non-existent-category"
-          className="mt-2 w-full px-3 py-2 border border-gray-300 rounded-md text-sm"
-        />
       </Field>
 
       <Field

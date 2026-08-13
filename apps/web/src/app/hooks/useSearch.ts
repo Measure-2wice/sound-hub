@@ -1,63 +1,51 @@
 "use client";
 
+// Browser-side search hook. The browser builds a candidate v1 request
+// payload from the buyer's inputs and parses it with the shared
+// `talentSearchRequestV1Schema` before sending it. The schema is the
+// executable contract; the browser MUST NOT silently drop or relax
+// fields, and MUST surface malformed input as a field-level error
+// envelope rather than converting it into a successful request.
+//
+// Earlier revisions of this hook manually constructed a request and
+// dropped a one-character query when any required filter was supplied.
+// That silently violated the rule that required constraints are never
+// "saved" by relaxing or dropping a query. The build-the-payload-then-
+// parse-the-payload flow sends only schema-valid data, and a one-
+// character query now produces a field-level error envelope that the
+// page renders beside the text control.
+
 import { useCallback, useRef, useState } from "react";
+import type { ZodError, ZodIssue } from "zod";
 import {
   apiErrorResponseV1Schema,
+  talentSearchRequestV1Schema,
   talentSearchResponseV1Schema,
   type ApiFieldErrorV1,
-  type ServiceModeV1,
   type TalentSearchRequestV1,
   type TalentSearchResponseV1,
 } from "@soundhub/types";
+import {
+  buildCandidatePayload,
+  hasUsableCriteria,
+  type RequiredFiltersValue,
+} from "../lib/talent-search-request-builder";
 
-// The web's browser-side representation of a buyer-supplied structured
-// required filter. Each field is optional and serialised into the v1
-// request body when present. The hook is the single source of truth
-// for which values are sent over the wire: empty strings are dropped so
-// the API never receives a meaningless filter, and the buyer can
-// leave any individual filter blank.
-export interface RequiredFilters {
-  readonly primaryCategoryKey: string;
-  readonly customPrimaryCategoryKey: string;
-  readonly independentlyPurchasableServiceKey: string;
-  readonly serviceModes: readonly ServiceModeV1[];
-  readonly basedInCountryCode: string;
-  readonly serviceAreaCountryCode: string;
-}
+// Re-export the shared type and helpers so other browser modules
+// continue to import everything from this hook. The page and the
+// filter component both consume these definitions; the hook remains
+// the single surface for the browser.
+export { buildCandidatePayload, hasUsableCriteria };
+export type { RequiredFiltersValue };
 
-// `RequiredFilters` is a flat UI shape; `toRequestCriteria` is the only
-// place that converts it to the structured v1 schema. Centralising the
-// conversion keeps the UI honest about which keys actually map to the
-// contract and prevents the browser from sending a half-empty filter
-// object to the API.
-function toRequestCriteria(
-  filters: RequiredFilters,
-): TalentSearchRequestV1["required"] | undefined {
-  const primaryCategoryKeys = [
-    filters.primaryCategoryKey,
-    ...(filters.customPrimaryCategoryKey ? [filters.customPrimaryCategoryKey] : []),
-  ].filter((value) => value.length > 0);
-  const independentlyPurchasableServiceKeys = filters.independentlyPurchasableServiceKey
-    ? [filters.independentlyPurchasableServiceKey]
-    : [];
-  const basedInCountryCode = filters.basedInCountryCode.trim().toUpperCase();
-  const serviceAreaCountryCode = filters.serviceAreaCountryCode.trim().toUpperCase();
-  const result: {
-    primaryCategoryKeys?: string[];
-    independentlyPurchasableServiceKeys?: string[];
-    serviceModes?: ServiceModeV1[];
-    basedIn?: { countryCode: string };
-    serviceArea?: { countryCode: string };
-  } = {};
-  if (primaryCategoryKeys.length > 0) result.primaryCategoryKeys = primaryCategoryKeys;
-  if (independentlyPurchasableServiceKeys.length > 0) {
-    result.independentlyPurchasableServiceKeys = independentlyPurchasableServiceKeys;
-  }
-  if (filters.serviceModes.length > 0) result.serviceModes = [...filters.serviceModes];
-  if (basedInCountryCode) result.basedIn = { countryCode: basedInCountryCode };
-  if (serviceAreaCountryCode) result.serviceArea = { countryCode: serviceAreaCountryCode };
-  if (Object.keys(result).length === 0) return undefined;
-  return result;
+// Map a Zod issue path to the public request path. The schema uses
+// `[]` for empty root paths, which the contract renders as `<root>`.
+function zodIssuesToFieldErrors(issues: readonly ZodIssue[]): readonly ApiFieldErrorV1[] {
+  return issues.map((issue) => ({
+    path: issue.path.length === 0 ? "<root>" : issue.path.join("."),
+    code: issue.code,
+    message: issue.message,
+  }));
 }
 
 export interface UseSearchReturn {
@@ -67,7 +55,7 @@ export interface UseSearchReturn {
   errorCode: string | null;
   fieldErrors: readonly ApiFieldErrorV1[];
   requestId: string | null;
-  search: (query: string, filters: RequiredFilters) => Promise<void>;
+  search: (query: string, filters: RequiredFiltersValue) => Promise<void>;
   clearResults: () => void;
 }
 
@@ -82,19 +70,44 @@ export function useSearch(): UseSearchReturn {
   // Cancellation guard to prevent stale responses from overwriting newer state.
   const requestIdRef = useRef(0);
 
-  const search = useCallback(async (rawQuery: string, filters: RequiredFilters) => {
+  const search = useCallback(async (rawQuery: string, filters: RequiredFiltersValue) => {
     const trimmed = rawQuery.trim();
-    const request = buildRequest(trimmed, filters);
-    if (request === null) {
-      // Client-side rejection: trimmed query is too short. Field-level
-      // errors are empty here because the v1 schema rejection is
-      // single-issue and the buyer-visible message is sufficient.
+
+    // Phase 1: build the candidate payload that preserves every
+    // supplied non-empty field. The candidate is the unvalidated
+    // shrink-wrap; the schema is the only thing that decides which
+    // of these fields survive. We deliberately do NOT pre-drop a
+    // one-character query or a malformed country code here, because
+    // that is exactly the silent relaxation the contract forbids.
+    const candidate = buildCandidatePayload(trimmed, filters);
+
+    // Phase 2: parse the candidate with the shared schema. Any
+    // failure here is a CLIENT-side rejection; we surface it through
+    // the same field-error envelope the API uses so the buyer sees
+    // actionable feedback without the round trip.
+    const parsed = talentSearchRequestV1Schema.safeParse(candidate);
+    if (!parsed.success) {
+      const issues = (parsed.error as ZodError).issues;
+      const firstIssue = issues[0];
+      const isNoCriteria =
+        issues.length === 1 &&
+        firstIssue !== undefined &&
+        firstIssue.message.includes(
+          "at least one of query, required, or preferred must contain criteria",
+        );
       setResults(null);
-      setError("Please enter at least 2 characters of search criteria.");
+      setError(
+        isNoCriteria
+          ? "Please enter at least 2 characters of search criteria or a required filter."
+          : "Search request failed validation.",
+      );
       setErrorCode("INVALID_SEARCH_CRITERIA");
-      setFieldErrors([]);
+      setFieldErrors(isNoCriteria ? [] : zodIssuesToFieldErrors(issues));
+      setRequestId(null);
       return;
     }
+
+    const request: TalentSearchRequestV1 = parsed.data;
 
     const currentRequest = requestIdRef.current + 1;
     requestIdRef.current = currentRequest;
@@ -176,33 +189,4 @@ export function useSearch(): UseSearchReturn {
   }, []);
 
   return { results, isLoading, error, errorCode, fieldErrors, requestId, search, clearResults };
-}
-
-// Builds the v1 request from the raw query and the UI filter shape.
-// Returns null ONLY when the buyer has supplied no usable criteria at
-// all, so the caller can short-circuit with a client-side error rather
-// than sending an empty request. The actual value-level validation
-// (shape, length, regex, canonical existence) is owned by the API and
-// the shared Zod schema; we deliberately do not pre-validate here so
-// the buyer sees the canonical safe-envelope errors rather than a
-// silent client-side rejection. Empty individual filters collapse out
-// so the API never sees them.
-function buildRequest(query: string, filters: RequiredFilters): TalentSearchRequestV1 | null {
-  const hasQuery = query.length >= 2;
-  const hasFilters =
-    filters.primaryCategoryKey.length > 0 ||
-    filters.customPrimaryCategoryKey.length > 0 ||
-    filters.independentlyPurchasableServiceKey.length > 0 ||
-    filters.serviceModes.length > 0 ||
-    filters.basedInCountryCode.trim().length > 0 ||
-    filters.serviceAreaCountryCode.trim().length > 0;
-  if (!hasQuery && !hasFilters) return null;
-
-  const request: TalentSearchRequestV1 = {};
-  if (hasQuery) request.query = query;
-  const required = toRequestCriteria(filters);
-  // Drop empty-key objects so the schema's strict mode is satisfied and
-  // the request is as small as possible.
-  if (required) request.required = required;
-  return request;
 }

@@ -1,9 +1,9 @@
 // M1.4 browser-visible strict required search constraints tracer.
 //
 // The M1.1 happy-path spec proves a text query renders real sellers. The
-// M1.3 negative-eligibility spec proves ineligible sellers stay out of
-// the result list. This spec proves the browser surface that lets a
-// buyer apply STRICT REQUIRED constraints and the field-level validation
+// M1.3 negative-eligibility spec proves ineligible sellers stay out of the
+// result list. This spec proves the browser surface that lets a buyer
+// apply STRICT REQUIRED constraints and the field-level validation
 // feedback that preserves the buyer's input on a rejected request.
 //
 // It runs against the real Next.js proxy, the real Express API, the real
@@ -21,6 +21,15 @@
 //   - A malformed basedIn countryCode (numeric `12`) renders the
 //     field-level error envelope, the buyer's input is preserved, and no
 //     cards are rendered.
+//   - A required serviceArea countryCode that matches a subset of sellers
+//     narrows the result list to those sellers and excludes non-matching
+//     sellers.
+//   - A required serviceArea countryCode that no seller matches renders
+//     the empty state, NOT a 400, and preserves the buyer's filter
+//     input.
+//   - A malformed serviceArea countryCode (numeric `12`) renders the
+//     field-level error envelope beside the serviceArea control, the
+//     buyer's input is preserved, and no cards are rendered.
 //   - Required category and service-mode constraints compound (AND).
 //   - A bundle-only IncludedService category key cannot satisfy a
 //     required independentlyPurchasableServiceKeys filter.
@@ -113,33 +122,74 @@ test("M1.4: a malformed required basedIn countryCode surfaces a field-level erro
   await expect(page.getByTestId("result-card")).toHaveCount(0);
 });
 
-test("M1.4: an unknown required category key surfaces a canonical validation error and preserves the input", async ({
+test("M1.4: a required serviceArea countryCode that matches a subset of sellers narrows the result list", async ({
   page,
 }) => {
   await loadHome(page);
 
-  // The structured select is allow-listed; the custom text input is the
-  // buyer's escape hatch for testing unknown canonical values. Sending
-  // a non-canonical key triggers the service-layer canonical
-  // validation, which surfaces an INVALID_SEARCH_CRITERIA error from
-  // the safe envelope. The browser must render the error and preserve
-  // the buyer's input so they can correct or remove it.
-  await page.getByTestId("required-category").selectOption("");
-  await page.getByTestId("required-category-custom").fill("non-existent-category");
+  // GB is the service area only Aisha offers. The structured-only
+  // request must surface only Aisha and exclude every other seller
+  // whose offering does not include GB in its serviceAreas.
+  // (Sanity: the canonical database lists Aisha's serviceAreas as
+  // [GB, TT, US] and Marc-André's as [US, HT].)
+  await page.getByTestId("required-service-area-country").fill("GB");
+  await submitAndWaitForCards(page);
+
+  const cards = page.getByTestId("result-card");
+  await expect(cards.filter({ hasText: "Aisha Mohammed" }).first()).toBeVisible();
+
+  const bodyText = (await page.textContent("body")) ?? "";
+  // Marc-André Pierre's offering serviceAreas are [US, HT], so the
+  // GB constraint MUST exclude them.
+  expect(bodyText).not.toContain("Marc-André Pierre");
+  expect(bodyText).not.toContain("Haitian dancehall single production");
+});
+
+test("M1.4: a required serviceArea countryCode with no match renders the empty state and preserves the filter", async ({
+  page,
+}) => {
+  await loadHome(page);
+
+  // No seller has FR in their serviceAreas. The search must complete
+  // (no 400), the empty state must render, and the structured filter
+  // must remain in the form so the buyer can correct it.
+  await page.getByTestId("required-service-area-country").fill("FR");
   await page.getByTestId("search-submit").click();
 
-  // The global error envelope is rendered with the canonical
-  // validation message and the request ID, even when the rejection
-  // does not carry a per-field path.
-  const errorPanel = page.getByTestId("search-error");
-  await expect(errorPanel).toBeVisible();
-  await expect(errorPanel.getByTestId("search-error-message")).toContainText(/service category/i);
-  await expect(page.getByTestId("search-error-request-id")).toContainText(/Request ID:/);
+  await expect(page.getByTestId("search-empty")).toBeVisible({ timeout: 15_000 });
 
-  // The buyer's input is preserved across the rejection.
-  await expect(page.getByTestId("required-category-custom")).toHaveValue("non-existent-category");
+  // The filter is preserved across the empty result.
+  await expect(page.getByTestId("required-service-area-country")).toHaveValue("FR");
+});
 
-  // No result cards render.
+test("M1.4: a malformed required serviceArea countryCode surfaces a field-level error and preserves the input", async ({
+  page,
+}) => {
+  await loadHome(page);
+
+  // Numeric input `12` passes the 2-char length check but fails the
+  // shared Zod `/^[A-Z]{2}$/` regex, so the schema rejects it. The
+  // browser must render the field-level error envelope beside the
+  // serviceArea control while preserving the buyer's input so they can
+  // correct it.
+  await page.getByTestId("required-service-area-country").fill("12");
+  await page.getByTestId("search-submit").click();
+
+  // Field-level error renders beside the serviceArea control with the
+  // safe message that names the path.
+  const serviceAreaField = page.getByTestId("required-service-area-country-field");
+  await expect(serviceAreaField).toBeVisible();
+  await expect(serviceAreaField.getByTestId("field-error-message")).toContainText(/alpha-2/i);
+  await expect(serviceAreaField.getByTestId("field-error-path")).toContainText(
+    "required.serviceArea.countryCode",
+  );
+
+  // Buyer's input is preserved; they can correct `12` -> `GB` without
+  // retyping it.
+  await expect(page.getByTestId("required-service-area-country")).toHaveValue("12");
+
+  // No result cards render because the request was rejected at the
+  // schema boundary.
   await expect(page.getByTestId("result-card")).toHaveCount(0);
 });
 

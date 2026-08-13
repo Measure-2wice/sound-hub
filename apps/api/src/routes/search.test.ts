@@ -223,6 +223,60 @@ describe("POST /api/search contract", () => {
     assert.equal(response.body.error.code, "INVALID_SEARCH_CRITERIA");
   });
 
+  test("required.primaryCategoryKeys with unknown key returns INVALID_SEARCH_CRITERIA (proof that the buyer UI cannot silently drop unknown keys)", async () => {
+    // The in-memory fixture exposes only `music-production` as a
+    // canonical service category. Sending `not-a-real-category`
+    // proves the canonical-validation layer rejects unknown keys
+    // with the safe INVALID_SEARCH_CRITERIA envelope. This is the
+    // contract seam that backs the buyer UI's "unknown category key
+    // surfaces an actionable error" UX after the test-only escape
+    // hatch was removed from the production form.
+    const response = await request(app)
+      .post("/api/search")
+      .set("content-type", "application/json")
+      .send({ required: { primaryCategoryKeys: ["not-a-real-category"] } });
+
+    assert.equal(response.status, 400);
+    assert.equal(response.body.error.code, "INVALID_SEARCH_CRITERIA");
+    assert.ok(
+      /Unsupported service category key/.test(response.body.error.message),
+      `unknown category rejection must mention unsupported-service-category, got: ${response.body.error.message}`,
+    );
+  });
+
+  test("required.independentlyPurchasableServiceKeys with unknown key returns INVALID_SEARCH_CRITERIA", async () => {
+    const response = await request(app)
+      .post("/api/search")
+      .set("content-type", "application/json")
+      .send({ required: { independentlyPurchasableServiceKeys: ["not-a-real-category"] } });
+
+    assert.equal(response.status, 400);
+    assert.equal(response.body.error.code, "INVALID_SEARCH_CRITERIA");
+  });
+
+  test("required.serviceArea with malformed countryCode returns INVALID_SEARCH_CRITERIA (proof that the shared schema rejects malformed service-area input)", async () => {
+    // The browser schema-parses the candidate payload before sending
+    // it, so the API should never receive a malformed countryCode.
+    // This test proves the contract envelope would still surface the
+    // error if a future client bypassed the browser schema.
+    const response = await request(app)
+      .post("/api/search")
+      .set("content-type", "application/json")
+      .send({ required: { serviceArea: { countryCode: "12" } } });
+
+    assert.equal(response.status, 400);
+    assert.equal(response.body.error.code, "INVALID_SEARCH_CRITERIA");
+    assert.ok(
+      Array.isArray(response.body.error.fields),
+      "field-level errors must accompany the malformed serviceArea rejection",
+    );
+    assert.ok(
+      (response.body.error.fields as Array<{ path: string }>).some((f) =>
+        f.path.includes("serviceArea.countryCode"),
+      ),
+    );
+  });
+
   test("database unavailability maps to SEARCH_UNAVAILABLE 503", async () => {
     const failingService = new TalentSearchService({
       search: async (): Promise<never> => {
