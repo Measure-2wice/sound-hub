@@ -295,13 +295,21 @@ describe("M1.1 seed regression coverage", () => {
       where: { slug: "creole-beats-dancehall-single-remote" },
     });
     assert.ok(offering);
-    // Move the offering to a different category before deleting the original.
+    // Move every offering that references the canonical category
+    // before deleting it. M1.3 added negative fixtures that also
+    // use music-production (e.g. negative-draft-profile-active-
+    // offering, negative-buyer-only-active-offering,
+    // negative-paused-offerings-offering-a, and
+    // negative-mixed-archived-offering-archived); the original
+    // test only moved the canonical Marc-André Pierre offering.
+    // Without moving all of them, the service_category foreign key
+    // would reject the delete.
     const other = await prisma.serviceCategory.findFirst({
       where: { key: { not: "music-production" } },
     });
     assert.ok(other);
-    await prisma.serviceOffering.update({
-      where: { id: offering.id },
+    await prisma.serviceOffering.updateMany({
+      where: { primaryCategoryId: category.id },
       data: { primaryCategoryId: other.id },
     });
     await prisma.serviceCategory.delete({ where: { key: "music-production" } });

@@ -1023,3 +1023,390 @@ describe("TalentSearchService", () => {
     }
   });
 });
+
+// M1.3 negative eligibility fixtures (service layer).
+//
+// The in-memory adapter mirrors the Prisma repository's eligibility
+// rules. These tests exercise every excluded state at the service
+// boundary so the rule chain (Workspace.status → Workspace capability
+// → SellerProfile.status → ServiceOffering.status) is asserted
+// deterministically without touching the database.
+const NEG_OFF_REMOTE: InMemoryOffering = {
+  offeringId: "neg-off-remote",
+  title: "Hidden Caribbean production offering",
+  description: "Used as the offering row on every excluded-state fixture.",
+  status: "Active",
+  serviceMode: "Remote",
+  primaryCategory: { key: "music-production", name: "Music Production", bundleOnly: false },
+  includedServices: [],
+  genreTags: ["Dancehall"],
+  serviceAreas: [{ city: null, region: null, countryCode: "JM" }],
+  pricing: null,
+};
+
+const NEG_OFF_DRAFT: InMemoryOffering = {
+  ...NEG_OFF_REMOTE,
+  offeringId: "neg-off-draft",
+  status: "Draft",
+};
+const NEG_OFF_PAUSED: InMemoryOffering = {
+  ...NEG_OFF_REMOTE,
+  offeringId: "neg-off-paused",
+  status: "Paused",
+};
+const NEG_OFF_ARCHIVED: InMemoryOffering = {
+  ...NEG_OFF_REMOTE,
+  offeringId: "neg-off-archived",
+  status: "Archived",
+};
+
+function buildNegativeFixture(): InMemoryFixture {
+  const sellers: InMemorySeller[] = [
+    {
+      sellerId: "neg-draft-profile",
+      workspaceId: "neg-ws-draft-profile",
+      professionalName: "Draft Profile Seller",
+      bio: "",
+      status: "Draft",
+      basedInCity: null,
+      basedInRegion: null,
+      basedInCountryCode: "JM",
+      avatarUrl: null,
+      specialtyKeys: ["Producer"],
+      caribbeanAffiliationCodes: ["JM"],
+      workspaceStatus: "Active",
+      workspaceHasSellerCapability: true,
+      offerings: [NEG_OFF_REMOTE],
+    },
+    {
+      sellerId: "neg-suspended-profile",
+      workspaceId: "neg-ws-suspended-profile",
+      professionalName: "Suspended Profile Seller",
+      bio: "",
+      status: "Suspended",
+      basedInCity: null,
+      basedInRegion: null,
+      basedInCountryCode: "TT",
+      avatarUrl: null,
+      specialtyKeys: ["Artist"],
+      caribbeanAffiliationCodes: ["TT"],
+      workspaceStatus: "Active",
+      workspaceHasSellerCapability: true,
+      offerings: [NEG_OFF_REMOTE],
+    },
+    {
+      sellerId: "neg-suspended-workspace",
+      workspaceId: "neg-ws-suspended-workspace",
+      professionalName: "Suspended Workspace Seller",
+      bio: "",
+      status: "Published",
+      basedInCity: null,
+      basedInRegion: null,
+      basedInCountryCode: "BB",
+      avatarUrl: null,
+      specialtyKeys: ["Musician"],
+      caribbeanAffiliationCodes: ["BB"],
+      workspaceStatus: "Suspended",
+      workspaceHasSellerCapability: true,
+      offerings: [NEG_OFF_REMOTE],
+    },
+    {
+      sellerId: "neg-buyer-only",
+      workspaceId: "neg-ws-buyer-only",
+      professionalName: "Buyer-Only Seller",
+      bio: "",
+      status: "Published",
+      basedInCity: null,
+      basedInRegion: null,
+      basedInCountryCode: "GY",
+      avatarUrl: null,
+      specialtyKeys: ["Producer"],
+      caribbeanAffiliationCodes: ["GY"],
+      workspaceStatus: "Active",
+      workspaceHasSellerCapability: false,
+      offerings: [NEG_OFF_REMOTE],
+    },
+    {
+      sellerId: "neg-draft-offerings",
+      workspaceId: "neg-ws-draft-offerings",
+      professionalName: "Draft-Only Seller",
+      bio: "",
+      status: "Published",
+      basedInCity: null,
+      basedInRegion: null,
+      basedInCountryCode: "DM",
+      avatarUrl: null,
+      specialtyKeys: ["Songwriter"],
+      caribbeanAffiliationCodes: ["DM"],
+      workspaceStatus: "Active",
+      workspaceHasSellerCapability: true,
+      offerings: [NEG_OFF_DRAFT],
+    },
+    {
+      sellerId: "neg-paused-offerings",
+      workspaceId: "neg-ws-paused-offerings",
+      professionalName: "Paused-Only Seller",
+      bio: "",
+      status: "Published",
+      basedInCity: null,
+      basedInRegion: null,
+      basedInCountryCode: "AG",
+      avatarUrl: null,
+      specialtyKeys: ["Producer"],
+      caribbeanAffiliationCodes: ["AG"],
+      workspaceStatus: "Active",
+      workspaceHasSellerCapability: true,
+      offerings: [NEG_OFF_PAUSED],
+    },
+    {
+      sellerId: "neg-archived-offerings",
+      workspaceId: "neg-ws-archived-offerings",
+      professionalName: "Archived-Only Seller",
+      bio: "",
+      status: "Published",
+      basedInCity: null,
+      basedInRegion: null,
+      basedInCountryCode: "LC",
+      avatarUrl: null,
+      specialtyKeys: ["SoundEngineer"],
+      caribbeanAffiliationCodes: ["LC"],
+      workspaceStatus: "Active",
+      workspaceHasSellerCapability: true,
+      offerings: [NEG_OFF_ARCHIVED],
+    },
+    {
+      sellerId: "neg-mixed-paused",
+      workspaceId: "neg-ws-mixed-paused",
+      professionalName: "Mixed Paused Seller",
+      bio: "",
+      status: "Published",
+      basedInCity: null,
+      basedInRegion: null,
+      basedInCountryCode: "KN",
+      avatarUrl: null,
+      specialtyKeys: ["Artist", "Musician"],
+      caribbeanAffiliationCodes: ["KN"],
+      workspaceStatus: "Active",
+      workspaceHasSellerCapability: true,
+      offerings: [NEG_OFF_REMOTE, { ...NEG_OFF_PAUSED, offeringId: "neg-off-mixed-paused-paused" }],
+    },
+    {
+      sellerId: "neg-mixed-archived",
+      workspaceId: "neg-ws-mixed-archived",
+      professionalName: "Mixed Archived Seller",
+      bio: "",
+      status: "Published",
+      basedInCity: null,
+      basedInRegion: null,
+      basedInCountryCode: "VC",
+      avatarUrl: null,
+      specialtyKeys: ["Songwriter"],
+      caribbeanAffiliationCodes: ["VC"],
+      workspaceStatus: "Active",
+      workspaceHasSellerCapability: true,
+      offerings: [
+        NEG_OFF_REMOTE,
+        { ...NEG_OFF_ARCHIVED, offeringId: "neg-off-mixed-archived-archived" },
+      ],
+    },
+  ];
+  return {
+    sellers,
+    controlledKeys: {
+      serviceCategoryKeys: [
+        "music-production",
+        "songwriting",
+        "custom-composition",
+        "session-vocals",
+        "session-instrument-performance",
+        "featured-artist-performance",
+        "mixing",
+        "mastering",
+        "recording-engineering",
+        "live-performance",
+      ],
+      specialtyKeys: ["Artist", "Producer", "Musician", "Songwriter", "SoundEngineer"],
+      pricingUnitKeys: ["hour", "track", "project", "session", "event", "day"],
+    },
+  };
+}
+
+describe("TalentSearchService M1.3 negative eligibility fixtures", () => {
+  test("a Draft SellerProfile is excluded from search results", async () => {
+    const service = new TalentSearchService(
+      new InMemoryTalentSearchRepository(buildNegativeFixture()),
+    );
+    const response = await service.search({ query: "Hidden Caribbean production" });
+    const sellerIds = response.results.map((r) => r.seller.sellerId);
+    assert.ok(!sellerIds.includes("neg-draft-profile"));
+  });
+
+  test("a Suspended SellerProfile is excluded from search results", async () => {
+    const service = new TalentSearchService(
+      new InMemoryTalentSearchRepository(buildNegativeFixture()),
+    );
+    const response = await service.search({ query: "Hidden Caribbean production" });
+    const sellerIds = response.results.map((r) => r.seller.sellerId);
+    assert.ok(!sellerIds.includes("neg-suspended-profile"));
+  });
+
+  test("a SellerProfile under a Suspended Workspace is excluded from search results", async () => {
+    const service = new TalentSearchService(
+      new InMemoryTalentSearchRepository(buildNegativeFixture()),
+    );
+    const response = await service.search({ query: "Hidden Caribbean production" });
+    const sellerIds = response.results.map((r) => r.seller.sellerId);
+    assert.ok(!sellerIds.includes("neg-suspended-workspace"));
+  });
+
+  test("a SellerProfile whose Workspace lacks the Seller capability is excluded", async () => {
+    const service = new TalentSearchService(
+      new InMemoryTalentSearchRepository(buildNegativeFixture()),
+    );
+    const response = await service.search({ query: "Hidden Caribbean production" });
+    const sellerIds = response.results.map((r) => r.seller.sellerId);
+    assert.ok(!sellerIds.includes("neg-buyer-only"));
+  });
+
+  test("a seller whose only offerings are Draft is excluded", async () => {
+    const service = new TalentSearchService(
+      new InMemoryTalentSearchRepository(buildNegativeFixture()),
+    );
+    const response = await service.search({ query: "Hidden Caribbean production" });
+    const sellerIds = response.results.map((r) => r.seller.sellerId);
+    assert.ok(!sellerIds.includes("neg-draft-offerings"));
+  });
+
+  test("a seller whose only offerings are Paused is excluded", async () => {
+    const service = new TalentSearchService(
+      new InMemoryTalentSearchRepository(buildNegativeFixture()),
+    );
+    const response = await service.search({ query: "Hidden Caribbean production" });
+    const sellerIds = response.results.map((r) => r.seller.sellerId);
+    assert.ok(!sellerIds.includes("neg-paused-offerings"));
+  });
+
+  test("a seller whose only offerings are Archived is excluded", async () => {
+    const service = new TalentSearchService(
+      new InMemoryTalentSearchRepository(buildNegativeFixture()),
+    );
+    const response = await service.search({ query: "Hidden Caribbean production" });
+    const sellerIds = response.results.map((r) => r.seller.sellerId);
+    assert.ok(!sellerIds.includes("neg-archived-offerings"));
+  });
+
+  test("a mixed Active+Paused seller surfaces only the Active offering (Paused is hidden, seller stays discoverable)", async () => {
+    const service = new TalentSearchService(
+      new InMemoryTalentSearchRepository(buildNegativeFixture()),
+    );
+    const response = await service.search({ query: "Hidden Caribbean production" });
+    const mixed = response.results.find((r) => r.seller.sellerId === "neg-mixed-paused");
+    assert.ok(mixed, "mixed Active+Paused seller must remain discoverable via the Active offering");
+    assert.equal(mixed.bestMatchingOffering.offeringId, "neg-off-remote");
+    assert.deepEqual(mixed.additionalMatchingOfferings, []);
+  });
+
+  test("a mixed Active+Archived seller surfaces only the Active offering (Archived is hidden, seller stays discoverable)", async () => {
+    const service = new TalentSearchService(
+      new InMemoryTalentSearchRepository(buildNegativeFixture()),
+    );
+    const response = await service.search({ query: "Hidden Caribbean production" });
+    const mixed = response.results.find((r) => r.seller.sellerId === "neg-mixed-archived");
+    assert.ok(
+      mixed,
+      "mixed Active+Archived seller must remain discoverable via the Active offering",
+    );
+    assert.equal(mixed.bestMatchingOffering.offeringId, "neg-off-remote");
+    assert.deepEqual(mixed.additionalMatchingOfferings, []);
+  });
+
+  test("the full negative fixture set never produces a Paused or Archived offering in the public response", async () => {
+    const service = new TalentSearchService(
+      new InMemoryTalentSearchRepository(buildNegativeFixture()),
+    );
+    const response = await service.search({ query: "Hidden Caribbean production" });
+    // JSON-serialize the whole response and assert no Paused/Archived
+    // status string appears in any result.
+    const serialized = JSON.stringify(response);
+    assert.equal(
+      serialized.includes('"status":"Paused"'),
+      false,
+      "no Paused offering may leak into the public response",
+    );
+    assert.equal(
+      serialized.includes('"status":"Archived"'),
+      false,
+      "no Archived offering may leak into the public response",
+    );
+  });
+
+  test("the structured-only query path also excludes every negative fixture", async () => {
+    const service = new TalentSearchService(
+      new InMemoryTalentSearchRepository(buildNegativeFixture()),
+    );
+    // No query text: eligibility must still hold via the repository.
+    const response = await service.search({
+      required: { primaryCategoryKeys: ["music-production"] },
+    });
+    const surfacedNegativeIds = response.results
+      .map((r) => r.seller.sellerId)
+      .filter((id) => id.startsWith("neg-"));
+    // Only the two mixed-lifecycle sellers may surface.
+    assert.deepEqual(surfacedNegativeIds.sort(), ["neg-mixed-archived", "neg-mixed-paused"]);
+  });
+
+  test("Paused and Archived are distinguishable by status on the in-memory candidate contract", async () => {
+    // The repository's internal candidate contract exposes the
+    // status so downstream layers (and tests) can verify the
+    // distinction. Search hides both, but Paused is recoverable
+    // while Archived is terminal; the data model preserves the
+    // difference.
+    const repo = new InMemoryTalentSearchRepository(buildNegativeFixture());
+    const candidates = await repo.search({
+      serviceModes: [],
+      primaryCategoryKeys: ["music-production"],
+      independentlyPurchasableServiceKeys: [],
+      basedIn: null,
+      serviceArea: null,
+    });
+    const pausedOffering = candidates
+      .flatMap((seller) => seller.offerings)
+      .find((offering) => offering.offeringId === "neg-off-mixed-paused-paused");
+    const archivedOffering = candidates
+      .flatMap((seller) => seller.offerings)
+      .find((offering) => offering.offeringId === "neg-off-mixed-archived-archived");
+    assert.equal(pausedOffering, undefined, "Paused offering must not surface as a candidate");
+    assert.equal(archivedOffering, undefined, "Archived offering must not surface as a candidate");
+    // But the in-memory seller still carries the offering row with its
+    // status preserved: search hides it; the contract does not collapse
+    // Paused into Archived.
+    const pausedSeller = (
+      await repo.search({
+        serviceModes: [],
+        primaryCategoryKeys: [],
+        independentlyPurchasableServiceKeys: [],
+        basedIn: null,
+        serviceArea: null,
+      })
+    ).find((s) => s.sellerId === "neg-paused-offerings");
+    assert.equal(
+      pausedSeller,
+      undefined,
+      "the seller is itself excluded; the Paused status is preserved on the underlying row, not on a hidden candidate",
+    );
+  });
+
+  test("a Draft-profile seller is excluded even when the offering matches every required filter", async () => {
+    const service = new TalentSearchService(
+      new InMemoryTalentSearchRepository(buildNegativeFixture()),
+    );
+    const response = await service.search({
+      required: {
+        primaryCategoryKeys: ["music-production"],
+        serviceModes: ["Remote"],
+      },
+    });
+    const sellerIds = response.results.map((r) => r.seller.sellerId);
+    assert.ok(!sellerIds.includes("neg-draft-profile"));
+  });
+});

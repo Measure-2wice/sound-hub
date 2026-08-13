@@ -13,6 +13,7 @@ import {
   type InMemoryFixture,
 } from "../repositories/in-memory-talent-search.repository.js";
 import {
+  talentSearchResponseV1Schema,
   type SellerProfileStatusV1,
   type ServiceOfferingStatusV1,
   type WorkspaceStatusV1,
@@ -604,5 +605,500 @@ describe("POST /api/search contract", () => {
     } finally {
       await new Promise<void>((resolve) => server.close(() => resolve()));
     }
+  });
+});
+
+// M1.3 negative eligibility fixtures (API contract layer).
+//
+// These tests prove that every excluded state is filtered end-to-end
+// through the Express route. The fixture mirrors the in-memory
+// negative fixture set in services/talent-search.service.test.ts.
+const NEG_FIXTURE: InMemoryFixture = {
+  sellers: [
+    {
+      sellerId: "neg-public-draft-profile",
+      workspaceId: "neg-ws-draft-profile",
+      professionalName: "Draft Profile Seller",
+      bio: "",
+      status: "Draft",
+      basedInCity: null,
+      basedInRegion: null,
+      basedInCountryCode: "JM",
+      avatarUrl: null,
+      specialtyKeys: ["Producer"],
+      caribbeanAffiliationCodes: ["JM"],
+      workspaceStatus: "Active",
+      workspaceHasSellerCapability: true,
+      offerings: [
+        {
+          offeringId: "neg-public-off-draft-profile",
+          title: "Hidden Caribbean production offering",
+          description: "",
+          status: "Active",
+          serviceMode: "Remote",
+          primaryCategory: { key: "music-production", name: "Music Production", bundleOnly: false },
+          includedServices: [],
+          genreTags: [],
+          serviceAreas: [{ city: null, region: null, countryCode: "JM" }],
+          pricing: null,
+        },
+      ],
+    },
+    {
+      sellerId: "neg-public-suspended-profile",
+      workspaceId: "neg-ws-suspended-profile",
+      professionalName: "Suspended Profile Seller",
+      bio: "",
+      status: "Suspended",
+      basedInCity: null,
+      basedInRegion: null,
+      basedInCountryCode: "TT",
+      avatarUrl: null,
+      specialtyKeys: ["Artist"],
+      caribbeanAffiliationCodes: ["TT"],
+      workspaceStatus: "Active",
+      workspaceHasSellerCapability: true,
+      offerings: [
+        {
+          offeringId: "neg-public-off-suspended-profile",
+          title: "Hidden Caribbean production offering",
+          description: "",
+          status: "Active",
+          serviceMode: "Remote",
+          primaryCategory: { key: "music-production", name: "Music Production", bundleOnly: false },
+          includedServices: [],
+          genreTags: [],
+          serviceAreas: [{ city: null, region: null, countryCode: "TT" }],
+          pricing: null,
+        },
+      ],
+    },
+    {
+      sellerId: "neg-public-suspended-workspace",
+      workspaceId: "neg-ws-suspended-workspace",
+      professionalName: "Suspended Workspace Seller",
+      bio: "",
+      status: "Published",
+      basedInCity: null,
+      basedInRegion: null,
+      basedInCountryCode: "BB",
+      avatarUrl: null,
+      specialtyKeys: ["Musician"],
+      caribbeanAffiliationCodes: ["BB"],
+      workspaceStatus: "Suspended",
+      workspaceHasSellerCapability: true,
+      offerings: [
+        {
+          offeringId: "neg-public-off-suspended-workspace",
+          title: "Hidden Caribbean production offering",
+          description: "",
+          status: "Active",
+          serviceMode: "Remote",
+          primaryCategory: { key: "music-production", name: "Music Production", bundleOnly: false },
+          includedServices: [],
+          genreTags: [],
+          serviceAreas: [{ city: null, region: null, countryCode: "BB" }],
+          pricing: null,
+        },
+      ],
+    },
+    {
+      sellerId: "neg-public-buyer-only",
+      workspaceId: "neg-ws-buyer-only",
+      professionalName: "Buyer-Only Seller",
+      bio: "",
+      status: "Published",
+      basedInCity: null,
+      basedInRegion: null,
+      basedInCountryCode: "GY",
+      avatarUrl: null,
+      specialtyKeys: ["Producer"],
+      caribbeanAffiliationCodes: ["GY"],
+      workspaceStatus: "Active",
+      workspaceHasSellerCapability: false,
+      offerings: [
+        {
+          offeringId: "neg-public-off-buyer-only",
+          title: "Hidden Caribbean production offering",
+          description: "",
+          status: "Active",
+          serviceMode: "Remote",
+          primaryCategory: { key: "music-production", name: "Music Production", bundleOnly: false },
+          includedServices: [],
+          genreTags: [],
+          serviceAreas: [{ city: null, region: null, countryCode: "GY" }],
+          pricing: null,
+        },
+      ],
+    },
+    {
+      sellerId: "neg-public-draft-offerings",
+      workspaceId: "neg-ws-draft-offerings",
+      professionalName: "Draft-Only Seller",
+      bio: "",
+      status: "Published",
+      basedInCity: null,
+      basedInRegion: null,
+      basedInCountryCode: "DM",
+      avatarUrl: null,
+      specialtyKeys: ["Songwriter"],
+      caribbeanAffiliationCodes: ["DM"],
+      workspaceStatus: "Active",
+      workspaceHasSellerCapability: true,
+      offerings: [
+        {
+          offeringId: "neg-public-off-draft-offerings",
+          title: "Draft writing offering",
+          description: "",
+          status: "Draft",
+          serviceMode: "Remote",
+          primaryCategory: { key: "songwriting", name: "Songwriting", bundleOnly: false },
+          includedServices: [],
+          genreTags: [],
+          serviceAreas: [{ city: null, region: null, countryCode: "DM" }],
+          pricing: null,
+        },
+      ],
+    },
+    {
+      sellerId: "neg-public-paused-offerings",
+      workspaceId: "neg-ws-paused-offerings",
+      professionalName: "Paused-Only Seller",
+      bio: "",
+      status: "Published",
+      basedInCity: null,
+      basedInRegion: null,
+      basedInCountryCode: "AG",
+      avatarUrl: null,
+      specialtyKeys: ["Producer"],
+      caribbeanAffiliationCodes: ["AG"],
+      workspaceStatus: "Active",
+      workspaceHasSellerCapability: true,
+      offerings: [
+        {
+          offeringId: "neg-public-off-paused-offerings",
+          title: "Paused production offering",
+          description: "",
+          status: "Paused",
+          serviceMode: "Remote",
+          primaryCategory: { key: "music-production", name: "Music Production", bundleOnly: false },
+          includedServices: [],
+          genreTags: [],
+          serviceAreas: [{ city: null, region: null, countryCode: "AG" }],
+          pricing: null,
+        },
+      ],
+    },
+    {
+      sellerId: "neg-public-archived-offerings",
+      workspaceId: "neg-ws-archived-offerings",
+      professionalName: "Archived-Only Seller",
+      bio: "",
+      status: "Published",
+      basedInCity: null,
+      basedInRegion: null,
+      basedInCountryCode: "LC",
+      avatarUrl: null,
+      specialtyKeys: ["SoundEngineer"],
+      caribbeanAffiliationCodes: ["LC"],
+      workspaceStatus: "Active",
+      workspaceHasSellerCapability: true,
+      offerings: [
+        {
+          offeringId: "neg-public-off-archived-offerings",
+          title: "Archived mixing offering",
+          description: "",
+          status: "Archived",
+          serviceMode: "Remote",
+          primaryCategory: { key: "mixing", name: "Mixing", bundleOnly: false },
+          includedServices: [],
+          genreTags: [],
+          serviceAreas: [{ city: null, region: null, countryCode: "LC" }],
+          pricing: null,
+        },
+      ],
+    },
+    {
+      sellerId: "neg-public-mixed-paused",
+      workspaceId: "neg-ws-mixed-paused",
+      professionalName: "Mixed Paused Seller",
+      bio: "",
+      status: "Published",
+      basedInCity: null,
+      basedInRegion: null,
+      basedInCountryCode: "KN",
+      avatarUrl: null,
+      specialtyKeys: ["Artist", "Musician"],
+      caribbeanAffiliationCodes: ["KN"],
+      workspaceStatus: "Active",
+      workspaceHasSellerCapability: true,
+      offerings: [
+        {
+          offeringId: "neg-public-off-mixed-paused-active",
+          title: "Active session vocals for Caribbean releases",
+          description: "",
+          status: "Active",
+          serviceMode: "Remote",
+          primaryCategory: { key: "session-vocals", name: "Session Vocals", bundleOnly: false },
+          includedServices: [],
+          genreTags: [],
+          serviceAreas: [{ city: null, region: null, countryCode: "KN" }],
+          pricing: null,
+        },
+        {
+          offeringId: "neg-public-off-mixed-paused-paused",
+          title: "Paused songwriting add-on",
+          description: "",
+          status: "Paused",
+          serviceMode: "Remote",
+          primaryCategory: { key: "songwriting", name: "Songwriting", bundleOnly: false },
+          includedServices: [],
+          genreTags: [],
+          serviceAreas: [{ city: null, region: null, countryCode: "KN" }],
+          pricing: null,
+        },
+      ],
+    },
+    {
+      sellerId: "neg-public-mixed-archived",
+      workspaceId: "neg-ws-mixed-archived",
+      professionalName: "Mixed Archived Seller",
+      bio: "",
+      status: "Published",
+      basedInCity: null,
+      basedInRegion: null,
+      basedInCountryCode: "VC",
+      avatarUrl: null,
+      specialtyKeys: ["Songwriter"],
+      caribbeanAffiliationCodes: ["VC"],
+      workspaceStatus: "Active",
+      workspaceHasSellerCapability: true,
+      offerings: [
+        {
+          offeringId: "neg-public-off-mixed-archived-active",
+          title: "Active custom composition for releases",
+          description: "",
+          status: "Active",
+          serviceMode: "Remote",
+          primaryCategory: {
+            key: "custom-composition",
+            name: "Custom Composition",
+            bundleOnly: false,
+          },
+          includedServices: [],
+          genreTags: [],
+          serviceAreas: [{ city: null, region: null, countryCode: "VC" }],
+          pricing: null,
+        },
+        {
+          offeringId: "neg-public-off-mixed-archived-archived",
+          title: "Archived production offering",
+          description: "",
+          status: "Archived",
+          serviceMode: "Remote",
+          primaryCategory: { key: "music-production", name: "Music Production", bundleOnly: false },
+          includedServices: [],
+          genreTags: [],
+          serviceAreas: [{ city: null, region: null, countryCode: "VC" }],
+          pricing: null,
+        },
+      ],
+    },
+  ],
+  controlledKeys: {
+    serviceCategoryKeys: [
+      "music-production",
+      "songwriting",
+      "custom-composition",
+      "session-vocals",
+      "session-instrument-performance",
+      "featured-artist-performance",
+      "mixing",
+      "mastering",
+      "recording-engineering",
+      "live-performance",
+    ],
+    specialtyKeys: ["Artist", "Producer", "Musician", "Songwriter", "SoundEngineer"],
+    pricingUnitKeys: ["hour", "track", "project", "session", "event", "day"],
+  },
+};
+
+const negService = new TalentSearchService(new InMemoryTalentSearchRepository(NEG_FIXTURE));
+const negStubPrisma = new Proxy({} as never, {
+  get() {
+    throw new Error(
+      "Prisma client was invoked; the route tests must use the in-memory repository.",
+    );
+  },
+});
+const { app: negApp } = buildApp({ service: negService, prismaClient: negStubPrisma });
+
+describe("POST /api/search M1.3 negative eligibility", () => {
+  test("Draft SellerProfile is excluded from the public response", async () => {
+    const response = await request(negApp)
+      .post("/api/search")
+      .set("content-type", "application/json")
+      .send({ query: "Hidden Caribbean production" });
+    assert.equal(response.status, 200);
+    const sellerIds = (response.body.results as Array<{ seller: { sellerId: string } }>).map(
+      (r) => r.seller.sellerId,
+    );
+    assert.ok(!sellerIds.includes("neg-public-draft-profile"));
+  });
+
+  test("Suspended SellerProfile is excluded from the public response", async () => {
+    const response = await request(negApp)
+      .post("/api/search")
+      .set("content-type", "application/json")
+      .send({ query: "Hidden Caribbean production" });
+    const sellerIds = (response.body.results as Array<{ seller: { sellerId: string } }>).map(
+      (r) => r.seller.sellerId,
+    );
+    assert.ok(!sellerIds.includes("neg-public-suspended-profile"));
+  });
+
+  test("Suspended Workspace is excluded from the public response", async () => {
+    const response = await request(negApp)
+      .post("/api/search")
+      .set("content-type", "application/json")
+      .send({ query: "Hidden Caribbean production" });
+    const sellerIds = (response.body.results as Array<{ seller: { sellerId: string } }>).map(
+      (r) => r.seller.sellerId,
+    );
+    assert.ok(!sellerIds.includes("neg-public-suspended-workspace"));
+  });
+
+  test("Buyer-only Workspace is excluded from the public response", async () => {
+    const response = await request(negApp)
+      .post("/api/search")
+      .set("content-type", "application/json")
+      .send({ query: "Hidden Caribbean production" });
+    const sellerIds = (response.body.results as Array<{ seller: { sellerId: string } }>).map(
+      (r) => r.seller.sellerId,
+    );
+    assert.ok(!sellerIds.includes("neg-public-buyer-only"));
+  });
+
+  test("Draft-only offerings exclude the seller from the public response", async () => {
+    const response = await request(negApp)
+      .post("/api/search")
+      .set("content-type", "application/json")
+      .send({ required: { primaryCategoryKeys: ["songwriting"] } });
+    const sellerIds = (response.body.results as Array<{ seller: { sellerId: string } }>).map(
+      (r) => r.seller.sellerId,
+    );
+    assert.ok(!sellerIds.includes("neg-public-draft-offerings"));
+  });
+
+  test("Paused-only offerings exclude the seller from the public response", async () => {
+    const response = await request(negApp)
+      .post("/api/search")
+      .set("content-type", "application/json")
+      .send({ query: "Paused production" });
+    const sellerIds = (response.body.results as Array<{ seller: { sellerId: string } }>).map(
+      (r) => r.seller.sellerId,
+    );
+    assert.ok(!sellerIds.includes("neg-public-paused-offerings"));
+  });
+
+  test("Archived-only offerings exclude the seller from the public response", async () => {
+    const response = await request(negApp)
+      .post("/api/search")
+      .set("content-type", "application/json")
+      .send({ required: { primaryCategoryKeys: ["mixing"] } });
+    const sellerIds = (response.body.results as Array<{ seller: { sellerId: string } }>).map(
+      (r) => r.seller.sellerId,
+    );
+    assert.ok(!sellerIds.includes("neg-public-archived-offerings"));
+  });
+
+  test("Paused offerings never appear in the public response (status is hidden)", async () => {
+    const response = await request(negApp)
+      .post("/api/search")
+      .set("content-type", "application/json")
+      .send({ query: "Hidden Caribbean production" });
+    const serialized = JSON.stringify(response.body);
+    assert.equal(
+      serialized.includes('"status":"Paused"'),
+      false,
+      "no Paused offering may leak into the public response",
+    );
+  });
+
+  test("Archived offerings never appear in the public response (status is hidden)", async () => {
+    const response = await request(negApp)
+      .post("/api/search")
+      .set("content-type", "application/json")
+      .send({ query: "Hidden Caribbean production" });
+    const serialized = JSON.stringify(response.body);
+    assert.equal(
+      serialized.includes('"status":"Archived"'),
+      false,
+      "no Archived offering may leak into the public response",
+    );
+  });
+
+  test("Draft offerings never appear in the public response (status is hidden)", async () => {
+    const response = await request(negApp)
+      .post("/api/search")
+      .set("content-type", "application/json")
+      .send({ query: "Hidden Caribbean production" });
+    const serialized = JSON.stringify(response.body);
+    assert.equal(
+      serialized.includes('"status":"Draft"'),
+      false,
+      "no Draft offering may leak into the public response",
+    );
+  });
+
+  test("a mixed Active+Paused seller surfaces with only the Active offering", async () => {
+    const response = await request(negApp)
+      .post("/api/search")
+      .set("content-type", "application/json")
+      .send({ required: { primaryCategoryKeys: ["session-vocals"] } });
+    const result = (
+      response.body.results as Array<{
+        seller: { sellerId: string };
+        bestMatchingOffering: { offeringId: string };
+      }>
+    ).find((r) => r.seller.sellerId === "neg-public-mixed-paused");
+    assert.ok(result, "mixed Active+Paused seller must remain discoverable");
+    assert.equal(result.bestMatchingOffering.offeringId, "neg-public-off-mixed-paused-active");
+  });
+
+  test("a mixed Active+Archived seller surfaces with only the Active offering", async () => {
+    const response = await request(negApp)
+      .post("/api/search")
+      .set("content-type", "application/json")
+      .send({ required: { primaryCategoryKeys: ["custom-composition"] } });
+    const result = (
+      response.body.results as Array<{
+        seller: { sellerId: string };
+        bestMatchingOffering: { offeringId: string };
+      }>
+    ).find((r) => r.seller.sellerId === "neg-public-mixed-archived");
+    assert.ok(result, "mixed Active+Archived seller must remain discoverable");
+    assert.equal(result.bestMatchingOffering.offeringId, "neg-public-off-mixed-archived-active");
+  });
+
+  test("the public response validates against the strict v1 schema", async () => {
+    // The whole negative-fixture response must validate end to end:
+    // any leak of an excluded field would cause a schema rejection and
+    // map to SEARCH_FAILED 500. This is the load-bearing assertion
+    // that the eligibility filter and the public DTO mapping are
+    // both in sync.
+    const response = await request(negApp)
+      .post("/api/search")
+      .set("content-type", "application/json")
+      .send({ query: "Hidden Caribbean production" });
+    assert.equal(response.status, 200);
+    const parsed = talentSearchResponseV1Schema.safeParse(response.body);
+    assert.equal(
+      parsed.success,
+      true,
+      `public response failed schema validation: ${
+        parsed.success ? "" : JSON.stringify(parsed.error.issues)
+      }`,
+    );
   });
 });
