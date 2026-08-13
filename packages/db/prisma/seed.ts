@@ -34,6 +34,7 @@
 
 import { PrismaPg } from "@prisma/adapter-pg";
 import { PrismaClient } from "../src/generated/client.js";
+import type { Prisma } from "../src/generated/client.js";
 import type {
   MarketplaceCapability,
   PricingKind,
@@ -173,14 +174,22 @@ const PRICING_UNITS = [
   { key: "day", name: "Day" },
 ] as const;
 
-type SellerSeed = {
+// Shared seller-graph shape used by both the canonical SELLERS array
+// and the M1.3 negative eligibility fixtures. The canonical sellers
+// always supply `workspaceStatus: "Active"` and
+// `workspaceCapabilities: ["Seller"]`; the negative fixtures supply
+// the excluded state values. The same persistence flow applies to
+// both, so `applySellerGraph` (below) is the single source of truth.
+type SellerGraphSeed = {
   readonly ownerEmail: string;
   readonly workspaceSlug: string;
   readonly workspaceName: string;
   readonly workspaceType: WorkspaceType;
+  readonly workspaceStatus: WorkspaceStatus;
+  readonly workspaceCapabilities: readonly MarketplaceCapability[];
   readonly professionalName: string;
   readonly bio: string;
-  readonly status: SellerProfileStatus;
+  readonly profileStatus: SellerProfileStatus;
   readonly basedInCity: string | null;
   readonly basedInRegion: string | null;
   readonly basedInCountryCode: string;
@@ -189,6 +198,8 @@ type SellerSeed = {
   readonly specialtyKeys: readonly (typeof SPECIALTY_KEYS)[number][];
   readonly offerings: readonly OfferingSeed[];
 };
+
+type SellerSeed = SellerGraphSeed;
 
 type OfferingSeed = {
   readonly slug: string;
@@ -213,9 +224,11 @@ const SELLERS: readonly SellerSeed[] = [
     workspaceSlug: "creole-beats-brooklyn",
     workspaceName: "Creole Beats Brooklyn",
     workspaceType: "Personal",
+    workspaceStatus: "Active",
+    workspaceCapabilities: ["Seller"],
     professionalName: "Marc-André Pierre",
     bio: "Brooklyn-based Haitian producer crafting dancehall, soca, and hip-hop instrumentals for diaspora artists worldwide.",
-    status: "Published",
+    profileStatus: "Published",
     basedInCity: "Brooklyn",
     basedInRegion: "NY",
     basedInCountryCode: "US",
@@ -245,9 +258,11 @@ const SELLERS: readonly SellerSeed[] = [
     workspaceSlug: "kingson-to-songs",
     workspaceName: "Kingson TO Songs",
     workspaceType: "Personal",
+    workspaceStatus: "Active",
+    workspaceCapabilities: ["Seller"],
     professionalName: "Keisha Williams",
     bio: "Toronto-based Jamaican songwriter specializing in R&B and afrobeats toplines for global artists.",
-    status: "Published",
+    profileStatus: "Published",
     basedInCity: "Toronto",
     basedInRegion: "ON",
     basedInCountryCode: "CA",
@@ -284,9 +299,11 @@ const SELLERS: readonly SellerSeed[] = [
     workspaceSlug: "aisha-london-sessions",
     workspaceName: "Aisha London Sessions",
     workspaceType: "Personal",
+    workspaceStatus: "Active",
+    workspaceCapabilities: ["Seller"],
     professionalName: "Aisha Mohammed",
     bio: "Trinidadian session vocalist based in London, recording lead and harmony vocals for dancehall, soca, and afrobeats releases.",
-    status: "Published",
+    profileStatus: "Published",
     basedInCity: "London",
     basedInRegion: null,
     basedInCountryCode: "GB",
@@ -317,9 +334,11 @@ const SELLERS: readonly SellerSeed[] = [
     workspaceSlug: "junior-roberts-mix",
     workspaceName: "Junior Roberts Mix",
     workspaceType: "Personal",
+    workspaceStatus: "Active",
+    workspaceCapabilities: ["Seller"],
     professionalName: "Junior Roberts",
     bio: "Barbadian mix engineer in Brooklyn, mixing dancehall, hip-hop, and R&B records with a focus on loud, clean masters.",
-    status: "Published",
+    profileStatus: "Published",
     basedInCity: "Brooklyn",
     basedInRegion: "NY",
     basedInCountryCode: "US",
@@ -346,9 +365,11 @@ const SELLERS: readonly SellerSeed[] = [
     workspaceSlug: "selene-dominicana-live",
     workspaceName: "Selene Dominicana Live",
     workspaceType: "Personal",
+    workspaceStatus: "Active",
+    workspaceCapabilities: ["Seller"],
     professionalName: "Selene García",
     bio: "Dominican bachata and merengue artist available for in-person festival and club performances across the Caribbean and Latin America.",
-    status: "Published",
+    profileStatus: "Published",
     basedInCity: "Santo Domingo",
     basedInRegion: null,
     basedInCountryCode: "DO",
@@ -375,9 +396,11 @@ const SELLERS: readonly SellerSeed[] = [
     workspaceSlug: "marina-joseph-compositions",
     workspaceName: "Marina Joseph Compositions",
     workspaceType: "Personal",
+    workspaceStatus: "Active",
+    workspaceCapabilities: ["Seller"],
     professionalName: "Marina Joseph",
     bio: "Saint Lucian composer producing original scores for short films, branded content, and sync placements.",
-    status: "Published",
+    profileStatus: "Published",
     basedInCity: "Castries",
     basedInRegion: null,
     basedInCountryCode: "LC",
@@ -403,9 +426,11 @@ const SELLERS: readonly SellerSeed[] = [
     workspaceSlug: "devon-king-bahamas-live",
     workspaceName: "Devon King Bahamas Live",
     workspaceType: "Personal",
+    workspaceStatus: "Active",
+    workspaceCapabilities: ["Seller"],
     professionalName: "Devon King",
     bio: "Bahamian live performer and music director hosting resort and festival sets across the Caribbean and the US East Coast.",
-    status: "Published",
+    profileStatus: "Published",
     basedInCity: "Nassau",
     basedInRegion: null,
     basedInCountryCode: "BS",
@@ -437,9 +462,11 @@ const SELLERS: readonly SellerSeed[] = [
     workspaceSlug: "anika-charles-mastering",
     workspaceName: "Anika Charles Mastering",
     workspaceType: "Personal",
+    workspaceStatus: "Active",
+    workspaceCapabilities: ["Seller"],
     professionalName: "Anika Charles",
     bio: "Grenadian mastering engineer preparing streaming-ready masters for independent Caribbean labels.",
-    status: "Published",
+    profileStatus: "Published",
     basedInCity: "St. George's",
     basedInRegion: null,
     basedInCountryCode: "GD",
@@ -481,39 +508,7 @@ const SELLERS: readonly SellerSeed[] = [
 // snapshot proves the closed canonical SELLERS set is correct, and these
 // fixtures add rows that prove the eligibility filters work; the
 // repository integration tests assert the latter.
-type NegativeFixture = {
-  readonly ownerEmail: string;
-  readonly workspaceSlug: string;
-  readonly workspaceName: string;
-  readonly workspaceType: WorkspaceType;
-  readonly workspaceStatus: WorkspaceStatus;
-  readonly workspaceCapabilities: readonly MarketplaceCapability[];
-  readonly professionalName: string;
-  readonly bio: string;
-  readonly profileStatus: SellerProfileStatus;
-  readonly basedInCity: string | null;
-  readonly basedInRegion: string | null;
-  readonly basedInCountryCode: string;
-  readonly avatarUrl: string | null;
-  readonly caribbeanAffiliationCodes: readonly string[];
-  readonly specialtyKeys: readonly (typeof SPECIALTY_KEYS)[number][];
-  readonly offerings: readonly {
-    readonly slug: string;
-    readonly title: string;
-    readonly description: string;
-    readonly status: ServiceOfferingStatus;
-    readonly serviceMode: ServiceMode;
-    readonly primaryCategoryKey: string;
-    readonly genreTags: readonly string[];
-    readonly pricing?: {
-      readonly kind: PricingKind;
-      readonly amountMinor?: number;
-      readonly currency?: string;
-      readonly unitKey?: string;
-    };
-    readonly serviceAreas: readonly { city?: string; region?: string; countryCode: string }[];
-  }[];
-};
+type NegativeFixture = SellerGraphSeed;
 
 const NEGATIVE_FIXTURES: readonly NegativeFixture[] = [
   {
@@ -843,6 +838,216 @@ function toOfferingId(slug: string): string {
   return `of-${slug}`;
 }
 
+// applySellerGraph: the single source of truth for persisting a full
+// seller graph (UserAccount → Workspace → WorkspaceMembership →
+// WorkspaceCapability → SellerProfile → CaribbeanAffiliation →
+// SellerProfileSpecialty → ServiceOffering → ServiceOfferingServiceArea
+// → ServiceOfferingPricing; includedService rows are reset to empty
+// to match the M1.1 fixture).
+//
+// Both the canonical SELLERS (workspaceStatus "Active" + Seller
+// capability) and the M1.3 negative eligibility fixtures (deliberately
+// excluded states) flow through this helper. The differences are
+// captured by the `workspaceStatus` and `workspaceCapabilities` fields
+// on the seed plus the `profileStatus` field on the profile.
+//
+// The capability set is replaced (deleteMany + recreate) on every run
+// so a stale capability mutation from a previous fixture does not
+// persist. The same idempotent upsert pattern applies to the
+// CaribbeanAffiliation and SellerProfileSpecialty join rows.
+async function applySellerGraph(
+  tx: Prisma.TransactionClient,
+  seller: SellerGraphSeed,
+): Promise<void> {
+  const userId = toUserId(seller.ownerEmail);
+  const workspaceId = toWorkspaceId(seller.workspaceSlug);
+  const sellerProfileId = toSellerProfileId(seller.workspaceSlug);
+
+  const owner = await tx.userAccount.upsert({
+    where: { id: userId },
+    create: { id: userId, email: seller.ownerEmail },
+    // Restore the canonical email on every run so a stale email
+    // mutation is restored.
+    update: { email: seller.ownerEmail },
+  });
+
+  const workspace = await tx.workspace.upsert({
+    where: { slug: seller.workspaceSlug },
+    create: {
+      id: workspaceId,
+      slug: seller.workspaceSlug,
+      name: seller.workspaceName,
+      type: seller.workspaceType,
+      status: seller.workspaceStatus,
+      ownerUserId: owner.id,
+    },
+    // Restore the canonical ownerUserId and other fields on every run
+    // so a stale update cannot persist.
+    update: {
+      name: seller.workspaceName,
+      type: seller.workspaceType,
+      status: seller.workspaceStatus,
+      ownerUserId: owner.id,
+    },
+  });
+
+  await tx.workspaceMembership.upsert({
+    where: { userId_workspaceId: { userId: owner.id, workspaceId: workspace.id } },
+    create: { userId: owner.id, workspaceId: workspace.id, role: "Owner" },
+    update: { role: "Owner" },
+  });
+
+  // Replace the canonical capability set so re-running the seed
+  // converges on the approved capability set (canonical: ["Seller"];
+  // negative fixtures: ["Buyer"] or whatever the excluded state needs).
+  await tx.workspaceCapability.deleteMany({ where: { workspaceId: workspace.id } });
+  for (const capability of seller.workspaceCapabilities) {
+    await tx.workspaceCapability.create({
+      data: { workspaceId: workspace.id, capability },
+    });
+  }
+
+  const profile = await tx.sellerProfile.upsert({
+    where: { workspaceId: workspace.id },
+    create: {
+      id: sellerProfileId,
+      workspaceId: workspace.id,
+      professionalName: seller.professionalName,
+      bio: seller.bio,
+      status: seller.profileStatus,
+      basedInCity: seller.basedInCity,
+      basedInRegion: seller.basedInRegion,
+      basedInCountryCode: seller.basedInCountryCode,
+      avatarUrl: seller.avatarUrl,
+    },
+    update: {
+      professionalName: seller.professionalName,
+      bio: seller.bio,
+      status: seller.profileStatus,
+      basedInCity: seller.basedInCity,
+      basedInRegion: seller.basedInRegion,
+      basedInCountryCode: seller.basedInCountryCode,
+      avatarUrl: seller.avatarUrl,
+    },
+  });
+
+  // Caribbean affiliations: replace the canonical set, keyed on the
+  // (sellerProfileId, countryCode) unique constraint.
+  await tx.caribbeanAffiliation.deleteMany({ where: { sellerProfileId: profile.id } });
+  for (const countryCode of seller.caribbeanAffiliationCodes) {
+    await tx.caribbeanAffiliation.upsert({
+      where: { sellerProfileId_countryCode: { sellerProfileId: profile.id, countryCode } },
+      create: { sellerProfileId: profile.id, countryCode },
+      update: {},
+    });
+  }
+
+  // Specialties: replace the canonical set, keyed on the
+  // (sellerProfileId, specialtyId) composite key.
+  await tx.sellerProfileSpecialty.deleteMany({ where: { sellerProfileId: profile.id } });
+  for (const specialtyKey of seller.specialtyKeys) {
+    const specialty = await tx.specialty.findUnique({ where: { key: specialtyKey } });
+    if (!specialty) {
+      throw new Error(`Specialty ${specialtyKey} missing from controlled records`);
+    }
+    await tx.sellerProfileSpecialty.upsert({
+      where: {
+        sellerProfileId_specialtyId: {
+          sellerProfileId: profile.id,
+          specialtyId: specialty.id,
+        },
+      },
+      create: { sellerProfileId: profile.id, specialtyId: specialty.id },
+      update: {},
+    });
+  }
+
+  for (const offering of seller.offerings) {
+    const category = await tx.serviceCategory.findUnique({
+      where: { key: offering.primaryCategoryKey },
+    });
+    if (!category) {
+      throw new Error(
+        `ServiceCategory ${offering.primaryCategoryKey} missing from controlled records`,
+      );
+    }
+
+    await tx.serviceOffering.upsert({
+      where: { slug: offering.slug },
+      create: {
+        id: toOfferingId(offering.slug),
+        slug: offering.slug,
+        sellerProfileId: profile.id,
+        title: offering.title,
+        description: offering.description,
+        status: offering.status,
+        serviceMode: offering.serviceMode,
+        primaryCategoryId: category.id,
+        genreTags: [...offering.genreTags],
+      },
+      // Restore the canonical sellerProfileId and primaryCategoryId on
+      // every run so a stale update cannot persist.
+      update: {
+        title: offering.title,
+        description: offering.description,
+        status: offering.status,
+        serviceMode: offering.serviceMode,
+        sellerProfileId: profile.id,
+        primaryCategoryId: category.id,
+        genreTags: [...offering.genreTags],
+      },
+    });
+
+    const persisted = await tx.serviceOffering.findUnique({ where: { slug: offering.slug } });
+    if (!persisted) {
+      throw new Error(`Failed to persist offering ${offering.slug}`);
+    }
+
+    // Service areas: replace the canonical set.
+    await tx.serviceOfferingServiceArea.deleteMany({ where: { offeringId: persisted.id } });
+    for (const area of offering.serviceAreas) {
+      await tx.serviceOfferingServiceArea.create({
+        data: {
+          offeringId: persisted.id,
+          city: area.city ?? null,
+          region: area.region ?? null,
+          countryCode: area.countryCode,
+        },
+      });
+    }
+
+    // Pricing: replace the canonical single-row record.
+    await tx.serviceOfferingPricing.deleteMany({ where: { offeringId: persisted.id } });
+    if (offering.pricing) {
+      let unitId: string | null = null;
+      if (offering.pricing.unitKey) {
+        const unit = await tx.pricingUnit.findUnique({
+          where: { key: offering.pricing.unitKey },
+        });
+        if (!unit) {
+          throw new Error(
+            `PricingUnit ${offering.pricing.unitKey} missing from controlled records`,
+          );
+        }
+        unitId = unit.id;
+      }
+      await tx.serviceOfferingPricing.create({
+        data: {
+          offeringId: persisted.id,
+          kind: offering.pricing.kind,
+          amountMinor: offering.pricing.amountMinor ?? null,
+          currency: offering.pricing.currency ?? null,
+          unitId,
+        },
+      });
+    }
+
+    // Reset bundle-only IncludedServices (M1.1 ships with no bundles;
+    // future tickets will add them).
+    await tx.includedService.deleteMany({ where: { offeringId: persisted.id } });
+  }
+}
+
 async function applySeed(): Promise<void> {
   await prisma.$transaction(async (tx) => {
     // Controlled records (categorical taxonomies).
@@ -872,373 +1077,24 @@ async function applySeed(): Promise<void> {
       });
     }
 
-    // Sellers and their full relationship graph.
+    // Sellers and their full relationship graph. The canonical SELLERS
+    // and the M1.3 negative fixtures share the same persistence flow;
+    // `applySellerGraph` (below) is the single source of truth and
+    // handles both sets.
     for (const seller of SELLERS) {
-      const userId = toUserId(seller.ownerEmail);
-      const workspaceId = toWorkspaceId(seller.workspaceSlug);
-      const sellerProfileId = toSellerProfileId(seller.workspaceSlug);
-
-      const owner = await tx.userAccount.upsert({
-        where: { id: userId },
-        create: { id: userId, email: seller.ownerEmail },
-        // Restore the canonical email on every run so a stale email
-        // mutation is restored.
-        update: { email: seller.ownerEmail },
-      });
-
-      const workspace = await tx.workspace.upsert({
-        where: { slug: seller.workspaceSlug },
-        create: {
-          id: workspaceId,
-          slug: seller.workspaceSlug,
-          name: seller.workspaceName,
-          type: seller.workspaceType,
-          status: "Active",
-          ownerUserId: owner.id,
-        },
-        // Restore the canonical ownerUserId and other fields on every run
-        // so a stale update cannot persist.
-        update: {
-          name: seller.workspaceName,
-          type: seller.workspaceType,
-          status: "Active",
-          ownerUserId: owner.id,
-        },
-      });
-
-      await tx.workspaceMembership.upsert({
-        where: { userId_workspaceId: { userId: owner.id, workspaceId: workspace.id } },
-        create: { userId: owner.id, workspaceId: workspace.id, role: "Owner" },
-        update: { role: "Owner" },
-      });
-
-      await tx.workspaceCapability.upsert({
-        where: {
-          workspaceId_capability: { workspaceId: workspace.id, capability: "Seller" },
-        },
-        create: { workspaceId: workspace.id, capability: "Seller" },
-        update: {},
-      });
-
-      const profile = await tx.sellerProfile.upsert({
-        where: { workspaceId: workspace.id },
-        create: {
-          id: sellerProfileId,
-          workspaceId: workspace.id,
-          professionalName: seller.professionalName,
-          bio: seller.bio,
-          status: seller.status,
-          basedInCity: seller.basedInCity,
-          basedInRegion: seller.basedInRegion,
-          basedInCountryCode: seller.basedInCountryCode,
-          avatarUrl: seller.avatarUrl,
-        },
-        update: {
-          professionalName: seller.professionalName,
-          bio: seller.bio,
-          status: seller.status,
-          basedInCity: seller.basedInCity,
-          basedInRegion: seller.basedInRegion,
-          basedInCountryCode: seller.basedInCountryCode,
-          avatarUrl: seller.avatarUrl,
-        },
-      });
-
-      // Caribbean affiliations: replace the canonical set, keyed on the
-      // (sellerProfileId, countryCode) unique constraint.
-      await tx.caribbeanAffiliation.deleteMany({ where: { sellerProfileId: profile.id } });
-      for (const countryCode of seller.caribbeanAffiliationCodes) {
-        await tx.caribbeanAffiliation.upsert({
-          where: { sellerProfileId_countryCode: { sellerProfileId: profile.id, countryCode } },
-          create: { sellerProfileId: profile.id, countryCode },
-          update: {},
-        });
-      }
-
-      // Specialties: replace the canonical set, keyed on the
-      // (sellerProfileId, specialtyId) composite key.
-      await tx.sellerProfileSpecialty.deleteMany({ where: { sellerProfileId: profile.id } });
-      for (const specialtyKey of seller.specialtyKeys) {
-        const specialty = await tx.specialty.findUnique({ where: { key: specialtyKey } });
-        if (!specialty) {
-          throw new Error(`Specialty ${specialtyKey} missing from controlled records`);
-        }
-        await tx.sellerProfileSpecialty.upsert({
-          where: {
-            sellerProfileId_specialtyId: {
-              sellerProfileId: profile.id,
-              specialtyId: specialty.id,
-            },
-          },
-          create: { sellerProfileId: profile.id, specialtyId: specialty.id },
-          update: {},
-        });
-      }
-
-      for (const offering of seller.offerings) {
-        const category = await tx.serviceCategory.findUnique({
-          where: { key: offering.primaryCategoryKey },
-        });
-        if (!category) {
-          throw new Error(
-            `ServiceCategory ${offering.primaryCategoryKey} missing from controlled records`,
-          );
-        }
-
-        await tx.serviceOffering.upsert({
-          where: { slug: offering.slug },
-          create: {
-            id: toOfferingId(offering.slug),
-            slug: offering.slug,
-            sellerProfileId: profile.id,
-            title: offering.title,
-            description: offering.description,
-            status: offering.status,
-            serviceMode: offering.serviceMode,
-            primaryCategoryId: category.id,
-            genreTags: [...offering.genreTags],
-          },
-          // Restore the canonical sellerProfileId and primaryCategoryId on
-          // every run so a stale update cannot persist.
-          update: {
-            title: offering.title,
-            description: offering.description,
-            status: offering.status,
-            serviceMode: offering.serviceMode,
-            sellerProfileId: profile.id,
-            primaryCategoryId: category.id,
-            genreTags: [...offering.genreTags],
-          },
-        });
-
-        const persisted = await tx.serviceOffering.findUnique({ where: { slug: offering.slug } });
-        if (!persisted) {
-          throw new Error(`Failed to persist offering ${offering.slug}`);
-        }
-
-        // Service areas: replace the canonical set.
-        await tx.serviceOfferingServiceArea.deleteMany({ where: { offeringId: persisted.id } });
-        for (const area of offering.serviceAreas) {
-          await tx.serviceOfferingServiceArea.create({
-            data: {
-              offeringId: persisted.id,
-              city: area.city ?? null,
-              region: area.region ?? null,
-              countryCode: area.countryCode,
-            },
-          });
-        }
-
-        // Pricing: replace the canonical single-row record.
-        await tx.serviceOfferingPricing.deleteMany({ where: { offeringId: persisted.id } });
-        if (offering.pricing) {
-          let unitId: string | null = null;
-          if (offering.pricing.unitKey) {
-            const unit = await tx.pricingUnit.findUnique({
-              where: { key: offering.pricing.unitKey },
-            });
-            if (!unit) {
-              throw new Error(
-                `PricingUnit ${offering.pricing.unitKey} missing from controlled records`,
-              );
-            }
-            unitId = unit.id;
-          }
-          await tx.serviceOfferingPricing.create({
-            data: {
-              offeringId: persisted.id,
-              kind: offering.pricing.kind,
-              amountMinor: offering.pricing.amountMinor ?? null,
-              currency: offering.pricing.currency ?? null,
-              unitId,
-            },
-          });
-        }
-
-        // Reset bundle-only IncludedServices (M1.1 ships with no bundles;
-        // future tickets will add them).
-        await tx.includedService.deleteMany({ where: { offeringId: persisted.id } });
-      }
+      await applySellerGraph(tx, seller);
     }
 
+    // M1.3 negative eligibility fixtures. These deliberately cover every
+    // excluded state called out by issue #4 and are seeded with stable
+    // IDs so repository integration tests can reference them by primary
     // M1.3 negative eligibility fixtures. These deliberately cover every
     // excluded state called out by issue #4 and are seeded with stable
     // IDs so repository integration tests can reference them by primary
     // key. They are NOT included in the canonical SELLERS array, so the
     // canonical snapshot assertion is unchanged.
     for (const fixture of NEGATIVE_FIXTURES) {
-      const userId = toUserId(fixture.ownerEmail);
-      const workspaceId = toWorkspaceId(fixture.workspaceSlug);
-      const sellerProfileId = toSellerProfileId(fixture.workspaceSlug);
-
-      const owner = await tx.userAccount.upsert({
-        where: { id: userId },
-        create: { id: userId, email: fixture.ownerEmail },
-        update: { email: fixture.ownerEmail },
-      });
-
-      const workspace = await tx.workspace.upsert({
-        where: { slug: fixture.workspaceSlug },
-        create: {
-          id: workspaceId,
-          slug: fixture.workspaceSlug,
-          name: fixture.workspaceName,
-          type: fixture.workspaceType,
-          status: fixture.workspaceStatus,
-          ownerUserId: owner.id,
-        },
-        update: {
-          name: fixture.workspaceName,
-          type: fixture.workspaceType,
-          status: fixture.workspaceStatus,
-          ownerUserId: owner.id,
-        },
-      });
-
-      await tx.workspaceMembership.upsert({
-        where: { userId_workspaceId: { userId: owner.id, workspaceId: workspace.id } },
-        create: { userId: owner.id, workspaceId: workspace.id, role: "Owner" },
-        update: { role: "Owner" },
-      });
-
-      // Replace the canonical capability set so re-running the seed
-      // converges on the approved excluded-state capability set.
-      await tx.workspaceCapability.deleteMany({ where: { workspaceId: workspace.id } });
-      for (const capability of fixture.workspaceCapabilities) {
-        await tx.workspaceCapability.create({
-          data: { workspaceId: workspace.id, capability },
-        });
-      }
-
-      const profile = await tx.sellerProfile.upsert({
-        where: { workspaceId: workspace.id },
-        create: {
-          id: sellerProfileId,
-          workspaceId: workspace.id,
-          professionalName: fixture.professionalName,
-          bio: fixture.bio,
-          status: fixture.profileStatus,
-          basedInCity: fixture.basedInCity,
-          basedInRegion: fixture.basedInRegion,
-          basedInCountryCode: fixture.basedInCountryCode,
-          avatarUrl: fixture.avatarUrl,
-        },
-        update: {
-          professionalName: fixture.professionalName,
-          bio: fixture.bio,
-          status: fixture.profileStatus,
-          basedInCity: fixture.basedInCity,
-          basedInRegion: fixture.basedInRegion,
-          basedInCountryCode: fixture.basedInCountryCode,
-          avatarUrl: fixture.avatarUrl,
-        },
-      });
-
-      await tx.caribbeanAffiliation.deleteMany({ where: { sellerProfileId: profile.id } });
-      for (const countryCode of fixture.caribbeanAffiliationCodes) {
-        await tx.caribbeanAffiliation.upsert({
-          where: { sellerProfileId_countryCode: { sellerProfileId: profile.id, countryCode } },
-          create: { sellerProfileId: profile.id, countryCode },
-          update: {},
-        });
-      }
-
-      await tx.sellerProfileSpecialty.deleteMany({ where: { sellerProfileId: profile.id } });
-      for (const specialtyKey of fixture.specialtyKeys) {
-        const specialty = await tx.specialty.findUnique({ where: { key: specialtyKey } });
-        if (!specialty) {
-          throw new Error(`Specialty ${specialtyKey} missing from controlled records`);
-        }
-        await tx.sellerProfileSpecialty.upsert({
-          where: {
-            sellerProfileId_specialtyId: {
-              sellerProfileId: profile.id,
-              specialtyId: specialty.id,
-            },
-          },
-          create: { sellerProfileId: profile.id, specialtyId: specialty.id },
-          update: {},
-        });
-      }
-
-      for (const offering of fixture.offerings) {
-        const category = await tx.serviceCategory.findUnique({
-          where: { key: offering.primaryCategoryKey },
-        });
-        if (!category) {
-          throw new Error(
-            `ServiceCategory ${offering.primaryCategoryKey} missing from controlled records`,
-          );
-        }
-
-        await tx.serviceOffering.upsert({
-          where: { slug: offering.slug },
-          create: {
-            id: toOfferingId(offering.slug),
-            slug: offering.slug,
-            sellerProfileId: profile.id,
-            title: offering.title,
-            description: offering.description,
-            status: offering.status,
-            serviceMode: offering.serviceMode,
-            primaryCategoryId: category.id,
-            genreTags: [...offering.genreTags],
-          },
-          update: {
-            title: offering.title,
-            description: offering.description,
-            status: offering.status,
-            serviceMode: offering.serviceMode,
-            sellerProfileId: profile.id,
-            primaryCategoryId: category.id,
-            genreTags: [...offering.genreTags],
-          },
-        });
-
-        const persisted = await tx.serviceOffering.findUnique({ where: { slug: offering.slug } });
-        if (!persisted) {
-          throw new Error(`Failed to persist offering ${offering.slug}`);
-        }
-
-        await tx.serviceOfferingServiceArea.deleteMany({ where: { offeringId: persisted.id } });
-        for (const area of offering.serviceAreas) {
-          await tx.serviceOfferingServiceArea.create({
-            data: {
-              offeringId: persisted.id,
-              city: area.city ?? null,
-              region: area.region ?? null,
-              countryCode: area.countryCode,
-            },
-          });
-        }
-
-        await tx.serviceOfferingPricing.deleteMany({ where: { offeringId: persisted.id } });
-        if (offering.pricing) {
-          let unitId: string | null = null;
-          if (offering.pricing.unitKey) {
-            const unit = await tx.pricingUnit.findUnique({
-              where: { key: offering.pricing.unitKey },
-            });
-            if (!unit) {
-              throw new Error(
-                `PricingUnit ${offering.pricing.unitKey} missing from controlled records`,
-              );
-            }
-            unitId = unit.id;
-          }
-          await tx.serviceOfferingPricing.create({
-            data: {
-              offeringId: persisted.id,
-              kind: offering.pricing.kind,
-              amountMinor: offering.pricing.amountMinor ?? null,
-              currency: offering.pricing.currency ?? null,
-              unitId,
-            },
-          });
-        }
-
-        await tx.includedService.deleteMany({ where: { offeringId: persisted.id } });
-      }
+      await applySellerGraph(tx, fixture);
     }
   });
 }
@@ -1584,9 +1440,9 @@ export function assertCanonicalSnapshotCorrect(snapshot: CanonicalSnapshot): voi
         `SellerProfile.avatarUrl drifted for ${seller.workspaceSlug}: expected ${JSON.stringify(seller.avatarUrl)} got ${JSON.stringify(actual.avatarUrl)}`,
       );
     }
-    if (actual.status !== seller.status) {
+    if (actual.status !== seller.profileStatus) {
       throw new Error(
-        `SellerProfile ${seller.workspaceSlug}.status drifted: expected ${seller.status} got ${actual.status}`,
+        `SellerProfile ${seller.workspaceSlug}.status drifted: expected ${seller.profileStatus} got ${actual.status}`,
       );
     }
     if (actual.basedInCity !== seller.basedInCity) {
