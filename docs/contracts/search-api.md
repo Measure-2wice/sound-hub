@@ -158,6 +158,10 @@ interface TalentSearchResultV1 {
     readonly matched: number;
     readonly total: number;
   };
+  readonly textCoverage?: {
+    readonly matched: number;
+    readonly total: number;
+  };
 }
 
 interface TalentSearchResponseV1 {
@@ -195,14 +199,32 @@ interface TalentSearchResponseV1 {
   Both are derived from the deterministic preference matcher, never from `relevanceScore`. The buyer
   UI may surface this coverage as a factual qualitative-fit description but must not render it as a
   percentage and must not derive a confidence or quality band from it.
-- `preferenceCoverage` is optional in the public DTO. When the service omits the field, the legacy
-  client surfaces the deterministic factual evidence in `matchReason` alone and the qualitative-fit
-  block is omitted. The field is omitted only when the buyer supplied no usable preferences (in
-  which case `preferenceCoverage.total` would be `0` and the resulting "0 of 0" statement is not
-  factual evidence); clients that do not render the field at all therefore receive the same
-  buyer-facing behavior as a client that renders "no preferences were requested" for that case. The
-  field is always present when the buyer supplied at least one canonical preference atom so the
-  coverage line is never absent on a meaningful preference-bearing result.
+- `preferenceCoverage` is optional in the public DTO. When the service omits the field, the buyer UI
+  falls back to `textCoverage` (if the buyer supplied a query) and otherwise surfaces the
+  deterministic factual evidence in `matchReason` alone. The field is omitted only when the buyer
+  supplied no usable preferences (in which case `preferenceCoverage.total` would be `0` and the
+  resulting "0 of 0" statement is not factual evidence); clients that do not render the field at
+  all therefore receive the same buyer-facing behavior as a client that renders "no preferences
+  were requested" for that case. The field is always present when the buyer supplied at least one
+  canonical preference atom so the coverage line is never absent on a meaningful preference-bearing
+  result.
+- `textCoverage.matched` is the count of distinct canonical query tokens that matched the best
+  matching offering's `title`, primary-category `key`, or primary-category `name` fields;
+  `textCoverage.total` is the count of distinct canonical query tokens the buyer supplied. Both are
+  derived from the deterministic text matcher, never from `relevanceScore`. The buyer UI may surface
+  this coverage as a factual qualitative-fit description but must not render it as a percentage and
+  must not derive a confidence or quality band from it.
+- `textCoverage` is optional in the public DTO. When the service omits the field, the buyer UI
+  falls back to `preferenceCoverage` (if the buyer supplied preferences) and otherwise surfaces the
+  deterministic factual evidence in `matchReason` alone. The field is omitted only when the buyer
+  supplied no usable query (in which case `textCoverage.total` would be `0` and the resulting "0 of
+  0" statement is not factual evidence); clients that do not render the field at all therefore
+  receive the same buyer-facing behavior as a client that renders "no query was provided" for that
+  case. The field is always present when the buyer supplied at least one canonical query token so
+  the qualitative-fit line is never absent on a meaningful query-bearing result, including the
+  query-only case.
+- A request that supplies both a query and preferences carries both factual-evidence lines; a
+  request that supplies neither omits both coverage fields and relies on `matchReason` alone.
 - Empty results return `200` with `results: []`; constraints are not relaxed automatically.
 
 ### Incremental M1.1 semantics
@@ -322,15 +344,18 @@ The shared runtime contract is the executable source of truth. The conceptual in
 semantics, and the runtime schema are reviewed together so that the browser, the API, and the
 contract document cannot drift.
 
-- **v1 (current) — `preferenceCoverage` added as an optional response field.** Issue #6 (M1.5)
-  extends the M1.1 result with deterministic preference-atom coverage so the buyer UI can surface a
-  factual qualitative-fit line in addition to the existing `matchReason` evidence. The field is
-  declared optional in the conceptual interface and in the runtime schema (`preferenceCoverageV1Schema`
-  is used inside `talentSearchResultV1Schema` through `.optional()`) for backward compatibility with
-  in-flight clients; semantically the service emits it whenever the buyer supplied at least one
-  canonical preference atom and omits it only when no preferences were requested. The service-owned
-  fallback for the omitted case is the existing `matchReason` evidence. The field is never rendered
-  as a percentage and never derived from `relevanceScore`, which remains strategy-specific ordering.
+- **v1 (current) — `preferenceCoverage` and `textCoverage` added as optional response fields.** Issue
+  #6 (M1.5) extends the M1.1 result with two independent factual coverage lines: `preferenceCoverage`
+  carries the canonical preference-atom coverage, and `textCoverage` carries the canonical
+  distinct-query-token coverage. Both fields are declared optional in the conceptual interface and in
+  the runtime schema (`preferenceCoverageV1Schema` and `textCoverageV1Schema` are used inside
+  `talentSearchResultV1Schema` through `.optional()`) for backward compatibility with in-flight
+  clients; semantically the service emits each field whenever the buyer supplied the corresponding
+  signal (preferences for `preferenceCoverage`, query for `textCoverage`) and omits it only when the
+  buyer did not. The "0 of 0" payload is not factual evidence, so a buyer who supplied neither
+  signal falls back to the existing `matchReason` evidence alone; a buyer who supplied both signals
+  receives both factual-evidence lines. Neither field is ever rendered as a percentage and neither
+  is ever derived from `relevanceScore`, which remains strategy-specific ordering.
 
   **Approval and notification evidence:** This shared-contract revision is approved by the
   Milestone 1 integration owner (Caleb Matteis) on commit

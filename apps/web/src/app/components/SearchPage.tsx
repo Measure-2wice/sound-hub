@@ -232,6 +232,7 @@ function ResultCardImpl({ result }: { result: TalentSearchResultV1 }) {
     additionalMatchingOfferings,
     matchReason,
     preferenceCoverage,
+    textCoverage,
   } = result;
 
   return (
@@ -347,25 +348,33 @@ function ResultCardImpl({ result }: { result: TalentSearchResultV1 }) {
           <p className="text-sm text-blue-800">{matchReason}</p>
         </div>
 
-        {/* Qualitative fit: factual preference coverage derived from the
-            deterministic matched/total preference atom counts the search
-            service produces. Never a percentage, never a score-derived
-            confidence or quality band — the matchReason above names the
-            matched fields factually, and this line names the scope of
-            preference coverage factually. Issue #6 requires both
-            deterministic evidence AND qualitative fit; the P1-001 review
-            found qualitative fit had been dropped entirely, so we
-            restore it as a deterministic coverage statement instead of
-            a score-derived band.
-            Optional in the public DTO (P1-002): the service omits the
-            field whenever the buyer supplied no canonical preference
-            atoms, so this section is skipped and the matchReason above
-            is the sole buyer-facing evidence in that case. */}
+        {/* Qualitative fit: factual coverage statements derived from the
+            deterministic matched/total counts the search service
+            produces. Two independent sources can be present:
+              - `preferenceCoverage` from canonical preference atoms.
+              - `textCoverage` from the buyer's normalized query tokens.
+            The UI renders whichever lines the service emitted; both are
+            non-percentage, never derived from `relevanceScore`. Issue #6
+            requires both deterministic evidence AND qualitative fit;
+            the P1-001 review found qualitative fit had been dropped
+            entirely on query-only searches, so this block now renders
+            the textCoverage line whenever the buyer supplied a query and
+            the preferenceCoverage line whenever they supplied
+            preferences. Optional in the public DTO per the v1 contract
+            (P1-002). */}
         {preferenceCoverage && (
           <div className="bg-blue-50 p-3 rounded-lg mt-2" data-testid="result-qualitative-fit">
             <p className="text-sm font-medium text-blue-900 mb-1">Preference coverage</p>
             <p className="text-sm text-blue-800" data-testid="result-qualitative-fit-text">
               {formatPreferenceCoverage(preferenceCoverage)}
+            </p>
+          </div>
+        )}
+        {textCoverage && (
+          <div className="bg-blue-50 p-3 rounded-lg mt-2" data-testid="result-qualitative-fit">
+            <p className="text-sm font-medium text-blue-900 mb-1">Brief coverage</p>
+            <p className="text-sm text-blue-800" data-testid="result-qualitative-fit-text">
+              {formatTextCoverage(textCoverage)}
             </p>
           </div>
         )}
@@ -527,9 +536,9 @@ function BestOfferingCard({
 // Factual preference coverage statement. Counts only — never a percentage,
 // never derived from `relevanceScore`. The contract guarantees this helper
 // is only called when the buyer supplied at least one canonical preference
-// atom; the no-preferences case is rendered by simply skipping the
-// qualitative-fit block and surfacing `matchReason` as the sole
-// buyer-facing evidence (P1-001).
+// atom; the no-preferences case is rendered by simply skipping this line
+// (P1-001). The textCoverage line is rendered independently when the buyer
+// supplied a usable query.
 function formatPreferenceCoverage(coverage: {
   readonly matched: number;
   readonly total: number;
@@ -539,6 +548,21 @@ function formatPreferenceCoverage(coverage: {
   }
   const unmet = coverage.total - coverage.matched;
   return `Matches ${coverage.matched} of ${coverage.total} requested preferences; ${unmet} not matched.`;
+}
+
+// Factual query-token coverage statement. Counts only — never a percentage,
+// never derived from `relevanceScore`. The contract guarantees this helper
+// is only called when the buyer supplied at least one canonical query
+// token; the no-query case is rendered by simply skipping this line.
+function formatTextCoverage(coverage: {
+  readonly matched: number;
+  readonly total: number;
+}): string {
+  if (coverage.matched === coverage.total) {
+    return `Matches all ${coverage.total} word${coverage.total === 1 ? "" : "s"} of your brief.`;
+  }
+  const unmet = coverage.total - coverage.matched;
+  return `Matches ${coverage.matched} of ${coverage.total} words from your brief; ${unmet} not matched.`;
 }
 
 // Renders "City, Region · CC" while tolerating the optional city/region fields.

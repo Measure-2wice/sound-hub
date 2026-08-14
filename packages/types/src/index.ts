@@ -311,6 +311,33 @@ export const preferenceCoverageV1Schema = z
   });
 export type PreferenceCoverageV1 = z.infer<typeof preferenceCoverageV1Schema>;
 
+// Factual coverage of the buyer's normalized query tokens against the
+// best matching offering's matched text fields. The matched count is
+// bounded by `total` and both are computed from the canonical
+// distinct-query-tokens set and the deterministic text matcher (never
+// derived from `relevanceScore`, which is strategy-specific ordering
+// and explicitly NOT a buyer-facing confidence signal).
+//
+// Optional in the public DTO so adding the field is backward-compatible
+// per the v1 contract's compatibility rules. Older clients see a response
+// without the field and the UI falls back to `matchReason` evidence only.
+// Emitted whenever the buyer supplied a usable query (at least one
+// distinct canonical token); omitted when the request had no query, in
+// which case `textCoverage.total` would be `0` and the resulting "0 of
+// 0" statement is not factual evidence. Persisted separately from
+// `preferenceCoverage` so a request that supplies both a query and
+// preferences carries both factual-evidence lines.
+export const textCoverageV1Schema = z
+  .object({
+    matched: z.number().int().nonnegative(),
+    total: z.number().int().nonnegative(),
+  })
+  .strict()
+  .refine((value) => value.matched <= value.total, {
+    message: "matched must not exceed total",
+  });
+export type TextCoverageV1 = z.infer<typeof textCoverageV1Schema>;
+
 export const talentSearchResultV1Schema = z
   .object({
     seller: publicSellerSummaryV1Schema,
@@ -323,6 +350,7 @@ export const talentSearchResultV1Schema = z
       .finite(),
     matchReason: z.string().min(1).max(500),
     preferenceCoverage: preferenceCoverageV1Schema.optional(),
+    textCoverage: textCoverageV1Schema.optional(),
   })
   .strict();
 export type TalentSearchResultV1 = z.infer<typeof talentSearchResultV1Schema>;

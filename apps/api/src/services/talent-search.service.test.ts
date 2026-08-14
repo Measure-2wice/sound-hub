@@ -2307,13 +2307,60 @@ describe("TalentSearchService M1.5 preference ranking and grouping", () => {
         "preferenceCoverage must be present when preferences were supplied",
       );
       assert.equal(
-        result.preferenceCoverage!.total,
+        result.preferenceCoverage.total,
         1,
         "preferenceCoverage.total must equal the canonical preference-atom count",
       );
       assert.ok(
-        result.preferenceCoverage!.matched >= 0 && result.preferenceCoverage!.matched <= 1,
+        result.preferenceCoverage.matched >= 0 && result.preferenceCoverage.matched <= 1,
         "preferenceCoverage.matched must be bounded by preferenceCoverage.total",
+      );
+    }
+  });
+
+  // P1-001 Codex remediation: the service MUST also emit `textCoverage`
+  // whenever the buyer supplied a query that produced canonical tokens;
+  // a "0 of 0" payload is not factual evidence, so the field is omitted
+  // when no query is supplied. The buyer-facing UI uses this field to
+  // surface a non-percentage qualitative-fit line for query-only
+  // searches so Issue #6's "deterministic evidence AND qualitative fit"
+  // acceptance criterion is satisfied.
+  test("textCoverage is present on every result when a query is supplied", async () => {
+    const service = new TalentSearchService(new InMemoryTalentSearchRepository(buildM15Fixture()));
+    const response = await service.search({ query: "dancehall production" });
+    assert.ok(response.results.length > 0, "the fixture must produce at least one result");
+    for (const result of response.results) {
+      assert.ok(
+        result.textCoverage !== undefined,
+        "textCoverage must be present when a canonical query was supplied",
+      );
+      assert.equal(
+        result.textCoverage.total,
+        2,
+        "textCoverage.total must equal the canonical distinct-query-token count",
+      );
+      assert.ok(
+        result.textCoverage.matched >= 0 && result.textCoverage.matched <= 2,
+        "textCoverage.matched must be bounded by textCoverage.total",
+      );
+    }
+  });
+
+  // P1-001 Codex remediation: when the request has no query, the
+  // service MUST omit `textCoverage` so a "0 of 0" payload never
+  // surfaces as buyer-facing evidence. Symmetric with the
+  // preferenceCoverage omission test above.
+  test("textCoverage is omitted from every result when no query is supplied", async () => {
+    const service = new TalentSearchService(new InMemoryTalentSearchRepository(buildM15Fixture()));
+    const response = await service.search({
+      required: { primaryCategoryKeys: ["music-production"] },
+    });
+    assert.ok(response.results.length > 0, "the fixture must produce at least one result");
+    for (const result of response.results) {
+      assert.equal(
+        result.textCoverage,
+        undefined,
+        "textCoverage must be omitted when no canonical query tokens were supplied",
       );
     }
   });

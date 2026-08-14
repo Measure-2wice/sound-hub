@@ -174,13 +174,13 @@ describe("SearchPage buyer-facing match evidence (P1-001)", () => {
     );
   });
 
-  // P1-001 regression: the service omits `preferenceCoverage` whenever
-  // the buyer supplied no canonical preference atoms. The result card
-  // must skip the qualitative-fit block entirely (no "no preferences
-  // were requested" placeholder) and the matchReason above must still
-  // carry the only buyer-facing evidence. Optional in the public DTO
+  // P1-001 regression (revised after Codex review): the service omits
+  // `preferenceCoverage` whenever the buyer supplied no canonical
+  // preference atoms, AND it omits `textCoverage` whenever the buyer
+  // supplied no usable query. A request that supplies neither must skip
+  // the qualitative-fit block entirely. Optional in the public DTO
   // (P1-002) for backward compatibility with in-flight clients.
-  test("omits the qualitative-fit block when the service omits preferenceCoverage", () => {
+  test("omits the qualitative-fit block when neither preferenceCoverage nor textCoverage is present", () => {
     const omittedCoverageResult: TalentSearchResultV1 = {
       seller: sampleResult.seller,
       bestMatchingOffering: sampleResult.bestMatchingOffering,
@@ -192,7 +192,7 @@ describe("SearchPage buyer-facing match evidence (P1-001)", () => {
 
     assert.ok(
       html.includes('data-testid="result-match-reason"'),
-      "the matchReason block must still render when preferenceCoverage is absent",
+      "the matchReason block must still render when coverage is absent",
     );
     assert.ok(
       html.includes("matched offering title; preferred genre: Dancehall"),
@@ -200,11 +200,102 @@ describe("SearchPage buyer-facing match evidence (P1-001)", () => {
     );
     assert.ok(
       !html.includes('data-testid="result-qualitative-fit"'),
-      "the qualitative-fit block must be skipped when preferenceCoverage is absent",
+      "the qualitative-fit block must be skipped when both coverage fields are absent",
     );
     assert.ok(
       !html.includes("Preference coverage"),
-      "the qualitative-fit header must not appear when preferenceCoverage is absent",
+      "the preference-coverage header must not appear when preferenceCoverage is absent",
+    );
+    assert.ok(
+      !html.includes("Brief coverage"),
+      "the brief-coverage header must not appear when textCoverage is absent",
+    );
+  });
+
+  // P1-001 Codex review remediation: a query-only search (no preferences)
+  // must STILL surface a qualitative-fit block — the `textCoverage` line
+  // describes matched vs total query tokens factually, never as a
+  // percentage, never derived from `relevanceScore`. The matchReason
+  // alone does not satisfy Issue #6's "deterministic evidence AND
+  // qualitative fit" requirement.
+  test("renders the brief-coverage qualitative-fit block when textCoverage is present without preferences", () => {
+    const textOnlyResult: TalentSearchResultV1 = {
+      seller: sampleResult.seller,
+      bestMatchingOffering: sampleResult.bestMatchingOffering,
+      additionalMatchingOfferings: sampleResult.additionalMatchingOfferings,
+      relevanceScore: sampleResult.relevanceScore,
+      matchReason: "matched offering title; matched category key",
+      textCoverage: { matched: 2, total: 4 },
+    };
+    const html = renderToStaticMarkup(ResultCard({ result: textOnlyResult }));
+
+    assert.ok(
+      html.includes('data-testid="result-qualitative-fit"'),
+      "the qualitative-fit block must render when textCoverage is present",
+    );
+    assert.ok(
+      html.includes("Brief coverage"),
+      "the qualitative-fit header must label the textCoverage line distinctly",
+    );
+    assert.ok(
+      html.includes("Matches 2 of 4 words from your brief; 2 not matched."),
+      "the brief-coverage line must describe matched/total words factually",
+    );
+    assert.ok(
+      !html.includes("Preference coverage"),
+      "the preference-coverage header must not appear for a query-only request",
+    );
+  });
+
+  // P1-001 Codex review remediation: a request that supplies BOTH a
+  // query and preferences must surface BOTH factual-evidence lines,
+  // each labeled distinctly. The buyer-facing state carries the
+  // deterministic matchReason plus two independent coverage lines.
+  test("renders both preference and brief coverage when both fields are present", () => {
+    const combinedResult: TalentSearchResultV1 = {
+      seller: sampleResult.seller,
+      bestMatchingOffering: sampleResult.bestMatchingOffering,
+      additionalMatchingOfferings: sampleResult.additionalMatchingOfferings,
+      relevanceScore: sampleResult.relevanceScore,
+      matchReason: sampleResult.matchReason,
+      preferenceCoverage: { matched: 1, total: 2 },
+      textCoverage: { matched: 3, total: 4 },
+    };
+    const html = renderToStaticMarkup(ResultCard({ result: combinedResult }));
+
+    const qualitativeBlocks = html.match(/data-testid="result-qualitative-fit"/g) ?? [];
+    assert.ok(
+      qualitativeBlocks.length >= 2,
+      "both coverage lines must render, producing at least two qualitative-fit blocks",
+    );
+    assert.ok(html.includes("Preference coverage"), "the preference-coverage header must render");
+    assert.ok(
+      html.includes("Matches 1 of 2 requested preferences; 1 not matched."),
+      "the preference-coverage line must be present",
+    );
+    assert.ok(html.includes("Brief coverage"), "the brief-coverage header must render");
+    assert.ok(
+      html.includes("Matches 3 of 4 words from your brief; 1 not matched."),
+      "the brief-coverage line must be present",
+    );
+  });
+
+  // P1-001 Codex review remediation: the brief-coverage full-match
+  // variant uses the singular/plural wording exactly like the preference
+  // variant so the two coverage lines read consistently.
+  test("brief coverage shows the full-coverage variant when all words matched", () => {
+    const fullTextCoverageResult: TalentSearchResultV1 = {
+      seller: sampleResult.seller,
+      bestMatchingOffering: sampleResult.bestMatchingOffering,
+      additionalMatchingOfferings: sampleResult.additionalMatchingOfferings,
+      relevanceScore: sampleResult.relevanceScore,
+      matchReason: sampleResult.matchReason,
+      textCoverage: { matched: 1, total: 1 },
+    };
+    const html = renderToStaticMarkup(ResultCard({ result: fullTextCoverageResult }));
+    assert.ok(
+      html.includes("Matches all 1 word of your brief."),
+      "the brief-coverage description must say full coverage when matched === total",
     );
   });
 });

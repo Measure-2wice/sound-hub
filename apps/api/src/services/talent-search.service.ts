@@ -139,13 +139,33 @@ export class TalentSearchService {
       // signal or quality claim. The contract specifies that the field is
       // omitted whenever the buyer supplied no canonical preference atoms;
       // the "0 of 0" payload is not factual evidence, so a buyer who
-      // supplied no preferences gets the deterministic `matchReason` as
-      // the sole buyer-facing qualitative-fit evidence (P1-001).
+      // supplied no preferences gets the deterministic `matchReason` plus
+      // any textCoverage line as the buyer-facing qualitative-fit
+      // evidence (P1-001).
       ...(preferenceAtoms.length > 0
         ? {
             preferenceCoverage: {
               matched: entry.best.matchedAtomCount,
               total: preferenceAtoms.length,
+            },
+          }
+        : {}),
+      // Factual coverage of the buyer's distinct normalized query tokens
+      // against the best matching offering's matched text fields. Counts
+      // only, never a percentage, never derived from `relevanceScore`.
+      // Emitted whenever the buyer supplied at least one canonical query
+      // token so a query-only search surfaces a factual qualitative-fit
+      // line alongside `matchReason`; omitted when the request had no
+      // usable query because `total` would be `0` and the "0 of 0"
+      // statement is not factual evidence. Persists independently of
+      // `preferenceCoverage` so a request that supplies both a query
+      // and preferences carries both factual-evidence lines (P1-001
+      // Codex remediation).
+      ...(queryTokens.length > 0
+        ? {
+            textCoverage: {
+              matched: entry.best.matchedTokenCount,
+              total: queryTokens.length,
             },
           }
         : {}),
@@ -557,6 +577,11 @@ interface RankedOffering {
   // already incorporates this signal, so it is NOT used as a sort key
   // (P1-001 remediation keeps the documented two-key order).
   readonly matchedAtomCount: number;
+  // Number of distinct normalized query tokens that matched this
+  // offering's title/category-key/category-name fields. Carried through
+  // to the public textCoverage payload (P1-001 Codex remediation). NOT
+  // used as a sort key — the documented two-key order stays intact.
+  readonly matchedTokenCount: number;
   readonly reason: string;
 }
 
@@ -620,6 +645,7 @@ function rankOfferingsForSeller(
       offering,
       score: clamp01(combinedScore),
       matchedAtomCount: matchedAtoms.length,
+      matchedTokenCount: textMatchedCount,
       reason,
     });
   }

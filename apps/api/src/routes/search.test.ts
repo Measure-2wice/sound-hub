@@ -1286,14 +1286,68 @@ describe("POST /api/search M1.5 preference ranking and grouping", () => {
         "the route response must include preferenceCoverage when preferences were requested",
       );
       assert.equal(
-        result.preferenceCoverage!.total,
+        result.preferenceCoverage.total,
         1,
         "preferenceCoverage.total must equal the canonical preference-atom count",
       );
       assert.ok(
-        result.preferenceCoverage!.matched >= 0 &&
-          result.preferenceCoverage!.matched <= result.preferenceCoverage!.total,
+        result.preferenceCoverage.matched >= 0 &&
+          result.preferenceCoverage.matched <= result.preferenceCoverage.total,
         "preferenceCoverage.matched must be bounded by preferenceCoverage.total",
+      );
+    }
+  });
+
+  // P1-001 Codex remediation: the route response must include
+  // `textCoverage` whenever the buyer supplied a query so query-only
+  // searches still surface a non-percentage qualitative-fit line. The
+  // field counts distinct normalized query tokens matched by the best
+  // matching offering; it is bounded by `total` and is never derived
+  // from `relevanceScore`.
+  test("the route includes textCoverage when a query was supplied", async () => {
+    const response = await request(m15App)
+      .post("/api/search")
+      .set("content-type", "application/json")
+      .send({ query: "dancehall production" });
+    assert.equal(response.status, 200);
+    const results = response.body.results as Array<{
+      textCoverage?: { matched: number; total: number };
+    }>;
+    assert.ok(results.length > 0, "the fixture must produce at least one result");
+    for (const result of results) {
+      assert.ok(
+        result.textCoverage !== undefined,
+        "the route response must include textCoverage when a query was supplied",
+      );
+      assert.equal(
+        result.textCoverage.total,
+        2,
+        "textCoverage.total must equal the canonical distinct-query-token count",
+      );
+      assert.ok(
+        result.textCoverage.matched >= 0 &&
+          result.textCoverage.matched <= result.textCoverage.total,
+        "textCoverage.matched must be bounded by textCoverage.total",
+      );
+    }
+  });
+
+  // P1-001 Codex remediation: symmetric with the preference-coverage
+  // omission, the route must omit `textCoverage` when the request had
+  // no query so a "0 of 0" payload never reaches the buyer.
+  test("the route omits textCoverage when no query was supplied", async () => {
+    const response = await request(m15App)
+      .post("/api/search")
+      .set("content-type", "application/json")
+      .send({ required: { primaryCategoryKeys: ["music-production"] } });
+    assert.equal(response.status, 200);
+    const results = response.body.results as Array<{ textCoverage?: unknown }>;
+    assert.ok(results.length > 0, "the fixture must produce at least one result");
+    for (const result of results) {
+      assert.equal(
+        result.textCoverage,
+        undefined,
+        "the route response must omit textCoverage when no query was supplied",
       );
     }
   });
