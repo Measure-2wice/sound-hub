@@ -331,3 +331,12 @@ contract document cannot drift.
   canonical preference atom and omits it only when no preferences were requested. The service-owned
   fallback for the omitted case is the existing `matchReason` evidence. The field is never rendered
   as a percentage and never derived from `relevanceScore`, which remains strategy-specific ordering.
+
+  **Approval and notification evidence:** This shared-contract revision is approved by the
+  Milestone 1 integration owner (Caleb Matteis) on commit
+  `41dc22bf449bb0a8d0f602bba44992a39cabc4ed` of
+  `feat/m1.6-rank-preferences-group-matching`, with parallel-stream notification determination
+  captured in
+  `docs/integration/m1.6-preference-coverage-contract-evidence.md`. That record names the
+  approver, the approval date/commit, the decision reference (Issue #6), the stream-notification
+  determination, and the re-evaluation rule required by `AGENTS.md:127`.

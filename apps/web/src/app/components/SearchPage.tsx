@@ -357,9 +357,10 @@ function ResultCardImpl({ result }: { result: TalentSearchResultV1 }) {
             found qualitative fit had been dropped entirely, so we
             restore it as a deterministic coverage statement instead of
             a score-derived band.
-            Optional in the public DTO (P1-002 remediation): when the
-            service omits the field, this section is skipped and the
-            matchReason above is the sole buyer-facing evidence. */}
+            Optional in the public DTO (P1-002): the service omits the
+            field whenever the buyer supplied no canonical preference
+            atoms, so this section is skipped and the matchReason above
+            is the sole buyer-facing evidence in that case. */}
         {preferenceCoverage && (
           <div className="bg-blue-50 p-3 rounded-lg mt-2" data-testid="result-qualitative-fit">
             <p className="text-sm font-medium text-blue-900 mb-1">Preference coverage</p>
@@ -524,16 +525,15 @@ function BestOfferingCard({
 }
 
 // Factual preference coverage statement. Counts only — never a percentage,
-// never derived from `relevanceScore`. The "no preferences requested" branch
-// is its own distinct presentation so a buyer who supplied no preferences
-// does not see a meaningless "0 of 0 preferences matched" line.
+// never derived from `relevanceScore`. The contract guarantees this helper
+// is only called when the buyer supplied at least one canonical preference
+// atom; the no-preferences case is rendered by simply skipping the
+// qualitative-fit block and surfacing `matchReason` as the sole
+// buyer-facing evidence (P1-001).
 function formatPreferenceCoverage(coverage: {
   readonly matched: number;
   readonly total: number;
 }): string {
-  if (coverage.total === 0) {
-    return "No preferences were requested for this search.";
-  }
   if (coverage.matched === coverage.total) {
     return `Matches all ${coverage.total} requested preference${coverage.total === 1 ? "" : "s"}.`;
   }

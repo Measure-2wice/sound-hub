@@ -1004,7 +1004,6 @@ describe("TalentSearchService", () => {
           additionalMatchingOfferings: [],
           relevanceScore: 1,
           matchReason: "matched",
-          preferenceCoverage: { matched: 0, total: 0 },
         },
       ],
       metadata: {
@@ -2269,6 +2268,53 @@ describe("TalentSearchService M1.5 preference ranking and grouping", () => {
           );
         }
       }
+    }
+  });
+
+  // P1-001 regression: the v1 contract states that `preferenceCoverage`
+  // is omitted whenever the buyer supplied no canonical preference atoms;
+  // a "0 of 0" payload is not factual evidence, so the service must not
+  // emit it. This locks the documented omission semantics at the service
+  // boundary so the runtime schema, the public contract, and the spec
+  // cannot drift back to the unconditional-serialization behavior.
+  test("preferenceCoverage is omitted from every result when no preferences were supplied", async () => {
+    const service = new TalentSearchService(new InMemoryTalentSearchRepository(buildM15Fixture()));
+    const response = await service.search({ query: "dancehall" });
+    assert.ok(response.results.length > 0, "the fixture must produce at least one result");
+    for (const result of response.results) {
+      assert.equal(
+        result.preferenceCoverage,
+        undefined,
+        "preferenceCoverage must be omitted when no canonical preference atoms were supplied",
+      );
+    }
+  });
+
+  // P1-001 regression: when at least one canonical preference atom IS
+  // supplied, the field must be present with the factual matched/total
+  // counts derived from the deterministic matcher (never from
+  // relevanceScore).
+  test("preferenceCoverage is present when at least one canonical preference atom is supplied", async () => {
+    const service = new TalentSearchService(new InMemoryTalentSearchRepository(buildM15Fixture()));
+    const response = await service.search({
+      query: "dancehall",
+      preferred: { caribbeanAffiliationCodes: ["JM"] },
+    });
+    assert.ok(response.results.length > 0, "the fixture must produce at least one result");
+    for (const result of response.results) {
+      assert.ok(
+        result.preferenceCoverage !== undefined,
+        "preferenceCoverage must be present when preferences were supplied",
+      );
+      assert.equal(
+        result.preferenceCoverage!.total,
+        1,
+        "preferenceCoverage.total must equal the canonical preference-atom count",
+      );
+      assert.ok(
+        result.preferenceCoverage!.matched >= 0 && result.preferenceCoverage!.matched <= 1,
+        "preferenceCoverage.matched must be bounded by preferenceCoverage.total",
+      );
     }
   });
 });

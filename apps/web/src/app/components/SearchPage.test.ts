@@ -92,12 +92,6 @@ const fullCoverageResult: TalentSearchResultV1 = {
   preferenceCoverage: { matched: 2, total: 2 },
 };
 
-const noPreferencesResult: TalentSearchResultV1 = {
-  ...sampleResult,
-  matchReason: "matched offering title",
-  preferenceCoverage: { matched: 0, total: 0 },
-};
-
 describe("SearchPage buyer-facing match evidence (P1-001)", () => {
   test("renders both the deterministic matchReason evidence and the qualitative fit", () => {
     const html = renderToStaticMarkup(ResultCard({ result: sampleResult }));
@@ -144,15 +138,6 @@ describe("SearchPage buyer-facing match evidence (P1-001)", () => {
     );
   });
 
-  test("qualitative fit shows the no-preferences variant distinctly when the buyer supplied none", () => {
-    const html = renderToStaticMarkup(ResultCard({ result: noPreferencesResult }));
-
-    assert.ok(
-      html.includes("No preferences were requested for this search."),
-      "the qualitative-fit description must say no-preferences distinctly when total === 0",
-    );
-  });
-
   test("does not render a buyer-facing percentage or confidence claim", () => {
     const html = renderToStaticMarkup(ResultCard({ result: sampleResult }));
 
@@ -189,11 +174,12 @@ describe("SearchPage buyer-facing match evidence (P1-001)", () => {
     );
   });
 
-  // P1-002 regression: preferenceCoverage is optional in the public DTO
-  // (backward-compatible per the v1 contract). When the service omits
-  // the field, the result card must skip the qualitative-fit block
-  // entirely and the matchReason above must still carry the only
-  // buyer-facing evidence.
+  // P1-001 regression: the service omits `preferenceCoverage` whenever
+  // the buyer supplied no canonical preference atoms. The result card
+  // must skip the qualitative-fit block entirely (no "no preferences
+  // were requested" placeholder) and the matchReason above must still
+  // carry the only buyer-facing evidence. Optional in the public DTO
+  // (P1-002) for backward compatibility with in-flight clients.
   test("omits the qualitative-fit block when the service omits preferenceCoverage", () => {
     const omittedCoverageResult: TalentSearchResultV1 = {
       seller: sampleResult.seller,

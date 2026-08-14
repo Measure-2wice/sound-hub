@@ -1153,7 +1153,6 @@ describe("POST /api/search M1.5 preference ranking and grouping", () => {
           ],
           relevanceScore: 0.5,
           matchReason: "matched",
-          preferenceCoverage: { matched: 0, total: 0 },
         },
       ],
       metadata: {
@@ -1238,5 +1237,64 @@ describe("POST /api/search M1.5 preference ranking and grouping", () => {
       (a.body.results as Array<{ seller: { sellerId: string } }>).map((r) => r.seller.sellerId),
       (b.body.results as Array<{ seller: { sellerId: string } }>).map((r) => r.seller.sellerId),
     );
+  });
+
+  // P1-001 regression: the v1 contract states that `preferenceCoverage`
+  // is omitted whenever the buyer supplied no canonical preference atoms.
+  // This route-level test pins the omission at the HTTP boundary so the
+  // browser, the API, and the public contract cannot drift back to the
+  // unconditional-serialization behavior.
+  test("the route omits preferenceCoverage when no preferences were requested", async () => {
+    const response = await request(m15App)
+      .post("/api/search")
+      .set("content-type", "application/json")
+      .send({ query: "dancehall production" });
+    assert.equal(response.status, 200);
+    const results = response.body.results as Array<{
+      preferenceCoverage?: unknown;
+    }>;
+    assert.ok(results.length > 0, "the fixture must produce at least one result");
+    for (const result of results) {
+      assert.equal(
+        result.preferenceCoverage,
+        undefined,
+        "the route response must omit preferenceCoverage when no preferences were requested",
+      );
+    }
+  });
+
+  // P1-001 regression: when at least one canonical preference atom IS
+  // supplied, the route response must carry the factual matched/total
+  // coverage. This is the symmetric guarantee that the omission above is
+  // scoped strictly to the no-preferences case.
+  test("the route includes preferenceCoverage when preferences were requested", async () => {
+    const response = await request(m15App)
+      .post("/api/search")
+      .set("content-type", "application/json")
+      .send({
+        query: "dancehall production",
+        preferred: { caribbeanAffiliationCodes: ["JM"] },
+      });
+    assert.equal(response.status, 200);
+    const results = response.body.results as Array<{
+      preferenceCoverage?: { matched: number; total: number };
+    }>;
+    assert.ok(results.length > 0, "the fixture must produce at least one result");
+    for (const result of results) {
+      assert.ok(
+        result.preferenceCoverage !== undefined,
+        "the route response must include preferenceCoverage when preferences were requested",
+      );
+      assert.equal(
+        result.preferenceCoverage!.total,
+        1,
+        "preferenceCoverage.total must equal the canonical preference-atom count",
+      );
+      assert.ok(
+        result.preferenceCoverage!.matched >= 0 &&
+          result.preferenceCoverage!.matched <= result.preferenceCoverage!.total,
+        "preferenceCoverage.matched must be bounded by preferenceCoverage.total",
+      );
+    }
   });
 });

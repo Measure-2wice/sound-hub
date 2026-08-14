@@ -51,17 +51,11 @@ test("renders real sellers and Active offerings for the M1.1 happy path", async 
 
   // Qualitative fit: a factual preference coverage statement derived from
   // matched/total preference atoms. Never a percentage, never a score-derived
-  // confidence band. The result-qualitative-fit block carries the
-  // description; its text must name matched vs total preferences and must
-  // not include any percentage or confidence claim.
-  await expect(top.getByTestId("result-qualitative-fit")).toBeVisible();
-  const qualitativeFit =
-    (await top.getByTestId("result-qualitative-fit-text").textContent()) ?? "";
-  expect(qualitativeFit).not.toMatch(/\d{1,3}%/);
-  expect(qualitativeFit).not.toMatch(/ai|artificial|intelligence|confidence|guarantee|quality/i);
-  expect(qualitativeFit).toMatch(
-    /Matches (all|\d+) of \d+ requested preferences|No preferences were requested for this search\./,
-  );
+  // confidence band. The happy path issues a query-only request, so the
+  // service omits `preferenceCoverage` per the v1 contract and the
+  // `result-qualitative-fit` block must be absent. The `matchReason` block
+  // above is the sole buyer-facing evidence in that case (P1-001).
+  await expect(top.getByTestId("result-qualitative-fit")).toHaveCount(0);
 
   // The relevanceScore must not be displayed as a buyer-facing percentage.
   const bodyText = (await page.textContent("body")) ?? "";

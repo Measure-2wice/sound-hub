@@ -136,11 +136,19 @@ export class TalentSearchService {
       // deterministic match counts against the best matching offering.
       // Never derived from `relevanceScore`; the score is strategy-specific
       // ordering and the contract forbids presenting it as a confidence
-      // signal or quality claim.
-      preferenceCoverage: {
-        matched: entry.best.matchedAtomCount,
-        total: preferenceAtoms.length,
-      },
+      // signal or quality claim. The contract specifies that the field is
+      // omitted whenever the buyer supplied no canonical preference atoms;
+      // the "0 of 0" payload is not factual evidence, so a buyer who
+      // supplied no preferences gets the deterministic `matchReason` as
+      // the sole buyer-facing qualitative-fit evidence (P1-001).
+      ...(preferenceAtoms.length > 0
+        ? {
+            preferenceCoverage: {
+              matched: entry.best.matchedAtomCount,
+              total: preferenceAtoms.length,
+            },
+          }
+        : {}),
     }));
 
     return {
