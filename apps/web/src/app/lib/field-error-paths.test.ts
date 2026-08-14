@@ -38,7 +38,11 @@ describe("isControlledRequiredPath", () => {
     assert.equal(isControlledRequiredPath("required.independentlyPurchasableServiceKeys.0"), true);
     assert.equal(isControlledRequiredPath("required.serviceModes.0"), true);
     assert.equal(isControlledRequiredPath("required.basedIn.countryCode"), true);
+    assert.equal(isControlledRequiredPath("required.basedIn.region"), true);
+    assert.equal(isControlledRequiredPath("required.basedIn.city"), true);
     assert.equal(isControlledRequiredPath("required.serviceArea.countryCode"), true);
+    assert.equal(isControlledRequiredPath("required.serviceArea.region"), true);
+    assert.equal(isControlledRequiredPath("required.serviceArea.city"), true);
   });
 
   test("returns false for unconsumed nested required paths so the global panel can render them", () => {
@@ -47,8 +51,8 @@ describe("isControlledRequiredPath", () => {
     // global panel rather than be silently swallowed by the panel claim.
     assert.equal(isControlledRequiredPath("required"), true);
     assert.equal(isControlledRequiredPath("required.futureField"), false);
-    assert.equal(isControlledRequiredPath("required.basedIn.city"), false);
-    assert.equal(isControlledRequiredPath("required.serviceArea.region"), false);
+    assert.equal(isControlledRequiredPath("required.basedIn.coordinate"), false);
+    assert.equal(isControlledRequiredPath("required.serviceArea.postcode"), false);
   });
 
   test("returns false for non-controlled paths", () => {
@@ -66,7 +70,11 @@ describe("partitionFieldErrors", () => {
       errorAt("required.independentlyPurchasableServiceKeys"),
       errorAt("required.serviceModes"),
       errorAt("required.basedIn.countryCode"),
+      errorAt("required.basedIn.region"),
+      errorAt("required.basedIn.city"),
       errorAt("required.serviceArea.countryCode"),
+      errorAt("required.serviceArea.region"),
+      errorAt("required.serviceArea.city"),
       errorAt("required"),
       errorAt("query"),
       errorAt("preferred.categoryKeys"),
@@ -74,7 +82,7 @@ describe("partitionFieldErrors", () => {
     ];
     const { controlled, unmatched } = partitionFieldErrors(errors);
 
-    assert.equal(controlled.length, 6, "every controlled required error is captured by the panel");
+    assert.equal(controlled.length, 10, "every controlled required error is captured by the panel");
     assert.equal(unmatched.length, 3, "every other error is unmatched");
 
     // No error appears in both buckets.
@@ -100,11 +108,12 @@ describe("partitionFieldErrors", () => {
     // shares the `required` prefix.
     const errors: ApiFieldErrorV1[] = [
       errorAt("required.futureField"),
-      errorAt("required.basedIn.city"),
+      errorAt("required.basedIn.coordinate"),
+      errorAt("required.serviceArea.postcode"),
     ];
     const { controlled, unmatched } = partitionFieldErrors(errors);
     assert.equal(controlled.length, 0, "no rendered control claims these paths");
-    assert.equal(unmatched.length, 2, "global panel renders both");
+    assert.equal(unmatched.length, 3, "global panel renders all three");
   });
 
   test("empty input produces empty partitions", () => {

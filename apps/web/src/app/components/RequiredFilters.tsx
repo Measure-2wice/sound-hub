@@ -199,6 +199,40 @@ export function RequiredFilters({
       </Field>
 
       <Field
+        label="Required based in region"
+        path="required.basedIn.region"
+        testId="required-based-in-region-field"
+        errors={visibleErrors}
+      >
+        <input
+          data-testid="required-based-in-region"
+          value={value.basedInRegion}
+          onChange={(e) => update("basedInRegion", e.target.value)}
+          disabled={disabled}
+          placeholder="e.g. NY"
+          maxLength={120}
+          className="w-full px-3 py-2 border border-gray-300 rounded-md"
+        />
+      </Field>
+
+      <Field
+        label="Required based in city"
+        path="required.basedIn.city"
+        testId="required-based-in-city-field"
+        errors={visibleErrors}
+      >
+        <input
+          data-testid="required-based-in-city"
+          value={value.basedInCity}
+          onChange={(e) => update("basedInCity", e.target.value)}
+          disabled={disabled}
+          placeholder="e.g. Brooklyn"
+          maxLength={120}
+          className="w-full px-3 py-2 border border-gray-300 rounded-md"
+        />
+      </Field>
+
+      <Field
         label="Required service area country"
         path="required.serviceArea.countryCode"
         testId="required-service-area-country-field"
@@ -212,6 +246,40 @@ export function RequiredFilters({
           placeholder="e.g. GB"
           maxLength={2}
           className="w-full px-3 py-2 border border-gray-300 rounded-md uppercase"
+        />
+      </Field>
+
+      <Field
+        label="Required service area region"
+        path="required.serviceArea.region"
+        testId="required-service-area-region-field"
+        errors={visibleErrors}
+      >
+        <input
+          data-testid="required-service-area-region"
+          value={value.serviceAreaRegion}
+          onChange={(e) => update("serviceAreaRegion", e.target.value)}
+          disabled={disabled}
+          placeholder="e.g. ON"
+          maxLength={120}
+          className="w-full px-3 py-2 border border-gray-300 rounded-md"
+        />
+      </Field>
+
+      <Field
+        label="Required service area city"
+        path="required.serviceArea.city"
+        testId="required-service-area-city-field"
+        errors={visibleErrors}
+      >
+        <input
+          data-testid="required-service-area-city"
+          value={value.serviceAreaCity}
+          onChange={(e) => update("serviceAreaCity", e.target.value)}
+          disabled={disabled}
+          placeholder="e.g. London"
+          maxLength={120}
+          className="w-full px-3 py-2 border border-gray-300 rounded-md"
         />
       </Field>
     </section>

@@ -22,7 +22,11 @@ export function SearchPage() {
     independentlyPurchasableServiceKey: "",
     serviceModes: [],
     basedInCountryCode: "",
+    basedInRegion: "",
+    basedInCity: "",
     serviceAreaCountryCode: "",
+    serviceAreaRegion: "",
+    serviceAreaCity: "",
   });
   const { results, isLoading, error, errorCode, fieldErrors, requestId, search } = useSearch();
 

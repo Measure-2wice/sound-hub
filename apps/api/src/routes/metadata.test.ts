@@ -17,31 +17,37 @@
 // (b) a newly-inserted canonical ServiceCategory is reflected by the
 // route without any code change in apps/web, and (c) the shared schema
 // rejects malformed elements and unknown fields so the public contract
-// cannot drift.
+// cannot drift. The route reads through the repository on every request
+// so a separate `buildApp` instance always observes the latest
+// PostgreSQL snapshot — there is no process-global cache to invalidate.
 
 import assert from "node:assert/strict";
 import { describe, test } from "node:test";
 import request from "supertest";
 import express from "express";
 import { categoryMetadataResponseV1Schema, type CategoryMetadataResponseV1 } from "@soundhub/types";
-import { createMetadataRouter, resetMetadataCache } from "./metadata.js";
+import { createMetadataRouter } from "./metadata.js";
 import type {
   MetadataRepository,
   RepositoryCategoryMetadata,
 } from "../repositories/metadata.repository.js";
 
 class StubMetadataRepository implements MetadataRepository {
-  constructor(private readonly rows: readonly RepositoryCategoryMetadata[]) {}
+  private currentRows: readonly RepositoryCategoryMetadata[];
+  callCount = 0;
+  constructor(initial: readonly RepositoryCategoryMetadata[]) {
+    this.currentRows = initial;
+  }
   getCanonicalCategories(): Promise<readonly RepositoryCategoryMetadata[]> {
-    return Promise.resolve(this.rows);
+    this.callCount += 1;
+    return Promise.resolve(this.currentRows);
+  }
+  setRows(next: readonly RepositoryCategoryMetadata[]): void {
+    this.currentRows = next;
   }
 }
 
 describe("GET /api/metadata/categories", () => {
-  test.beforeEach(() => {
-    resetMetadataCache();
-  });
-
   test("returns the canonical ServiceCategory records allow-list-mapped from the repository", async () => {
     const repository = new StubMetadataRepository([
       { key: "music-production", name: "Music Production" },
@@ -103,26 +109,15 @@ describe("GET /api/metadata/categories", () => {
       assert.equal(firstResponse.status, 200);
       assert.equal(firstResponse.body.categories.length, 9);
 
-      // Reset the cache to simulate a cache expiry between the
-      // two snapshots. The point is that the route's content
-      // derives from the repository, not from a baked-in
-      // browser list. After the cache resets, the route must
-      // surface whatever the live repository returns.
-      resetMetadataCache();
-
       // Second snapshot: a tenth canonical category is added
-      // (simulating an admin insertion or a future seed update).
-      // The metadata route must surface the new category without
-      // the browser shipping a new category list.
-      const updatedRows: readonly RepositoryCategoryMetadata[] = [
-        ...nineRows,
-        { key: "live-performance", name: "Live Performance" },
-      ];
-      const updatedRepository = new StubMetadataRepository(updatedRows);
-      const app2 = express();
-      app2.use("/api/metadata", createMetadataRouter({ repository: updatedRepository }));
+      // (simulating an admin insertion or a future seed update). The
+      // SAME `app` instance must surface the new category because the
+      // route reads through the repository on every request. This
+      // also implicitly proves there is no cache: the repository is
+      // the only source of truth.
+      repository.setRows([...nineRows, { key: "live-performance", name: "Live Performance" }]);
 
-      const secondResponse = await request(app2).get("/api/metadata/categories");
+      const secondResponse = await request(app).get("/api/metadata/categories");
       assert.equal(secondResponse.status, 200);
       assert.equal(secondResponse.body.categories.length, 10);
       assert.ok(
@@ -133,6 +128,33 @@ describe("GET /api/metadata/categories", () => {
       );
     },
   );
+
+  test("the route reads through the repository on every request — there is no process-global cache", async () => {
+    // Two distinct `buildApp` instances stand up the same stub
+    // repository (counter incremented per call). Each call must hit
+    // the repository; a process-global cache would short-circuit one
+    // or both of the calls.
+    const repository = new StubMetadataRepository([
+      { key: "music-production", name: "Music Production" },
+    ]);
+    const appA = express();
+    appA.use("/api/metadata", createMetadataRouter({ repository }));
+    const appB = express();
+    appB.use("/api/metadata", createMetadataRouter({ repository }));
+
+    const responseA = await request(appA).get("/api/metadata/categories");
+    const responseB = await request(appB).get("/api/metadata/categories");
+    const responseA2 = await request(appA).get("/api/metadata/categories");
+
+    assert.equal(responseA.status, 200);
+    assert.equal(responseB.status, 200);
+    assert.equal(responseA2.status, 200);
+    assert.equal(
+      repository.callCount,
+      3,
+      "every request must read through the repository; a cache would reduce this count",
+    );
+  });
 
   test("returns an empty list when no ServiceCategory records exist", async () => {
     const repository = new StubMetadataRepository([]);

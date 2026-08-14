@@ -28,7 +28,11 @@ export const CONTROLLED_REQUIRED_PATHS = [
   "required.independentlyPurchasableServiceKeys",
   "required.serviceModes",
   "required.basedIn.countryCode",
+  "required.basedIn.region",
+  "required.basedIn.city",
   "required.serviceArea.countryCode",
+  "required.serviceArea.region",
+  "required.serviceArea.city",
 ] as const;
 
 export type ControlledRequiredPath = (typeof CONTROLLED_REQUIRED_PATHS)[number];

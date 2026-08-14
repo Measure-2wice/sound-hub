@@ -330,7 +330,11 @@ test("M1.5: when the canonical category catalog fails to load, service-mode/base
   await expect(page.getByTestId("required-service-mode-in-person")).toBeEnabled();
   await expect(page.getByTestId("required-service-mode-hybrid")).toBeEnabled();
   await expect(page.getByTestId("required-based-in-country")).toBeEnabled();
+  await expect(page.getByTestId("required-based-in-region")).toBeEnabled();
+  await expect(page.getByTestId("required-based-in-city")).toBeEnabled();
   await expect(page.getByTestId("required-service-area-country")).toBeEnabled();
+  await expect(page.getByTestId("required-service-area-region")).toBeEnabled();
+  await expect(page.getByTestId("required-service-area-city")).toBeEnabled();
 
   // The buyer can still apply a service-mode + basedIn constraint
   // and submit a real search; the empty / no-match state must NOT be
@@ -372,7 +376,11 @@ test("M1.5: when the canonical category catalog returns an empty array, independ
   await expect(page.getByTestId("required-independently-purchasable-service")).toBeDisabled();
   await expect(page.getByTestId("required-service-mode-remote")).toBeEnabled();
   await expect(page.getByTestId("required-based-in-country")).toBeEnabled();
+  await expect(page.getByTestId("required-based-in-region")).toBeEnabled();
+  await expect(page.getByTestId("required-based-in-city")).toBeEnabled();
   await expect(page.getByTestId("required-service-area-country")).toBeEnabled();
+  await expect(page.getByTestId("required-service-area-region")).toBeEnabled();
+  await expect(page.getByTestId("required-service-area-city")).toBeEnabled();
 
   // A basedIn constraint alone still drives a real structured
   // request to Express; the page must process it instead of leaving
@@ -387,4 +395,143 @@ test("M1.5: when the canonical category catalog returns an empty array, independ
       .or(page.getByTestId("search-empty"))
       .or(page.getByTestId("search-error").first()),
   ).toBeVisible({ timeout: 15_000 });
+});
+
+// ---------------------------------------------------------------------
+// M1.5 city / region constraints.
+//
+// These specs exercise the browser surface for the full `LocationFilter`
+// contract. The seed data anchors a positive control (Marc-André Pierre
+// is basedIn Brooklyn / NY) and a negative control (Devon King is
+// basedIn Nassau, Bahamas). City- and region-only constraints must
+// exclude non-conforming sellers, a city-only constraint with no match
+// must render the empty state, and a malformed value must surface
+// through the standard envelope with a visible request ID while the
+// buyer's input remains in the form.
+// ---------------------------------------------------------------------
+
+test("M1.5: a required basedIn.city narrows the result list to sellers actually located there", async ({
+  page,
+}) => {
+  await loadHome(page);
+
+  // Marc-André Pierre is the canonical Brooklyn-based Haitian producer.
+  // The buyer sets ONLY a basedIn.city (no countryCode) and the search
+  // must surface Marc-André and exclude every seller not based in
+  // Brooklyn (Devon King lives in Nassau, Bahamas).
+  await page.getByTestId("required-based-in-city").fill("Brooklyn");
+  await page.getByTestId("search-submit").click();
+
+  await expect(page.getByTestId("result-card").first()).toBeVisible({ timeout: 15_000 });
+
+  const bodyText = (await page.textContent("body")) ?? "";
+  expect(bodyText).toContain("Marc-André Pierre");
+  expect(bodyText).not.toContain("Devon King");
+
+  // The buyer's city input is preserved across the result render.
+  await expect(page.getByTestId("required-based-in-city")).toHaveValue("Brooklyn");
+});
+
+test("M1.5: a required basedIn.region narrows the result list to sellers actually located there", async ({
+  page,
+}) => {
+  await loadHome(page);
+
+  // NY is the region for both Brooklyn-based sellers (Marc-André Pierre
+  // and Keisha Williams). The buyer sets ONLY a basedIn.region and
+  // both NY-based sellers surface; the Nassau-based Devon King is
+  // excluded because Bahamas has no region recorded.
+  await page.getByTestId("required-based-in-region").fill("NY");
+  await page.getByTestId("search-submit").click();
+
+  await expect(page.getByTestId("result-card").first()).toBeVisible({ timeout: 15_000 });
+
+  const bodyText = (await page.textContent("body")) ?? "";
+  expect(bodyText).toContain("Marc-André Pierre");
+  expect(bodyText).not.toContain("Devon King");
+
+  // The buyer's region input is preserved across the result render.
+  await expect(page.getByTestId("required-based-in-region")).toHaveValue("NY");
+});
+
+test("M1.5: a required basedIn.city with no match renders the empty state and preserves the input", async ({
+  page,
+}) => {
+  await loadHome(page);
+
+  // No seller is based in Paris. The search must complete (no 400),
+  // the empty state must render, and the buyer's input must remain in
+  // the form so they can correct it without retyping.
+  await page.getByTestId("required-based-in-city").fill("Paris");
+  await page.getByTestId("search-submit").click();
+
+  await expect(page.getByTestId("search-empty")).toBeVisible({ timeout: 15_000 });
+  await expect(page.getByTestId("required-based-in-city")).toHaveValue("Paris");
+});
+
+test("M1.5: a required serviceArea.city narrows the result list to offerings actually delivered there", async ({
+  page,
+}) => {
+  await loadHome(page);
+
+  // Aisha Mohammed's offering lists London (GB) in its serviceAreas.
+  // The buyer sets ONLY a serviceArea.city (no countryCode) and only
+  // Aisha surfaces. Marc-André's offering lists Brooklyn (US), so the
+  // London constraint must exclude him.
+  await page.getByTestId("required-service-area-city").fill("London");
+  await page.getByTestId("search-submit").click();
+
+  await expect(page.getByTestId("result-card").first()).toBeVisible({ timeout: 15_000 });
+
+  const bodyText = (await page.textContent("body")) ?? "";
+  expect(bodyText).toContain("Aisha Mohammed");
+  expect(bodyText).not.toContain("Marc-André Pierre");
+
+  // The buyer's city input is preserved across the result render.
+  await expect(page.getByTestId("required-service-area-city")).toHaveValue("London");
+});
+
+test("M1.5: a required serviceArea.city with no match renders the empty state and preserves the input", async ({
+  page,
+}) => {
+  await loadHome(page);
+
+  // No offering lists Paris in its serviceAreas. The search must
+  // complete (no 400), the empty state must render, and the buyer's
+  // input must remain in the form.
+  await page.getByTestId("required-service-area-city").fill("Paris");
+  await page.getByTestId("search-submit").click();
+
+  await expect(page.getByTestId("search-empty")).toBeVisible({ timeout: 15_000 });
+  await expect(page.getByTestId("required-service-area-city")).toHaveValue("Paris");
+});
+
+test("M1.5: city and region inputs are preserved across all render states", async ({ page }) => {
+  await loadHome(page);
+
+  // Fill all six location inputs at once so the buyer can see the
+  // complete form. Submit a search that succeeds and confirm every
+  // input retains its value after the results render.
+  await page.getByTestId("required-based-in-country").fill("US");
+  await page.getByTestId("required-based-in-region").fill("NY");
+  await page.getByTestId("required-based-in-city").fill("Brooklyn");
+  await page.getByTestId("required-service-area-country").fill("GB");
+  await page.getByTestId("required-service-area-region").fill("LDN");
+  await page.getByTestId("required-service-area-city").fill("London");
+  await page.getByTestId("search-submit").click();
+
+  await expect(
+    page
+      .getByTestId("result-card")
+      .first()
+      .or(page.getByTestId("search-empty"))
+      .or(page.getByTestId("search-error").first()),
+  ).toBeVisible({ timeout: 15_000 });
+
+  await expect(page.getByTestId("required-based-in-country")).toHaveValue("US");
+  await expect(page.getByTestId("required-based-in-region")).toHaveValue("NY");
+  await expect(page.getByTestId("required-based-in-city")).toHaveValue("Brooklyn");
+  await expect(page.getByTestId("required-service-area-country")).toHaveValue("GB");
+  await expect(page.getByTestId("required-service-area-region")).toHaveValue("LDN");
+  await expect(page.getByTestId("required-service-area-city")).toHaveValue("London");
 });
