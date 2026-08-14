@@ -589,14 +589,19 @@ function formatTextCoverage(coverage: {
 // Issue #6 requires the buyer UI to show both deterministic evidence
 // (`matchReason`) AND qualitative fit; this helper derives the
 // qualitative-fit line from the existing `matchReason` fact so no new
-// public DTO field is introduced. Counts-only wording, never a
-// percentage, never derived from `relevanceScore`.
+// public DTO field is introduced. Mode-neutral wording ("Eligible for this
+// search.") because absence of the optional coverage fields does not by
+// itself prove the request was structured-only — `preferenceCoverage` and
+// `textCoverage` are optional in the public DTO for backward compatibility
+// and may be omitted on query- or preference-bearing searches from
+// in-flight clients. Counts-only wording, never a percentage, never
+// derived from `relevanceScore`.
 function formatRequiredOnlyFit(matchReason: string): string {
   const trimmed = matchReason.trim();
   if (trimmed.length === 0) {
-    return "Eligible based on your structured filters.";
+    return "Eligible for this search.";
   }
-  return `Eligible based on your structured filters (${trimmed}).`;
+  return `Eligible for this search (${trimmed}).`;
 }
 
 // Renders "City, Region · CC" while tolerating the optional city/region fields.

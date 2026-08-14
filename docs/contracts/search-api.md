@@ -358,12 +358,15 @@ contract document cannot drift.
   is ever derived from `relevanceScore`, which remains strategy-specific ordering.
 
   **Approval and notification evidence:** This shared-contract revision is approved by the
-  Milestone 1 integration owner (Caleb Matteis) on commit
-  `f2fec9ab20cc0021d45194b6c9c8f40ccf541e86` of
-  `feat/m1.6-rank-preferences-group-matching`, with parallel-stream notification determination
-  captured in
-  `docs/integration/m1.6-preference-coverage-contract-evidence.md`. That record names the
-  approver, the approval date/commit, the decision reference (Issue #6), the truthful
-  per-field introduction provenance (preferenceCoverage first in `d28ae8a`, textCoverage first
-  in `f2fec9a`), the stream-notification determination, and the re-evaluation rule required by
-  `AGENTS.md:127`.
+  Milestone 1 integration owner (Caleb Matteis) on the new fix commit on
+  `feat/m1.6-rank-preferences-group-matching` (the same commit that introduces the
+  mode-neutral "Eligible for this search." qualitative-fit wording and corrects the
+  evidence record's provenance statements). The approval is not backdated onto any
+  earlier implementation commit on this branch. The parallel-stream notification
+  determination is captured in
+  `docs/integration/m1.6-preference-coverage-contract-evidence.md`. That record names
+  the approver, the approval commit reference, the decision reference (Issue #6), the
+  truthful per-field introduction provenance (`preferenceCoverage` first introduced in
+  `d28ae8a`, made optional in `e8556e9`, conditional service-side omission in
+  `b67231a`; `textCoverage` first introduced in `f2fec9a`), the stream-notification
+  determination, and the re-evaluation rule required by `AGENTS.md:127`.

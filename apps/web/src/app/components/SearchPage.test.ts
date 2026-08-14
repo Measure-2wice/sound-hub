@@ -181,7 +181,11 @@ describe("SearchPage buyer-facing match evidence (P1-001)", () => {
   // requirement is satisfied for every meaningful result. The fallback
   // wording is derived from existing result facts (matchReason +
   // absence of coverage fields) and is non-percentage / never derived
-  // from `relevanceScore` / never a confidence claim.
+  // from `relevanceScore` / never a confidence claim. The wording is
+  // mode-neutral ("Eligible for this search.") because the optional
+  // coverage fields may also be absent on query- or preference-bearing
+  // searches from in-flight clients, so we cannot infer the originating
+  // request mode from response-field absence.
   test("renders a deterministic required-only qualitative-fit fallback when both coverage fields are absent", () => {
     const requiredOnlyResult: TalentSearchResultV1 = {
       seller: sampleResult.seller,
@@ -209,8 +213,8 @@ describe("SearchPage buyer-facing match evidence (P1-001)", () => {
       "the required-only fallback must label its qualitative-fit block distinctly",
     );
     assert.ok(
-      html.includes("Eligible based on your structured filters (eligible standalone offering)."),
-      "the required-only qualitative-fit must name the deterministic matchReason fact alongside the structured-filters wording",
+      html.includes("Eligible for this search (eligible standalone offering)."),
+      "the required-only qualitative-fit must name the deterministic matchReason fact alongside the mode-neutral eligibility wording",
     );
     assert.ok(
       !html.includes("Preference coverage"),
