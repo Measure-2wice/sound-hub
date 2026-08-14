@@ -10,16 +10,73 @@
 
 import { type ServiceModeV1 } from "@soundhub/types";
 
+// The browser's representation of the contract's `LocationFilter`
+// sub-block (`{ city?, region?, countryCode? }`). The UI form has a
+// controlled text input for every named field; the countryCode is
+// upper-cased as the buyer types so the schema sees `JM` rather
+// than `jm`. Both `basedIn` and `serviceArea` use this same shape
+// so the request construction never has to repeat the trim/omit
+// logic — `toLocationFilterPayload` is the single owner.
+//
+// Trimming and omission rules:
+// - Each sub-field is trimmed.
+// - A sub-field whose trimmed value is empty is omitted from the
+//   wire payload so individual inputs can be left blank without
+//   "poisoning" the others.
+// - The resulting `LocationFilter` object is emitted only when at
+//   least one sub-field is non-empty after trimming.
+export interface LocationFilterValue {
+  readonly city: string;
+  readonly region: string;
+  readonly countryCode: string;
+}
+
+export const EMPTY_LOCATION_FILTER_VALUE: LocationFilterValue = {
+  city: "",
+  region: "",
+  countryCode: "",
+};
+
+// Convert a UI `LocationFilterValue` into the on-the-wire shape
+// (the contract's `LocationFilter`). The shared Zod schema is the
+// authoritative validator of the result; this helper only mirrors
+// the form-state representation into the wire format.
+//
+// Returns `undefined` when every sub-field is empty after trimming so
+// callers can decide whether to emit the parent block.
+export function toLocationFilterPayload(
+  value: LocationFilterValue,
+): { city?: string; region?: string; countryCode?: string } | undefined {
+  const payload: { city?: string; region?: string; countryCode?: string } = {};
+  const city = value.city.trim();
+  if (city.length > 0) payload.city = city;
+  const region = value.region.trim();
+  if (region.length > 0) payload.region = region;
+  // Country codes are stored upper-cased on input; the schema requires
+  // an ISO 3166-1 alpha-2 code, so we never lower-case on the way out.
+  const countryCode = value.countryCode.trim().toUpperCase();
+  if (countryCode.length > 0) payload.countryCode = countryCode;
+  if (Object.keys(payload).length === 0) return undefined;
+  return payload;
+}
+
+// True when a `LocationFilterValue` carries at least one usable
+// (non-empty after trimming) sub-field. Used by `hasUsableCriteria`
+// to evaluate `basedIn` and `serviceArea` through the same predicate.
+export function isLocationFilterValueNonEmpty(value: LocationFilterValue): boolean {
+  return (
+    value.countryCode.trim().length > 0 ||
+    value.region.trim().length > 0 ||
+    value.city.trim().length > 0
+  );
+}
+
 export interface RequiredFiltersValue {
   readonly primaryCategoryKey: string;
   readonly independentlyPurchasableServiceKey: string;
   readonly serviceModes: readonly ServiceModeV1[];
-  readonly basedInCountryCode: string;
-  readonly basedInRegion: string;
-  readonly basedInCity: string;
-  readonly serviceAreaCountryCode: string;
-  readonly serviceAreaRegion: string;
-  readonly serviceAreaCity: string;
+  readonly basedIn: LocationFilterValue;
+  readonly serviceArea: LocationFilterValue;
 }
 
 // A buyer request has "usable" criteria when at least one of the
@@ -29,12 +86,8 @@ export function hasUsableCriteria(query: string, filters: RequiredFiltersValue):
   if (filters.primaryCategoryKey.length > 0) return true;
   if (filters.independentlyPurchasableServiceKey.length > 0) return true;
   if (filters.serviceModes.length > 0) return true;
-  if (filters.basedInCountryCode.trim().length > 0) return true;
-  if (filters.basedInRegion.trim().length > 0) return true;
-  if (filters.basedInCity.trim().length > 0) return true;
-  if (filters.serviceAreaCountryCode.trim().length > 0) return true;
-  if (filters.serviceAreaRegion.trim().length > 0) return true;
-  if (filters.serviceAreaCity.trim().length > 0) return true;
+  if (isLocationFilterValueNonEmpty(filters.basedIn)) return true;
+  if (isLocationFilterValueNonEmpty(filters.serviceArea)) return true;
   return false;
 }
 
@@ -42,10 +95,10 @@ export function hasUsableCriteria(query: string, filters: RequiredFiltersValue):
 // field. The candidate is then parsed by the shared schema; the schema
 // is the only thing that decides which of these fields survive.
 //
-// The `LocationFilter` sub-block is emitted whenever any of its three
-// sub-fields (city, region, countryCode) is non-empty after trimming.
-// A sub-field whose trimmed value is empty is omitted so the buyer
-// can leave individual inputs blank without poisoning the others.
+// `LocationFilter` sub-blocks go through `toLocationFilterPayload` so
+// the trim/omit logic exists in exactly one place — the precedent set
+// by the M1.4 review (P2-001) was that two parallel country/region/city
+// triplets duplicated that logic and would inevitably drift.
 export function buildCandidatePayload(
   query: string,
   filters: RequiredFiltersValue,
@@ -62,22 +115,10 @@ export function buildCandidatePayload(
   if (filters.serviceModes.length > 0) {
     required.serviceModes = [...filters.serviceModes];
   }
-  const basedIn: Record<string, string> = {};
-  const basedInCountryCode = filters.basedInCountryCode.trim().toUpperCase();
-  if (basedInCountryCode.length > 0) basedIn.countryCode = basedInCountryCode;
-  const basedInRegion = filters.basedInRegion.trim();
-  if (basedInRegion.length > 0) basedIn.region = basedInRegion;
-  const basedInCity = filters.basedInCity.trim();
-  if (basedInCity.length > 0) basedIn.city = basedInCity;
-  if (Object.keys(basedIn).length > 0) required.basedIn = basedIn;
-  const serviceArea: Record<string, string> = {};
-  const serviceAreaCountryCode = filters.serviceAreaCountryCode.trim().toUpperCase();
-  if (serviceAreaCountryCode.length > 0) serviceArea.countryCode = serviceAreaCountryCode;
-  const serviceAreaRegion = filters.serviceAreaRegion.trim();
-  if (serviceAreaRegion.length > 0) serviceArea.region = serviceAreaRegion;
-  const serviceAreaCity = filters.serviceAreaCity.trim();
-  if (serviceAreaCity.length > 0) serviceArea.city = serviceAreaCity;
-  if (Object.keys(serviceArea).length > 0) required.serviceArea = serviceArea;
+  const basedInPayload = toLocationFilterPayload(filters.basedIn);
+  if (basedInPayload !== undefined) required.basedIn = basedInPayload;
+  const serviceAreaPayload = toLocationFilterPayload(filters.serviceArea);
+  if (serviceAreaPayload !== undefined) required.serviceArea = serviceAreaPayload;
   if (Object.keys(required).length > 0) candidate.required = required;
   return candidate;
 }

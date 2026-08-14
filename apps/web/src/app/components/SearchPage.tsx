@@ -21,12 +21,8 @@ export function SearchPage() {
     primaryCategoryKey: "",
     independentlyPurchasableServiceKey: "",
     serviceModes: [],
-    basedInCountryCode: "",
-    basedInRegion: "",
-    basedInCity: "",
-    serviceAreaCountryCode: "",
-    serviceAreaRegion: "",
-    serviceAreaCity: "",
+    basedIn: { city: "", region: "", countryCode: "" },
+    serviceArea: { city: "", region: "", countryCode: "" },
   });
   const { results, isLoading, error, errorCode, fieldErrors, requestId, search } = useSearch();
 

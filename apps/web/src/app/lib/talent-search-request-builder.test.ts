@@ -19,20 +19,91 @@ import { talentSearchRequestV1Schema } from "@soundhub/types";
 import {
   buildCandidatePayload,
   hasUsableCriteria,
+  isLocationFilterValueNonEmpty,
+  toLocationFilterPayload,
+  type LocationFilterValue,
   type RequiredFiltersValue,
 } from "./talent-search-request-builder.js";
+
+const emptyLocation: LocationFilterValue = { city: "", region: "", countryCode: "" };
 
 const emptyFilters: RequiredFiltersValue = {
   primaryCategoryKey: "",
   independentlyPurchasableServiceKey: "",
   serviceModes: [],
-  basedInCountryCode: "",
-  basedInRegion: "",
-  basedInCity: "",
-  serviceAreaCountryCode: "",
-  serviceAreaRegion: "",
-  serviceAreaCity: "",
+  basedIn: emptyLocation,
+  serviceArea: emptyLocation,
 };
+
+// Convenience helpers so individual tests can spell out just the
+// sub-fields they care about — P2-001 introduced the nested
+// `LocationFilterValue` shape and we still want each test to read
+// at a glance.
+function withBasedIn(overrides: Partial<LocationFilterValue>): RequiredFiltersValue {
+  return { ...emptyFilters, basedIn: { ...emptyLocation, ...overrides } };
+}
+
+function withServiceArea(overrides: Partial<LocationFilterValue>): RequiredFiltersValue {
+  return { ...emptyFilters, serviceArea: { ...emptyLocation, ...overrides } };
+}
+
+describe("toLocationFilterPayload", () => {
+  test("an empty LocationFilterValue returns undefined so callers can omit the parent block", () => {
+    assert.equal(toLocationFilterPayload(emptyLocation), undefined);
+  });
+
+  test("a whitespace-only LocationFilterValue is treated as empty", () => {
+    const value: LocationFilterValue = { city: "   ", region: "\t", countryCode: "  " };
+    assert.equal(toLocationFilterPayload(value), undefined);
+  });
+
+  test("a city-only value emits a LocationFilter with no region or countryCode", () => {
+    const out = toLocationFilterPayload({ city: "Brooklyn", region: "", countryCode: "" });
+    assert.deepEqual(out, { city: "Brooklyn" });
+  });
+
+  test("a region-only value emits a LocationFilter with no city or countryCode", () => {
+    const out = toLocationFilterPayload({ city: "", region: "NY", countryCode: "" });
+    assert.deepEqual(out, { region: "NY" });
+  });
+
+  test("a countryCode is upper-cased on the way out so the schema sees `JM`, not `jm`", () => {
+    const out = toLocationFilterPayload({ city: "", region: "", countryCode: "jm" });
+    assert.deepEqual(out, { countryCode: "JM" });
+  });
+
+  test("a trimmed-empty sub-field is omitted even when other sub-fields are present", () => {
+    const out = toLocationFilterPayload({ city: "  ", region: "NY", countryCode: "US" });
+    assert.deepEqual(out, { region: "NY", countryCode: "US" });
+  });
+
+  test("a fully populated value emits all three sub-fields verbatim", () => {
+    const out = toLocationFilterPayload({ city: "Brooklyn", region: "NY", countryCode: "US" });
+    assert.deepEqual(out, { city: "Brooklyn", region: "NY", countryCode: "US" });
+  });
+});
+
+describe("isLocationFilterValueNonEmpty", () => {
+  test("an empty value is non-usable", () => {
+    assert.equal(isLocationFilterValueNonEmpty(emptyLocation), false);
+  });
+
+  test("a whitespace-only value is non-usable", () => {
+    assert.equal(
+      isLocationFilterValueNonEmpty({ city: "   ", region: " \t", countryCode: " " }),
+      false,
+    );
+  });
+
+  test("any single non-empty sub-field is usable", () => {
+    assert.equal(isLocationFilterValueNonEmpty({ city: "", region: "", countryCode: "JM" }), true);
+    assert.equal(isLocationFilterValueNonEmpty({ city: "", region: "NY", countryCode: "" }), true);
+    assert.equal(
+      isLocationFilterValueNonEmpty({ city: "Brooklyn", region: "", countryCode: "" }),
+      true,
+    );
+  });
+});
 
 describe("buildCandidatePayload + talentSearchRequestV1Schema", () => {
   test("empty query and empty filters produce a payload that the schema rejects (no usable criteria)", () => {
@@ -73,10 +144,7 @@ describe("buildCandidatePayload + talentSearchRequestV1Schema", () => {
     // Numeric `12` passes the 2-char length check but fails the
     // shared Zod `/^[A-Z]{2}$/` regex. The schema rejects the
     // payload with a field-level error pointing at the countryCode.
-    const candidate = buildCandidatePayload("dancehall", {
-      ...emptyFilters,
-      basedInCountryCode: "12",
-    });
+    const candidate = buildCandidatePayload("dancehall", withBasedIn({ countryCode: "12" }));
     const parsed = talentSearchRequestV1Schema.safeParse(candidate);
     assert.equal(parsed.success, false);
     assert.ok(
@@ -86,10 +154,7 @@ describe("buildCandidatePayload + talentSearchRequestV1Schema", () => {
   });
 
   test("a malformed serviceArea countryCode is NOT silently dropped — it reaches the schema and the schema rejects it", () => {
-    const candidate = buildCandidatePayload("dancehall", {
-      ...emptyFilters,
-      serviceAreaCountryCode: "12",
-    });
+    const candidate = buildCandidatePayload("dancehall", withServiceArea({ countryCode: "12" }));
     const parsed = talentSearchRequestV1Schema.safeParse(candidate);
     assert.equal(parsed.success, false);
     assert.ok(
@@ -99,20 +164,14 @@ describe("buildCandidatePayload + talentSearchRequestV1Schema", () => {
   });
 
   test("a lower-case basedIn countryCode is upper-cased so the schema accepts it", () => {
-    const candidate = buildCandidatePayload("dancehall", {
-      ...emptyFilters,
-      basedInCountryCode: "jm",
-    });
+    const candidate = buildCandidatePayload("dancehall", withBasedIn({ countryCode: "jm" }));
     const parsed = talentSearchRequestV1Schema.safeParse(candidate);
     assert.equal(parsed.success, true);
     assert.equal(parsed.data.required?.basedIn?.countryCode, "JM");
   });
 
   test("a lower-case serviceArea countryCode is upper-cased so the schema accepts it", () => {
-    const candidate = buildCandidatePayload("dancehall", {
-      ...emptyFilters,
-      serviceAreaCountryCode: "gb",
-    });
+    const candidate = buildCandidatePayload("dancehall", withServiceArea({ countryCode: "gb" }));
     const parsed = talentSearchRequestV1Schema.safeParse(candidate);
     assert.equal(parsed.success, true);
     assert.equal(parsed.data.required?.serviceArea?.countryCode, "GB");
@@ -123,10 +182,7 @@ describe("buildCandidatePayload + talentSearchRequestV1Schema", () => {
     // Pierre. The buyer is allowed to constrain basedIn.city without
     // supplying a countryCode; the schema accepts the partial
     // LocationFilter and the builder does not silently drop it.
-    const candidate = buildCandidatePayload("dancehall", {
-      ...emptyFilters,
-      basedInCity: "Brooklyn",
-    });
+    const candidate = buildCandidatePayload("dancehall", withBasedIn({ city: "Brooklyn" }));
     const parsed = talentSearchRequestV1Schema.safeParse(candidate);
     assert.equal(parsed.success, true);
     assert.equal(parsed.data.required?.basedIn?.city, "Brooklyn");
@@ -135,10 +191,7 @@ describe("buildCandidatePayload + talentSearchRequestV1Schema", () => {
   });
 
   test("a basedIn region-only constraint survives the schema and is preserved on the request", () => {
-    const candidate = buildCandidatePayload("dancehall", {
-      ...emptyFilters,
-      basedInRegion: "NY",
-    });
+    const candidate = buildCandidatePayload("dancehall", withBasedIn({ region: "NY" }));
     const parsed = talentSearchRequestV1Schema.safeParse(candidate);
     assert.equal(parsed.success, true);
     assert.equal(parsed.data.required?.basedIn?.region, "NY");
@@ -147,32 +200,24 @@ describe("buildCandidatePayload + talentSearchRequestV1Schema", () => {
   });
 
   test("a serviceArea city-only constraint survives the schema and is preserved on the request", () => {
-    const candidate = buildCandidatePayload("", {
-      ...emptyFilters,
-      serviceAreaCity: "London",
-    });
+    const candidate = buildCandidatePayload("", withServiceArea({ city: "London" }));
     const parsed = talentSearchRequestV1Schema.safeParse(candidate);
     assert.equal(parsed.success, true);
     assert.equal(parsed.data.required?.serviceArea?.city, "London");
   });
 
   test("a serviceArea region-only constraint survives the schema and is preserved on the request", () => {
-    const candidate = buildCandidatePayload("", {
-      ...emptyFilters,
-      serviceAreaRegion: "ON",
-    });
+    const candidate = buildCandidatePayload("", withServiceArea({ region: "ON" }));
     const parsed = talentSearchRequestV1Schema.safeParse(candidate);
     assert.equal(parsed.success, true);
     assert.equal(parsed.data.required?.serviceArea?.region, "ON");
   });
 
   test("a fully populated basedIn (city + region + countryCode) is preserved verbatim", () => {
-    const candidate = buildCandidatePayload("dancehall", {
-      ...emptyFilters,
-      basedInCity: "Brooklyn",
-      basedInRegion: "NY",
-      basedInCountryCode: "US",
-    });
+    const candidate = buildCandidatePayload(
+      "dancehall",
+      withBasedIn({ city: "Brooklyn", region: "NY", countryCode: "US" }),
+    );
     const parsed = talentSearchRequestV1Schema.safeParse(candidate);
     assert.equal(parsed.success, true);
     assert.deepEqual(parsed.data.required?.basedIn, {
@@ -183,12 +228,10 @@ describe("buildCandidatePayload + talentSearchRequestV1Schema", () => {
   });
 
   test("a fully populated serviceArea (city + region + countryCode) is preserved verbatim", () => {
-    const candidate = buildCandidatePayload("dancehall", {
-      ...emptyFilters,
-      serviceAreaCity: "London",
-      serviceAreaRegion: "LDN",
-      serviceAreaCountryCode: "GB",
-    });
+    const candidate = buildCandidatePayload(
+      "dancehall",
+      withServiceArea({ city: "London", region: "LDN", countryCode: "GB" }),
+    );
     const parsed = talentSearchRequestV1Schema.safeParse(candidate);
     assert.equal(parsed.success, true);
     assert.deepEqual(parsed.data.required?.serviceArea, {
@@ -203,11 +246,10 @@ describe("buildCandidatePayload + talentSearchRequestV1Schema", () => {
     // it, sees an empty string, and omits the field rather than
     // sending a value the schema would reject. The rest of the
     // request remains valid.
-    const candidate = buildCandidatePayload("dancehall", {
-      ...emptyFilters,
-      basedInCity: "   ",
-      basedInCountryCode: "JM",
-    });
+    const candidate = buildCandidatePayload(
+      "dancehall",
+      withBasedIn({ city: "   ", countryCode: "JM" }),
+    );
     const parsed = talentSearchRequestV1Schema.safeParse(candidate);
     assert.equal(parsed.success, true);
     assert.equal(parsed.data.required?.basedIn?.city, undefined);
@@ -215,11 +257,10 @@ describe("buildCandidatePayload + talentSearchRequestV1Schema", () => {
   });
 
   test("whitespace-only serviceArea.region is trimmed and dropped, NOT surfaced as a malformed payload", () => {
-    const candidate = buildCandidatePayload("dancehall", {
-      ...emptyFilters,
-      serviceAreaRegion: "   ",
-      serviceAreaCountryCode: "GB",
-    });
+    const candidate = buildCandidatePayload(
+      "dancehall",
+      withServiceArea({ region: "   ", countryCode: "GB" }),
+    );
     const parsed = talentSearchRequestV1Schema.safeParse(candidate);
     assert.equal(parsed.success, true);
     assert.equal(parsed.data.required?.serviceArea?.region, undefined);
@@ -232,10 +273,7 @@ describe("buildCandidatePayload + talentSearchRequestV1Schema", () => {
     // the schema and be rejected at the canonical boundary so the
     // browser surfaces a standard envelope rather than silently
     // dropping a field the buyer actually typed.
-    const candidate = buildCandidatePayload("dancehall", {
-      ...emptyFilters,
-      basedInCity: "x".repeat(200),
-    });
+    const candidate = buildCandidatePayload("dancehall", withBasedIn({ city: "x".repeat(200) }));
     const parsed = talentSearchRequestV1Schema.safeParse(candidate);
     assert.equal(parsed.success, false);
     assert.ok(
@@ -269,12 +307,8 @@ describe("buildCandidatePayload + talentSearchRequestV1Schema", () => {
       primaryCategoryKey: "music-production",
       independentlyPurchasableServiceKey: "mixing",
       serviceModes: ["Remote", "Hybrid"],
-      basedInCountryCode: "GB",
-      basedInRegion: "LDN",
-      basedInCity: "London",
-      serviceAreaCountryCode: "US",
-      serviceAreaRegion: "NY",
-      serviceAreaCity: "Brooklyn",
+      basedIn: { city: "London", region: "LDN", countryCode: "GB" },
+      serviceArea: { city: "Brooklyn", region: "NY", countryCode: "US" },
     });
     const parsed = talentSearchRequestV1Schema.safeParse(candidate);
     assert.equal(parsed.success, true);
@@ -313,20 +347,20 @@ describe("hasUsableCriteria", () => {
       true,
     );
     assert.equal(hasUsableCriteria("", { ...emptyFilters, serviceModes: ["Remote"] }), true);
-    assert.equal(hasUsableCriteria("", { ...emptyFilters, basedInCountryCode: "JM" }), true);
-    assert.equal(hasUsableCriteria("", { ...emptyFilters, basedInRegion: "NY" }), true);
-    assert.equal(hasUsableCriteria("", { ...emptyFilters, basedInCity: "Brooklyn" }), true);
-    assert.equal(hasUsableCriteria("", { ...emptyFilters, serviceAreaCountryCode: "GB" }), true);
-    assert.equal(hasUsableCriteria("", { ...emptyFilters, serviceAreaRegion: "LDN" }), true);
-    assert.equal(hasUsableCriteria("", { ...emptyFilters, serviceAreaCity: "London" }), true);
+    assert.equal(hasUsableCriteria("", withBasedIn({ countryCode: "JM" })), true);
+    assert.equal(hasUsableCriteria("", withBasedIn({ region: "NY" })), true);
+    assert.equal(hasUsableCriteria("", withBasedIn({ city: "Brooklyn" })), true);
+    assert.equal(hasUsableCriteria("", withServiceArea({ countryCode: "GB" })), true);
+    assert.equal(hasUsableCriteria("", withServiceArea({ region: "LDN" })), true);
+    assert.equal(hasUsableCriteria("", withServiceArea({ city: "London" })), true);
   });
 
-  test("whitespace-only filter inputs are not usable", () => {
-    assert.equal(hasUsableCriteria("", { ...emptyFilters, basedInCountryCode: "   " }), false);
-    assert.equal(hasUsableCriteria("", { ...emptyFilters, basedInRegion: "   " }), false);
-    assert.equal(hasUsableCriteria("", { ...emptyFilters, basedInCity: "   " }), false);
-    assert.equal(hasUsableCriteria("", { ...emptyFilters, serviceAreaCountryCode: "  " }), false);
-    assert.equal(hasUsableCriteria("", { ...emptyFilters, serviceAreaRegion: "  " }), false);
-    assert.equal(hasUsableCriteria("", { ...emptyFilters, serviceAreaCity: "  " }), false);
+  test("whitespace-only LocationFilter sub-fields are not usable", () => {
+    assert.equal(hasUsableCriteria("", withBasedIn({ countryCode: "   " })), false);
+    assert.equal(hasUsableCriteria("", withBasedIn({ region: "   " })), false);
+    assert.equal(hasUsableCriteria("", withBasedIn({ city: "   " })), false);
+    assert.equal(hasUsableCriteria("", withServiceArea({ countryCode: "  " })), false);
+    assert.equal(hasUsableCriteria("", withServiceArea({ region: "  " })), false);
+    assert.equal(hasUsableCriteria("", withServiceArea({ city: "  " })), false);
   });
 });

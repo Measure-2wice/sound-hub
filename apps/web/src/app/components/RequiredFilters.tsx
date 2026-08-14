@@ -14,16 +14,26 @@
 // partition of field errors into "rendered beside a control" vs
 // "rendered globally as an unmatched field error" so the global panel
 // never duplicates errors that already appear next to a control.
+//
+// Both `basedIn` and `serviceArea` share the same `LocationFilterValue`
+// shape (`{ city?, region?, countryCode? }`); the helper
+// `toLocationFilterPayload` is the single owner of the
+// trim / omit / upper-case logic (Codex P2-001). The component still
+// keeps a separate input per sub-field so the e2e controls and field
+// paths remain stable.
 
 import {
   type ApiFieldErrorV1,
   type CategoryMetadataItemV1,
   type ServiceModeV1,
 } from "@soundhub/types";
-import { type RequiredFiltersValue } from "../lib/talent-search-request-builder";
+import {
+  type LocationFilterValue,
+  type RequiredFiltersValue,
+} from "../lib/talent-search-request-builder";
 import { isControlledRequiredPath } from "../lib/field-error-paths";
 
-export type { RequiredFiltersValue };
+export type { RequiredFiltersValue, LocationFilterValue };
 
 export interface RequiredFiltersProps {
   readonly value: RequiredFiltersValue;
@@ -48,6 +58,22 @@ export interface RequiredFiltersProps {
 
 function errorsFor(pathPrefix: string, errors: readonly ApiFieldErrorV1[]): ApiFieldErrorV1[] {
   return errors.filter((err) => err.path === pathPrefix || err.path.startsWith(`${pathPrefix}.`));
+}
+
+// Update one sub-field of the `LocationFilterValue` carried under one
+// of the two location triplets. Returns the next `RequiredFiltersValue`
+// shape with only the named sub-field replaced.
+function updateLocationSubField(
+  filters: RequiredFiltersValue,
+  group: "basedIn" | "serviceArea",
+  subField: keyof LocationFilterValue,
+  next: string,
+): RequiredFiltersValue {
+  const updatedLocation: LocationFilterValue = {
+    ...filters[group],
+    [subField]: next,
+  };
+  return { ...filters, [group]: updatedLocation };
 }
 
 export function RequiredFilters({
@@ -75,6 +101,14 @@ export function RequiredFilters({
     next: RequiredFiltersValue[K],
   ): void {
     onChange({ ...value, [key]: next });
+  }
+
+  function updateLocation(
+    group: "basedIn" | "serviceArea",
+    subField: keyof LocationFilterValue,
+    next: string,
+  ): void {
+    onChange(updateLocationSubField(value, group, subField, next));
   }
 
   function toggleServiceMode(mode: ServiceModeV1): void {
@@ -189,8 +223,8 @@ export function RequiredFilters({
       >
         <input
           data-testid="required-based-in-country"
-          value={value.basedInCountryCode}
-          onChange={(e) => update("basedInCountryCode", e.target.value.toUpperCase())}
+          value={value.basedIn.countryCode}
+          onChange={(e) => updateLocation("basedIn", "countryCode", e.target.value.toUpperCase())}
           disabled={disabled}
           placeholder="e.g. JM"
           maxLength={2}
@@ -206,8 +240,8 @@ export function RequiredFilters({
       >
         <input
           data-testid="required-based-in-region"
-          value={value.basedInRegion}
-          onChange={(e) => update("basedInRegion", e.target.value)}
+          value={value.basedIn.region}
+          onChange={(e) => updateLocation("basedIn", "region", e.target.value)}
           disabled={disabled}
           placeholder="e.g. NY"
           maxLength={120}
@@ -223,8 +257,8 @@ export function RequiredFilters({
       >
         <input
           data-testid="required-based-in-city"
-          value={value.basedInCity}
-          onChange={(e) => update("basedInCity", e.target.value)}
+          value={value.basedIn.city}
+          onChange={(e) => updateLocation("basedIn", "city", e.target.value)}
           disabled={disabled}
           placeholder="e.g. Brooklyn"
           maxLength={120}
@@ -240,8 +274,10 @@ export function RequiredFilters({
       >
         <input
           data-testid="required-service-area-country"
-          value={value.serviceAreaCountryCode}
-          onChange={(e) => update("serviceAreaCountryCode", e.target.value.toUpperCase())}
+          value={value.serviceArea.countryCode}
+          onChange={(e) =>
+            updateLocation("serviceArea", "countryCode", e.target.value.toUpperCase())
+          }
           disabled={disabled}
           placeholder="e.g. GB"
           maxLength={2}
@@ -257,8 +293,8 @@ export function RequiredFilters({
       >
         <input
           data-testid="required-service-area-region"
-          value={value.serviceAreaRegion}
-          onChange={(e) => update("serviceAreaRegion", e.target.value)}
+          value={value.serviceArea.region}
+          onChange={(e) => updateLocation("serviceArea", "region", e.target.value)}
           disabled={disabled}
           placeholder="e.g. ON"
           maxLength={120}
@@ -274,8 +310,8 @@ export function RequiredFilters({
       >
         <input
           data-testid="required-service-area-city"
-          value={value.serviceAreaCity}
-          onChange={(e) => update("serviceAreaCity", e.target.value)}
+          value={value.serviceArea.city}
+          onChange={(e) => updateLocation("serviceArea", "city", e.target.value)}
           disabled={disabled}
           placeholder="e.g. London"
           maxLength={120}
