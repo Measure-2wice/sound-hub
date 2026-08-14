@@ -358,8 +358,10 @@ contract document cannot drift.
   is ever derived from `relevanceScore`, which remains strategy-specific ordering.
 
   **Approval and notification evidence:** This shared-contract revision is approved by the
-  Milestone 1 integration owner (Caleb Matteis) on the new fix commit on
-  `feat/m1.6-rank-preferences-group-matching` (the same commit that introduces the
+  Milestone 1 integration owner (Caleb Matteis) in commit
+  `41e0d025a9e4aeec58ae213eb2225c018ff84a86` on
+  `feat/m1.6-rank-preferences-group-matching` (committed
+  `2026-08-14T18:15:09-04:00`; the same commit that introduces the
   mode-neutral "Eligible for this search." qualitative-fit wording and corrects the
   evidence record's provenance statements). The approval is not backdated onto any
   earlier implementation commit on this branch. The parallel-stream notification
