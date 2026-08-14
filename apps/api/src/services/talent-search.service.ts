@@ -8,17 +8,18 @@
 // 2. Match distinct query tokens against the seeded offering title and the
 //    primary ServiceCategory key and name using case-insensitive comparison.
 // 3. Compute relevanceScore as a deterministic blend of text coverage and
-//    a fraction of the buyer's preference atoms that matched:
-//        score = clamp01(textScore + PREFERENCE_WEIGHT * preferenceScore)
-//    The blend preserves the M1.1 invariant that a query whose tokens all
-//    match the offering fields produces a relevanceScore of 1.0; the
-//    preference weight caps the additive lift at a fixed fraction so the
-//    score remains bounded inside [0, 1] and is finite. Because the
-//    blend can saturate at 1.0 under full text coverage, the seller sort
-//    uses the count of matched preference atoms as a secondary
-//    tie-breaker ahead of the stable sellerId so preference evidence
-//    stays order-significant at full coverage. Stable offeringId is the
-//    per-seller tie-breaker for best/additional selection.
+//    the buyer's preference atoms that matched. The blend is naturally
+//    bounded inside [0, 1] without clamping because each axis counts
+//    matches against a known capacity:
+//        numerator   = textMatchedCount + PREFERENCE_WEIGHT * matchedAtomCount
+//        denominator = queryTokenCount + PREFERENCE_WEIGHT * preferenceAtomCount
+//        score       = numerator / denominator   (when denominator > 0)
+//    matchedCount can never exceed its total on either axis, so the score
+//    stays inside [0, 1] and is finite. The M1.1 invariant holds: a query
+//    whose tokens all match the offering fields with no preferences still
+//    produces 1.0. Because the score reflects both signals by construction,
+//    no secondary sort key is required; sellers and offerings tie-break on
+//    the stable identifier only, satisfying the documented contract.
 // 4. Build matchReason only from fields that actually matched, using factual
 //    wording such as `matched offering title`, `matched category`, or
 //    `preferred genre: Dancehall`. Never use qualitative labels, randomness,
@@ -66,9 +67,11 @@ export class TalentSearchInvalidCriteriaError extends Error {
 // relevanceScore is bounded inside [0, 1] and finite, that it preserves
 // the M1.1 invariant that full text overlap produces 1.0, and that
 // preferences additively influence ranking without excluding candidates.
-// Keeping the weight at 0.5 means preferences can lift a candidate at most
-// halfway toward the unattainable "above 1.0" ceiling, which the clamp
-// then enforces. Tuned once and reviewed; changing it moves the strategy.
+// Keeping the weight at 0.5 means preferences contribute the same total
+// share as one matched query token when fully matched (2 matched atoms
+// equal 1 matched token at the boundary), so the bounded ratio stays
+// stable and order-significant without saturating. Tuned once and
+// reviewed; changing it moves the strategy.
 const PREFERENCE_WEIGHT = 0.5;
 
 export class TalentSearchService {
@@ -111,15 +114,13 @@ export class TalentSearchService {
     }
 
     ranked.sort((a, b) => {
-      // Primary: bounded score desc. Secondary: matched preference
-      // count desc (a seller whose preferences all matched outranks a
-      // seller who matched a smaller number of preferences, even when
-      // the bounded score saturated at 1.0 under full text coverage).
-      // Tertiary: stable sellerId asc so identical evidence produces
-      // identical order. See P1-001 remediation.
+      // Primary: bounded score desc. The score already incorporates both
+      // text coverage and preference influence in a single bounded
+      // quantity, so preference evidence stays order-significant without
+      // saturating at 1.0 under full text coverage. Final tie-break:
+      // stable sellerId asc per the documented contract. No secondary
+      // sort key is permitted.
       if (a.best.score !== b.best.score) return b.best.score - a.best.score;
-      if (a.best.matchedAtomCount !== b.best.matchedAtomCount)
-        return b.best.matchedAtomCount - a.best.matchedAtomCount;
       return a.seller.sellerId.localeCompare(b.seller.sellerId);
     });
 
@@ -544,9 +545,9 @@ interface RankedOffering {
   readonly offering: RepositoryCandidateOffering;
   readonly score: number;
   // Number of canonical preference atoms that matched for this offering.
-  // Carried through to the seller-level sort as a secondary tie-breaker
-  // so the bounded score saturating at 1.0 under full text coverage does
-  // not collapse the order onto sellerId alone. See P1-001 remediation.
+  // Carried through to the public preferenceCoverage payload; the score
+  // already incorporates this signal, so it is NOT used as a sort key
+  // (P1-001 remediation keeps the documented two-key order).
   readonly matchedAtomCount: number;
   readonly reason: string;
 }
@@ -561,23 +562,17 @@ function rankOfferingsForSeller(
   for (const offering of offerings) {
     const text = scoreOffering(offering, queryTokens);
 
-    // textScore: matched / total distinct query tokens, or 0 when no
-    // query was supplied. The score is unchanged from M1.1: a query whose
-    // tokens all overlap the offering's title + primary category fields
-    // produces 1.0 so the long-standing M1.1 invariant holds.
-    let textScore = 0;
-    if (queryTokens.length > 0) {
-      textScore = text.matched / queryTokens.length;
-    }
-
-    const matchedAtoms = matchPreferenceAtoms(seller, offering, preferenceAtoms);
-    const preferenceScore =
-      preferenceAtoms.length === 0 ? 0 : matchedAtoms.length / preferenceAtoms.length;
-
-    // Combined score: text coverage is the foundation; preferences can lift,
-    // but the total is bounded inside [0, 1] by clamp01. The named weight
-    // PREFERENCE_WEIGHT (declared at module top) keeps the additive lift
-    // bounded so preference density alone cannot push the score above 1.
+    // Bounded score: text coverage is the foundation and preferences add a
+    // weighted share of the same bounded quantity. The score is naturally
+    // bounded inside [0, 1] without clamping because matchedCount on each
+    // axis cannot exceed its total (textMatchedCount <= queryTokenCount
+    // and matchedAtomCount <= preferenceAtomCount). The M1.1 invariant
+    // holds: a query whose tokens all overlap the offering's title +
+    // primary category fields, with no preferences supplied, still
+    // produces 1.0. The PREFERENCE_WEIGHT constant (declared at module
+    // top) sets how strongly a matched preference atom lifts the score
+    // against an unmatched token, and keeps the influence bounded.
+    //
     // Eligibility rules (M1.5):
     //   - Structured-only path (no query): every eligible standalone
     //     offering from this seller stays in the result set.
@@ -591,11 +586,19 @@ function rankOfferingsForSeller(
     //     candidates." A buyer who combines a query with a preference
     //     therefore gets sellers whose offerings match EITHER the query
     //     OR the preference (or both), never silently fewer.
-    if (queryTokens.length > 0 && text.matched === 0 && matchedAtoms.length === 0) {
+    const textMatchedCount = text.matched;
+    const queryTokenCount = queryTokens.length;
+    const matchedAtoms = matchPreferenceAtoms(seller, offering, preferenceAtoms);
+    const matchedAtomCount = matchedAtoms.length;
+    const preferenceAtomCount = preferenceAtoms.length;
+
+    if (queryTokenCount > 0 && textMatchedCount === 0 && matchedAtomCount === 0) {
       continue;
     }
 
-    const combinedScore = textScore + PREFERENCE_WEIGHT * preferenceScore;
+    const totalCapacity = queryTokenCount + PREFERENCE_WEIGHT * preferenceAtomCount;
+    const totalMatched = textMatchedCount + PREFERENCE_WEIGHT * matchedAtomCount;
+    const combinedScore = totalCapacity === 0 ? 0 : totalMatched / totalCapacity;
     const reasonParts: string[] = [];
     if (text.matched > 0) {
       reasonParts.push(describeMatch(text.fields));
@@ -612,13 +615,12 @@ function rankOfferingsForSeller(
       reason,
     });
   }
-  // Stable three-key sort: score desc, matched-preference-atom count
-  // desc, then offeringId asc. The matchedAtomCount tie-breaker keeps
-  // preferences order-significant at full text coverage where the
-  // bounded score saturates at 1.0; see P1-001 remediation.
+  // Stable two-key sort: score desc, then offeringId asc. The bounded
+  // score already incorporates both text coverage and preference
+  // influence without saturating, so no secondary sort key is
+  // permitted (P1-001 remediation).
   scored.sort((a, b) => {
     if (a.score !== b.score) return b.score - a.score;
-    if (a.matchedAtomCount !== b.matchedAtomCount) return b.matchedAtomCount - a.matchedAtomCount;
     return a.offering.offeringId.localeCompare(b.offering.offeringId);
   });
   return scored;

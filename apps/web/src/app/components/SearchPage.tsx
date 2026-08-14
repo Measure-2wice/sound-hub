@@ -356,16 +356,18 @@ function ResultCardImpl({ result }: { result: TalentSearchResultV1 }) {
             deterministic evidence AND qualitative fit; the P1-001 review
             found qualitative fit had been dropped entirely, so we
             restore it as a deterministic coverage statement instead of
-            a score-derived band. */}
-        <div
-          className="bg-blue-50 p-3 rounded-lg mt-2"
-          data-testid="result-qualitative-fit"
-        >
-          <p className="text-sm font-medium text-blue-900 mb-1">Preference coverage</p>
-          <p className="text-sm text-blue-800" data-testid="result-qualitative-fit-text">
-            {formatPreferenceCoverage(preferenceCoverage)}
-          </p>
-        </div>
+            a score-derived band.
+            Optional in the public DTO (P1-002 remediation): when the
+            service omits the field, this section is skipped and the
+            matchReason above is the sole buyer-facing evidence. */}
+        {preferenceCoverage && (
+          <div className="bg-blue-50 p-3 rounded-lg mt-2" data-testid="result-qualitative-fit">
+            <p className="text-sm font-medium text-blue-900 mb-1">Preference coverage</p>
+            <p className="text-sm text-blue-800" data-testid="result-qualitative-fit-text">
+              {formatPreferenceCoverage(preferenceCoverage)}
+            </p>
+          </div>
+        )}
       </Card.Content>
     </Card>
   );
@@ -386,7 +388,9 @@ export const ResultCard = ResultCardImpl;
 // conventions instead of duplicating five lines of JSX (P2-002
 // remediation). Lead-only content (service areas, genres, pricing, and
 // the pricing disclaimer) stays on BestOfferingCard because additional
-// offerings are intentionally compact.
+// offerings are intentionally compact. Kept private (no `export`) so the
+// implementation helper does not leak to external consumers until one
+// exists (P2-001 remediation).
 //
 // Presentation style is selected via `variant` so the four CSS class
 // strings travel as one cohesive style record owned by this component
@@ -417,7 +421,7 @@ const OFFERING_DETAIL_STYLES: Record<
   },
 };
 
-export function OfferingDetail({
+function OfferingDetail({
   offering,
   testIdPrefix,
   variant,
@@ -471,11 +475,7 @@ function BestOfferingCard({
   const pricingLabel = formatPricing(offering.pricing);
   return (
     <div className="bg-gray-50 p-3 rounded-lg mb-3" data-testid={`${testIdPrefix}-card`}>
-      <OfferingDetail
-        offering={offering}
-        testIdPrefix={testIdPrefix}
-        variant="lead"
-      />
+      <OfferingDetail offering={offering} testIdPrefix={testIdPrefix} variant="lead" />
 
       <dl className="text-xs text-gray-700 mt-2 space-y-1">
         {offering.serviceAreas.length > 0 && (

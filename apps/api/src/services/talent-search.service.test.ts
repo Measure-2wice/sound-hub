@@ -1972,14 +1972,14 @@ describe("TalentSearchService M1.5 preference ranking and grouping", () => {
     }
   });
 
-  // P1-001 regression: the bounded score saturates at 1.0 under full text
-  // coverage. Without a secondary tie-breaker the only thing left to
-  // decide ordering is sellerId, so a lexically later seller whose
-  // preferences matched would never outrank a lexically earlier seller
-  // that did not match them. The fix adds the matched-preference-atom
-  // count as a secondary sort key ahead of sellerId; this test pins
-  // that behavior so a regression collapses the order back onto
-  // sellerId alone.
+  // P1-001 regression (revised after codex review): the bounded score
+  // no longer saturates at 1.0 under full text coverage because the
+  // score now incorporates both signals as a ratio over a known
+  // capacity (textMatched/total + preference lift / total preference).
+  // A seller whose preference matched must outrank a seller whose
+  // preference did not, even when the lexically earlier seller would
+  // have won under stable sellerId alone. This test pins the documented
+  // two-key ordering: descending score, then stable sellerId asc.
   test("preference ordering is preserved at full text coverage when only the lexically later seller matches", async () => {
     const sellers: InMemorySeller[] = [
       {
@@ -2035,19 +2035,22 @@ describe("TalentSearchService M1.5 preference ranking and grouping", () => {
         controlledKeys: M15_CONTROLLED_KEYS,
       }),
     );
-    // Single-token query that fully matches the offering title; both
-    // sellers' relevanceScore saturates at 1.0 under the bounded blend.
+    // Single-token query that fully matches the offering title; the
+    // bounded score still differentiates the two sellers because the
+    // JM-preferred seller lifts the matched preference share.
     const response = await service.search({
       query: "dancehall",
       preferred: { caribbeanAffiliationCodes: ["JM"] },
     });
     assert.equal(response.results.length, 2);
-    // The JM seller must outrank the HT seller; the only differentiator
-    // under saturated scores is the matched preference count.
-    assert.equal(response.results[0]?.seller.sellerId, "p1-001-seller-z");
-    assert.equal(response.results[1]?.seller.sellerId, "p1-001-seller-a");
-    // Both relevanceScore values are bounded and finite; the saturation
-    // at 1.0 is the very property that motivated the new tie-breaker.
+    // The JM seller must outrank the HT seller; their scores differ
+    // (the JM seller carries the preference lift).
+    const [first, second] = response.results;
+    assert.ok(first && second);
+    assert.equal(first.seller.sellerId, "p1-001-seller-z");
+    assert.equal(second.seller.sellerId, "p1-001-seller-a");
+    assert.ok(first.relevanceScore > second.relevanceScore);
+    // Both relevanceScore values are bounded and finite.
     for (const result of response.results) {
       assert.ok(
         Number.isFinite(result.relevanceScore) &&
@@ -2057,11 +2060,87 @@ describe("TalentSearchService M1.5 preference ranking and grouping", () => {
     }
     // The JM seller's matchReason must include the factual preference
     // label so the order change is observable, not just a hidden score.
-    const jmMatchReason = response.results[0].matchReason;
+    const jmMatchReason = first.matchReason;
     assert.ok(
       jmMatchReason.includes("preferred Caribbean affiliation: JM"),
       `JM-preferred seller must carry the factual preference label, got: ${jmMatchReason}`,
     );
+  });
+
+  // P1-001 contract test (added after codex review): the documented
+  // two-key ordering is descending score, then stable sellerId asc.
+  // Two sellers with TRULY EQUAL relevanceScore (full text + preference
+  // coverage) must therefore break the tie on the stable sellerId; the
+  // previous matchedAtomCount secondary sort key would have inserted
+  // a non-deterministic preference comparison before sellerId, which
+  // violated the documented order when both candidates' matched
+  // preference count was also equal.
+  test("equal-score candidates with matching preferences break ties on the documented stable sellerId", async () => {
+    const sharedOffering: InMemoryOffering = {
+      ...PRODUCTION_OFFERING_A,
+      offeringId: "p1-001-equal-offering",
+      title: "Dancehall production package",
+      genreTags: ["Dancehall"],
+    };
+    const sellers: InMemorySeller[] = [
+      {
+        // Lexically later; identical coverage, should land second.
+        sellerId: "p1-001-equal-z",
+        workspaceId: "ws-p1-001-equal-z",
+        professionalName: "Z twin",
+        bio: "",
+        status: "Published",
+        basedInCity: "Brooklyn",
+        basedInRegion: "NY",
+        basedInCountryCode: "US",
+        avatarUrl: null,
+        specialtyKeys: ["Producer"],
+        caribbeanAffiliationCodes: ["JM"],
+        workspaceStatus: "Active",
+        workspaceHasSellerCapability: true,
+        offerings: [sharedOffering],
+      },
+      {
+        // Lexically earlier; identical coverage, should land first.
+        sellerId: "p1-001-equal-a",
+        workspaceId: "ws-p1-001-equal-a",
+        professionalName: "A twin",
+        bio: "",
+        status: "Published",
+        basedInCity: "Brooklyn",
+        basedInRegion: "NY",
+        basedInCountryCode: "US",
+        avatarUrl: null,
+        specialtyKeys: ["Producer"],
+        caribbeanAffiliationCodes: ["JM"],
+        workspaceStatus: "Active",
+        workspaceHasSellerCapability: true,
+        offerings: [sharedOffering],
+      },
+    ];
+    const service = new TalentSearchService(
+      new InMemoryTalentSearchRepository({
+        sellers,
+        controlledKeys: M15_CONTROLLED_KEYS,
+      }),
+    );
+    // Query fully matches the shared title and the JM+Brooklyn
+    // preferences match both sellers identically; both reach 1.0.
+    const response = await service.search({
+      query: "dancehall production",
+      preferred: {
+        caribbeanAffiliationCodes: ["JM"],
+        basedIn: { city: "Brooklyn" },
+      },
+    });
+    assert.equal(response.results.length, 2);
+    const [first, second] = response.results;
+    assert.ok(first && second);
+    // Equal-score invariant.
+    assert.equal(first.relevanceScore, second.relevanceScore);
+    // Documented tie-break: stable sellerId ascending.
+    assert.equal(first.seller.sellerId, "p1-001-equal-a");
+    assert.equal(second.seller.sellerId, "p1-001-equal-z");
   });
 
   // P1-002 regression: every preference axis is canonicalized (trim,

@@ -295,6 +295,11 @@ export type PublicOfferingSummaryV1 = z.infer<typeof publicOfferingSummaryV1Sche
 // are computed from the canonical preference atoms and the deterministic
 // matcher (never derived from `relevanceScore`, which is strategy-specific
 // ordering and explicitly NOT a buyer-facing confidence signal).
+//
+// Optional in the public DTO so adding the field is backward-compatible
+// per the v1 contract's compatibility rules. Older clients see a response
+// without the field and the UI falls back to `matchReason` evidence only
+// (P1-002 remediation).
 export const preferenceCoverageV1Schema = z
   .object({
     matched: z.number().int().nonnegative(),
@@ -317,7 +322,7 @@ export const talentSearchResultV1Schema = z
       .max(1, "relevanceScore must be at most 1")
       .finite(),
     matchReason: z.string().min(1).max(500),
-    preferenceCoverage: preferenceCoverageV1Schema,
+    preferenceCoverage: preferenceCoverageV1Schema.optional(),
   })
   .strict();
 export type TalentSearchResultV1 = z.infer<typeof talentSearchResultV1Schema>;

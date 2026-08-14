@@ -188,6 +188,39 @@ describe("SearchPage buyer-facing match evidence (P1-001)", () => {
       "the result card must not render a buyer-facing confidence/guarantee/quality claim",
     );
   });
+
+  // P1-002 regression: preferenceCoverage is optional in the public DTO
+  // (backward-compatible per the v1 contract). When the service omits
+  // the field, the result card must skip the qualitative-fit block
+  // entirely and the matchReason above must still carry the only
+  // buyer-facing evidence.
+  test("omits the qualitative-fit block when the service omits preferenceCoverage", () => {
+    const omittedCoverageResult: TalentSearchResultV1 = {
+      seller: sampleResult.seller,
+      bestMatchingOffering: sampleResult.bestMatchingOffering,
+      additionalMatchingOfferings: sampleResult.additionalMatchingOfferings,
+      relevanceScore: sampleResult.relevanceScore,
+      matchReason: sampleResult.matchReason,
+    };
+    const html = renderToStaticMarkup(ResultCard({ result: omittedCoverageResult }));
+
+    assert.ok(
+      html.includes('data-testid="result-match-reason"'),
+      "the matchReason block must still render when preferenceCoverage is absent",
+    );
+    assert.ok(
+      html.includes("matched offering title; preferred genre: Dancehall"),
+      "the matchReason text must still round-trip verbatim",
+    );
+    assert.ok(
+      !html.includes('data-testid="result-qualitative-fit"'),
+      "the qualitative-fit block must be skipped when preferenceCoverage is absent",
+    );
+    assert.ok(
+      !html.includes("Preference coverage"),
+      "the qualitative-fit header must not appear when preferenceCoverage is absent",
+    );
+  });
 });
 
 describe("SearchPage shared offering-detail markup (P2-001)", () => {
@@ -244,10 +277,7 @@ describe("SearchPage shared offering-detail markup (P2-001)", () => {
       html.includes("Remote coaching"),
       "the bundle component must appear by its public name",
     );
-    assert.ok(
-      html.includes("bundle only"),
-      "every bundle component must be labeled 'bundle only'",
-    );
+    assert.ok(html.includes("bundle only"), "every bundle component must be labeled 'bundle only'");
   });
 
   test("renders the deterministic pricing disclaimer so no pricing presentation reads as a quote", () => {
