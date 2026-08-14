@@ -1,23 +1,100 @@
 "use client";
 
-import { useState, type FormEvent } from "react";
+import { useEffect, useMemo, useState, type FormEvent } from "react";
 import { useSearch } from "../hooks/useSearch";
+import { hasUsableCriteria, type RequiredFiltersValue } from "../lib/talent-search-request-builder";
+import { isControlledRequiredPath } from "../lib/field-error-paths";
 import { Card } from "./ui/Card";
 import { SearchForm } from "./SearchForm";
+import { RequiredFilters } from "./RequiredFilters";
 import { formatPricing } from "../lib/pricing";
-import type { TalentSearchResultV1 } from "@soundhub/types";
+import {
+  categoryMetadataResponseV1Schema,
+  type ApiFieldErrorV1,
+  type CategoryMetadataItemV1,
+  type TalentSearchResultV1,
+} from "@soundhub/types";
 
 export function SearchPage() {
   const [query, setQuery] = useState("");
-  const { results, isLoading, error, errorCode, requestId, search } = useSearch();
+  const [filters, setFilters] = useState<RequiredFiltersValue>({
+    primaryCategoryKey: "",
+    independentlyPurchasableServiceKey: "",
+    serviceModes: [],
+    basedIn: { city: "", region: "", countryCode: "" },
+    serviceArea: { city: "", region: "", countryCode: "" },
+  });
+  const { results, isLoading, error, errorCode, fieldErrors, requestId, search } = useSearch();
+
+  // Canonical categories are fetched from the public metadata seam
+  // (`GET /api/metadata/categories`) so the browser never holds a
+  // second, independently deployable list of category keys. The
+  // browser consumes the rendered list; PostgreSQL (via the API) is
+  // the only source of truth.
+  const [categories, setCategories] = useState<readonly CategoryMetadataItemV1[]>([]);
+  const [categoriesError, setCategoriesError] = useState<string | null>(null);
+
+  useEffect(() => {
+    let cancelled = false;
+    void (async () => {
+      try {
+        const response = await fetch("/api/metadata/categories", {
+          method: "GET",
+          headers: { Accept: "application/json" },
+        });
+        if (!response.ok) {
+          throw new Error(`Metadata request failed (${response.status}).`);
+        }
+        const body: unknown = await response.json();
+        // Runtime validation against the shared Zod schema. The
+        // browser MUST NOT trust a handwritten DTO cast; any
+        // contract drift between PostgreSQL and the browser
+        // surfaces here as a rejected categories load instead of
+        // a silently populated select.
+        const parsed = categoryMetadataResponseV1Schema.safeParse(body);
+        if (!parsed.success) {
+          throw new Error("Metadata response does not match the shared category schema.");
+        }
+        if (cancelled) return;
+        // Reuse the shared inferred type directly; the API contract
+        // and the UI model are intentionally the same shape so there
+        // is no field-by-field remapping here (Codex P2-001).
+        setCategories(parsed.data.categories);
+        setCategoriesError(null);
+      } catch (err) {
+        if (cancelled) return;
+        setCategoriesError(
+          err instanceof Error ? err.message : "Could not load the canonical category catalog.",
+        );
+      }
+    })();
+    return () => {
+      cancelled = true;
+    };
+  }, []);
 
   const handleSubmit = (e: FormEvent) => {
     e.preventDefault();
-    void search(query);
+    void search(query, filters);
   };
 
-  const showEmptyState =
-    !isLoading && results !== null && results.results.length === 0 && query.trim().length >= 2;
+  // Errors whose path the `RequiredFilters` panel does not render
+  // are shown in the global panel. The full `fieldErrors` array is
+  // already passed down to the panel, so the global list shows ONLY
+  // the unmatched entries — controlled errors render exactly once,
+  // beside their control.
+  const unmatchedFieldErrors = useMemo<readonly ApiFieldErrorV1[]>(
+    () => fieldErrors.filter((err) => !isControlledRequiredPath(err.path)),
+    [fieldErrors],
+  );
+
+  // The empty state renders whenever the most recent completed search
+  // returned no results. The buyer's request is meaningful if it has
+  // either a usable query OR a usable structured filter, so both
+  // paths qualify the page to show actionable feedback rather than
+  // letting a no-result response read as a system error.
+  const usable = hasUsableCriteria(query, filters);
+  const showEmptyState = !isLoading && results !== null && results.results.length === 0 && usable;
 
   return (
     <div className="max-w-4xl mx-auto px-6 py-8">
@@ -30,14 +107,51 @@ export function SearchPage() {
 
       <Card className="mb-8">
         <Card.Content>
-          <SearchForm
-            query={query}
-            setQuery={setQuery}
-            onSearch={handleSubmit}
-            loading={isLoading}
-          />
+          <form onSubmit={handleSubmit} className="space-y-6" data-testid="search-form">
+            <SearchForm query={query} setQuery={setQuery} loading={isLoading} />
+            <RequiredFilters
+              value={filters}
+              onChange={setFilters}
+              fieldErrors={fieldErrors}
+              categories={categories}
+              // The whole panel only disables during an in-flight search.
+              // The category catalog only blocks the two category selects
+              // — service mode, based-in, and service-area controls do
+              // not depend on category metadata and stay usable so the
+              // buyer can still apply those strict constraints even when
+              // the catalog is loading, unavailable, or validly empty.
+              disabled={isLoading}
+              categorySelectsDisabled={categories.length === 0}
+            />
+            <button
+              type="submit"
+              disabled={isLoading}
+              data-testid="search-submit"
+              className="w-full bg-blue-600 text-white py-3 px-6 rounded-lg font-medium hover:bg-blue-700 disabled:opacity-50 disabled:cursor-not-allowed transition-colors"
+            >
+              {isLoading ? "Searching…" : "Search talent"}
+            </button>
+          </form>
         </Card.Content>
       </Card>
+
+      {categoriesError && (
+        <Card
+          variant="outlined"
+          className="mb-6 border-amber-200 bg-amber-50"
+          data-testid="catalog-error"
+        >
+          <Card.Content>
+            <p className="text-amber-800" data-testid="catalog-error-message">
+              The canonical category catalog is unavailable. {categoriesError}
+            </p>
+            <p className="mt-2 text-sm text-amber-700">
+              Category selects are disabled until the catalog loads. Service mode, based-in, and
+              service-area controls remain usable. Retry by refreshing the page.
+            </p>
+          </Card.Content>
+        </Card>
+      )}
 
       {error && (
         <Card
@@ -53,6 +167,16 @@ export function SearchPage() {
               <p className="mt-2 text-sm text-red-700">
                 The brief is preserved. You can retry without retyping it.
               </p>
+            )}
+            {unmatchedFieldErrors.length > 0 && (
+              <ul className="mt-3 space-y-1" data-testid="search-error-fields">
+                {unmatchedFieldErrors.map((err) => (
+                  <li key={`${err.path}-${err.code}`} className="text-sm text-red-700">
+                    <span className="font-mono text-xs mr-1">{err.path}</span>
+                    {err.message}
+                  </li>
+                ))}
+              </ul>
             )}
             {requestId && (
               <p className="mt-2 text-xs text-red-600" data-testid="search-error-request-id">

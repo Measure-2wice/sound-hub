@@ -5,12 +5,16 @@ import helmet from "helmet";
 import { createPrismaClient, type PrismaClient } from "@soundhub/db";
 import { healthRoutes } from "./routes/health.js";
 import { createSearchRouter } from "./routes/search.js";
+import { createMetadataRouter } from "./routes/metadata.js";
 import { TalentSearchService } from "./services/talent-search.service.js";
 import { PrismaTalentSearchRepository } from "./repositories/prisma-talent-search.repository.js";
+import { PrismaMetadataRepository } from "./repositories/prisma-metadata.repository.js";
+import type { MetadataRepository } from "./repositories/metadata.repository.js";
 import { buildSafeError, generateRequestId, writeSafeError } from "./lib/errors.js";
 
 export interface AppOptions {
   readonly service?: TalentSearchService;
+  readonly metadataRepository?: MetadataRepository;
   readonly prismaClient?: PrismaClient;
 }
 
@@ -24,6 +28,7 @@ export function buildApp(options: AppOptions = {}): BuiltApp {
   const prisma = options.prismaClient ?? createPrismaClient();
   const service =
     options.service ?? new TalentSearchService(new PrismaTalentSearchRepository(prisma));
+  const metadataRepository = options.metadataRepository ?? new PrismaMetadataRepository(prisma);
 
   const app: Application = express();
   app.disable("x-powered-by");
@@ -48,6 +53,7 @@ export function buildApp(options: AppOptions = {}): BuiltApp {
 
   app.use("/api/health", healthRoutes);
   app.use("/api/search", createSearchRouter({ service }));
+  app.use("/api/metadata", createMetadataRouter({ repository: metadataRepository }));
 
   // 404 fallback
   app.use((req: Request, res: Response) => {
