@@ -1153,6 +1153,7 @@ describe("POST /api/search M1.5 preference ranking and grouping", () => {
           ],
           relevanceScore: 0.5,
           matchReason: "matched",
+          preferenceCoverage: { matched: 0, total: 0 },
         },
       ],
       metadata: {

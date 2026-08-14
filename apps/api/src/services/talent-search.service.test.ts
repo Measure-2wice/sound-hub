@@ -1004,6 +1004,7 @@ describe("TalentSearchService", () => {
           additionalMatchingOfferings: [],
           relevanceScore: 1,
           matchReason: "matched",
+          preferenceCoverage: { matched: 0, total: 0 },
         },
       ],
       metadata: {

@@ -131,6 +131,15 @@ export class TalentSearchService {
       ),
       relevanceScore: clamp01(entry.best.score),
       matchReason: entry.best.reason,
+      // Factual coverage derived from canonical preference atoms and their
+      // deterministic match counts against the best matching offering.
+      // Never derived from `relevanceScore`; the score is strategy-specific
+      // ordering and the contract forbids presenting it as a confidence
+      // signal or quality claim.
+      preferenceCoverage: {
+        matched: entry.best.matchedAtomCount,
+        total: preferenceAtoms.length,
+      },
     }));
 
     return {

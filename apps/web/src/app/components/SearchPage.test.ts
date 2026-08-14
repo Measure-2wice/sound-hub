@@ -1,150 +1,269 @@
 /* eslint-disable @typescript-eslint/no-floating-promises */
+// React 18 ships `renderToStaticMarkup` with a synchronous string return
+// type, but `react-dom/server`'s typings expose the concurrent entry points
+// alongside it. `@typescript-eslint/no-floating-promises` flags the call
+// sites as floating promises even though the function returns a string,
+// and the only calls in this file are the synchronous server renderer.
+//
 // Buyer-facing match-evidence UI tests.
 //
-// P1-003 regression: the result card previously rendered a qualitative
-// "Strong/Good/Partial/Weak fit" band derived directly from the internal
-// `relevanceScore`, and exposed the raw score in a `data-relevance-score`
-// DOM attribute. The v1 contract says `relevanceScore` is a bounded
-// strategy-specific ordering signal — not a probability, confidence
-// estimate, or quality rating — and the buyer UI must not render it as a
-// percentage OR derive a qualitative strength band from it. The fix
-// removes the score-derived fit summary, the raw-score DOM attribute,
-// and the `fitBandFor` / `describeFit` helpers; the deterministic
-// `matchReason` produced by the search service stays visible.
+// These tests exercise the rendered output of `ResultCard` against a
+// controlled sample `TalentSearchResultV1` and assert on the HTML a real
+// browser would see, not on private source structure. The web test suite
+// runs in plain `node:test`; React ships `react-dom/server` so a presentational
+// component can be rendered to an HTML string and asserted on without
+// taking on a DOM testing dependency.
 //
-// This test reads the component source as a static string and asserts
-// that no score-derived UI surface is reintroduced. The web test suite
-// runs in plain `node:test` without DOM testing infrastructure, so a
-// component source-level assertion is the most direct regression we can
-// pin without taking on a new dependency. The assertions cover both the
-// buyer-facing strings (which a screen reader would read) and the data
-// attributes (which downstream tests, telemetry, or extensions could
-// observe).
+// What the tests pin (per the M1.5 / M1.6 review findings):
 //
-// P2-002 regression: the previous markup duplicated title/description/
-// category/mode/bundle rendering between the best and additional paths.
-// The fix extracts a shared `OfferingDetail` component; this test pins
-// that the shared renderer exists and that both call sites consume it
-// with stable `data-testid` prefixes.
+//   - P1-001 remediation: the result card renders BOTH deterministic
+//     `matchReason` evidence AND a qualitative-fit presentation. The
+//     qualitative-fit description names matched vs total preferences
+//     factually. It is NEVER a percentage and NEVER a confidence or
+//     quality claim.
+//   - P1-002 remediation: the suite no longer reads `SearchPage.tsx` as
+//     text, no longer pins helper names, and no longer greps for JSX
+//     template literals or implementation structure. A behavior-preserving
+//     refactor of `ResultCard` / `OfferingDetail` must keep these tests
+//     green.
+//   - P1-003 regression: the result card does not render
+//     `relevanceScore` as a buyer-facing percentage or derive a
+//     qualitative strength band from it.
+//   - P2-001 regression: the additional-offering row uses the same
+//     `data-testid` conventions as the best-offering row so the buyer
+//     UI never collapses two distinct presentations onto one row.
 
 import assert from "node:assert/strict";
-import { readFileSync } from "node:fs";
-import { dirname, resolve } from "node:path";
-import { fileURLToPath } from "node:url";
 import { describe, test } from "node:test";
+import { renderToStaticMarkup } from "react-dom/server";
+import type { TalentSearchResultV1 } from "@soundhub/types";
+import { ResultCard } from "./SearchPage";
 
-const here = dirname(fileURLToPath(import.meta.url));
-const searchPageSource = readFileSync(resolve(here, "SearchPage.tsx"), "utf8");
+// Stable sample so the assertions read as a single behavioral contract
+// rather than as ad-hoc strings. The values are minimal-but-valid for the
+// public schema: a real seller, one best matching offering, one
+// additional matching offering with a bundle-only IncludedService.
+const sampleResult: TalentSearchResultV1 = {
+  seller: {
+    sellerId: "seller-1",
+    professionalName: "Marc-André Pierre",
+    specialties: ["Producer"],
+    bio: "Brooklyn-based Haitian producer.",
+    basedIn: { city: "Brooklyn", region: "NY", countryCode: "US" },
+    caribbeanAffiliationCodes: ["HT"],
+  },
+  bestMatchingOffering: {
+    offeringId: "offering-1",
+    title: "Haitian dancehall single production — remote",
+    description: "Remote dancehall single production.",
+    primaryCategory: { key: "music-production", name: "Music Production" },
+    includedServices: [],
+    genreTags: ["Dancehall"],
+    serviceMode: "Remote",
+    serviceAreas: [{ countryCode: "US" }],
+    pricing: {
+      kind: "StartingAt",
+      amount: { amountMinor: 60000, currency: "USD" },
+      unit: "track",
+    },
+  },
+  additionalMatchingOfferings: [
+    {
+      offeringId: "offering-2",
+      title: "Mixing for Caribbean-rooted releases",
+      description: "Mixing for Caribbean-rooted releases.",
+      primaryCategory: { key: "mixing", name: "Mixing" },
+      includedServices: [
+        { key: "remote-coaching", name: "Remote coaching", purchaseMode: "BundleOnly" },
+      ],
+      genreTags: ["Dancehall"],
+      serviceMode: "Remote",
+      serviceAreas: [{ countryCode: "US" }],
+    },
+  ],
+  relevanceScore: 0.75,
+  matchReason: "matched offering title; preferred genre: Dancehall",
+  preferenceCoverage: { matched: 1, total: 2 },
+};
 
-describe("SearchPage buyer-facing match evidence (P1-003)", () => {
-  test("does not expose relevanceScore as a DOM data attribute", () => {
-    assert.equal(
-      searchPageSource.includes("data-relevance-score"),
-      false,
-      "the buyer UI must not expose the raw relevanceScore as a DOM attribute",
+const fullCoverageResult: TalentSearchResultV1 = {
+  ...sampleResult,
+  matchReason: "matched offering title; preferred genre: Dancehall; preferred specialty: Producer",
+  preferenceCoverage: { matched: 2, total: 2 },
+};
+
+const noPreferencesResult: TalentSearchResultV1 = {
+  ...sampleResult,
+  matchReason: "matched offering title",
+  preferenceCoverage: { matched: 0, total: 0 },
+};
+
+describe("SearchPage buyer-facing match evidence (P1-001)", () => {
+  test("renders both the deterministic matchReason evidence and the qualitative fit", () => {
+    const html = renderToStaticMarkup(ResultCard({ result: sampleResult }));
+
+    // Deterministic evidence: the result-match-reason block carries the
+    // factual matchReason the search service produced.
+    assert.ok(
+      html.includes('data-testid="result-match-reason"'),
+      "the result card must render the result-match-reason block",
+    );
+    assert.ok(
+      html.includes("Why this matches"),
+      "the matchReason block must keep its buyer-facing header",
+    );
+    assert.ok(
+      html.includes("matched offering title; preferred genre: Dancehall"),
+      "the matchReason text must round-trip verbatim from the API result",
+    );
+
+    // Qualitative fit: a distinct, separately-labeled block that names
+    // matched vs total preferences factually. It is NOT a percentage, it
+    // is NOT derived from relevanceScore, and it is NOT a score-derived
+    // confidence or quality band.
+    assert.ok(
+      html.includes('data-testid="result-qualitative-fit"'),
+      "the result card must render the result-qualitative-fit block",
+    );
+    assert.ok(
+      html.includes("Preference coverage"),
+      "the qualitative-fit block must keep its buyer-facing header",
+    );
+    assert.ok(
+      html.includes("Matches 1 of 2 requested preferences; 1 not matched."),
+      "the qualitative-fit description must name matched/total preferences factually",
     );
   });
 
-  test("does not expose a derived fit-band DOM attribute", () => {
-    assert.equal(
-      searchPageSource.includes("data-fit-band"),
-      false,
-      "the buyer UI must not expose a qualitative fit band derived from relevanceScore",
+  test("qualitative fit shows the full-coverage variant when all preferences match", () => {
+    const html = renderToStaticMarkup(ResultCard({ result: fullCoverageResult }));
+
+    assert.ok(
+      html.includes("Matches all 2 requested preferences."),
+      "the qualitative-fit description must say full coverage when matched === total",
     );
   });
 
-  test("does not render a result-fit-summary block", () => {
-    assert.equal(
-      searchPageSource.includes('data-testid="result-fit-summary"'),
-      false,
-      "the result-fit-summary block (score-derived qualitative fit) must be removed",
+  test("qualitative fit shows the no-preferences variant distinctly when the buyer supplied none", () => {
+    const html = renderToStaticMarkup(ResultCard({ result: noPreferencesResult }));
+
+    assert.ok(
+      html.includes("No preferences were requested for this search."),
+      "the qualitative-fit description must say no-preferences distinctly when total === 0",
     );
   });
 
-  test("does not define score-derived fit-band helpers", () => {
-    assert.equal(
-      searchPageSource.includes("function fitBandFor"),
-      false,
-      "fitBandFor must be removed; relevanceScore must not drive a buyer-facing band",
-    );
-    assert.equal(
-      searchPageSource.includes("function describeFit"),
-      false,
-      "describeFit must be removed; relevanceScore must not produce buyer-facing prose",
-    );
-  });
+  test("does not render a buyer-facing percentage or confidence claim", () => {
+    const html = renderToStaticMarkup(ResultCard({ result: sampleResult }));
 
-  test("does not include buyer-facing score-derived strength prose", () => {
-    // The previous implementation rendered one of four bands derived
-    // from `relevanceScore` thresholds. None of these phrases should
-    // appear in the buyer-facing UI anymore.
-    const forbidden = [
+    // No numeric percentage next to any of the prohibited labels.
+    assert.doesNotMatch(
+      html,
+      /\b\d{1,3}%\s*(match|score|confidence|fit)/i,
+      "the result card must not render any percentage-based match score",
+    );
+    // The bounded strategy-specific score must never reach the buyer.
+    assert.doesNotMatch(
+      html,
+      /relevanceScore/i,
+      "the result card must not surface the internal relevanceScore name",
+    );
+    // The previous (P1-003) score-derived bands must stay out.
+    for (const phrase of [
       "Strong qualitative fit",
       "Good qualitative fit",
       "Partial qualitative fit",
       "Weak qualitative fit",
-    ];
-    for (const phrase of forbidden) {
-      assert.equal(
-        searchPageSource.includes(phrase),
-        false,
-        `buyer-facing phrase "${phrase}" must be removed`,
+    ]) {
+      assert.doesNotMatch(
+        html,
+        new RegExp(phrase, "i"),
+        `the result card must not render the score-derived band "${phrase}"`,
       );
     }
-  });
-
-  test("still renders the deterministic matchReason block as the buyer-facing evidence", () => {
-    assert.ok(
-      searchPageSource.includes('data-testid="result-match-reason"'),
-      "the result-match-reason testid anchors the deterministic match evidence",
-    );
-    assert.ok(
-      searchPageSource.includes("Why this matches"),
-      "the matchReason block must keep its buyer-facing header",
+    // Confidence and guarantee claims are also off the table.
+    assert.doesNotMatch(
+      html,
+      /\b(confidence|guarantee|quality)\b/i,
+      "the result card must not render a buyer-facing confidence/guarantee/quality claim",
     );
   });
 });
 
-describe("SearchPage shared offering-detail markup (P2-002)", () => {
-  test("extracts an OfferingDetail renderer used by both best and additional paths", () => {
+describe("SearchPage shared offering-detail markup (P2-001)", () => {
+  test("best offering and additional offerings render the same data-testid conventions", () => {
+    const html = renderToStaticMarkup(ResultCard({ result: sampleResult }));
+
+    // The best-offering path uses the `result-offering-…` prefix.
     assert.ok(
-      searchPageSource.includes("function OfferingDetail"),
-      "the shared OfferingDetail component must exist",
-    );
-    // The best card uses the shared renderer; its lead-only additions
-    // (service areas, genres, pricing, pricing disclaimer) remain on
-    // the BestOfferingCard body.
-    assert.ok(
-      searchPageSource.includes("<OfferingDetail"),
-      "the best card must consume the shared OfferingDetail",
+      html.includes('data-testid="result-offering-title"'),
+      "the best offering must render with the result-offering-title testid",
     );
     assert.ok(
-      searchPageSource.match(/OfferingDetail[\s\S]*?testIdPrefix="result-additional-offering"/) !==
-        null,
-      "the additional offerings list must consume the shared OfferingDetail",
+      html.includes('data-testid="result-offering-category"'),
+      "the best offering must render with the result-offering-category testid",
+    );
+    assert.ok(
+      html.includes('data-testid="result-offering-service-mode"'),
+      "the best offering must render with the result-offering-service-mode testid",
+    );
+    assert.ok(
+      html.includes('data-testid="result-offering-pricing"'),
+      "the best offering must render with the result-offering-pricing testid",
+    );
+
+    // The additional-offering path uses the `result-additional-offering-…`
+    // prefix for the row markup that OfferingDetail owns. The full set is
+    // pinned here so a future OfferingDetail refactor (P2-001) cannot
+    // silently drop one of the row fields.
+    assert.ok(
+      html.includes('data-testid="result-additional-offering-title"'),
+      "the additional offering must render with the result-additional-offering-title testid",
+    );
+    assert.ok(
+      html.includes('data-testid="result-additional-offering-category"'),
+      "the additional offering must render with the result-additional-offering-category testid",
+    );
+    assert.ok(
+      html.includes('data-testid="result-additional-offering-service-mode"'),
+      "the additional offering must render with the result-additional-offering-service-mode testid",
+    );
+    assert.ok(
+      html.includes('data-testid="result-additional-offering-included-services"'),
+      "the additional offering must render its bundle-includes testid",
     );
   });
 
-  test("additional offerings keep the same row markup as the best card", () => {
-    // The shared component renders title + category + service-mode +
-    // bundle-includes testids via `${testIdPrefix}-title` template
-    // literals; both call sites must pass a stable prefix so the
-    // rendered DOM carries the same data-testid conventions.
-    for (const testId of ["title", "category", "service-mode", "included-services"]) {
-      const suffix = `-${testId}`;
-      const sharedTemplate = `\`\${testIdPrefix}${suffix}\``;
-      assert.ok(
-        searchPageSource.includes(sharedTemplate),
-        `shared OfferingDetail must render the "${testId}" testid via template literal`,
-      );
-      assert.ok(
-        searchPageSource.includes('testIdPrefix="result-additional-offering"'),
-        `additional offerings must pass the "result-additional-offering" prefix`,
-      );
-      assert.ok(
-        searchPageSource.includes('testIdPrefix="result-offering"'),
-        `best offering must pass the "result-offering" prefix`,
-      );
-    }
+  test("bundle-only IncludedServices are labeled 'bundle only' on both paths", () => {
+    // The best offering has no IncludedServices. The additional offering
+    // carries one bundle-only IncludedService that must be labeled
+    // `bundle only` so the buyer never reads it as a standalone purchase.
+    const html = renderToStaticMarkup(ResultCard({ result: sampleResult }));
+
+    assert.ok(
+      html.includes("Remote coaching"),
+      "the bundle component must appear by its public name",
+    );
+    assert.ok(
+      html.includes("bundle only"),
+      "every bundle component must be labeled 'bundle only'",
+    );
+  });
+
+  test("renders the deterministic pricing disclaimer so no pricing presentation reads as a quote", () => {
+    const html = renderToStaticMarkup(ResultCard({ result: sampleResult }));
+
+    assert.ok(
+      html.includes('data-testid="result-offering-pricing-disclaimer"'),
+      "the best offering must render its pricing disclaimer",
+    );
+    assert.ok(
+      html.includes("non-binding"),
+      "the pricing disclaimer must name the non-binding framing",
+    );
+    assert.ok(
+      html.includes("approved terms"),
+      "the pricing disclaimer must name the approved-terms boundary",
+    );
   });
 });

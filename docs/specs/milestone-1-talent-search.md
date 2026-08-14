@@ -140,9 +140,11 @@ SearchTalentTool.
 - Search returns at most ten results, one per seller, ordered by relevanceScore and a stable seller
   identifier tie-breaker.
 - Each result includes an allow-listed seller summary, best matching offering, up to two additional
-  offerings, deterministic match reason, and relevanceScore.
+  offerings, deterministic match reason, relevanceScore, and factual preference coverage.
 - relevanceScore is finite, bounded from zero through one, specific to the declared strategy, and
-  not displayed as a buyer-facing percentage.
+  not displayed as a buyer-facing percentage. The buyer UI may surface the deterministic preference
+  coverage as a factual qualitative-fit description but must not render it as a percentage and must
+  not derive a confidence or quality band from relevanceScore.
 - Unknown request fields are rejected with the shared safe error envelope.
 - PostgreSQL is canonical. Model/vector failure later falls back to deterministic PostgreSQL;
   PostgreSQL failure returns a retriable unavailable response.

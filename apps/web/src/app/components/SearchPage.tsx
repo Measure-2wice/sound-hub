@@ -220,8 +220,19 @@ export function SearchPage() {
   );
 }
 
-function ResultCard({ result }: { result: TalentSearchResultV1 }) {
-  const { seller, bestMatchingOffering, additionalMatchingOfferings, matchReason } = result;
+// ResultCard is the presentational subcomponent that renders one search
+// result. It is exported (further down, after its declaration) so unit
+// tests can render it in isolation against a controlled sample
+// `TalentSearchResultV1` and assert on rendered HTML without spinning up
+// the parent `SearchPage` (which owns the fetch/state lifecycle).
+function ResultCardImpl({ result }: { result: TalentSearchResultV1 }) {
+  const {
+    seller,
+    bestMatchingOffering,
+    additionalMatchingOfferings,
+    matchReason,
+    preferenceCoverage,
+  } = result;
 
   return (
     <Card
@@ -315,10 +326,7 @@ function ResultCard({ result }: { result: TalentSearchResultV1 }) {
                   <OfferingDetail
                     offering={offering}
                     testIdPrefix="result-additional-offering"
-                    titleClassName="text-sm font-medium text-gray-800"
-                    descriptionClassName="text-xs text-gray-600 mt-0.5"
-                    dlClassName="text-xs text-gray-700 mt-1 space-y-0.5"
-                    bundleClassName="text-xs text-gray-700 mt-1"
+                    variant="additional"
                   />
                 </li>
               ))}
@@ -338,10 +346,38 @@ function ResultCard({ result }: { result: TalentSearchResultV1 }) {
           <p className="text-sm font-medium text-blue-900 mb-1">Why this matches</p>
           <p className="text-sm text-blue-800">{matchReason}</p>
         </div>
+
+        {/* Qualitative fit: factual preference coverage derived from the
+            deterministic matched/total preference atom counts the search
+            service produces. Never a percentage, never a score-derived
+            confidence or quality band — the matchReason above names the
+            matched fields factually, and this line names the scope of
+            preference coverage factually. Issue #6 requires both
+            deterministic evidence AND qualitative fit; the P1-001 review
+            found qualitative fit had been dropped entirely, so we
+            restore it as a deterministic coverage statement instead of
+            a score-derived band. */}
+        <div
+          className="bg-blue-50 p-3 rounded-lg mt-2"
+          data-testid="result-qualitative-fit"
+        >
+          <p className="text-sm font-medium text-blue-900 mb-1">Preference coverage</p>
+          <p className="text-sm text-blue-800" data-testid="result-qualitative-fit-text">
+            {formatPreferenceCoverage(preferenceCoverage)}
+          </p>
+        </div>
       </Card.Content>
     </Card>
   );
 }
+
+// Public re-export so unit tests can render the presentational result
+// card in isolation against a controlled sample `TalentSearchResultV1`
+// without spinning up the parent `SearchPage` (which owns the fetch/state
+// lifecycle). The export deliberately sits at module scope rather than on
+// the function declaration so the React component name in devtools and
+// the function name used by `react-dom/server` both stay `ResultCardImpl`.
+export const ResultCard = ResultCardImpl;
 
 // OfferingDetail: the shared markup that the best and additional
 // offering paths both render — title, description, service category,
@@ -351,28 +387,53 @@ function ResultCard({ result }: { result: TalentSearchResultV1 }) {
 // remediation). Lead-only content (service areas, genres, pricing, and
 // the pricing disclaimer) stays on BestOfferingCard because additional
 // offerings are intentionally compact.
-function OfferingDetail({
+//
+// Presentation style is selected via `variant` so the four CSS class
+// strings travel as one cohesive style record owned by this component
+// instead of being passed as a data clump from every call site (P2-001
+// remediation).
+type OfferingDetailVariant = "lead" | "additional";
+
+const OFFERING_DETAIL_STYLES: Record<
+  OfferingDetailVariant,
+  {
+    readonly title: string;
+    readonly description: string;
+    readonly dl: string;
+    readonly bundle: string;
+  }
+> = {
+  lead: {
+    title: "text-sm font-medium text-gray-900",
+    description: "text-xs text-gray-600 mt-1",
+    dl: "text-xs text-gray-700 mt-2 space-y-1",
+    bundle: "text-xs text-gray-700 mt-2",
+  },
+  additional: {
+    title: "text-sm font-medium text-gray-800",
+    description: "text-xs text-gray-600 mt-0.5",
+    dl: "text-xs text-gray-700 mt-1 space-y-0.5",
+    bundle: "text-xs text-gray-700 mt-1",
+  },
+};
+
+export function OfferingDetail({
   offering,
   testIdPrefix,
-  titleClassName,
-  descriptionClassName,
-  dlClassName,
-  bundleClassName,
+  variant,
 }: {
   readonly offering: TalentSearchResultV1["bestMatchingOffering"];
   readonly testIdPrefix: string;
-  readonly titleClassName: string;
-  readonly descriptionClassName: string;
-  readonly dlClassName: string;
-  readonly bundleClassName: string;
+  readonly variant: OfferingDetailVariant;
 }) {
+  const styles = OFFERING_DETAIL_STYLES[variant];
   return (
     <>
-      <p className={titleClassName} data-testid={`${testIdPrefix}-title`}>
+      <p className={styles.title} data-testid={`${testIdPrefix}-title`}>
         {offering.title}
       </p>
-      <p className={descriptionClassName}>{offering.description}</p>
-      <dl className={dlClassName}>
+      <p className={styles.description}>{offering.description}</p>
+      <dl className={styles.dl}>
         <div>
           <dt className="inline font-medium text-gray-500">Service category: </dt>
           <dd className="inline" data-testid={`${testIdPrefix}-category`}>
@@ -387,7 +448,7 @@ function OfferingDetail({
         </div>
       </dl>
       {offering.includedServices.length > 0 && (
-        <p className={bundleClassName} data-testid={`${testIdPrefix}-included-services`}>
+        <p className={styles.bundle} data-testid={`${testIdPrefix}-included-services`}>
           <span className="font-medium text-gray-500">Bundle includes: </span>
           {offering.includedServices.map((included) => `${included.name} (bundle only)`).join(", ")}
         </p>
@@ -413,10 +474,7 @@ function BestOfferingCard({
       <OfferingDetail
         offering={offering}
         testIdPrefix={testIdPrefix}
-        titleClassName="text-sm font-medium text-gray-900"
-        descriptionClassName="text-xs text-gray-600 mt-1"
-        dlClassName="text-xs text-gray-700 mt-2 space-y-1"
-        bundleClassName="text-xs text-gray-700 mt-2"
+        variant="lead"
       />
 
       <dl className="text-xs text-gray-700 mt-2 space-y-1">
@@ -463,6 +521,24 @@ function BestOfferingCard({
       </p>
     </div>
   );
+}
+
+// Factual preference coverage statement. Counts only — never a percentage,
+// never derived from `relevanceScore`. The "no preferences requested" branch
+// is its own distinct presentation so a buyer who supplied no preferences
+// does not see a meaningless "0 of 0 preferences matched" line.
+function formatPreferenceCoverage(coverage: {
+  readonly matched: number;
+  readonly total: number;
+}): string {
+  if (coverage.total === 0) {
+    return "No preferences were requested for this search.";
+  }
+  if (coverage.matched === coverage.total) {
+    return `Matches all ${coverage.total} requested preference${coverage.total === 1 ? "" : "s"}.`;
+  }
+  const unmet = coverage.total - coverage.matched;
+  return `Matches ${coverage.matched} of ${coverage.total} requested preferences; ${unmet} not matched.`;
 }
 
 // Renders "City, Region · CC" while tolerating the optional city/region fields.

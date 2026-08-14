@@ -154,6 +154,10 @@ interface TalentSearchResultV1 {
   readonly additionalMatchingOfferings: readonly PublicOfferingSummaryV1[];
   readonly relevanceScore: number;
   readonly matchReason: string;
+  readonly preferenceCoverage: {
+    readonly matched: number;
+    readonly total: number;
+  };
 }
 
 interface TalentSearchResponseV1 {
@@ -186,6 +190,11 @@ interface TalentSearchResponseV1 {
 - relevanceScore is not a probability, confidence estimate, quality rating, or guarantee. The buyer
   UI must not render it as a percentage.
 - matchReason names deterministic evidence and never claims AI participation.
+- `preferenceCoverage.matched` is the count of canonical preference atoms that matched the best matching
+  offering; `preferenceCoverage.total` is the count of canonical preference atoms the buyer supplied.
+  Both are derived from the deterministic preference matcher, never from `relevanceScore`. The buyer
+  UI may surface this coverage as a factual qualitative-fit description but must not render it as a
+  percentage and must not derive a confidence or quality band from it.
 - Empty results return `200` with `results: []`; constraints are not relaxed automatically.
 
 ### Incremental M1.1 semantics

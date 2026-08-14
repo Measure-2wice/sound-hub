@@ -290,6 +290,22 @@ export type PublicOfferingSummaryV1 = z.infer<typeof publicOfferingSummaryV1Sche
 
 // ---------- Result and response ----------
 
+// Factual coverage of the buyer's preference atoms against the best matching
+// offering's matched atoms. The matched count is bounded by `total` and both
+// are computed from the canonical preference atoms and the deterministic
+// matcher (never derived from `relevanceScore`, which is strategy-specific
+// ordering and explicitly NOT a buyer-facing confidence signal).
+export const preferenceCoverageV1Schema = z
+  .object({
+    matched: z.number().int().nonnegative(),
+    total: z.number().int().nonnegative(),
+  })
+  .strict()
+  .refine((value) => value.matched <= value.total, {
+    message: "matched must not exceed total",
+  });
+export type PreferenceCoverageV1 = z.infer<typeof preferenceCoverageV1Schema>;
+
 export const talentSearchResultV1Schema = z
   .object({
     seller: publicSellerSummaryV1Schema,
@@ -301,6 +317,7 @@ export const talentSearchResultV1Schema = z
       .max(1, "relevanceScore must be at most 1")
       .finite(),
     matchReason: z.string().min(1).max(500),
+    preferenceCoverage: preferenceCoverageV1Schema,
   })
   .strict();
 export type TalentSearchResultV1 = z.infer<typeof talentSearchResultV1Schema>;
