@@ -1,38 +1,18 @@
 "use client";
 
 import { useEffect, useMemo, useState, type FormEvent } from "react";
-import { useSearch, hasUsableCriteria, type RequiredFiltersValue } from "../hooks/useSearch";
+import { useSearch } from "../hooks/useSearch";
+import { hasUsableCriteria, type RequiredFiltersValue } from "../lib/talent-search-request-builder";
+import { isControlledRequiredPath } from "../lib/field-error-paths";
 import { Card } from "./ui/Card";
 import { SearchForm } from "./SearchForm";
 import { RequiredFilters, type CategoryOption } from "./RequiredFilters";
 import { formatPricing } from "../lib/pricing";
-import type { ApiFieldErrorV1, TalentSearchResultV1 } from "@soundhub/types";
-
-// Path prefixes that the `RequiredFilters` panel claims. Errors that
-// target one of these paths are rendered beside the relevant control,
-// so the global panel must NOT re-render them (P2-003). Everything
-// else is "unmatched" from the page's perspective and is rendered
-// once in the global error panel.
-const CONTROLLED_PATHS = [
-  "required.primaryCategoryKeys",
-  "required.independentlyPurchasableServiceKeys",
-  "required.serviceModes",
-  "required.basedIn",
-  "required.serviceArea",
-  "required",
-] as const;
-
-function isControlledPath(path: string): boolean {
-  return CONTROLLED_PATHS.some((prefix) => path === prefix || path.startsWith(`${prefix}.`));
-}
-
-// Response shape of the public metadata endpoint. The endpoint is
-// server-only and returns the canonical list from PostgreSQL via the
-// TalentSearchService repository — there is no second handheld list
-// of category keys in the browser.
-interface CategoryMetadataResponse {
-  readonly categories: readonly CategoryOption[];
-}
+import {
+  categoryMetadataResponseV1Schema,
+  type ApiFieldErrorV1,
+  type TalentSearchResultV1,
+} from "@soundhub/types";
 
 export function SearchPage() {
   const [query, setQuery] = useState("");
@@ -65,18 +45,17 @@ export function SearchPage() {
           throw new Error(`Metadata request failed (${response.status}).`);
         }
         const body: unknown = await response.json();
-        // Defensive parse: the browser rejects the response if it
-        // does not match the expected shape.
-        if (
-          !body ||
-          typeof body !== "object" ||
-          !Array.isArray((body as CategoryMetadataResponse).categories)
-        ) {
-          throw new Error("Metadata response is missing the categories array.");
+        // Runtime validation against the shared Zod schema. The
+        // browser MUST NOT trust a handwritten DTO cast; any
+        // contract drift between PostgreSQL and the browser
+        // surfaces here as a rejected categories load instead of
+        // a silently populated select.
+        const parsed = categoryMetadataResponseV1Schema.safeParse(body);
+        if (!parsed.success) {
+          throw new Error("Metadata response does not match the shared category schema.");
         }
-        const parsed = body as CategoryMetadataResponse;
         if (cancelled) return;
-        setCategories(parsed.categories);
+        setCategories(parsed.data.categories.map((c) => ({ key: c.key, name: c.name })));
         setCategoriesError(null);
       } catch (err) {
         if (cancelled) return;
@@ -101,7 +80,7 @@ export function SearchPage() {
   // the unmatched entries — controlled errors render exactly once,
   // beside their control.
   const unmatchedFieldErrors = useMemo<readonly ApiFieldErrorV1[]>(
-    () => fieldErrors.filter((err) => !isControlledPath(err.path)),
+    () => fieldErrors.filter((err) => !isControlledRequiredPath(err.path)),
     [fieldErrors],
   );
 

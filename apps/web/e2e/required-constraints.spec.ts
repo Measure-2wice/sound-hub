@@ -122,6 +122,44 @@ test("M1.4: a malformed required basedIn countryCode surfaces a field-level erro
   await expect(page.getByTestId("result-card")).toHaveCount(0);
 });
 
+test("M1.5: malformed criteria returns the standard error envelope and a visible request ID through the Next.js proxy", async ({
+  page,
+}) => {
+  await loadHome(page);
+
+  // Submit a single-character query with a malformed country code.
+  // The shared schema rejects the candidate with INVALID_SEARCH_CRITERIA;
+  // the browser MUST surface the standard error envelope with field
+  // errors and a non-empty request ID returned by Express via the
+  // Next.js proxy. This closes the Codex P1-001 finding.
+  await page.getByTestId("search-input").fill("a");
+  await page.getByTestId("required-based-in-country").fill("12");
+  await page.getByTestId("search-submit").click();
+
+  // The standard error envelope surfaces as the visible search error.
+  const errorCard = page.getByTestId("search-error");
+  await expect(errorCard).toBeVisible({ timeout: 15_000 });
+
+  // INVALID_SEARCH_CRITERIA and field-level feedback appear beside
+  // the malformed control.
+  const countryField = page.getByTestId("required-based-in-country-field");
+  await expect(countryField.getByTestId("field-error-message")).toContainText(/alpha-2/i);
+  await expect(countryField.getByTestId("field-error-path")).toContainText(
+    "required.basedIn.countryCode",
+  );
+
+  // Buyer's input is preserved across the rejection.
+  await expect(page.getByTestId("required-based-in-country")).toHaveValue("12");
+  await expect(page.getByTestId("search-input")).toHaveValue("a");
+
+  // The standard envelope includes a request ID rendered by the page
+  // so the rejection is traceable end-to-end through the Next.js proxy.
+  const requestId = page.getByTestId("search-error-request-id");
+  await expect(requestId).toBeVisible();
+  const text = (await requestId.textContent()) ?? "";
+  expect(text.trim().length).toBeGreaterThan(0);
+});
+
 test("M1.4: a required serviceArea countryCode that matches a subset of sellers narrows the result list", async ({
   page,
 }) => {
@@ -191,6 +229,35 @@ test("M1.4: a malformed required serviceArea countryCode surfaces a field-level 
   // No result cards render because the request was rejected at the
   // schema boundary.
   await expect(page.getByTestId("result-card")).toHaveCount(0);
+});
+
+test("M1.5: malformed serviceArea returns the standard error envelope and a visible request ID through the Next.js proxy", async ({
+  page,
+}) => {
+  await loadHome(page);
+
+  // Mirror the basedIn case for the serviceArea control. The standard
+  // INVALID_SEARCH_CRITERIA envelope with field errors and a request ID
+  // must surface through the Next.js proxy. This closes the Codex
+  // P1-001 verification for the serviceArea path.
+  await page.getByTestId("required-service-area-country").fill("12");
+  await page.getByTestId("search-submit").click();
+
+  const errorCard = page.getByTestId("search-error");
+  await expect(errorCard).toBeVisible({ timeout: 15_000 });
+
+  const serviceAreaField = page.getByTestId("required-service-area-country-field");
+  await expect(serviceAreaField.getByTestId("field-error-message")).toContainText(/alpha-2/i);
+  await expect(serviceAreaField.getByTestId("field-error-path")).toContainText(
+    "required.serviceArea.countryCode",
+  );
+
+  await expect(page.getByTestId("required-service-area-country")).toHaveValue("12");
+
+  const requestId = page.getByTestId("search-error-request-id");
+  await expect(requestId).toBeVisible();
+  const text = (await requestId.textContent()) ?? "";
+  expect(text.trim().length).toBeGreaterThan(0);
 });
 
 test("M1.4: required independentlyPurchasableServiceKeys excludes bundle-only offerings", async ({

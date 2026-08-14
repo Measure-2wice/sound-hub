@@ -4,31 +4,25 @@
 // category keys. It calls `GET /api/metadata/categories` on mount and
 // uses the returned list to populate the `RequiredFilters` selects.
 // PostgreSQL is the only source of truth; this route reads the
-// canonical ServiceCategory records through the shared repository
-// (the same PrismaTalentSearchRepository the search service uses) and
-// maps them through an allow-listed DTO.
+// canonical ServiceCategory records through the shared `MetadataRepository`
+// and maps them through an allow-listed DTO that the browser parses
+// with the shared `categoryMetadataResponseV1Schema` from `@soundhub/types`.
 //
 // The route is read-only, public, and never exposes private fields,
-// controlled internal flags, or storage details. The response is
-// cached for a short window so the page does not refetch on every
-// navigation; the cache key is the canonical service categories
-// snapshot, which is server-controlled.
+// controlled internal flags, or storage details. It depends only on the
+// repository interface — Prisma queries never leak into the HTTP layer
+// per the contract rule that routes and agents never query Prisma
+// directly. The response is cached for a short window so the page does
+// not refetch on every navigation; the cache key is the canonical
+// service categories snapshot, which is server-controlled.
 
 import { Router, type Request, type Response } from "express";
-import type { PrismaClient } from "@soundhub/db";
+import { categoryMetadataResponseV1Schema, type CategoryMetadataResponseV1 } from "@soundhub/types";
 import { buildSafeError, generateRequestId, writeSafeError } from "../lib/errors.js";
+import type { MetadataRepository } from "../repositories/metadata.repository.js";
 
 export interface MetadataRouteDeps {
-  readonly prisma: PrismaClient;
-}
-
-export interface CategoryMetadataV1 {
-  readonly key: string;
-  readonly name: string;
-}
-
-export interface CategoryMetadataResponseV1 {
-  readonly categories: readonly CategoryMetadataV1[];
+  readonly repository: MetadataRepository;
 }
 
 const CACHE_TTL_MS = 60_000;
@@ -65,15 +59,14 @@ async function handleCategories(
   }
 
   try {
-    const rows = await deps.prisma.serviceCategory.findMany({
-      orderBy: [{ id: "asc" }],
-      select: { key: true, name: true },
-    });
-    const payload: CategoryMetadataResponseV1 = {
-      categories: rows.map((row) => ({ key: row.key, name: row.name })),
-    };
-    cache = { fetchedAt: now, payload };
-    res.status(200).json(payload);
+    const rows = await deps.repository.getCanonicalCategories();
+    const payload: CategoryMetadataResponseV1 = { categories: [...rows] };
+    // Validate our own payload against the shared schema before
+    // sending it. This catches drift between the repository
+    // contract and the public contract the browser parses.
+    const validated = categoryMetadataResponseV1Schema.parse(payload);
+    cache = { fetchedAt: now, payload: validated };
+    res.status(200).json(validated);
   } catch (err) {
     console.error(`[metadata] requestId=${requestId} unhandled:`, err);
     const safe = buildSafeError(

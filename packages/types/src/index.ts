@@ -325,6 +325,28 @@ export const talentSearchResponseV1Schema = z
   .strict();
 export type TalentSearchResponseV1 = z.infer<typeof talentSearchResponseV1Schema>;
 
+// ---------- Public metadata envelope ----------
+//
+// The canonical category catalog returned by `GET /api/metadata/categories`.
+// The browser NEVER holds a second list of category keys; it parses the
+// response against this shared Zod schema before rendering the option
+// list. Unknown fields and malformed elements are rejected so a contract
+// mismatch can never silently populate the page.
+const categoryMetadataItemV1Schema = z
+  .object({
+    key: z.string().min(1).max(64),
+    name: z.string().min(1).max(200),
+  })
+  .strict();
+
+export const categoryMetadataResponseV1Schema = z
+  .object({
+    categories: z.array(categoryMetadataItemV1Schema).max(200),
+  })
+  .strict();
+export type CategoryMetadataItemV1 = z.infer<typeof categoryMetadataItemV1Schema>;
+export type CategoryMetadataResponseV1 = z.infer<typeof categoryMetadataResponseV1Schema>;
+
 // ---------- Standard error envelope ----------
 
 export const apiErrorCodeV1Schema = z.enum([

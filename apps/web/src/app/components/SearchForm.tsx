@@ -5,6 +5,15 @@
 // `RequiredFilters` component. The parent owns the submit handler and
 // owns the structured filters, so the SearchForm stays narrowly
 // responsible for the text query.
+//
+// The contract assigns runtime validation to Express
+// (docs/contracts/search-api.md: "Express owns HTTP parsing, content
+// type, runtime validation, request IDs, and error mapping."). The
+// browser therefore does NOT enforce a `minLength` HTML5 attribute —
+// that would silently block submission for short queries and produce
+// an envelope that is not the standard `ApiErrorResponseV1`. Submit
+// everything; let Express (with the shared Zod schema) be the only
+// thing that decides which payloads are valid.
 
 interface SearchFormProps {
   query: string;
@@ -36,7 +45,6 @@ export function SearchForm({
         data-testid="search-input"
         className="w-full px-4 py-3 border border-gray-300 rounded-lg focus:ring-2 focus:ring-blue-500 focus:border-transparent"
         disabled={loading}
-        minLength={2}
         maxLength={500}
       />
     </div>

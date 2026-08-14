@@ -2,8 +2,8 @@
 
 // The structured required filters component. Each filter is a controlled
 // input wired to the parent's `RequiredFiltersValue` shape, which lives
-// in `useSearch.ts` so the rendered controls and the serialised request
-// cannot diverge. The component is intentionally dumb: it surfaces
+// in `talent-search-request-builder.ts` so the rendered controls and the
+// serialised request cannot diverge. The component is intentionally dumb: it surfaces
 // canonical categories (passed in by the page) and the closed service-mode
 // enum, and it emits change events upward so the page owns the state.
 //
@@ -16,9 +16,10 @@
 // never duplicates errors that already appear next to a control.
 
 import { type ApiFieldErrorV1, type ServiceModeV1 } from "@soundhub/types";
-import { type RequiredFiltersValue } from "../hooks/useSearch";
+import { type RequiredFiltersValue } from "../lib/talent-search-request-builder";
+import { isControlledRequiredPath } from "../lib/field-error-paths";
 
-export type { RequiredFiltersValue } from "../hooks/useSearch";
+export type { RequiredFiltersValue };
 
 export interface CategoryOption {
   readonly key: string;
@@ -33,22 +34,6 @@ export interface RequiredFiltersProps {
   readonly disabled?: boolean;
 }
 
-// Path prefixes that this component owns. Field errors whose `path`
-// matches one of these prefixes are rendered beside the relevant
-// control. Anything else is forwarded to the parent.
-const CONTROLLED_PATHS = [
-  "required.primaryCategoryKeys",
-  "required.independentlyPurchasableServiceKeys",
-  "required.serviceModes",
-  "required.basedIn",
-  "required.serviceArea",
-  "required",
-] as const;
-
-function isControlledPath(path: string): boolean {
-  return CONTROLLED_PATHS.some((prefix) => path === prefix || path.startsWith(`${prefix}.`));
-}
-
 function errorsFor(pathPrefix: string, errors: readonly ApiFieldErrorV1[]): ApiFieldErrorV1[] {
   return errors.filter((err) => err.path === pathPrefix || err.path.startsWith(`${pathPrefix}.`));
 }
@@ -60,11 +45,11 @@ export function RequiredFilters({
   categories,
   disabled,
 }: RequiredFiltersProps) {
-  // Errors that target a path this component renders. Errors whose
-  // path is outside this list are treated as "unmatched" by the
-  // parent (the page) so the global panel can show them without
-  // duplicating anything that already appears next to a control.
-  const visibleErrors = fieldErrors.filter((err) => isControlledPath(err.path));
+  // Errors that target a path this component renders. The
+  // ownership predicate lives in `field-error-paths.ts` so the
+  // panel and the page cannot disagree about which errors belong
+  // here vs in the global error list.
+  const visibleErrors = fieldErrors.filter((err) => isControlledRequiredPath(err.path));
 
   function update<K extends keyof RequiredFiltersValue>(
     key: K,
