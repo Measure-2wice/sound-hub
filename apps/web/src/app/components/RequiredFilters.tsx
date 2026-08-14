@@ -15,23 +15,35 @@
 // "rendered globally as an unmatched field error" so the global panel
 // never duplicates errors that already appear next to a control.
 
-import { type ApiFieldErrorV1, type ServiceModeV1 } from "@soundhub/types";
+import {
+  type ApiFieldErrorV1,
+  type CategoryMetadataItemV1,
+  type ServiceModeV1,
+} from "@soundhub/types";
 import { type RequiredFiltersValue } from "../lib/talent-search-request-builder";
 import { isControlledRequiredPath } from "../lib/field-error-paths";
 
 export type { RequiredFiltersValue };
 
-export interface CategoryOption {
-  readonly key: string;
-  readonly name: string;
-}
-
 export interface RequiredFiltersProps {
   readonly value: RequiredFiltersValue;
   readonly onChange: (next: RequiredFiltersValue) => void;
   readonly fieldErrors: readonly ApiFieldErrorV1[];
-  readonly categories: readonly CategoryOption[];
+  readonly categories: readonly CategoryMetadataItemV1[];
+  /**
+   * Whole-panel disable. Use while a search is in flight so the buyer
+   * cannot mutate the request that is already being processed.
+   */
   readonly disabled?: boolean;
+  /**
+   * Disable ONLY the controls that depend on the canonical category
+   * catalog (the category and independently-purchasable-service selects).
+   * Service-mode, based-in, and service-area inputs do NOT depend on the
+   * catalog and must remain usable when the catalog is loading,
+   * unavailable, or validly empty so buyers can still apply those strict
+   * constraints. Closes the Codex P1-003 finding.
+   */
+  readonly categorySelectsDisabled?: boolean;
 }
 
 function errorsFor(pathPrefix: string, errors: readonly ApiFieldErrorV1[]): ApiFieldErrorV1[] {
@@ -44,12 +56,19 @@ export function RequiredFilters({
   fieldErrors,
   categories,
   disabled,
+  categorySelectsDisabled,
 }: RequiredFiltersProps) {
   // Errors that target a path this component renders. The
   // ownership predicate lives in `field-error-paths.ts` so the
   // panel and the page cannot disagree about which errors belong
   // here vs in the global error list.
   const visibleErrors = fieldErrors.filter((err) => isControlledRequiredPath(err.path));
+  // Category-dependent selects combine the whole-panel disable (during a
+  // search) with the catalog-unavailability flag. Independent controls
+  // (service modes, based-in, service-area) only honour the whole-panel
+  // disable — they do not depend on the catalog and must stay usable when
+  // the catalog is loading, unavailable, or validly empty.
+  const selectDisabled = Boolean(disabled) || Boolean(categorySelectsDisabled);
 
   function update<K extends keyof RequiredFiltersValue>(
     key: K,
@@ -76,6 +95,13 @@ export function RequiredFilters({
         relaxed on empty results.
       </p>
 
+      {/* Section-level required errors. The shared schema can emit errors
+          at the bare `required` path (for example when the whole required
+          block is malformed). These are claimed by the panel here so they
+          render exactly once and never silently disappear. Errors at any
+          other `required.*` path fall through to the global panel. */}
+      <SectionErrors errors={visibleErrors} />
+
       <Field
         label="Required service category"
         path="required.primaryCategoryKeys"
@@ -86,7 +112,7 @@ export function RequiredFilters({
           data-testid="required-category"
           value={value.primaryCategoryKey}
           onChange={(e) => update("primaryCategoryKey", e.target.value)}
-          disabled={disabled}
+          disabled={selectDisabled}
           className="w-full px-3 py-2 border border-gray-300 rounded-md"
         >
           <option value="">Any category</option>
@@ -112,7 +138,7 @@ export function RequiredFilters({
           data-testid="required-independently-purchasable-service"
           value={value.independentlyPurchasableServiceKey}
           onChange={(e) => update("independentlyPurchasableServiceKey", e.target.value)}
-          disabled={disabled}
+          disabled={selectDisabled}
           className="w-full px-3 py-2 border border-gray-300 rounded-md"
         >
           <option value="">Any independently purchasable service</option>
@@ -212,6 +238,33 @@ function Field({ label, path, testId, errors, children }: FieldProps) {
       <label className="block text-sm font-medium text-gray-700 mb-1">{label}</label>
       {children}
       {matching.map((err) => (
+        <div key={`${err.path}-${err.code}`} className="mt-1 text-sm text-red-700">
+          <span data-testid="field-error-path" className="font-mono text-xs mr-1">
+            {err.path}
+          </span>
+          <span data-testid="field-error-message">{err.message}</span>
+        </div>
+      ))}
+    </div>
+  );
+}
+
+// Renders errors at the section-level `required` path. The predicate in
+// `field-error-paths.ts` claims only this exact path (no `required.*`
+// wildcard), so anything that lands here is necessarily a section-level
+// error targeting the whole required block. Other `required.*` paths are
+// owned by specific Field renderers and never reach this component.
+function SectionErrors({ errors }: { readonly errors: readonly ApiFieldErrorV1[] }) {
+  const sectionErrors = errors.filter((err) => err.path === "required");
+  if (sectionErrors.length === 0) return null;
+  return (
+    <div
+      data-testid="required-section-errors"
+      data-field-path="required"
+      className="border-l-4 border-red-400 pl-3"
+      role="alert"
+    >
+      {sectionErrors.map((err) => (
         <div key={`${err.path}-${err.code}`} className="mt-1 text-sm text-red-700">
           <span data-testid="field-error-path" className="font-mono text-xs mr-1">
             {err.path}

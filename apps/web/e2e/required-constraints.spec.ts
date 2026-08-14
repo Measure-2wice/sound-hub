@@ -304,3 +304,87 @@ test("M1.4: required constraints compound (category AND service mode are both en
     await expect(card.getByTestId("result-service-mode")).toHaveText("Remote");
   }
 });
+
+test("M1.5: when the canonical category catalog fails to load, service-mode/basedIn/serviceArea remain usable", async ({
+  page,
+}) => {
+  // Force the canonical metadata fetch to fail so the catalog stays
+  // empty and the catalog-error banner renders. Independent required
+  // filters (service mode, basedIn, serviceArea) must remain usable so
+  // buyers are not blocked from applying those strict constraints.
+  await page.route("**/api/metadata/categories", (route) => route.abort("failed"));
+
+  await loadHome(page);
+
+  // Catalog error banner appears so the buyer knows the categories
+  // are unavailable.
+  await expect(page.getByTestId("catalog-error")).toBeVisible();
+
+  // Category-dependent selects are disabled.
+  await expect(page.getByTestId("required-category")).toBeDisabled();
+  await expect(page.getByTestId("required-independently-purchasable-service")).toBeDisabled();
+
+  // Independent required controls remain enabled — they do not
+  // depend on the category catalog.
+  await expect(page.getByTestId("required-service-mode-remote")).toBeEnabled();
+  await expect(page.getByTestId("required-service-mode-in-person")).toBeEnabled();
+  await expect(page.getByTestId("required-service-mode-hybrid")).toBeEnabled();
+  await expect(page.getByTestId("required-based-in-country")).toBeEnabled();
+  await expect(page.getByTestId("required-service-area-country")).toBeEnabled();
+
+  // The buyer can still apply a service-mode + basedIn constraint
+  // and submit a real search; the empty / no-match state must NOT be
+  // caused by disabling the controls.
+  await page.getByTestId("required-service-mode-remote").check();
+  await page.getByTestId("required-based-in-country").fill("JM");
+  await page.getByTestId("search-submit").click();
+
+  // Either we surface real matching sellers or the empty state —
+  // never a submission error caused by disabling an unrelated
+  // control. We assert that the page accepts and processes the
+  // request by waiting for one of those terminal states.
+  await expect(
+    page
+      .getByTestId("result-card")
+      .first()
+      .or(page.getByTestId("search-empty"))
+      .or(page.getByTestId("search-error").first()),
+  ).toBeVisible({ timeout: 15_000 });
+});
+
+test("M1.5: when the canonical category catalog returns an empty array, independent required filters remain usable", async ({
+  page,
+}) => {
+  // Force the canonical metadata fetch to return a structurally valid
+  // but empty array. Categories list is empty; the two category selects
+  // are disabled, but service mode / basedIn / serviceArea stay enabled.
+  await page.route("**/api/metadata/categories", (route) =>
+    route.fulfill({
+      status: 200,
+      contentType: "application/json",
+      body: JSON.stringify({ categories: [] }),
+    }),
+  );
+
+  await loadHome(page);
+
+  await expect(page.getByTestId("required-category")).toBeDisabled();
+  await expect(page.getByTestId("required-independently-purchasable-service")).toBeDisabled();
+  await expect(page.getByTestId("required-service-mode-remote")).toBeEnabled();
+  await expect(page.getByTestId("required-based-in-country")).toBeEnabled();
+  await expect(page.getByTestId("required-service-area-country")).toBeEnabled();
+
+  // A basedIn constraint alone still drives a real structured
+  // request to Express; the page must process it instead of leaving
+  // the buyer blocked.
+  await page.getByTestId("required-based-in-country").fill("JM");
+  await page.getByTestId("search-submit").click();
+
+  await expect(
+    page
+      .getByTestId("result-card")
+      .first()
+      .or(page.getByTestId("search-empty"))
+      .or(page.getByTestId("search-error").first()),
+  ).toBeVisible({ timeout: 15_000 });
+});

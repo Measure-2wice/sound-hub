@@ -6,11 +6,12 @@ import { hasUsableCriteria, type RequiredFiltersValue } from "../lib/talent-sear
 import { isControlledRequiredPath } from "../lib/field-error-paths";
 import { Card } from "./ui/Card";
 import { SearchForm } from "./SearchForm";
-import { RequiredFilters, type CategoryOption } from "./RequiredFilters";
+import { RequiredFilters } from "./RequiredFilters";
 import { formatPricing } from "../lib/pricing";
 import {
   categoryMetadataResponseV1Schema,
   type ApiFieldErrorV1,
+  type CategoryMetadataItemV1,
   type TalentSearchResultV1,
 } from "@soundhub/types";
 
@@ -30,7 +31,7 @@ export function SearchPage() {
   // second, independently deployable list of category keys. The
   // browser consumes the rendered list; PostgreSQL (via the API) is
   // the only source of truth.
-  const [categories, setCategories] = useState<readonly CategoryOption[]>([]);
+  const [categories, setCategories] = useState<readonly CategoryMetadataItemV1[]>([]);
   const [categoriesError, setCategoriesError] = useState<string | null>(null);
 
   useEffect(() => {
@@ -55,7 +56,10 @@ export function SearchPage() {
           throw new Error("Metadata response does not match the shared category schema.");
         }
         if (cancelled) return;
-        setCategories(parsed.data.categories.map((c) => ({ key: c.key, name: c.name })));
+        // Reuse the shared inferred type directly; the API contract
+        // and the UI model are intentionally the same shape so there
+        // is no field-by-field remapping here (Codex P2-001).
+        setCategories(parsed.data.categories);
         setCategoriesError(null);
       } catch (err) {
         if (cancelled) return;
@@ -110,7 +114,14 @@ export function SearchPage() {
               onChange={setFilters}
               fieldErrors={fieldErrors}
               categories={categories}
-              disabled={isLoading || categories.length === 0}
+              // The whole panel only disables during an in-flight search.
+              // The category catalog only blocks the two category selects
+              // — service mode, based-in, and service-area controls do
+              // not depend on category metadata and stay usable so the
+              // buyer can still apply those strict constraints even when
+              // the catalog is loading, unavailable, or validly empty.
+              disabled={isLoading}
+              categorySelectsDisabled={categories.length === 0}
             />
             <button
               type="submit"
@@ -135,7 +146,8 @@ export function SearchPage() {
               The canonical category catalog is unavailable. {categoriesError}
             </p>
             <p className="mt-2 text-sm text-amber-700">
-              Strict filters are disabled until the catalog loads. Retry by refreshing the page.
+              Category selects are disabled until the catalog loads. Service mode, based-in, and
+              service-area controls remain usable. Retry by refreshing the page.
             </p>
           </Card.Content>
         </Card>

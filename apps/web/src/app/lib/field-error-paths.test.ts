@@ -33,15 +33,28 @@ describe("isControlledRequiredPath", () => {
     }
   });
 
-  test("returns true for nested paths under a controlled prefix", () => {
+  test("returns true for nested paths under a controlled control-level prefix", () => {
+    assert.equal(isControlledRequiredPath("required.primaryCategoryKeys.0"), true);
+    assert.equal(isControlledRequiredPath("required.independentlyPurchasableServiceKeys.0"), true);
+    assert.equal(isControlledRequiredPath("required.serviceModes.0"), true);
     assert.equal(isControlledRequiredPath("required.basedIn.countryCode"), true);
     assert.equal(isControlledRequiredPath("required.serviceArea.countryCode"), true);
-    assert.equal(isControlledRequiredPath("required.primaryCategoryKeys.0"), true);
+  });
+
+  test("returns false for unconsumed nested required paths so the global panel can render them", () => {
+    // The bare section-level path IS controlled (rendered by the panel header),
+    // but any nested path that has no rendered control MUST fall through to the
+    // global panel rather than be silently swallowed by the panel claim.
+    assert.equal(isControlledRequiredPath("required"), true);
+    assert.equal(isControlledRequiredPath("required.futureField"), false);
+    assert.equal(isControlledRequiredPath("required.basedIn.city"), false);
+    assert.equal(isControlledRequiredPath("required.serviceArea.region"), false);
   });
 
   test("returns false for non-controlled paths", () => {
     assert.equal(isControlledRequiredPath("query"), false);
     assert.equal(isControlledRequiredPath("preferred.categoryKeys"), false);
+    assert.equal(isControlledRequiredPath("preferred.specialties.0"), false);
     assert.equal(isControlledRequiredPath(""), false);
   });
 });
@@ -49,11 +62,11 @@ describe("isControlledRequiredPath", () => {
 describe("partitionFieldErrors", () => {
   test("partitions a representative set into controlled + unmatched with no overlap or loss", () => {
     const errors: ApiFieldErrorV1[] = [
-      errorAt("required.basedIn.countryCode"),
-      errorAt("required.serviceArea.countryCode"),
       errorAt("required.primaryCategoryKeys"),
       errorAt("required.independentlyPurchasableServiceKeys"),
       errorAt("required.serviceModes"),
+      errorAt("required.basedIn.countryCode"),
+      errorAt("required.serviceArea.countryCode"),
       errorAt("required"),
       errorAt("query"),
       errorAt("preferred.categoryKeys"),
@@ -61,7 +74,7 @@ describe("partitionFieldErrors", () => {
     ];
     const { controlled, unmatched } = partitionFieldErrors(errors);
 
-    assert.equal(controlled.length, 6, "every required-prefixed error is controlled");
+    assert.equal(controlled.length, 6, "every controlled required error is captured by the panel");
     assert.equal(unmatched.length, 3, "every other error is unmatched");
 
     // No error appears in both buckets.
@@ -78,6 +91,20 @@ describe("partitionFieldErrors", () => {
     for (const path of unmatchedPaths) {
       assert.equal(isControlledRequiredPath(path), false);
     }
+  });
+
+  test("unconsumed required.* paths fall through to the global panel", () => {
+    // Regression for the P1-002 finding: an error at a `required.*` path
+    // that has no rendered control MUST land in `unmatched` so the global
+    // panel can show it. The predicate cannot claim it just because it
+    // shares the `required` prefix.
+    const errors: ApiFieldErrorV1[] = [
+      errorAt("required.futureField"),
+      errorAt("required.basedIn.city"),
+    ];
+    const { controlled, unmatched } = partitionFieldErrors(errors);
+    assert.equal(controlled.length, 0, "no rendered control claims these paths");
+    assert.equal(unmatched.length, 2, "global panel renders both");
   });
 
   test("empty input produces empty partitions", () => {
