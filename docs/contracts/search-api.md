@@ -359,9 +359,11 @@ contract document cannot drift.
 
   **Approval and notification evidence:** This shared-contract revision is approved by the
   Milestone 1 integration owner (Caleb Matteis) on commit
-  `41dc22bf449bb0a8d0f602bba44992a39cabc4ed` of
+  `f2fec9ab20cc0021d45194b6c9c8f40ccf541e86` of
   `feat/m1.6-rank-preferences-group-matching`, with parallel-stream notification determination
   captured in
   `docs/integration/m1.6-preference-coverage-contract-evidence.md`. That record names the
-  approver, the approval date/commit, the decision reference (Issue #6), the stream-notification
-  determination, and the re-evaluation rule required by `AGENTS.md:127`.
+  approver, the approval date/commit, the decision reference (Issue #6), the truthful
+  per-field introduction provenance (preferenceCoverage first in `d28ae8a`, textCoverage first
+  in `f2fec9a`), the stream-notification determination, and the re-evaluation rule required by
+  `AGENTS.md:127`.

@@ -350,18 +350,26 @@ function ResultCardImpl({ result }: { result: TalentSearchResultV1 }) {
 
         {/* Qualitative fit: factual coverage statements derived from the
             deterministic matched/total counts the search service
-            produces. Two independent sources can be present:
+            produces. Three independent sources can be present:
               - `preferenceCoverage` from canonical preference atoms.
               - `textCoverage` from the buyer's normalized query tokens.
-            The UI renders whichever lines the service emitted; both are
-            non-percentage, never derived from `relevanceScore`. Issue #6
-            requires both deterministic evidence AND qualitative fit;
-            the P1-001 review found qualitative fit had been dropped
-            entirely on query-only searches, so this block now renders
-            the textCoverage line whenever the buyer supplied a query and
-            the preferenceCoverage line whenever they supplied
-            preferences. Optional in the public DTO per the v1 contract
-            (P1-002). */}
+              - The required-only fallback: when both coverage fields
+                are absent, the request had no usable query AND no
+                canonical preferences, so the service emitted the bare
+                eligibility matchReason without either coverage line.
+                The result itself is the factual evidence — its
+                presence in the result set means it satisfied every
+                requested required criterion — so a separate
+                qualitative-fit block is rendered from existing result
+                facts (matchReason + the absence of coverage fields).
+                Deterministic, non-percentage, never derived from
+                `relevanceScore`. Issue #6 requires both deterministic
+                evidence AND qualitative fit; the P1-001 review found
+                qualitative fit had been dropped on query-only and
+                again on required-only searches, so the renderer now
+                always surfaces a qualitative-fit block on a result
+                that returned usable criteria. Optional coverage fields
+                in the public DTO per the v1 contract (P1-002). */}
         {preferenceCoverage && (
           <div className="bg-blue-50 p-3 rounded-lg mt-2" data-testid="result-qualitative-fit">
             <p className="text-sm font-medium text-blue-900 mb-1">Preference coverage</p>
@@ -375,6 +383,14 @@ function ResultCardImpl({ result }: { result: TalentSearchResultV1 }) {
             <p className="text-sm font-medium text-blue-900 mb-1">Brief coverage</p>
             <p className="text-sm text-blue-800" data-testid="result-qualitative-fit-text">
               {formatTextCoverage(textCoverage)}
+            </p>
+          </div>
+        )}
+        {!preferenceCoverage && !textCoverage && (
+          <div className="bg-blue-50 p-3 rounded-lg mt-2" data-testid="result-qualitative-fit">
+            <p className="text-sm font-medium text-blue-900 mb-1">Eligibility</p>
+            <p className="text-sm text-blue-800" data-testid="result-qualitative-fit-text">
+              {formatRequiredOnlyFit(matchReason)}
             </p>
           </div>
         )}
@@ -563,6 +579,24 @@ function formatTextCoverage(coverage: {
   }
   const unmet = coverage.total - coverage.matched;
   return `Matches ${coverage.matched} of ${coverage.total} words from your brief; ${unmet} not matched.`;
+}
+
+// Deterministic, non-percentage qualitative-fit fallback for required-only
+// results. The service emits this branch whenever the request had no usable
+// query AND no canonical preference atoms, in which case both coverage
+// fields are omitted from the public DTO and `matchReason` falls back to
+// the deterministic service-side wording for an eligibility-only match.
+// Issue #6 requires the buyer UI to show both deterministic evidence
+// (`matchReason`) AND qualitative fit; this helper derives the
+// qualitative-fit line from the existing `matchReason` fact so no new
+// public DTO field is introduced. Counts-only wording, never a
+// percentage, never derived from `relevanceScore`.
+function formatRequiredOnlyFit(matchReason: string): string {
+  const trimmed = matchReason.trim();
+  if (trimmed.length === 0) {
+    return "Eligible based on your structured filters.";
+  }
+  return `Eligible based on your structured filters (${trimmed}).`;
 }
 
 // Renders "City, Region · CC" while tolerating the optional city/region fields.

@@ -174,41 +174,85 @@ describe("SearchPage buyer-facing match evidence (P1-001)", () => {
     );
   });
 
-  // P1-001 regression (revised after Codex review): the service omits
-  // `preferenceCoverage` whenever the buyer supplied no canonical
-  // preference atoms, AND it omits `textCoverage` whenever the buyer
-  // supplied no usable query. A request that supplies neither must skip
-  // the qualitative-fit block entirely. Optional in the public DTO
-  // (P1-002) for backward compatibility with in-flight clients.
-  test("omits the qualitative-fit block when neither preferenceCoverage nor textCoverage is present", () => {
-    const omittedCoverageResult: TalentSearchResultV1 = {
+  // P1-001 Codex review remediation (revised again after Codex re-review):
+  // a required-only search returns no `preferenceCoverage` AND no
+  // `textCoverage`. The buyer UI must STILL surface a qualitative-fit
+  // block so Issue #6's "deterministic evidence AND qualitative fit"
+  // requirement is satisfied for every meaningful result. The fallback
+  // wording is derived from existing result facts (matchReason +
+  // absence of coverage fields) and is non-percentage / never derived
+  // from `relevanceScore` / never a confidence claim.
+  test("renders a deterministic required-only qualitative-fit fallback when both coverage fields are absent", () => {
+    const requiredOnlyResult: TalentSearchResultV1 = {
       seller: sampleResult.seller,
       bestMatchingOffering: sampleResult.bestMatchingOffering,
       additionalMatchingOfferings: sampleResult.additionalMatchingOfferings,
       relevanceScore: sampleResult.relevanceScore,
-      matchReason: sampleResult.matchReason,
+      matchReason: "eligible standalone offering",
     };
-    const html = renderToStaticMarkup(ResultCard({ result: omittedCoverageResult }));
+    const html = renderToStaticMarkup(ResultCard({ result: requiredOnlyResult }));
 
     assert.ok(
       html.includes('data-testid="result-match-reason"'),
       "the matchReason block must still render when coverage is absent",
     );
     assert.ok(
-      html.includes("matched offering title; preferred genre: Dancehall"),
+      html.includes("eligible standalone offering"),
       "the matchReason text must still round-trip verbatim",
     );
     assert.ok(
-      !html.includes('data-testid="result-qualitative-fit"'),
-      "the qualitative-fit block must be skipped when both coverage fields are absent",
+      html.includes('data-testid="result-qualitative-fit"'),
+      "the qualitative-fit block must render when both coverage fields are absent",
+    );
+    assert.ok(
+      html.includes("Eligibility"),
+      "the required-only fallback must label its qualitative-fit block distinctly",
+    );
+    assert.ok(
+      html.includes("Eligible based on your structured filters (eligible standalone offering)."),
+      "the required-only qualitative-fit must name the deterministic matchReason fact alongside the structured-filters wording",
     );
     assert.ok(
       !html.includes("Preference coverage"),
-      "the preference-coverage header must not appear when preferenceCoverage is absent",
+      "the preference-coverage header must not appear for a required-only request",
     );
     assert.ok(
       !html.includes("Brief coverage"),
-      "the brief-coverage header must not appear when textCoverage is absent",
+      "the brief-coverage header must not appear for a required-only request",
+    );
+  });
+
+  // P1-001 regression (revised after Codex review): the service omits
+  // `preferenceCoverage` whenever the buyer supplied no canonical
+  // preference atoms, AND it omits `textCoverage` whenever the buyer
+  // supplied no usable query. Both fields remain optional in the public
+  // DTO (P1-002) for backward compatibility with in-flight clients.
+  test("keeps the public DTO coverage fields optional and absent for a required-only result", () => {
+    const requiredOnlyResult: TalentSearchResultV1 = {
+      seller: sampleResult.seller,
+      bestMatchingOffering: sampleResult.bestMatchingOffering,
+      additionalMatchingOfferings: sampleResult.additionalMatchingOfferings,
+      relevanceScore: sampleResult.relevanceScore,
+      matchReason: "eligible standalone offering",
+    };
+    const html = renderToStaticMarkup(ResultCard({ result: requiredOnlyResult }));
+
+    // The public DTO still omits the optional coverage fields on a
+    // required-only request — the fallback is rendered entirely from
+    // existing result facts. No new DTO field is introduced.
+    assert.equal(
+      requiredOnlyResult.preferenceCoverage,
+      undefined,
+      "preferenceCoverage must remain absent on a required-only result",
+    );
+    assert.equal(
+      requiredOnlyResult.textCoverage,
+      undefined,
+      "textCoverage must remain absent on a required-only result",
+    );
+    assert.ok(
+      html.includes('data-testid="result-qualitative-fit"'),
+      "the required-only fallback must still surface a qualitative-fit block",
     );
   });
 
