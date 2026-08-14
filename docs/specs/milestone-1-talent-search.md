@@ -140,7 +140,10 @@ SearchTalentTool.
 - Search returns at most ten results, one per seller, ordered by relevanceScore and a stable seller
   identifier tie-breaker.
 - Each result includes an allow-listed seller summary, best matching offering, up to two additional
-  offerings, deterministic match reason, relevanceScore, and factual preference coverage.
+  offerings, deterministic match reason, relevanceScore, and factual preference coverage. The
+  preference coverage is an optional response field; the service emits it whenever the buyer supplied
+  at least one canonical preference atom and omits it only when no preferences were requested, in
+  which case the deterministic match reason is the sole buyer-facing qualitative-fit evidence.
 - relevanceScore is finite, bounded from zero through one, specific to the declared strategy, and
   not displayed as a buyer-facing percentage. The buyer UI may surface the deterministic preference
   coverage as a factual qualitative-fit description but must not render it as a percentage and must

@@ -154,7 +154,7 @@ interface TalentSearchResultV1 {
   readonly additionalMatchingOfferings: readonly PublicOfferingSummaryV1[];
   readonly relevanceScore: number;
   readonly matchReason: string;
-  readonly preferenceCoverage: {
+  readonly preferenceCoverage?: {
     readonly matched: number;
     readonly total: number;
   };
@@ -195,6 +195,14 @@ interface TalentSearchResponseV1 {
   Both are derived from the deterministic preference matcher, never from `relevanceScore`. The buyer
   UI may surface this coverage as a factual qualitative-fit description but must not render it as a
   percentage and must not derive a confidence or quality band from it.
+- `preferenceCoverage` is optional in the public DTO. When the service omits the field, the legacy
+  client surfaces the deterministic factual evidence in `matchReason` alone and the qualitative-fit
+  block is omitted. The field is omitted only when the buyer supplied no usable preferences (in
+  which case `preferenceCoverage.total` would be `0` and the resulting "0 of 0" statement is not
+  factual evidence); clients that do not render the field at all therefore receive the same
+  buyer-facing behavior as a client that renders "no preferences were requested" for that case. The
+  field is always present when the buyer supplied at least one canonical preference atom so the
+  coverage line is never absent on a meaningful preference-bearing result.
 - Empty results return `200` with `results: []`; constraints are not relaxed automatically.
 
 ### Incremental M1.1 semantics
@@ -307,3 +315,19 @@ and must preserve Express success/error status, response body, and request ID.
 8. Verify private fields never serialize.
 9. Verify database failure maps to the safe `503` envelope.
 10. Verify the Next.js proxy preserves both success and error contracts.
+
+## Contract revisions
+
+The shared runtime contract is the executable source of truth. The conceptual interface, the
+semantics, and the runtime schema are reviewed together so that the browser, the API, and the
+contract document cannot drift.
+
+- **v1 (current) — `preferenceCoverage` added as an optional response field.** Issue #6 (M1.5)
+  extends the M1.1 result with deterministic preference-atom coverage so the buyer UI can surface a
+  factual qualitative-fit line in addition to the existing `matchReason` evidence. The field is
+  declared optional in the conceptual interface and in the runtime schema (`preferenceCoverageV1Schema`
+  is used inside `talentSearchResultV1Schema` through `.optional()`) for backward compatibility with
+  in-flight clients; semantically the service emits it whenever the buyer supplied at least one
+  canonical preference atom and omits it only when no preferences were requested. The service-owned
+  fallback for the omitted case is the existing `matchReason` evidence. The field is never rendered
+  as a percentage and never derived from `relevanceScore`, which remains strategy-specific ordering.
