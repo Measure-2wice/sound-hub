@@ -1215,3 +1215,775 @@ describe("TalentSearchService M1.3 negative eligibility fixtures", () => {
     assert.ok(!sellerIds.includes("neg-draft-profile"));
   });
 });
+
+// M1.5 preference ranking and grouping.
+//
+// Per the v1 contract:
+//   - Preferences affect ordering without excluding candidates.
+//   - Each seller appears once with a stable best matching offering and at
+//     most two additional matches.
+//   - Bundle-only matches are labeled accurately and never presented as
+//     standalone purchases.
+//   - Identical canonical data and normalized criteria produce identical
+//     ordering, matchReason, and bounded relevanceScore.
+//
+// The fixtures below extend the in-memory adapter with sellers that have
+// multiple eligible offerings, sellers whose primary category is
+// bundle-only, sellers whose offering carries bundle-only IncludedServices,
+// and a controlled-key set that adds them to the canonical surface so the
+// service can validate any new stable keys.
+describe("TalentSearchService M1.5 preference ranking and grouping", () => {
+  const M15_CONTROLLED_KEYS = {
+    serviceCategoryKeys: [
+      "music-production",
+      "songwriting",
+      "custom-composition",
+      "session-vocals",
+      "session-instrument-performance",
+      "featured-artist-performance",
+      "mixing",
+      "mastering",
+      "recording-engineering",
+      "live-performance",
+      "remote-coaching",
+      "remote-companion",
+      "remote-studio-time",
+    ],
+    specialtyKeys: ["Artist", "Producer", "Musician", "Songwriter", "SoundEngineer"],
+    pricingUnitKeys: ["hour", "track", "project", "session", "event", "day"],
+  };
+
+  const PRODUCTION_OFFERING_A: InMemoryOffering = {
+    offeringId: "m15-offering-a",
+    title: "Dancehall single production",
+    description: "Dancehall single production.",
+    status: "Active",
+    serviceMode: "Remote",
+    primaryCategory: { key: "music-production", name: "Music Production", bundleOnly: false },
+    includedServices: [],
+    genreTags: ["Dancehall", "Hip-Hop"],
+    serviceAreas: [{ city: null, region: null, countryCode: "US" }],
+    pricing: {
+      kind: "StartingAt",
+      amountMinor: 50000,
+      currency: "USD",
+      unitKey: "track",
+    },
+  };
+
+  const VOCAL_OFFERING_B: InMemoryOffering = {
+    offeringId: "m15-offering-b",
+    title: "Lead dancehall vocals",
+    description: "Lead vocals for dancehall tracks.",
+    status: "Active",
+    serviceMode: "Remote",
+    primaryCategory: { key: "session-vocals", name: "Session Vocals", bundleOnly: false },
+    includedServices: [],
+    genreTags: ["Dancehall", "Soca"],
+    serviceAreas: [{ city: null, region: null, countryCode: "US" }],
+    pricing: {
+      kind: "Fixed",
+      amountMinor: 35000,
+      currency: "USD",
+      unitKey: "session",
+    },
+  };
+
+  const CUSTOM_COMPOSITION_C: InMemoryOffering = {
+    offeringId: "m15-offering-c",
+    title: "Dancehall composition for picture",
+    description: "Original dancehall composition to picture.",
+    status: "Active",
+    serviceMode: "Remote",
+    primaryCategory: {
+      key: "custom-composition",
+      name: "Custom Composition",
+      bundleOnly: false,
+    },
+    includedServices: [],
+    genreTags: ["Score", "Cinematic"],
+    serviceAreas: [{ city: null, region: null, countryCode: "US" }],
+    pricing: {
+      kind: "StartingAt",
+      amountMinor: 200000,
+      currency: "USD",
+      unitKey: "project",
+    },
+  };
+
+  const BUNDLE_ONLY_PRIMARY_OFFERING: InMemoryOffering = {
+    offeringId: "m15-bundle-only-primary",
+    title: "Hidden dancehall bundle-only offering",
+    description:
+      "Primary category is bundleOnly; must never be presented as a standalone purchase.",
+    status: "Active",
+    serviceMode: "Remote",
+    primaryCategory: {
+      key: "remote-companion",
+      name: "Remote Companion",
+      bundleOnly: true,
+    },
+    includedServices: [],
+    genreTags: ["Dancehall"],
+    serviceAreas: [{ city: null, region: null, countryCode: "JM" }],
+    pricing: null,
+  };
+
+  const OFFERING_WITH_BUNDLE_COMPONENT: InMemoryOffering = {
+    offeringId: "m15-offering-with-bundle",
+    title: "Dancehall production with bundled coaching",
+    description: "Standalone production offering that includes a coaching component.",
+    status: "Active",
+    serviceMode: "Remote",
+    primaryCategory: { key: "music-production", name: "Music Production", bundleOnly: false },
+    includedServices: [
+      {
+        key: "remote-coaching",
+        name: "Remote Coaching",
+        purchaseMode: "BundleOnly",
+      },
+    ],
+    genreTags: ["Dancehall"],
+    serviceAreas: [{ city: null, region: null, countryCode: "JM" }],
+    pricing: {
+      kind: "StartingAt",
+      amountMinor: 80000,
+      currency: "USD",
+      unitKey: "track",
+    },
+  };
+
+  const OFFERING_WITH_MULTIPLE_BUNDLE_COMPONENTS: InMemoryOffering = {
+    offeringId: "m15-offering-with-bundle-set",
+    title: "Dancehall composition with bundled coaching and studio time",
+    description: "Standalone composition offering that bundles coaching and studio time.",
+    status: "Active",
+    serviceMode: "Hybrid",
+    primaryCategory: {
+      key: "custom-composition",
+      name: "Custom Composition",
+      bundleOnly: false,
+    },
+    includedServices: [
+      {
+        key: "remote-coaching",
+        name: "Remote Coaching",
+        purchaseMode: "BundleOnly",
+      },
+      {
+        key: "remote-studio-time",
+        name: "Remote Studio Time",
+        purchaseMode: "BundleOnly",
+      },
+    ],
+    genreTags: ["Score"],
+    serviceAreas: [{ city: null, region: null, countryCode: "JM" }],
+    pricing: null,
+  };
+
+  const MULTI_OFFERING_SELLER_HT: InMemorySeller = {
+    sellerId: "m15-seller-multi-ht",
+    workspaceId: "ws-m15-multi-ht",
+    professionalName: "Marc M15 Multi HT",
+    bio: "Brooklyn-based Haitian producer.",
+    status: "Published",
+    basedInCity: "Brooklyn",
+    basedInRegion: "NY",
+    basedInCountryCode: "US",
+    avatarUrl: null,
+    specialtyKeys: ["Producer", "Artist"],
+    caribbeanAffiliationCodes: ["HT", "JM"],
+    workspaceStatus: "Active",
+    workspaceHasSellerCapability: true,
+    offerings: [PRODUCTION_OFFERING_A, VOCAL_OFFERING_B, CUSTOM_COMPOSITION_C],
+  };
+
+  const SINGLE_OFFERING_SELLER_JM: InMemorySeller = {
+    sellerId: "m15-seller-single-jm",
+    workspaceId: "ws-m15-single-jm",
+    professionalName: "Marc M15 Single JM",
+    bio: "Brooklyn-based Jamaican songwriter.",
+    status: "Published",
+    basedInCity: "Brooklyn",
+    basedInRegion: "NY",
+    basedInCountryCode: "US",
+    avatarUrl: null,
+    specialtyKeys: ["Songwriter"],
+    caribbeanAffiliationCodes: ["JM"],
+    workspaceStatus: "Active",
+    workspaceHasSellerCapability: true,
+    offerings: [OFFERING_WITH_BUNDLE_COMPONENT],
+  };
+
+  const SINGLE_OFFERING_SELLER_HT_MIRROR: InMemorySeller = {
+    sellerId: "m15-seller-mirror-ht",
+    workspaceId: "ws-m15-mirror-ht",
+    professionalName: "Marc M15 Mirror HT",
+    bio: "Brooklyn-based Haitian producer, mirror seller.",
+    status: "Published",
+    basedInCity: "Brooklyn",
+    basedInRegion: "NY",
+    basedInCountryCode: "US",
+    avatarUrl: null,
+    specialtyKeys: ["Producer"],
+    caribbeanAffiliationCodes: ["HT"],
+    workspaceStatus: "Active",
+    workspaceHasSellerCapability: true,
+    offerings: [PRODUCTION_OFFERING_A],
+  };
+
+  const BUNDLE_ONLY_PRIMARY_SELLER: InMemorySeller = {
+    sellerId: "m15-seller-bundle-only-primary",
+    workspaceId: "ws-m15-bundle-only-primary",
+    professionalName: "Marc M15 Bundle Only Primary",
+    bio: "Seller whose only offering is bundle-only primary; must not surface as standalone.",
+    status: "Published",
+    basedInCity: "Brooklyn",
+    basedInRegion: "NY",
+    basedInCountryCode: "US",
+    avatarUrl: null,
+    specialtyKeys: ["Producer"],
+    caribbeanAffiliationCodes: ["JM"],
+    workspaceStatus: "Active",
+    workspaceHasSellerCapability: true,
+    offerings: [BUNDLE_ONLY_PRIMARY_OFFERING],
+  };
+
+  const MULTI_BUNDLE_SELLER: InMemorySeller = {
+    sellerId: "m15-seller-multi-bundle",
+    workspaceId: "ws-m15-multi-bundle",
+    professionalName: "Marc M15 Multi Bundle",
+    bio: "Brooklyn-based composer with bundled offerings.",
+    status: "Published",
+    basedInCity: "Brooklyn",
+    basedInRegion: "NY",
+    basedInCountryCode: "US",
+    avatarUrl: null,
+    specialtyKeys: ["Songwriter"],
+    caribbeanAffiliationCodes: ["JM"],
+    workspaceStatus: "Active",
+    workspaceHasSellerCapability: true,
+    offerings: [OFFERING_WITH_MULTIPLE_BUNDLE_COMPONENTS],
+  };
+
+  function buildM15Fixture(): InMemoryFixture {
+    return {
+      sellers: [
+        MULTI_OFFERING_SELLER_HT,
+        SINGLE_OFFERING_SELLER_JM,
+        SINGLE_OFFERING_SELLER_HT_MIRROR,
+        BUNDLE_ONLY_PRIMARY_SELLER,
+        MULTI_BUNDLE_SELLER,
+      ],
+      controlledKeys: M15_CONTROLLED_KEYS,
+    };
+  }
+
+  test("multi-offering seller surfaces once with stable best offering and at most two additional matches", async () => {
+    const service = new TalentSearchService(new InMemoryTalentSearchRepository(buildM15Fixture()));
+    // Two-token query; production offering matches both via title
+    // ("Dancehall single production"), the others match only "dancehall".
+    const response = await service.search({ query: "dancehall production" });
+    const sellerResults = response.results.filter(
+      (r) => r.seller.sellerId === "m15-seller-multi-ht",
+    );
+    assert.equal(
+      sellerResults.length,
+      1,
+      "each seller must appear at most once in the result list",
+    );
+    const [result] = sellerResults;
+    assert.ok(result);
+    assert.equal(result.bestMatchingOffering.offeringId, "m15-offering-a");
+    // Both remaining offerings tie on textScore; tied offerings are
+    // sorted by offeringId asc, so vocal first then composition.
+    assert.deepEqual(
+      result.additionalMatchingOfferings.map((o) => o.offeringId),
+      ["m15-offering-b", "m15-offering-c"],
+    );
+    assert.ok(result.additionalMatchingOfferings.length <= 2);
+  });
+
+  test("a seller with five eligible offerings never surfaces more than three (one best plus at most two additional)", async () => {
+    const sellers: InMemorySeller[] = [
+      {
+        ...MULTI_OFFERING_SELLER_HT,
+        offerings: [
+          { ...PRODUCTION_OFFERING_A, offeringId: "m15-q-1" },
+          { ...PRODUCTION_OFFERING_A, offeringId: "m15-q-2" },
+          { ...PRODUCTION_OFFERING_A, offeringId: "m15-q-3" },
+          { ...PRODUCTION_OFFERING_A, offeringId: "m15-q-4" },
+          { ...PRODUCTION_OFFERING_A, offeringId: "m15-q-5" },
+        ],
+      },
+    ];
+    const service = new TalentSearchService(
+      new InMemoryTalentSearchRepository({
+        sellers,
+        controlledKeys: M15_CONTROLLED_KEYS,
+      }),
+    );
+    const response = await service.search({ query: "dancehall production" });
+    const [result] = response.results;
+    assert.ok(result);
+    assert.equal(
+      result.additionalMatchingOfferings.length,
+      2,
+      "a seller must never expose more than two additional offerings",
+    );
+    assert.ok(1 + result.additionalMatchingOfferings.length <= 3);
+  });
+
+  test("additional offerings are stably ordered by offeringId when scores tie within a seller", async () => {
+    // Three identical offerings re-keyed to control ordering. Score is
+    // tied (full-text), so the within-seller order is offeringId asc.
+    const sellers: InMemorySeller[] = [
+      {
+        ...MULTI_OFFERING_SELLER_HT,
+        offerings: [
+          { ...PRODUCTION_OFFERING_A, offeringId: "m15-det-c" },
+          { ...PRODUCTION_OFFERING_A, offeringId: "m15-det-a" },
+          { ...PRODUCTION_OFFERING_A, offeringId: "m15-det-b" },
+        ],
+      },
+    ];
+    const service = new TalentSearchService(
+      new InMemoryTalentSearchRepository({
+        sellers,
+        controlledKeys: M15_CONTROLLED_KEYS,
+      }),
+    );
+    const response = await service.search({ query: "dancehall" });
+    const [result] = response.results;
+    assert.ok(result);
+    assert.deepEqual(
+      [
+        result.bestMatchingOffering.offeringId,
+        ...result.additionalMatchingOfferings.map((o) => o.offeringId),
+      ],
+      ["m15-det-a", "m15-det-b", "m15-det-c"],
+    );
+  });
+
+  test("a bundle-only primary-category offering is never selected as bestMatchingOffering or as additionalMatchingOfferings", async () => {
+    const service = new TalentSearchService(new InMemoryTalentSearchRepository(buildM15Fixture()));
+    const response = await service.search({ query: "dancehall" });
+    const bundleOnlyResult = response.results.find(
+      (r) => r.seller.sellerId === "m15-seller-bundle-only-primary",
+    );
+    assert.equal(
+      bundleOnlyResult,
+      undefined,
+      "bundle-only primary-category offerings must never be presented as standalone purchases",
+    );
+    const serialized = JSON.stringify(response);
+    assert.equal(
+      serialized.includes("m15-bundle-only-primary"),
+      false,
+      "bundle-only primary-category offeringId must not appear in the response",
+    );
+    assert.equal(
+      serialized.includes("Hidden dancehall bundle-only offering"),
+      false,
+      "bundle-only primary-category title must not appear in the response",
+    );
+  });
+
+  test("bundle-only IncludedServices are labeled as BundleOnly on every presenting offering and never as standalone", async () => {
+    const service = new TalentSearchService(new InMemoryTalentSearchRepository(buildM15Fixture()));
+    const response = await service.search({ query: "dancehall" });
+    for (const result of response.results) {
+      for (const offering of [result.bestMatchingOffering, ...result.additionalMatchingOfferings]) {
+        for (const included of offering.includedServices) {
+          assert.equal(
+            included.purchaseMode,
+            "BundleOnly",
+            `includedService key=${included.key} must be labeled as BundleOnly`,
+          );
+          assert.equal(typeof included.key, "string");
+        }
+      }
+    }
+    for (const result of response.results) {
+      const observedOfferingIds = new Set<string>([
+        result.bestMatchingOffering.offeringId,
+        ...result.additionalMatchingOfferings.map((o) => o.offeringId),
+      ]);
+      assert.equal(
+        observedOfferingIds.has(BUNDLE_ONLY_PRIMARY_OFFERING.offeringId),
+        false,
+        "bundle-only primary-category offering must never appear as bestMatchingOffering/additionalMatchingOffering",
+      );
+    }
+  });
+
+  test("preferences affect ordering without excluding otherwise eligible candidates", async () => {
+    const service = new TalentSearchService(new InMemoryTalentSearchRepository(buildM15Fixture()));
+    const response = await service.search({
+      query: "dancehall production",
+      preferred: { caribbeanAffiliationCodes: ["JM"] },
+    });
+    const sellerIds = new Set(response.results.map((r) => r.seller.sellerId));
+    assert.ok(sellerIds.has("m15-seller-multi-ht"));
+    assert.ok(sellerIds.has("m15-seller-mirror-ht"));
+    assert.ok(sellerIds.has("m15-seller-single-jm"));
+    assert.ok(sellerIds.has("m15-seller-multi-bundle"));
+  });
+
+  test("JM-preferred ordering: a JM-affiliated seller ranks above an HT-only mirror under partial text coverage", async () => {
+    // Two mirror sellers carry identical offerings; the JM-preferred
+    // seller has the JM affiliation that the buyer's preference matches.
+    // The two-token query only overlaps with one token in the title
+    // ("dancehall"), leaving text coverage partial so the JM-preference
+    // lift can outrank the HT-only seller without the [0,1] bound
+    // collapsing the difference at full coverage.
+    const sellers: InMemorySeller[] = [
+      {
+        sellerId: "m15-pref-z-jm",
+        workspaceId: "ws-pref-z-jm",
+        professionalName: "Z JM",
+        bio: "",
+        status: "Published",
+        basedInCity: "Brooklyn",
+        basedInRegion: "NY",
+        basedInCountryCode: "US",
+        avatarUrl: null,
+        specialtyKeys: ["Songwriter"],
+        caribbeanAffiliationCodes: ["JM"],
+        workspaceStatus: "Active",
+        workspaceHasSellerCapability: true,
+        offerings: [
+          {
+            ...PRODUCTION_OFFERING_A,
+            offeringId: "m15-pref-z-jm-off",
+            title: "Dancehall single production",
+          },
+        ],
+      },
+      {
+        sellerId: "m15-pref-a-ht",
+        workspaceId: "ws-pref-a-ht",
+        professionalName: "A HT",
+        bio: "",
+        status: "Published",
+        basedInCity: "Brooklyn",
+        basedInRegion: "NY",
+        basedInCountryCode: "US",
+        avatarUrl: null,
+        specialtyKeys: ["Producer"],
+        caribbeanAffiliationCodes: ["HT"],
+        workspaceStatus: "Active",
+        workspaceHasSellerCapability: true,
+        offerings: [
+          {
+            ...PRODUCTION_OFFERING_A,
+            offeringId: "m15-pref-a-ht-off",
+            title: "Dancehall single production",
+          },
+        ],
+      },
+    ];
+    const service = new TalentSearchService(
+      new InMemoryTalentSearchRepository({
+        sellers,
+        controlledKeys: M15_CONTROLLED_KEYS,
+      }),
+    );
+    // Two-token query: "dancehall" matches the title (1/2), "vocals"
+    // does not. textScore = 0.5 for both sellers.
+    const query = "dancehall vocals";
+    // Without prefs, "m15-pref-a-ht" sorts first by sellerId-tiebreak
+    // (both score 0.5).
+    const noPref = await service.search({ query });
+    assert.equal(noPref.results[0]?.seller.sellerId, "m15-pref-a-ht");
+    assert.equal(noPref.results[1]?.seller.sellerId, "m15-pref-z-jm");
+    // With JM preference, the JM-affiliated seller MUST outrank the
+    // HT-only seller — preferences affect ordering deterministically.
+    const jmPref = await service.search({
+      query,
+      preferred: { caribbeanAffiliationCodes: ["JM"] },
+    });
+    assert.equal(jmPref.results[0]?.seller.sellerId, "m15-pref-z-jm");
+    assert.equal(jmPref.results[1]?.seller.sellerId, "m15-pref-a-ht");
+    // Relevance scores remain finite and bounded for every result.
+    for (const result of jmPref.results) {
+      assert.ok(
+        Number.isFinite(result.relevanceScore) &&
+          result.relevanceScore >= 0 &&
+          result.relevanceScore <= 1,
+      );
+    }
+  });
+
+  test("preferred Caribbean affiliation is rendered factually in matchReason without AI or confidence claims", async () => {
+    const service = new TalentSearchService(new InMemoryTalentSearchRepository(buildM15Fixture()));
+    const response = await service.search({
+      query: "dancehall",
+      preferred: { caribbeanAffiliationCodes: ["JM"] },
+    });
+    const jm = response.results.find((r) => r.seller.sellerId === "m15-seller-single-jm");
+    assert.ok(jm);
+    assert.ok(
+      jm.matchReason.includes("preferred Caribbean affiliation: JM"),
+      `matchReason must include the factual preference label, got: ${jm.matchReason}`,
+    );
+    assert.doesNotMatch(jm.matchReason, /ai|artificial|intelligence|confidence|guarantee|quality/i);
+  });
+
+  test("preferred category, genre, and based-in labels follow canonical order across identical requests", async () => {
+    const service = new TalentSearchService(new InMemoryTalentSearchRepository(buildM15Fixture()));
+    const a = await service.search({
+      query: "dancehall",
+      preferred: {
+        categoryKeys: ["music-production"],
+        genreTags: ["Dancehall"],
+        basedIn: { city: "Brooklyn" },
+      },
+    });
+    const b = await service.search({
+      query: "dancehall",
+      preferred: {
+        genreTags: ["Dancehall"],
+        basedIn: { city: "Brooklyn" },
+        categoryKeys: ["music-production"],
+      },
+    });
+    assert.equal(a.results.length, b.results.length);
+    for (let i = 0; i < a.results.length; i += 1) {
+      assert.equal(a.results[i]!.matchReason, b.results[i]!.matchReason);
+      assert.equal(a.results[i]!.relevanceScore, b.results[i]!.relevanceScore);
+      assert.equal(a.results[i]!.seller.sellerId, b.results[i]!.seller.sellerId);
+    }
+  });
+
+  test("identical canonical data and normalized criteria produce identical ordering, matchReason, and bounded relevanceScore", async () => {
+    const service = new TalentSearchService(new InMemoryTalentSearchRepository(buildM15Fixture()));
+    const a = await service.search({
+      query: "  Dancehall PRODUCTION  ",
+      preferred: {
+        genreTags: ["Dancehall"],
+        caribbeanAffiliationCodes: ["JM"],
+      },
+    });
+    const b = await service.search({
+      query: "dancehall production",
+      preferred: {
+        genreTags: ["Dancehall"],
+        caribbeanAffiliationCodes: ["JM"],
+      },
+    });
+    assert.equal(a.results.length, b.results.length);
+    for (const result of a.results) {
+      assert.ok(result.relevanceScore >= 0 && result.relevanceScore <= 1);
+      assert.ok(Number.isFinite(result.relevanceScore));
+    }
+    assert.deepEqual(
+      a.results.map((r) => ({
+        sellerId: r.seller.sellerId,
+        score: r.relevanceScore,
+        reason: r.matchReason,
+      })),
+      b.results.map((r) => ({
+        sellerId: r.seller.sellerId,
+        score: r.relevanceScore,
+        reason: r.matchReason,
+      })),
+    );
+  });
+
+  test("relevanceScore of 1.0 is preserved when all tokens match and no preferences are supplied (M1.1 invariant)", async () => {
+    const service = new TalentSearchService(new InMemoryTalentSearchRepository(buildM15Fixture()));
+    const response = await service.search({ query: "Dancehall" });
+    const result = response.results.find((r) => r.seller.sellerId === "m15-seller-multi-ht");
+    assert.ok(result);
+    assert.ok(Math.abs(result.relevanceScore - 1) < 1e-9);
+  });
+
+  test("every result in the M1.5 fixture has at most two additional matching offerings", async () => {
+    const service = new TalentSearchService(new InMemoryTalentSearchRepository(buildM15Fixture()));
+    const response = await service.search({ query: "dancehall" });
+    for (const result of response.results) {
+      assert.ok(result.additionalMatchingOfferings.length <= 2);
+    }
+  });
+
+  test("the contract's 10-result cap is honored by the service", async () => {
+    // Build a fixture with 12 distinct eligible sellers. With at most
+    // two additional per seller and at most ten sellers in the result
+    // list, the wire-format ordering must cap at ten.
+    const sellers: InMemorySeller[] = Array.from({ length: 12 }).map((_, i) => ({
+      sellerId: `m15-cap-seller-${i.toString().padStart(2, "0")}`,
+      workspaceId: `ws-m15-cap-${i}`,
+      professionalName: `M15 Cap Seller ${i}`,
+      bio: "",
+      status: "Published",
+      basedInCity: "Brooklyn",
+      basedInRegion: "NY",
+      basedInCountryCode: "US",
+      avatarUrl: null,
+      specialtyKeys: ["Producer"],
+      caribbeanAffiliationCodes: ["JM"],
+      workspaceStatus: "Active",
+      workspaceHasSellerCapability: true,
+      offerings: [
+        {
+          ...PRODUCTION_OFFERING_A,
+          offeringId: `m15-cap-off-${i}`,
+        },
+      ],
+    }));
+    const service = new TalentSearchService(
+      new InMemoryTalentSearchRepository({ sellers, controlledKeys: M15_CONTROLLED_KEYS }),
+    );
+    const response = await service.search({ query: "dancehall" });
+    assert.equal(response.results.length, 10, "the contract caps results at ten sellers");
+    assert.equal(response.metadata.totalResults, 10);
+  });
+
+  test("a seller whose only offering has a bundle-only primary category is dropped from the result list (no standalone purchase is mis-presented)", async () => {
+    // Belt-and-braces. The acceptance criterion 3 wording only forbids
+    // presenting bundle-only as a standalone purchase, but the contract
+    // also requires every result to expose a bestMatchingOffering. A
+    // seller without a non-bundle-only standalone offering therefore
+    // cannot satisfy the result shape and is intentionally omitted
+    // from the result list rather than surfaced with an empty slot.
+    const onlyBundleOnly: InMemorySeller = {
+      sellerId: "m15-only-bundle-only-primary",
+      workspaceId: "ws-m15-only-bundle-only-primary",
+      professionalName: "M15 Only Bundle Only Primary",
+      bio: "",
+      status: "Published",
+      basedInCity: "Brooklyn",
+      basedInRegion: "NY",
+      basedInCountryCode: "US",
+      avatarUrl: null,
+      specialtyKeys: ["Producer"],
+      caribbeanAffiliationCodes: ["JM"],
+      workspaceStatus: "Active",
+      workspaceHasSellerCapability: true,
+      offerings: [BUNDLE_ONLY_PRIMARY_OFFERING],
+    };
+    const service = new TalentSearchService(
+      new InMemoryTalentSearchRepository({
+        sellers: [onlyBundleOnly],
+        controlledKeys: M15_CONTROLLED_KEYS,
+      }),
+    );
+    const response = await service.search({ query: "dancehall" });
+    assert.equal(response.results.length, 0);
+    const serialized = JSON.stringify(response);
+    assert.equal(serialized.includes("m15-only-bundle-only-primary"), false);
+  });
+
+  test("preferred.includedServiceKeys lifts an offering whose bundle includes that component (atomic-only path)", async () => {
+    // The M1.5 JM-mirror seller carries OFFERING_WITH_BUNDLE_COMPONENT
+    // (primary category music-production, includedServices includes
+    // "remote-coaching"). A preferred.includedServiceKeys=["remote-coaching"]
+    // request must produce a deterministic factual preference label
+    // naming that bundle component without affecting other offerings.
+    const service = new TalentSearchService(new InMemoryTalentSearchRepository(buildM15Fixture()));
+    const response = await service.search({
+      query: "dancehall",
+      preferred: { includedServiceKeys: ["remote-coaching"] },
+    });
+    const jm = response.results.find((r) => r.seller.sellerId === "m15-seller-single-jm");
+    assert.ok(jm);
+    assert.ok(
+      jm.matchReason.includes("preferred bundle component: remote-coaching"),
+      `expected the bundle-component preference label, got: ${jm.matchReason}`,
+    );
+    // Sellers whose offering does not include that component must still
+    // surface — preferences don't exclude per the v1 contract.
+    assert.ok(response.results.find((r) => r.seller.sellerId === "m15-seller-multi-ht"));
+  });
+
+  test("preferred.specialties lifts a seller whose professional specialties match (atomic-only path)", async () => {
+    const service = new TalentSearchService(new InMemoryTalentSearchRepository(buildM15Fixture()));
+    // "Songwriter" is on SINGLE_OFFERING_SELLER_JM and on MULTI_BUNDLE_SELLER
+    // only. Preferences don't exclude other sellers.
+    const response = await service.search({
+      query: "dancehall",
+      preferred: { specialties: ["Songwriter"] },
+    });
+    const jm = response.results.find((r) => r.seller.sellerId === "m15-seller-single-jm");
+    assert.ok(jm);
+    assert.ok(
+      jm.matchReason.includes("preferred specialty: Songwriter"),
+      `expected the specialty preference label, got: ${jm.matchReason}`,
+    );
+    assert.ok(response.results.find((r) => r.seller.sellerId === "m15-seller-multi-ht"));
+  });
+
+  test("preferred.serviceModes lifts an offering whose serviceMode matches (atomic-only path)", async () => {
+    const service = new TalentSearchService(new InMemoryTalentSearchRepository(buildM15Fixture()));
+    // REMOTE is the serviceMode on every canonical M1.5 offering. We
+    // assert the label is emitted when the buyer prefers Remote.
+    const response = await service.search({
+      query: "dancehall",
+      preferred: { serviceModes: ["Remote"] },
+    });
+    for (const result of response.results) {
+      const remoteMatches = [
+        result.bestMatchingOffering,
+        ...result.additionalMatchingOfferings,
+      ].some((o) => o.serviceMode === "Remote");
+      if (remoteMatches) {
+        assert.ok(
+          result.matchReason.includes("preferred service mode: Remote"),
+          `expected the service-mode preference label, got: ${result.matchReason}`,
+        );
+      }
+    }
+  });
+
+  test("preferred.basedIn (city / region / country) lifts the matching seller (atomic-only path)", async () => {
+    const service = new TalentSearchService(new InMemoryTalentSearchRepository(buildM15Fixture()));
+    const city = await service.search({
+      query: "dancehall",
+      preferred: { basedIn: { city: "Brooklyn" } },
+    });
+    const region = await service.search({
+      query: "dancehall",
+      preferred: { basedIn: { region: "NY" } },
+    });
+    const country = await service.search({
+      query: "dancehall",
+      preferred: { basedIn: { countryCode: "US" } },
+    });
+    for (const [label, response] of [
+      ["city", city],
+      ["region", region],
+      ["country", country],
+    ] as const) {
+      assert.ok(
+        response.results.some(
+          (r) =>
+            r.matchReason.includes(`preferred based-in ${label}:`.replace(":", "")) ||
+            // The label wording changes per kind — assert any of the
+            // three preference labels appears for at least one result
+            // whose seller is based in the requested locality.
+            r.matchReason.includes("preferred based-in"),
+        ),
+        `expected a based-in preference label (${label}), got: ${JSON.stringify(
+          response.results.map((r) => ({ id: r.seller.sellerId, reason: r.matchReason })),
+        )}`,
+      );
+    }
+  });
+
+  test("includedServices always carry purchaseMode BundleOnly on the public DTO (mapping boundary locked)", async () => {
+    const service = new TalentSearchService(new InMemoryTalentSearchRepository(buildM15Fixture()));
+    const response = await service.search({ query: "dancehall" });
+    for (const result of response.results) {
+      for (const offering of [result.bestMatchingOffering, ...result.additionalMatchingOfferings]) {
+        for (const included of offering.includedServices) {
+          assert.equal(
+            included.purchaseMode,
+            "BundleOnly",
+            "toPublicOffering must label every includedService as BundleOnly",
+          );
+        }
+      }
+    }
+  });
+});

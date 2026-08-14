@@ -221,8 +221,7 @@ export function SearchPage() {
 }
 
 function ResultCard({ result }: { result: TalentSearchResultV1 }) {
-  const { seller, bestMatchingOffering, matchReason } = result;
-  const pricingLabel = formatPricing(bestMatchingOffering.pricing);
+  const { seller, bestMatchingOffering, additionalMatchingOfferings, matchReason } = result;
 
   return (
     <Card
@@ -294,81 +293,185 @@ function ResultCard({ result }: { result: TalentSearchResultV1 }) {
           )}
         </dl>
 
-        <div className="bg-gray-50 p-3 rounded-lg mb-3">
-          <p className="text-sm font-medium text-gray-900" data-testid="result-offering-title">
-            {bestMatchingOffering.title}
-          </p>
-          <p className="text-xs text-gray-600 mt-1">{bestMatchingOffering.description}</p>
+        {/* Best matching offering. Each result leads with the seller's
+            highest-eligible standalone offering — the one the buyer can
+            commission right now. Bundle-only IncludedServices ride along
+            below labeled as bundle-only (see ADR 0002 and CONTEXT.md). */}
+        <BestOfferingCard offering={bestMatchingOffering} testIdPrefix="result-offering" />
 
-          <dl className="text-xs text-gray-700 mt-2 space-y-1">
-            <div>
-              <dt className="inline font-medium text-gray-500">Service category: </dt>
-              <dd className="inline" data-testid="result-category">
-                {bestMatchingOffering.primaryCategory.name}
-              </dd>
-            </div>
-            <div>
-              <dt className="inline font-medium text-gray-500">Service mode: </dt>
-              <dd className="inline" data-testid="result-service-mode">
-                {formatServiceMode(bestMatchingOffering.serviceMode)}
-              </dd>
-            </div>
-            {bestMatchingOffering.serviceAreas.length > 0 && (
-              <div>
-                <dt className="inline font-medium text-gray-500">Service area: </dt>
-                <dd className="inline" data-testid="result-service-areas">
-                  {bestMatchingOffering.serviceAreas.map(formatLocation).join(" · ")}
-                </dd>
-              </div>
-            )}
-            {bestMatchingOffering.genreTags.length > 0 && (
-              <div>
-                <dt className="inline font-medium text-gray-500">Genres: </dt>
-                <dd className="inline" data-testid="result-genres">
-                  {bestMatchingOffering.genreTags.join(", ")}
-                </dd>
-              </div>
-            )}
-            <div>
-              <dt className="inline font-medium text-gray-500">Pricing: </dt>
-              <dd className="inline" data-testid="result-pricing">
-                {pricingLabel ?? "Not advertised"}
-              </dd>
-            </div>
-          </dl>
-
-          {/* Pricing is non-binding until it is incorporated into an approved
-              TermsVersion (ADR 0002, CONTEXT.md). Buyer-facing wording names
-              that approved-terms boundary rather than a weaker informal
-              milestone such as "agreed terms", which could imply an informal
-              agreement is sufficient to bind either party. The disclaimer is
-              always shown so no pricing presentation reads as a quote or
-              commitment, but its wording follows the state: disclaiming
-              "advertised pricing" on an offering that advertises none would
-              imply a price is present. */}
-          <p className="text-xs text-gray-500 mt-2 italic" data-testid="result-pricing-disclaimer">
-            {pricingLabel === null
-              ? "This seller has not advertised pricing. Any pricing discussed later is non-binding until it is incorporated into approved terms."
-              : "Advertised pricing is non-binding and not a quote. It binds no one until it is incorporated into approved terms."}
-          </p>
-
-          {bestMatchingOffering.includedServices.length > 0 && (
-            <p className="text-xs text-gray-700 mt-2" data-testid="result-included-services">
-              <span className="font-medium text-gray-500">Bundle includes: </span>
-              {bestMatchingOffering.includedServices
-                .map((included) => `${included.name} (bundle only)`)
-                .join(", ")}
+        {additionalMatchingOfferings.length > 0 && (
+          <div className="mt-3" data-testid="result-additional-offerings">
+            <p className="text-xs font-medium text-gray-500 mb-1">
+              Also available from this seller
             </p>
-          )}
-        </div>
+            <ul className="space-y-2">
+              {additionalMatchingOfferings.map((offering) => (
+                <li
+                  key={offering.offeringId}
+                  className="border-l-2 border-blue-200 pl-3"
+                  data-testid="result-additional-offering"
+                  data-offering-id={offering.offeringId}
+                >
+                  <p
+                    className="text-sm font-medium text-gray-800"
+                    data-testid="result-additional-offering-title"
+                  >
+                    {offering.title}
+                  </p>
+                  <p className="text-xs text-gray-600 mt-0.5">{offering.description}</p>
+                  <dl className="text-xs text-gray-700 mt-1 space-y-0.5">
+                    <div>
+                      <dt className="inline font-medium text-gray-500">Service category: </dt>
+                      <dd className="inline">{offering.primaryCategory.name}</dd>
+                    </div>
+                    <div>
+                      <dt className="inline font-medium text-gray-500">Service mode: </dt>
+                      <dd className="inline">{formatServiceMode(offering.serviceMode)}</dd>
+                    </div>
+                  </dl>
+                  {offering.includedServices.length > 0 && (
+                    <p className="text-xs text-gray-700 mt-1">
+                      <span className="font-medium text-gray-500">Bundle includes: </span>
+                      {offering.includedServices
+                        .map((included) => `${included.name} (bundle only)`)
+                        .join(", ")}
+                    </p>
+                  )}
+                </li>
+              ))}
+            </ul>
+          </div>
+        )}
 
-        <div className="bg-blue-50 p-3 rounded-lg" data-testid="result-match-reason">
+        <div className="bg-blue-50 p-3 rounded-lg mt-3" data-testid="result-match-reason">
           <p className="text-sm font-medium text-blue-900 mb-1">Why this matches</p>
           <p className="text-sm text-blue-800">{matchReason}</p>
+          {/* relevanceScore is a bounded strategy-specific ordering signal; it
+              is not a probability, quality rating, or confidence. The card
+              surfaces it as a qualitative fit description rather than a
+              percentage so the buyer is never led to read it as certainty. */}
+          <p
+            className="mt-2 text-xs text-blue-700"
+            data-testid="result-fit-summary"
+            data-relevance-score={result.relevanceScore}
+            data-fit-band={fitBandFor(result.relevanceScore)}
+          >
+            {describeFit(result.relevanceScore)}
+          </p>
         </div>
       </Card.Content>
     </Card>
   );
+}
+
+// BestOfferingCard: the lead offering for a result. Extracted so the
+// best/additional rendering paths share the same row markup. The
+// `testIdPrefix` lets the best card keep its `result-*` test ids and the
+// additional cards re-use stable names without collision.
+function BestOfferingCard({
+  offering,
+  testIdPrefix,
+}: {
+  readonly offering: TalentSearchResultV1["bestMatchingOffering"];
+  readonly testIdPrefix: string;
+}) {
+  const pricingLabel = formatPricing(offering.pricing);
+  return (
+    <div className="bg-gray-50 p-3 rounded-lg mb-3" data-testid={`${testIdPrefix}-card`}>
+      <p className="text-sm font-medium text-gray-900" data-testid={`${testIdPrefix}-title`}>
+        {offering.title}
+      </p>
+      <p className="text-xs text-gray-600 mt-1">{offering.description}</p>
+
+      <dl className="text-xs text-gray-700 mt-2 space-y-1">
+        <div>
+          <dt className="inline font-medium text-gray-500">Service category: </dt>
+          <dd className="inline" data-testid={`${testIdPrefix}-category`}>
+            {offering.primaryCategory.name}
+          </dd>
+        </div>
+        <div>
+          <dt className="inline font-medium text-gray-500">Service mode: </dt>
+          <dd className="inline" data-testid={`${testIdPrefix}-service-mode`}>
+            {formatServiceMode(offering.serviceMode)}
+          </dd>
+        </div>
+        {offering.serviceAreas.length > 0 && (
+          <div>
+            <dt className="inline font-medium text-gray-500">Service area: </dt>
+            <dd className="inline" data-testid={`${testIdPrefix}-service-areas`}>
+              {offering.serviceAreas.map(formatLocation).join(" · ")}
+            </dd>
+          </div>
+        )}
+        {offering.genreTags.length > 0 && (
+          <div>
+            <dt className="inline font-medium text-gray-500">Genres: </dt>
+            <dd className="inline" data-testid={`${testIdPrefix}-genres`}>
+              {offering.genreTags.join(", ")}
+            </dd>
+          </div>
+        )}
+        <div>
+          <dt className="inline font-medium text-gray-500">Pricing: </dt>
+          <dd className="inline" data-testid={`${testIdPrefix}-pricing`}>
+            {pricingLabel ?? "Not advertised"}
+          </dd>
+        </div>
+      </dl>
+
+      {/* Pricing is non-binding until it is incorporated into an approved
+          TermsVersion (ADR 0002, CONTEXT.md). Buyer-facing wording names
+          that approved-terms boundary rather than a weaker informal
+          milestone such as "agreed terms", which could imply an informal
+          agreement is sufficient to bind either party. The disclaimer is
+          always shown so no pricing presentation reads as a quote or
+          commitment, but its wording follows the state: disclaiming
+          "advertised pricing" on an offering that advertises none would
+          imply a price is present. */}
+      <p
+        className="text-xs text-gray-500 mt-2 italic"
+        data-testid={`${testIdPrefix}-pricing-disclaimer`}
+      >
+        {pricingLabel === null
+          ? "This seller has not advertised pricing. Any pricing discussed later is non-binding until it is incorporated into approved terms."
+          : "Advertised pricing is non-binding and not a quote. It binds no one until it is incorporated into approved terms."}
+      </p>
+
+      {offering.includedServices.length > 0 && (
+        <p className="text-xs text-gray-700 mt-2" data-testid={`${testIdPrefix}-included-services`}>
+          <span className="font-medium text-gray-500">Bundle includes: </span>
+          {offering.includedServices.map((included) => `${included.name} (bundle only)`).join(", ")}
+        </p>
+      )}
+    </div>
+  );
+}
+
+// Map a bounded [0, 1] strategy score to a qualitative fit phrase. The
+// raw value never reaches the page as a percentage; only the band label
+// and a one-sentence explanation do. The `data-fit-band` attribute
+// carries the band key for downstream tests so they can assert the
+// qualitative mapping without depending on threshold prose.
+function fitBandFor(score: number): "strong" | "good" | "partial" | "weak" {
+  if (score >= 0.75) return "strong";
+  if (score >= 0.5) return "good";
+  if (score >= 0.25) return "partial";
+  return "weak";
+}
+
+function describeFit(score: number): string {
+  const band = fitBandFor(score);
+  switch (band) {
+    case "strong":
+      return "Strong qualitative fit for this search.";
+    case "good":
+      return "Good qualitative fit; check details before commissioning.";
+    case "partial":
+      return "Partial qualitative fit; some preferences are unmet.";
+    case "weak":
+      return "Weak qualitative fit; consider broadening your search.";
+  }
 }
 
 // Renders "City, Region · CC" while tolerating the optional city/region fields.
