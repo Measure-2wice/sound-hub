@@ -13,9 +13,12 @@
 //    The blend preserves the M1.1 invariant that a query whose tokens all
 //    match the offering fields produces a relevanceScore of 1.0; the
 //    preference weight caps the additive lift at a fixed fraction so the
-//    score remains bounded inside [0, 1] and is finite. Stable sellerId
-//    is the final tie-breaker; stable offeringId is the per-seller tie-
-//    breaker for best/additional selection.
+//    score remains bounded inside [0, 1] and is finite. Because the
+//    blend can saturate at 1.0 under full text coverage, the seller sort
+//    uses the count of matched preference atoms as a secondary
+//    tie-breaker ahead of the stable sellerId so preference evidence
+//    stays order-significant at full coverage. Stable offeringId is the
+//    per-seller tie-breaker for best/additional selection.
 // 4. Build matchReason only from fields that actually matched, using factual
 //    wording such as `matched offering title`, `matched category`, or
 //    `preferred genre: Dancehall`. Never use qualitative labels, randomness,
@@ -39,7 +42,6 @@ import {
   type LocationFilterV1,
   type PublicOfferingSummaryV1,
   type PublicSellerSummaryV1,
-  type ServiceModeV1,
   type TalentSearchPreferredCriteriaV1,
   type TalentSearchRequestV1,
   type TalentSearchResponseV1,
@@ -109,7 +111,15 @@ export class TalentSearchService {
     }
 
     ranked.sort((a, b) => {
+      // Primary: bounded score desc. Secondary: matched preference
+      // count desc (a seller whose preferences all matched outranks a
+      // seller who matched a smaller number of preferences, even when
+      // the bounded score saturated at 1.0 under full text coverage).
+      // Tertiary: stable sellerId asc so identical evidence produces
+      // identical order. See P1-001 remediation.
       if (a.best.score !== b.best.score) return b.best.score - a.best.score;
+      if (a.best.matchedAtomCount !== b.best.matchedAtomCount)
+        return b.best.matchedAtomCount - a.best.matchedAtomCount;
       return a.seller.sellerId.localeCompare(b.seller.sellerId);
     });
 
@@ -240,29 +250,121 @@ function toRepositoryLocation(
 // (kind, value) pair is treated as a single "atom": it is collected once
 // when assembling the buyer's preference list and is matched once per
 // (seller, offering) candidate. The set of atoms is what preferenceScore
-// divides by. Adding a new preference axis means adding a new kind so the
-// matching rules stay exhaustive.
-type PreferenceAtom =
-  | { readonly kind: "category"; readonly value: string }
-  | { readonly kind: "includedService"; readonly value: string }
-  | { readonly kind: "specialty"; readonly value: string }
-  | { readonly kind: "genre"; readonly value: string }
-  | { readonly kind: "affiliation"; readonly value: string }
-  | { readonly kind: "basedInCity"; readonly value: string }
-  | { readonly kind: "basedInRegion"; readonly value: string }
-  | { readonly kind: "basedInCountryCode"; readonly value: string }
-  | { readonly kind: "serviceMode"; readonly value: ServiceModeV1 };
+// divides by. Adding a new preference axis means adding a new descriptor
+// entry in PREFERENCE_ATOM_DESCRIPTORS so the collection, matching, and
+// labeling rules stay co-located and exhaustive.
+type PreferenceKind =
+  | "category"
+  | "includedService"
+  | "specialty"
+  | "genre"
+  | "affiliation"
+  | "basedInCountryCode"
+  | "basedInRegion"
+  | "basedInCity"
+  | "serviceMode";
 
-const PREFERENCE_ATOM_ORDER: readonly PreferenceAtom["kind"][] = [
-  "category",
-  "includedService",
-  "specialty",
-  "genre",
-  "affiliation",
-  "basedInCountryCode",
-  "basedInRegion",
-  "basedInCity",
-  "serviceMode",
+interface PreferenceAtom {
+  readonly kind: PreferenceKind;
+  readonly value: string;
+}
+
+interface PreferenceAtomDescriptor {
+  readonly kind: PreferenceKind;
+  // Canonicalize a raw preference value into the form the matching
+  // predicate compares against. Genre tags, locality, and ISO codes
+  // have per-axis case conventions; stable controlled keys
+  // (category / includedService / specialty / serviceMode) are
+  // returned unchanged so the schema's strict keys stay verbatim.
+  readonly normalize: (raw: string) => string;
+  // Extract the raw values supplied by the buyer for this axis.
+  readonly rawValues: (preferred: TalentSearchPreferredCriteriaV1) => readonly string[];
+  // Test whether this axis matches a (seller, offering) candidate
+  // given the canonical value.
+  readonly matches: (
+    seller: RepositoryCandidateSeller,
+    offering: RepositoryCandidateOffering,
+    canonicalValue: string,
+  ) => boolean;
+  // Buyer-facing factual label for the canonical value.
+  readonly label: (canonicalValue: string) => string;
+}
+
+const trimAndNormalizeLower = (raw: string): string => raw.trim().toLowerCase();
+const trimAndNormalizeUpper = (raw: string): string => raw.trim().toUpperCase();
+const identityNormalize = (raw: string): string => raw.trim();
+
+// One typed descriptor per axis owns collection, matching, and labeling.
+// Adding a new axis only requires a new entry here; the iteration order
+// in collectPreferenceAtoms and the matchReason emission in
+// describePreferenceMatches both walk the descriptor entries so the
+// axis order is defined in exactly one place. See P2-001 remediation.
+const PREFERENCE_ATOM_DESCRIPTORS: readonly PreferenceAtomDescriptor[] = [
+  {
+    kind: "category",
+    normalize: identityNormalize,
+    rawValues: (p) => p.categoryKeys ?? [],
+    matches: (_seller, offering, value) => offering.primaryCategory.key === value,
+    label: (value) => `preferred category: ${value}`,
+  },
+  {
+    kind: "includedService",
+    normalize: identityNormalize,
+    rawValues: (p) => p.includedServiceKeys ?? [],
+    matches: (_seller, offering, value) =>
+      offering.includedServices.some((included) => included.key === value),
+    label: (value) => `preferred bundle component: ${value}`,
+  },
+  {
+    kind: "specialty",
+    normalize: identityNormalize,
+    rawValues: (p) => p.specialties ?? [],
+    matches: (seller, _offering, value) => seller.specialtyKeys.includes(value),
+    label: (value) => `preferred specialty: ${value}`,
+  },
+  {
+    kind: "genre",
+    normalize: trimAndNormalizeLower,
+    rawValues: (p) => p.genreTags ?? [],
+    matches: (_seller, offering, value) =>
+      offering.genreTags.some((tag) => tag.toLowerCase() === value),
+    label: (value) => `preferred genre: ${value}`,
+  },
+  {
+    kind: "affiliation",
+    normalize: trimAndNormalizeUpper,
+    rawValues: (p) => p.caribbeanAffiliationCodes ?? [],
+    matches: (seller, _offering, value) => seller.caribbeanAffiliationCodes.includes(value),
+    label: (value) => `preferred Caribbean affiliation: ${value}`,
+  },
+  {
+    kind: "basedInCountryCode",
+    normalize: trimAndNormalizeUpper,
+    rawValues: (p) => (p.basedIn?.countryCode ? [p.basedIn.countryCode] : []),
+    matches: (seller, _offering, value) => seller.basedInCountryCode === value,
+    label: (value) => `preferred based-in country: ${value}`,
+  },
+  {
+    kind: "basedInRegion",
+    normalize: trimAndNormalizeLower,
+    rawValues: (p) => (p.basedIn?.region ? [p.basedIn.region] : []),
+    matches: (seller, _offering, value) => seller.basedInRegion?.toLowerCase() === value,
+    label: (value) => `preferred based-in region: ${value}`,
+  },
+  {
+    kind: "basedInCity",
+    normalize: trimAndNormalizeLower,
+    rawValues: (p) => (p.basedIn?.city ? [p.basedIn.city] : []),
+    matches: (seller, _offering, value) => seller.basedInCity?.toLowerCase() === value,
+    label: (value) => `preferred based-in city: ${value}`,
+  },
+  {
+    kind: "serviceMode",
+    normalize: identityNormalize,
+    rawValues: (p) => p.serviceModes ?? [],
+    matches: (_seller, offering, value) => offering.serviceMode === value,
+    label: (value) => `preferred service mode: ${value}`,
+  },
 ];
 
 function atomKey(atom: PreferenceAtom): string {
@@ -270,26 +372,30 @@ function atomKey(atom: PreferenceAtom): string {
 }
 
 function atomLabel(atom: PreferenceAtom): string {
-  switch (atom.kind) {
-    case "category":
-      return `preferred category: ${atom.value}`;
-    case "includedService":
-      return `preferred bundle component: ${atom.value}`;
-    case "specialty":
-      return `preferred specialty: ${atom.value}`;
-    case "genre":
-      return `preferred genre: ${atom.value}`;
-    case "affiliation":
-      return `preferred Caribbean affiliation: ${atom.value}`;
-    case "basedInCity":
-      return `preferred based-in city: ${atom.value}`;
-    case "basedInRegion":
-      return `preferred based-in region: ${atom.value}`;
-    case "basedInCountryCode":
-      return `preferred based-in country: ${atom.value}`;
-    case "serviceMode":
-      return `preferred service mode: ${atom.value}`;
+  const descriptor = PREFERENCE_ATOM_DESCRIPTORS.find((d) => d.kind === atom.kind);
+  if (!descriptor) return atom.value;
+  return descriptor.label(atom.value);
+}
+
+// Canonicalize one preference axis: trim, apply the axis-specific case
+// normalization, drop empties, dedupe, and stably sort so that the
+// denominator of preferenceScore and the order of labels in matchReason
+// are deterministic regardless of how the buyer supplied the values.
+// See P1-002 remediation.
+function canonicalizeAxis(
+  rawValues: readonly string[],
+  normalize: (raw: string) => string,
+): readonly string[] {
+  const seen = new Set<string>();
+  const out: string[] = [];
+  for (const raw of rawValues) {
+    const canonical = normalize(raw);
+    if (canonical.length === 0) continue;
+    if (seen.has(canonical)) continue;
+    seen.add(canonical);
+    out.push(canonical);
   }
+  return out.sort();
 }
 
 function collectPreferenceAtoms(
@@ -297,39 +403,14 @@ function collectPreferenceAtoms(
 ): readonly PreferenceAtom[] {
   if (!preferred) return [];
   const atoms: PreferenceAtom[] = [];
-  // Push atoms in the canonical kind order so the resulting labels are
-  // deterministic across identical requests regardless of the order the
-  // buyer supplied fields.
-  for (const kind of PREFERENCE_ATOM_ORDER) {
-    switch (kind) {
-      case "category":
-        for (const value of preferred.categoryKeys ?? []) atoms.push({ kind, value });
-        break;
-      case "includedService":
-        for (const value of preferred.includedServiceKeys ?? []) atoms.push({ kind, value });
-        break;
-      case "specialty":
-        for (const value of preferred.specialties ?? []) atoms.push({ kind, value });
-        break;
-      case "genre":
-        for (const value of preferred.genreTags ?? []) atoms.push({ kind, value });
-        break;
-      case "affiliation":
-        for (const value of preferred.caribbeanAffiliationCodes ?? []) atoms.push({ kind, value });
-        break;
-      case "basedInCity":
-        if (preferred.basedIn?.city) atoms.push({ kind, value: preferred.basedIn.city });
-        break;
-      case "basedInRegion":
-        if (preferred.basedIn?.region) atoms.push({ kind, value: preferred.basedIn.region });
-        break;
-      case "basedInCountryCode":
-        if (preferred.basedIn?.countryCode)
-          atoms.push({ kind, value: preferred.basedIn.countryCode });
-        break;
-      case "serviceMode":
-        for (const value of preferred.serviceModes ?? []) atoms.push({ kind, value });
-        break;
+  // Iterate the descriptor table in canonical order so the resulting
+  // atoms and labels are deterministic across identical requests
+  // regardless of the order the buyer supplied fields. The descriptor
+  // table owns the order; there is no parallel kind-order array.
+  for (const descriptor of PREFERENCE_ATOM_DESCRIPTORS) {
+    const canonical = canonicalizeAxis(descriptor.rawValues(preferred), descriptor.normalize);
+    for (const value of canonical) {
+      atoms.push({ kind: descriptor.kind, value });
     }
   }
   return atoms;
@@ -344,39 +425,14 @@ function matchPreferenceAtoms(
   const seen = new Set<string>();
   for (const atom of atoms) {
     if (seen.has(atomKey(atom))) continue;
-    if (matchesAtom(seller, offering, atom)) {
+    const descriptor = PREFERENCE_ATOM_DESCRIPTORS.find((d) => d.kind === atom.kind);
+    if (!descriptor) continue;
+    if (descriptor.matches(seller, offering, atom.value)) {
       matched.push(atom);
       seen.add(atomKey(atom));
     }
   }
   return matched;
-}
-
-function matchesAtom(
-  seller: RepositoryCandidateSeller,
-  offering: RepositoryCandidateOffering,
-  atom: PreferenceAtom,
-): boolean {
-  switch (atom.kind) {
-    case "category":
-      return offering.primaryCategory.key === atom.value;
-    case "includedService":
-      return offering.includedServices.some((included) => included.key === atom.value);
-    case "specialty":
-      return seller.specialtyKeys.includes(atom.value);
-    case "genre":
-      return offering.genreTags.some((tag) => tag.toLowerCase() === atom.value.toLowerCase());
-    case "affiliation":
-      return seller.caribbeanAffiliationCodes.includes(atom.value);
-    case "basedInCity":
-      return seller.basedInCity?.toLowerCase() === atom.value.toLowerCase();
-    case "basedInRegion":
-      return seller.basedInRegion?.toLowerCase() === atom.value.toLowerCase();
-    case "basedInCountryCode":
-      return seller.basedInCountryCode === atom.value;
-    case "serviceMode":
-      return offering.serviceMode === atom.value;
-  }
 }
 
 // ---------- Standalone filter ----------
@@ -451,15 +507,17 @@ function describePreferenceMatches(matches: readonly PreferenceAtom[]): string {
   // Emit labels in canonical preference-atom order so the same canonical
   // match set produces an identical matchReason regardless of the order the
   // buyer supplied atoms in. This keeps the M1.5 determinism contract.
-  const byKind = new Map<PreferenceAtom["kind"], PreferenceAtom[]>();
+  // The order is defined by PREFERENCE_ATOM_DESCRIPTORS so there is no
+  // parallel kind-order list to drift out of sync.
+  const byKind = new Map<PreferenceKind, PreferenceAtom[]>();
   for (const atom of matches) {
     const bucket = byKind.get(atom.kind);
     if (bucket) bucket.push(atom);
     else byKind.set(atom.kind, [atom]);
   }
   const labels: string[] = [];
-  for (const kind of PREFERENCE_ATOM_ORDER) {
-    const bucket = byKind.get(kind);
+  for (const descriptor of PREFERENCE_ATOM_DESCRIPTORS) {
+    const bucket = byKind.get(descriptor.kind);
     if (!bucket) continue;
     for (const atom of bucket) labels.push(atomLabel(atom));
   }
@@ -476,6 +534,11 @@ function clamp01(value: number): number {
 interface RankedOffering {
   readonly offering: RepositoryCandidateOffering;
   readonly score: number;
+  // Number of canonical preference atoms that matched for this offering.
+  // Carried through to the seller-level sort as a secondary tie-breaker
+  // so the bounded score saturating at 1.0 under full text coverage does
+  // not collapse the order onto sellerId alone. See P1-001 remediation.
+  readonly matchedAtomCount: number;
   readonly reason: string;
 }
 
@@ -533,11 +596,20 @@ function rankOfferingsForSeller(
     }
     const reason = reasonParts.length > 0 ? reasonParts.join("; ") : "eligible standalone offering";
 
-    scored.push({ offering, score: clamp01(combinedScore), reason });
+    scored.push({
+      offering,
+      score: clamp01(combinedScore),
+      matchedAtomCount: matchedAtoms.length,
+      reason,
+    });
   }
-  // Stable two-key sort: score descending, offeringId ascending.
+  // Stable three-key sort: score desc, matched-preference-atom count
+  // desc, then offeringId asc. The matchedAtomCount tie-breaker keeps
+  // preferences order-significant at full text coverage where the
+  // bounded score saturates at 1.0; see P1-001 remediation.
   scored.sort((a, b) => {
     if (a.score !== b.score) return b.score - a.score;
+    if (a.matchedAtomCount !== b.matchedAtomCount) return b.matchedAtomCount - a.matchedAtomCount;
     return a.offering.offeringId.localeCompare(b.offering.offeringId);
   });
   return scored;

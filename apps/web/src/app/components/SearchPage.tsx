@@ -312,78 +312,67 @@ function ResultCard({ result }: { result: TalentSearchResultV1 }) {
                   data-testid="result-additional-offering"
                   data-offering-id={offering.offeringId}
                 >
-                  <p
-                    className="text-sm font-medium text-gray-800"
-                    data-testid="result-additional-offering-title"
-                  >
-                    {offering.title}
-                  </p>
-                  <p className="text-xs text-gray-600 mt-0.5">{offering.description}</p>
-                  <dl className="text-xs text-gray-700 mt-1 space-y-0.5">
-                    <div>
-                      <dt className="inline font-medium text-gray-500">Service category: </dt>
-                      <dd className="inline">{offering.primaryCategory.name}</dd>
-                    </div>
-                    <div>
-                      <dt className="inline font-medium text-gray-500">Service mode: </dt>
-                      <dd className="inline">{formatServiceMode(offering.serviceMode)}</dd>
-                    </div>
-                  </dl>
-                  {offering.includedServices.length > 0 && (
-                    <p className="text-xs text-gray-700 mt-1">
-                      <span className="font-medium text-gray-500">Bundle includes: </span>
-                      {offering.includedServices
-                        .map((included) => `${included.name} (bundle only)`)
-                        .join(", ")}
-                    </p>
-                  )}
+                  <OfferingDetail
+                    offering={offering}
+                    testIdPrefix="result-additional-offering"
+                    titleClassName="text-sm font-medium text-gray-800"
+                    descriptionClassName="text-xs text-gray-600 mt-0.5"
+                    dlClassName="text-xs text-gray-700 mt-1 space-y-0.5"
+                    bundleClassName="text-xs text-gray-700 mt-1"
+                  />
                 </li>
               ))}
             </ul>
           </div>
         )}
 
+        {/* Buyer-facing match evidence. The matchReason is the
+            deterministic factual reason produced by the search service;
+            it names only the fields that actually matched (offering
+            title, category, preferred genre, etc.). relevanceScore is a
+            bounded strategy-specific ordering signal and is not
+            surfaced to the buyer — the contract prohibits rendering it
+            as a percentage, and P1-003 prohibits deriving any
+            qualitative strength or confidence band from it. */}
         <div className="bg-blue-50 p-3 rounded-lg mt-3" data-testid="result-match-reason">
           <p className="text-sm font-medium text-blue-900 mb-1">Why this matches</p>
           <p className="text-sm text-blue-800">{matchReason}</p>
-          {/* relevanceScore is a bounded strategy-specific ordering signal; it
-              is not a probability, quality rating, or confidence. The card
-              surfaces it as a qualitative fit description rather than a
-              percentage so the buyer is never led to read it as certainty. */}
-          <p
-            className="mt-2 text-xs text-blue-700"
-            data-testid="result-fit-summary"
-            data-relevance-score={result.relevanceScore}
-            data-fit-band={fitBandFor(result.relevanceScore)}
-          >
-            {describeFit(result.relevanceScore)}
-          </p>
         </div>
       </Card.Content>
     </Card>
   );
 }
 
-// BestOfferingCard: the lead offering for a result. Extracted so the
-// best/additional rendering paths share the same row markup. The
-// `testIdPrefix` lets the best card keep its `result-*` test ids and the
-// additional cards re-use stable names without collision.
-function BestOfferingCard({
+// OfferingDetail: the shared markup that the best and additional
+// offering paths both render — title, description, service category,
+// service mode, and bundle-includes (when present). Extracted so the
+// two paths render the same row markup with the same data-testid
+// conventions instead of duplicating five lines of JSX (P2-002
+// remediation). Lead-only content (service areas, genres, pricing, and
+// the pricing disclaimer) stays on BestOfferingCard because additional
+// offerings are intentionally compact.
+function OfferingDetail({
   offering,
   testIdPrefix,
+  titleClassName,
+  descriptionClassName,
+  dlClassName,
+  bundleClassName,
 }: {
   readonly offering: TalentSearchResultV1["bestMatchingOffering"];
   readonly testIdPrefix: string;
+  readonly titleClassName: string;
+  readonly descriptionClassName: string;
+  readonly dlClassName: string;
+  readonly bundleClassName: string;
 }) {
-  const pricingLabel = formatPricing(offering.pricing);
   return (
-    <div className="bg-gray-50 p-3 rounded-lg mb-3" data-testid={`${testIdPrefix}-card`}>
-      <p className="text-sm font-medium text-gray-900" data-testid={`${testIdPrefix}-title`}>
+    <>
+      <p className={titleClassName} data-testid={`${testIdPrefix}-title`}>
         {offering.title}
       </p>
-      <p className="text-xs text-gray-600 mt-1">{offering.description}</p>
-
-      <dl className="text-xs text-gray-700 mt-2 space-y-1">
+      <p className={descriptionClassName}>{offering.description}</p>
+      <dl className={dlClassName}>
         <div>
           <dt className="inline font-medium text-gray-500">Service category: </dt>
           <dd className="inline" data-testid={`${testIdPrefix}-category`}>
@@ -396,6 +385,41 @@ function BestOfferingCard({
             {formatServiceMode(offering.serviceMode)}
           </dd>
         </div>
+      </dl>
+      {offering.includedServices.length > 0 && (
+        <p className={bundleClassName} data-testid={`${testIdPrefix}-included-services`}>
+          <span className="font-medium text-gray-500">Bundle includes: </span>
+          {offering.includedServices.map((included) => `${included.name} (bundle only)`).join(", ")}
+        </p>
+      )}
+    </>
+  );
+}
+
+// BestOfferingCard: the lead offering for a result. Uses OfferingDetail
+// for the row markup shared with additional offerings and adds the
+// lead-only service areas, genres, pricing, and pricing disclaimer
+// below it.
+function BestOfferingCard({
+  offering,
+  testIdPrefix,
+}: {
+  readonly offering: TalentSearchResultV1["bestMatchingOffering"];
+  readonly testIdPrefix: string;
+}) {
+  const pricingLabel = formatPricing(offering.pricing);
+  return (
+    <div className="bg-gray-50 p-3 rounded-lg mb-3" data-testid={`${testIdPrefix}-card`}>
+      <OfferingDetail
+        offering={offering}
+        testIdPrefix={testIdPrefix}
+        titleClassName="text-sm font-medium text-gray-900"
+        descriptionClassName="text-xs text-gray-600 mt-1"
+        dlClassName="text-xs text-gray-700 mt-2 space-y-1"
+        bundleClassName="text-xs text-gray-700 mt-2"
+      />
+
+      <dl className="text-xs text-gray-700 mt-2 space-y-1">
         {offering.serviceAreas.length > 0 && (
           <div>
             <dt className="inline font-medium text-gray-500">Service area: </dt>
@@ -437,41 +461,8 @@ function BestOfferingCard({
           ? "This seller has not advertised pricing. Any pricing discussed later is non-binding until it is incorporated into approved terms."
           : "Advertised pricing is non-binding and not a quote. It binds no one until it is incorporated into approved terms."}
       </p>
-
-      {offering.includedServices.length > 0 && (
-        <p className="text-xs text-gray-700 mt-2" data-testid={`${testIdPrefix}-included-services`}>
-          <span className="font-medium text-gray-500">Bundle includes: </span>
-          {offering.includedServices.map((included) => `${included.name} (bundle only)`).join(", ")}
-        </p>
-      )}
     </div>
   );
-}
-
-// Map a bounded [0, 1] strategy score to a qualitative fit phrase. The
-// raw value never reaches the page as a percentage; only the band label
-// and a one-sentence explanation do. The `data-fit-band` attribute
-// carries the band key for downstream tests so they can assert the
-// qualitative mapping without depending on threshold prose.
-function fitBandFor(score: number): "strong" | "good" | "partial" | "weak" {
-  if (score >= 0.75) return "strong";
-  if (score >= 0.5) return "good";
-  if (score >= 0.25) return "partial";
-  return "weak";
-}
-
-function describeFit(score: number): string {
-  const band = fitBandFor(score);
-  switch (band) {
-    case "strong":
-      return "Strong qualitative fit for this search.";
-    case "good":
-      return "Good qualitative fit; check details before commissioning.";
-    case "partial":
-      return "Partial qualitative fit; some preferences are unmet.";
-    case "weak":
-      return "Weak qualitative fit; consider broadening your search.";
-  }
 }
 
 // Renders "City, Region · CC" while tolerating the optional city/region fields.

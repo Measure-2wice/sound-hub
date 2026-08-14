@@ -1971,6 +1971,211 @@ describe("TalentSearchService M1.5 preference ranking and grouping", () => {
     }
   });
 
+  // P1-001 regression: the bounded score saturates at 1.0 under full text
+  // coverage. Without a secondary tie-breaker the only thing left to
+  // decide ordering is sellerId, so a lexically later seller whose
+  // preferences matched would never outrank a lexically earlier seller
+  // that did not match them. The fix adds the matched-preference-atom
+  // count as a secondary sort key ahead of sellerId; this test pins
+  // that behavior so a regression collapses the order back onto
+  // sellerId alone.
+  test("preference ordering is preserved at full text coverage when only the lexically later seller matches", async () => {
+    const sellers: InMemorySeller[] = [
+      {
+        // Lexically earlier; does NOT match the JM preference.
+        sellerId: "p1-001-seller-a",
+        workspaceId: "ws-p1-001-a",
+        professionalName: "A non-JM seller",
+        bio: "",
+        status: "Published",
+        basedInCity: "Brooklyn",
+        basedInRegion: "NY",
+        basedInCountryCode: "US",
+        avatarUrl: null,
+        specialtyKeys: ["Producer"],
+        caribbeanAffiliationCodes: ["HT"],
+        workspaceStatus: "Active",
+        workspaceHasSellerCapability: true,
+        offerings: [
+          {
+            ...PRODUCTION_OFFERING_A,
+            offeringId: "p1-001-offering-a",
+            title: "Dancehall single production",
+          },
+        ],
+      },
+      {
+        // Lexically later; DOES match the JM preference.
+        sellerId: "p1-001-seller-z",
+        workspaceId: "ws-p1-001-z",
+        professionalName: "Z JM seller",
+        bio: "",
+        status: "Published",
+        basedInCity: "Brooklyn",
+        basedInRegion: "NY",
+        basedInCountryCode: "US",
+        avatarUrl: null,
+        specialtyKeys: ["Producer"],
+        caribbeanAffiliationCodes: ["JM"],
+        workspaceStatus: "Active",
+        workspaceHasSellerCapability: true,
+        offerings: [
+          {
+            ...PRODUCTION_OFFERING_A,
+            offeringId: "p1-001-offering-z",
+            title: "Dancehall single production",
+          },
+        ],
+      },
+    ];
+    const service = new TalentSearchService(
+      new InMemoryTalentSearchRepository({
+        sellers,
+        controlledKeys: M15_CONTROLLED_KEYS,
+      }),
+    );
+    // Single-token query that fully matches the offering title; both
+    // sellers' relevanceScore saturates at 1.0 under the bounded blend.
+    const response = await service.search({
+      query: "dancehall",
+      preferred: { caribbeanAffiliationCodes: ["JM"] },
+    });
+    assert.equal(response.results.length, 2);
+    // The JM seller must outrank the HT seller; the only differentiator
+    // under saturated scores is the matched preference count.
+    assert.equal(response.results[0]?.seller.sellerId, "p1-001-seller-z");
+    assert.equal(response.results[1]?.seller.sellerId, "p1-001-seller-a");
+    // Both relevanceScore values are bounded and finite; the saturation
+    // at 1.0 is the very property that motivated the new tie-breaker.
+    for (const result of response.results) {
+      assert.ok(
+        Number.isFinite(result.relevanceScore) &&
+          result.relevanceScore >= 0 &&
+          result.relevanceScore <= 1,
+      );
+    }
+    // The JM seller's matchReason must include the factual preference
+    // label so the order change is observable, not just a hidden score.
+    const jmMatchReason = response.results[0].matchReason;
+    assert.ok(
+      jmMatchReason.includes("preferred Caribbean affiliation: JM"),
+      `JM-preferred seller must carry the factual preference label, got: ${jmMatchReason}`,
+    );
+  });
+
+  // P1-002 regression: every preference axis is canonicalized (trim,
+  // case-normalize, dedupe, stable sort) before scoring and reason
+  // generation. This test pins the determinism guarantee by feeding
+  // the buyer-supplied request in two orderings and asserting that
+  // the resulting seller order, scores, and reasons are identical.
+  test("reordered preference axes produce identical ordering, score, and matchReason", async () => {
+    const service = new TalentSearchService(new InMemoryTalentSearchRepository(buildM15Fixture()));
+    const reorderedA = await service.search({
+      query: "dancehall",
+      preferred: {
+        categoryKeys: ["music-production"],
+        genreTags: ["Dancehall"],
+        basedIn: { city: "Brooklyn" },
+      },
+    });
+    const reorderedB = await service.search({
+      query: "dancehall",
+      preferred: {
+        // Different field order, different value order within fields.
+        basedIn: { city: "Brooklyn" },
+        genreTags: ["Dancehall"],
+        categoryKeys: ["music-production"],
+      },
+    });
+    assert.equal(reorderedA.results.length, reorderedB.results.length);
+    for (let i = 0; i < reorderedA.results.length; i += 1) {
+      assert.equal(reorderedA.results[i]!.seller.sellerId, reorderedB.results[i]!.seller.sellerId);
+      assert.equal(reorderedA.results[i]!.relevanceScore, reorderedB.results[i]!.relevanceScore);
+      assert.equal(reorderedA.results[i]!.matchReason, reorderedB.results[i]!.matchReason);
+    }
+  });
+
+  // P1-002 regression: duplicate values inside a preference axis must
+  // not inflate the denominator of preferenceScore. Before the fix, a
+  // buyer who listed the same genre twice would have their score
+  // deflated even when the offering matched both copies; the duplicate
+  // would also emit two identical reason labels. The canonicalization
+  // step collapses the duplicates into a single atom so both the score
+  // and the reason stay deterministic.
+  test("duplicate values inside a preference axis are collapsed before scoring and labeling", async () => {
+    const service = new TalentSearchService(new InMemoryTalentSearchRepository(buildM15Fixture()));
+    const withDuplicates = await service.search({
+      query: "dancehall",
+      preferred: {
+        genreTags: ["Dancehall", "Dancehall", "dancehall"],
+      },
+    });
+    const withoutDuplicates = await service.search({
+      query: "dancehall",
+      preferred: { genreTags: ["Dancehall"] },
+    });
+    assert.equal(withDuplicates.results.length, withoutDuplicates.results.length);
+    for (let i = 0; i < withDuplicates.results.length; i += 1) {
+      // For every result whose reason actually names the matched genre,
+      // the duplicate-suppressed label must appear exactly once. Genre
+      // atoms are canonicalized to lowercase so the deterministic label
+      // reads "preferred genre: dancehall" regardless of buyer casing.
+      const occurrences =
+        withDuplicates.results[i]!.matchReason.split("preferred genre: dancehall").length - 1;
+      assert.ok(
+        occurrences <= 1,
+        `expected at most one genre label occurrence per matched offering, got ${occurrences} in "${withDuplicates.results[i]!.matchReason}"`,
+      );
+      // The two requests must be observationally identical: identical
+      // seller order, score, and reason for every result, including
+      // the ones whose best offering did not match the genre.
+      assert.equal(
+        withDuplicates.results[i]!.relevanceScore,
+        withoutDuplicates.results[i]!.relevanceScore,
+      );
+      assert.equal(
+        withDuplicates.results[i]!.matchReason,
+        withoutDuplicates.results[i]!.matchReason,
+      );
+    }
+  });
+
+  // P1-002 regression: case variants inside a preference axis (genre
+  // tags, locality, ISO codes) must canonicalize to a single atom.
+  // Without canonicalization a buyer typing ["Dancehall", "dancehall"]
+  // would emit a reason with two labels and would split the
+  // preferenceScore denominator in two.
+  test("case variants inside a preference axis canonicalize to a single atom", async () => {
+    const service = new TalentSearchService(new InMemoryTalentSearchRepository(buildM15Fixture()));
+    const mixedCase = await service.search({
+      query: "dancehall",
+      preferred: {
+        genreTags: ["Dancehall", "dancehall", "DANCEHALL"],
+        basedIn: { city: "brooklyn", region: "ny", countryCode: "us" },
+      },
+    });
+    const canonical = await service.search({
+      query: "dancehall",
+      preferred: {
+        genreTags: ["Dancehall"],
+        basedIn: { city: "Brooklyn", region: "NY", countryCode: "US" },
+      },
+    });
+    assert.equal(mixedCase.results.length, canonical.results.length);
+    for (let i = 0; i < mixedCase.results.length; i += 1) {
+      assert.equal(mixedCase.results[i]!.relevanceScore, canonical.results[i]!.relevanceScore);
+      assert.equal(mixedCase.results[i]!.matchReason, canonical.results[i]!.matchReason);
+      // The canonical reason must use the upper-case ISO country code
+      // and lower-case locality. Without canonicalization the reason
+      // would carry the raw buyercasing ("us", "brooklyn"), making
+      // the label nondeterministic across reorders.
+      assert.ok(
+        canonical.results[i]!.matchReason.includes("preferred based-in country: US"),
+        `expected canonical country label, got: ${canonical.results[i]!.matchReason}`,
+      );
+    }
+  });
+
   test("includedServices always carry purchaseMode BundleOnly on the public DTO (mapping boundary locked)", async () => {
     const service = new TalentSearchService(new InMemoryTalentSearchRepository(buildM15Fixture()));
     const response = await service.search({ query: "dancehall" });
