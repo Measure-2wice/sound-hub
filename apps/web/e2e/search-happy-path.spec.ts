@@ -20,6 +20,11 @@ const KEISHA_AVATAR_URL = `${FIXTURE_ORIGIN}/fixtures/sellers/keisha-williams/av
 //   - The match reason is factual and excludes any AI claim.
 //   - The relevanceScore is not rendered as a buyer-facing percentage.
 //   - Additional Caribbean affiliations render on the seller card.
+//   - Query-only results surface a qualitative-fit block (P1-001 Codex
+//     remediation) via `textCoverage` so the buyer receives both the
+//     deterministic `matchReason` evidence and a distinct
+//     non-percentage qualitative-fit presentation, exactly as Issue #6
+//     requires for the public acceptance criterion.
 //
 // Broader browser-state, retry, unavailable-path, and concurrency coverage
 // belongs to issues #7 and #8.
@@ -48,6 +53,23 @@ test("renders real sellers and Active offerings for the M1.1 happy path", async 
   const reason = await top.getByTestId("result-match-reason").textContent();
   expect(reason ?? "").not.toMatch(/ai|artificial|intelligence|confidence|guarantee|quality/i);
   expect(reason ?? "").toMatch(/matched/);
+
+  // Qualitative fit: a factual non-percentage coverage statement derived
+  // from the deterministic matched/total counts the search service
+  // produces. The happy path issues a query-only request, so the service
+  // emits `textCoverage` (the brief-coverage line) and the
+  // `result-qualitative-fit` block must be present with the matched-vs-
+  // total token fact. Neither percentage nor score-derived confidence
+  // band ever surfaces (P1-001 Codex remediation).
+  const qualitativeFit = top.getByTestId("result-qualitative-fit-text");
+  await expect(qualitativeFit.first()).toBeVisible();
+  const qualitativeText = (await qualitativeFit.first().textContent()) ?? "";
+  expect(qualitativeText).not.toMatch(/relevanceScore/i);
+  expect(qualitativeText).not.toMatch(/\b\d{1,3}%\s*(match|confidence|fit)/i);
+  // The matched/total brief-coverage wording is the buyer-facing fact.
+  expect(qualitativeText).toMatch(
+    /matches \d+ of \d+ words? from your brief|matches all \d+ words? of your brief/i,
+  );
 
   // The relevanceScore must not be displayed as a buyer-facing percentage.
   const bodyText = (await page.textContent("body")) ?? "";

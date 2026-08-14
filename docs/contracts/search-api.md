@@ -154,6 +154,14 @@ interface TalentSearchResultV1 {
   readonly additionalMatchingOfferings: readonly PublicOfferingSummaryV1[];
   readonly relevanceScore: number;
   readonly matchReason: string;
+  readonly preferenceCoverage?: {
+    readonly matched: number;
+    readonly total: number;
+  };
+  readonly textCoverage?: {
+    readonly matched: number;
+    readonly total: number;
+  };
 }
 
 interface TalentSearchResponseV1 {
@@ -186,6 +194,37 @@ interface TalentSearchResponseV1 {
 - relevanceScore is not a probability, confidence estimate, quality rating, or guarantee. The buyer
   UI must not render it as a percentage.
 - matchReason names deterministic evidence and never claims AI participation.
+- `preferenceCoverage.matched` is the count of canonical preference atoms that matched the best matching
+  offering; `preferenceCoverage.total` is the count of canonical preference atoms the buyer supplied.
+  Both are derived from the deterministic preference matcher, never from `relevanceScore`. The buyer
+  UI may surface this coverage as a factual qualitative-fit description but must not render it as a
+  percentage and must not derive a confidence or quality band from it.
+- `preferenceCoverage` is optional in the public DTO. When the service omits the field, the buyer UI
+  falls back to `textCoverage` (if the buyer supplied a query) and otherwise surfaces the
+  deterministic factual evidence in `matchReason` alone. The field is omitted only when the buyer
+  supplied no usable preferences (in which case `preferenceCoverage.total` would be `0` and the
+  resulting "0 of 0" statement is not factual evidence); clients that do not render the field at
+  all therefore receive the same buyer-facing behavior as a client that renders "no preferences
+  were requested" for that case. The field is always present when the buyer supplied at least one
+  canonical preference atom so the coverage line is never absent on a meaningful preference-bearing
+  result.
+- `textCoverage.matched` is the count of distinct canonical query tokens that matched the best
+  matching offering's `title`, primary-category `key`, or primary-category `name` fields;
+  `textCoverage.total` is the count of distinct canonical query tokens the buyer supplied. Both are
+  derived from the deterministic text matcher, never from `relevanceScore`. The buyer UI may surface
+  this coverage as a factual qualitative-fit description but must not render it as a percentage and
+  must not derive a confidence or quality band from it.
+- `textCoverage` is optional in the public DTO. When the service omits the field, the buyer UI
+  falls back to `preferenceCoverage` (if the buyer supplied preferences) and otherwise surfaces the
+  deterministic factual evidence in `matchReason` alone. The field is omitted only when the buyer
+  supplied no usable query (in which case `textCoverage.total` would be `0` and the resulting "0 of
+  0" statement is not factual evidence); clients that do not render the field at all therefore
+  receive the same buyer-facing behavior as a client that renders "no query was provided" for that
+  case. The field is always present when the buyer supplied at least one canonical query token so
+  the qualitative-fit line is never absent on a meaningful query-bearing result, including the
+  query-only case.
+- A request that supplies both a query and preferences carries both factual-evidence lines; a
+  request that supplies neither omits both coverage fields and relies on `matchReason` alone.
 - Empty results return `200` with `results: []`; constraints are not relaxed automatically.
 
 ### Incremental M1.1 semantics
@@ -298,3 +337,38 @@ and must preserve Express success/error status, response body, and request ID.
 8. Verify private fields never serialize.
 9. Verify database failure maps to the safe `503` envelope.
 10. Verify the Next.js proxy preserves both success and error contracts.
+
+## Contract revisions
+
+The shared runtime contract is the executable source of truth. The conceptual interface, the
+semantics, and the runtime schema are reviewed together so that the browser, the API, and the
+contract document cannot drift.
+
+- **v1 (current) — `preferenceCoverage` and `textCoverage` added as optional response fields.** Issue
+  #6 (M1.5) extends the M1.1 result with two independent factual coverage lines: `preferenceCoverage`
+  carries the canonical preference-atom coverage, and `textCoverage` carries the canonical
+  distinct-query-token coverage. Both fields are declared optional in the conceptual interface and in
+  the runtime schema (`preferenceCoverageV1Schema` and `textCoverageV1Schema` are used inside
+  `talentSearchResultV1Schema` through `.optional()`) for backward compatibility with in-flight
+  clients; semantically the service emits each field whenever the buyer supplied the corresponding
+  signal (preferences for `preferenceCoverage`, query for `textCoverage`) and omits it only when the
+  buyer did not. The "0 of 0" payload is not factual evidence, so a buyer who supplied neither
+  signal falls back to the existing `matchReason` evidence alone; a buyer who supplied both signals
+  receives both factual-evidence lines. Neither field is ever rendered as a percentage and neither
+  is ever derived from `relevanceScore`, which remains strategy-specific ordering.
+
+  **Approval and notification evidence:** This shared-contract revision is approved by the
+  Milestone 1 integration owner (Caleb Matteis) in commit
+  `41e0d025a9e4aeec58ae213eb2225c018ff84a86` on
+  `feat/m1.6-rank-preferences-group-matching` (committed
+  `2026-08-14T18:15:09-04:00`; the same commit that introduces the
+  mode-neutral "Eligible for this search." qualitative-fit wording and corrects the
+  evidence record's provenance statements). The approval is not backdated onto any
+  earlier implementation commit on this branch. The parallel-stream notification
+  determination is captured in
+  `docs/integration/m1.6-preference-coverage-contract-evidence.md`. That record names
+  the approver, the approval commit reference, the decision reference (Issue #6), the
+  truthful per-field introduction provenance (`preferenceCoverage` first introduced in
+  `d28ae8a`, made optional in `e8556e9`, conditional service-side omission in
+  `b67231a`; `textCoverage` first introduced in `f2fec9a`), the stream-notification
+  determination, and the re-evaluation rule required by `AGENTS.md:127`.

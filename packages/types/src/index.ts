@@ -290,6 +290,56 @@ export type PublicOfferingSummaryV1 = z.infer<typeof publicOfferingSummaryV1Sche
 
 // ---------- Result and response ----------
 
+// Factual coverage counts shared by the preference-atom coverage and the
+// normalized-query-token coverage response fields. Both fields have
+// identical shape, strictness, integer bounds, and `matched <= total`
+// refinement, so the schema is declared once here as a non-exported
+// internal record and re-exported under semantically named aliases.
+// P2-001 deduplication: a parallel handwritten copy of this schema
+// would inevitably drift; the aliases keep the public surface stable
+// while leaving a single source of truth for the validation.
+const coverageCountsV1Schema = z
+  .object({
+    matched: z.number().int().nonnegative(),
+    total: z.number().int().nonnegative(),
+  })
+  .strict()
+  .refine((value) => value.matched <= value.total, {
+    message: "matched must not exceed total",
+  });
+
+// Factual coverage of the buyer's preference atoms against the best matching
+// offering's matched atoms. The matched count is bounded by `total` and both
+// are computed from the canonical preference atoms and the deterministic
+// matcher (never derived from `relevanceScore`, which is strategy-specific
+// ordering and explicitly NOT a buyer-facing confidence signal).
+//
+// Optional in the public DTO so adding the field is backward-compatible
+// per the v1 contract's compatibility rules. Older clients see a response
+// without the field and the UI falls back to `matchReason` evidence only
+// (P1-002 remediation).
+export const preferenceCoverageV1Schema = coverageCountsV1Schema;
+export type PreferenceCoverageV1 = z.infer<typeof coverageCountsV1Schema>;
+
+// Factual coverage of the buyer's normalized query tokens against the
+// best matching offering's matched text fields. The matched count is
+// bounded by `total` and both are computed from the canonical
+// distinct-query-tokens set and the deterministic text matcher (never
+// derived from `relevanceScore`, which is strategy-specific ordering
+// and explicitly NOT a buyer-facing confidence signal).
+//
+// Optional in the public DTO so adding the field is backward-compatible
+// per the v1 contract's compatibility rules. Older clients see a response
+// without the field and the UI falls back to `matchReason` evidence only.
+// Emitted whenever the buyer supplied a usable query (at least one
+// distinct canonical token); omitted when the request had no query, in
+// which case `textCoverage.total` would be `0` and the resulting "0 of
+// 0" statement is not factual evidence. Persisted separately from
+// `preferenceCoverage` so a request that supplies both a query and
+// preferences carries both factual-evidence lines.
+export const textCoverageV1Schema = coverageCountsV1Schema;
+export type TextCoverageV1 = z.infer<typeof coverageCountsV1Schema>;
+
 export const talentSearchResultV1Schema = z
   .object({
     seller: publicSellerSummaryV1Schema,
@@ -301,6 +351,8 @@ export const talentSearchResultV1Schema = z
       .max(1, "relevanceScore must be at most 1")
       .finite(),
     matchReason: z.string().min(1).max(500),
+    preferenceCoverage: preferenceCoverageV1Schema.optional(),
+    textCoverage: textCoverageV1Schema.optional(),
   })
   .strict();
 export type TalentSearchResultV1 = z.infer<typeof talentSearchResultV1Schema>;

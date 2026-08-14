@@ -140,9 +140,19 @@ SearchTalentTool.
 - Search returns at most ten results, one per seller, ordered by relevanceScore and a stable seller
   identifier tie-breaker.
 - Each result includes an allow-listed seller summary, best matching offering, up to two additional
-  offerings, deterministic match reason, and relevanceScore.
+  offerings, deterministic match reason, relevanceScore, and factual coverage statements. Two
+  independent optional response fields carry the qualitative-fit coverage: `preferenceCoverage`
+  reports the canonical preference-atom coverage, and `textCoverage` reports the canonical query-token
+  coverage. Each is emitted whenever the buyer supplied the corresponding signal (preferences for
+  `preferenceCoverage`, query for `textCoverage`); a request that supplies neither relies on the
+  deterministic `matchReason` as the sole buyer-facing evidence. No field is emitted with a "0 of
+  0" payload — that is not factual evidence. A request that supplies both signals carries both
+  factual-evidence lines so the buyer receives deterministic evidence and qualitative fit without
+  the UI having to derive a score-derived confidence or quality band from `relevanceScore`.
 - relevanceScore is finite, bounded from zero through one, specific to the declared strategy, and
-  not displayed as a buyer-facing percentage.
+  not displayed as a buyer-facing percentage. The buyer UI may surface `preferenceCoverage` and/or
+  `textCoverage` as factual qualitative-fit descriptions but must not render them as percentages
+  and must not derive a confidence or quality band from relevanceScore.
 - Unknown request fields are rejected with the shared safe error envelope.
 - PostgreSQL is canonical. Model/vector failure later falls back to deterministic PostgreSQL;
   PostgreSQL failure returns a retriable unavailable response.

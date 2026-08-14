@@ -220,9 +220,20 @@ export function SearchPage() {
   );
 }
 
-function ResultCard({ result }: { result: TalentSearchResultV1 }) {
-  const { seller, bestMatchingOffering, matchReason } = result;
-  const pricingLabel = formatPricing(bestMatchingOffering.pricing);
+// ResultCard is the presentational subcomponent that renders one search
+// result. It is exported (further down, after its declaration) so unit
+// tests can render it in isolation against a controlled sample
+// `TalentSearchResultV1` and assert on rendered HTML without spinning up
+// the parent `SearchPage` (which owns the fetch/state lifecycle).
+function ResultCardImpl({ result }: { result: TalentSearchResultV1 }) {
+  const {
+    seller,
+    bestMatchingOffering,
+    additionalMatchingOfferings,
+    matchReason,
+    preferenceCoverage,
+    textCoverage,
+  } = result;
 
   return (
     <Card
@@ -294,81 +305,303 @@ function ResultCard({ result }: { result: TalentSearchResultV1 }) {
           )}
         </dl>
 
-        <div className="bg-gray-50 p-3 rounded-lg mb-3">
-          <p className="text-sm font-medium text-gray-900" data-testid="result-offering-title">
-            {bestMatchingOffering.title}
-          </p>
-          <p className="text-xs text-gray-600 mt-1">{bestMatchingOffering.description}</p>
+        {/* Best matching offering. Each result leads with the seller's
+            highest-eligible standalone offering — the one the buyer can
+            commission right now. Bundle-only IncludedServices ride along
+            below labeled as bundle-only (see ADR 0002 and CONTEXT.md). */}
+        <BestOfferingCard offering={bestMatchingOffering} testIdPrefix="result-offering" />
 
-          <dl className="text-xs text-gray-700 mt-2 space-y-1">
-            <div>
-              <dt className="inline font-medium text-gray-500">Service category: </dt>
-              <dd className="inline" data-testid="result-category">
-                {bestMatchingOffering.primaryCategory.name}
-              </dd>
-            </div>
-            <div>
-              <dt className="inline font-medium text-gray-500">Service mode: </dt>
-              <dd className="inline" data-testid="result-service-mode">
-                {formatServiceMode(bestMatchingOffering.serviceMode)}
-              </dd>
-            </div>
-            {bestMatchingOffering.serviceAreas.length > 0 && (
-              <div>
-                <dt className="inline font-medium text-gray-500">Service area: </dt>
-                <dd className="inline" data-testid="result-service-areas">
-                  {bestMatchingOffering.serviceAreas.map(formatLocation).join(" · ")}
-                </dd>
-              </div>
-            )}
-            {bestMatchingOffering.genreTags.length > 0 && (
-              <div>
-                <dt className="inline font-medium text-gray-500">Genres: </dt>
-                <dd className="inline" data-testid="result-genres">
-                  {bestMatchingOffering.genreTags.join(", ")}
-                </dd>
-              </div>
-            )}
-            <div>
-              <dt className="inline font-medium text-gray-500">Pricing: </dt>
-              <dd className="inline" data-testid="result-pricing">
-                {pricingLabel ?? "Not advertised"}
-              </dd>
-            </div>
-          </dl>
-
-          {/* Pricing is non-binding until it is incorporated into an approved
-              TermsVersion (ADR 0002, CONTEXT.md). Buyer-facing wording names
-              that approved-terms boundary rather than a weaker informal
-              milestone such as "agreed terms", which could imply an informal
-              agreement is sufficient to bind either party. The disclaimer is
-              always shown so no pricing presentation reads as a quote or
-              commitment, but its wording follows the state: disclaiming
-              "advertised pricing" on an offering that advertises none would
-              imply a price is present. */}
-          <p className="text-xs text-gray-500 mt-2 italic" data-testid="result-pricing-disclaimer">
-            {pricingLabel === null
-              ? "This seller has not advertised pricing. Any pricing discussed later is non-binding until it is incorporated into approved terms."
-              : "Advertised pricing is non-binding and not a quote. It binds no one until it is incorporated into approved terms."}
-          </p>
-
-          {bestMatchingOffering.includedServices.length > 0 && (
-            <p className="text-xs text-gray-700 mt-2" data-testid="result-included-services">
-              <span className="font-medium text-gray-500">Bundle includes: </span>
-              {bestMatchingOffering.includedServices
-                .map((included) => `${included.name} (bundle only)`)
-                .join(", ")}
+        {additionalMatchingOfferings.length > 0 && (
+          <div className="mt-3" data-testid="result-additional-offerings">
+            <p className="text-xs font-medium text-gray-500 mb-1">
+              Also available from this seller
             </p>
-          )}
-        </div>
+            <ul className="space-y-2">
+              {additionalMatchingOfferings.map((offering) => (
+                <li
+                  key={offering.offeringId}
+                  className="border-l-2 border-blue-200 pl-3"
+                  data-testid="result-additional-offering"
+                  data-offering-id={offering.offeringId}
+                >
+                  <OfferingDetail
+                    offering={offering}
+                    testIdPrefix="result-additional-offering"
+                    variant="additional"
+                  />
+                </li>
+              ))}
+            </ul>
+          </div>
+        )}
 
-        <div className="bg-blue-50 p-3 rounded-lg" data-testid="result-match-reason">
+        {/* Buyer-facing match evidence. The matchReason is the
+            deterministic factual reason produced by the search service;
+            it names only the fields that actually matched (offering
+            title, category, preferred genre, etc.). relevanceScore is a
+            bounded strategy-specific ordering signal and is not
+            surfaced to the buyer — the contract prohibits rendering it
+            as a percentage, and P1-003 prohibits deriving any
+            qualitative strength or confidence band from it. */}
+        <div className="bg-blue-50 p-3 rounded-lg mt-3" data-testid="result-match-reason">
           <p className="text-sm font-medium text-blue-900 mb-1">Why this matches</p>
           <p className="text-sm text-blue-800">{matchReason}</p>
         </div>
+
+        {/* Qualitative fit: factual coverage statements derived from the
+            deterministic matched/total counts the search service
+            produces. Three independent sources can be present:
+              - `preferenceCoverage` from canonical preference atoms.
+              - `textCoverage` from the buyer's normalized query tokens.
+              - The required-only fallback: when both coverage fields
+                are absent, the request had no usable query AND no
+                canonical preferences, so the service emitted the bare
+                eligibility matchReason without either coverage line.
+                The result itself is the factual evidence — its
+                presence in the result set means it satisfied every
+                requested required criterion — so a separate
+                qualitative-fit block is rendered from existing result
+                facts (matchReason + the absence of coverage fields).
+                Deterministic, non-percentage, never derived from
+                `relevanceScore`. Issue #6 requires both deterministic
+                evidence AND qualitative fit; the P1-001 review found
+                qualitative fit had been dropped on query-only and
+                again on required-only searches, so the renderer now
+                always surfaces a qualitative-fit block on a result
+                that returned usable criteria. Optional coverage fields
+                in the public DTO per the v1 contract (P1-002). */}
+        {preferenceCoverage && (
+          <div className="bg-blue-50 p-3 rounded-lg mt-2" data-testid="result-qualitative-fit">
+            <p className="text-sm font-medium text-blue-900 mb-1">Preference coverage</p>
+            <p className="text-sm text-blue-800" data-testid="result-qualitative-fit-text">
+              {formatPreferenceCoverage(preferenceCoverage)}
+            </p>
+          </div>
+        )}
+        {textCoverage && (
+          <div className="bg-blue-50 p-3 rounded-lg mt-2" data-testid="result-qualitative-fit">
+            <p className="text-sm font-medium text-blue-900 mb-1">Brief coverage</p>
+            <p className="text-sm text-blue-800" data-testid="result-qualitative-fit-text">
+              {formatTextCoverage(textCoverage)}
+            </p>
+          </div>
+        )}
+        {!preferenceCoverage && !textCoverage && (
+          <div className="bg-blue-50 p-3 rounded-lg mt-2" data-testid="result-qualitative-fit">
+            <p className="text-sm font-medium text-blue-900 mb-1">Eligibility</p>
+            <p className="text-sm text-blue-800" data-testid="result-qualitative-fit-text">
+              {formatRequiredOnlyFit(matchReason)}
+            </p>
+          </div>
+        )}
       </Card.Content>
     </Card>
   );
+}
+
+// Public re-export so unit tests can render the presentational result
+// card in isolation against a controlled sample `TalentSearchResultV1`
+// without spinning up the parent `SearchPage` (which owns the fetch/state
+// lifecycle). The export deliberately sits at module scope rather than on
+// the function declaration so the React component name in devtools and
+// the function name used by `react-dom/server` both stay `ResultCardImpl`.
+export const ResultCard = ResultCardImpl;
+
+// OfferingDetail: the shared markup that the best and additional
+// offering paths both render — title, description, service category,
+// service mode, and bundle-includes (when present). Extracted so the
+// two paths render the same row markup with the same data-testid
+// conventions instead of duplicating five lines of JSX (P2-002
+// remediation). Lead-only content (service areas, genres, pricing, and
+// the pricing disclaimer) stays on BestOfferingCard because additional
+// offerings are intentionally compact. Kept private (no `export`) so the
+// implementation helper does not leak to external consumers until one
+// exists (P2-001 remediation).
+//
+// Presentation style is selected via `variant` so the four CSS class
+// strings travel as one cohesive style record owned by this component
+// instead of being passed as a data clump from every call site (P2-001
+// remediation).
+type OfferingDetailVariant = "lead" | "additional";
+
+const OFFERING_DETAIL_STYLES: Record<
+  OfferingDetailVariant,
+  {
+    readonly title: string;
+    readonly description: string;
+    readonly dl: string;
+    readonly bundle: string;
+  }
+> = {
+  lead: {
+    title: "text-sm font-medium text-gray-900",
+    description: "text-xs text-gray-600 mt-1",
+    dl: "text-xs text-gray-700 mt-2 space-y-1",
+    bundle: "text-xs text-gray-700 mt-2",
+  },
+  additional: {
+    title: "text-sm font-medium text-gray-800",
+    description: "text-xs text-gray-600 mt-0.5",
+    dl: "text-xs text-gray-700 mt-1 space-y-0.5",
+    bundle: "text-xs text-gray-700 mt-1",
+  },
+};
+
+function OfferingDetail({
+  offering,
+  testIdPrefix,
+  variant,
+}: {
+  readonly offering: TalentSearchResultV1["bestMatchingOffering"];
+  readonly testIdPrefix: string;
+  readonly variant: OfferingDetailVariant;
+}) {
+  const styles = OFFERING_DETAIL_STYLES[variant];
+  return (
+    <>
+      <p className={styles.title} data-testid={`${testIdPrefix}-title`}>
+        {offering.title}
+      </p>
+      <p className={styles.description}>{offering.description}</p>
+      <dl className={styles.dl}>
+        <div>
+          <dt className="inline font-medium text-gray-500">Service category: </dt>
+          <dd className="inline" data-testid={`${testIdPrefix}-category`}>
+            {offering.primaryCategory.name}
+          </dd>
+        </div>
+        <div>
+          <dt className="inline font-medium text-gray-500">Service mode: </dt>
+          <dd className="inline" data-testid={`${testIdPrefix}-service-mode`}>
+            {formatServiceMode(offering.serviceMode)}
+          </dd>
+        </div>
+      </dl>
+      {offering.includedServices.length > 0 && (
+        <p className={styles.bundle} data-testid={`${testIdPrefix}-included-services`}>
+          <span className="font-medium text-gray-500">Bundle includes: </span>
+          {offering.includedServices.map((included) => `${included.name} (bundle only)`).join(", ")}
+        </p>
+      )}
+    </>
+  );
+}
+
+// BestOfferingCard: the lead offering for a result. Uses OfferingDetail
+// for the row markup shared with additional offerings and adds the
+// lead-only service areas, genres, pricing, and pricing disclaimer
+// below it.
+function BestOfferingCard({
+  offering,
+  testIdPrefix,
+}: {
+  readonly offering: TalentSearchResultV1["bestMatchingOffering"];
+  readonly testIdPrefix: string;
+}) {
+  const pricingLabel = formatPricing(offering.pricing);
+  return (
+    <div className="bg-gray-50 p-3 rounded-lg mb-3" data-testid={`${testIdPrefix}-card`}>
+      <OfferingDetail offering={offering} testIdPrefix={testIdPrefix} variant="lead" />
+
+      <dl className="text-xs text-gray-700 mt-2 space-y-1">
+        {offering.serviceAreas.length > 0 && (
+          <div>
+            <dt className="inline font-medium text-gray-500">Service area: </dt>
+            <dd className="inline" data-testid={`${testIdPrefix}-service-areas`}>
+              {offering.serviceAreas.map(formatLocation).join(" · ")}
+            </dd>
+          </div>
+        )}
+        {offering.genreTags.length > 0 && (
+          <div>
+            <dt className="inline font-medium text-gray-500">Genres: </dt>
+            <dd className="inline" data-testid={`${testIdPrefix}-genres`}>
+              {offering.genreTags.join(", ")}
+            </dd>
+          </div>
+        )}
+        <div>
+          <dt className="inline font-medium text-gray-500">Pricing: </dt>
+          <dd className="inline" data-testid={`${testIdPrefix}-pricing`}>
+            {pricingLabel ?? "Not advertised"}
+          </dd>
+        </div>
+      </dl>
+
+      {/* Pricing is non-binding until it is incorporated into an approved
+          TermsVersion (ADR 0002, CONTEXT.md). Buyer-facing wording names
+          that approved-terms boundary rather than a weaker informal
+          milestone such as "agreed terms", which could imply an informal
+          agreement is sufficient to bind either party. The disclaimer is
+          always shown so no pricing presentation reads as a quote or
+          commitment, but its wording follows the state: disclaiming
+          "advertised pricing" on an offering that advertises none would
+          imply a price is present. */}
+      <p
+        className="text-xs text-gray-500 mt-2 italic"
+        data-testid={`${testIdPrefix}-pricing-disclaimer`}
+      >
+        {pricingLabel === null
+          ? "This seller has not advertised pricing. Any pricing discussed later is non-binding until it is incorporated into approved terms."
+          : "Advertised pricing is non-binding and not a quote. It binds no one until it is incorporated into approved terms."}
+      </p>
+    </div>
+  );
+}
+
+// Factual preference coverage statement. Counts only — never a percentage,
+// never derived from `relevanceScore`. The contract guarantees this helper
+// is only called when the buyer supplied at least one canonical preference
+// atom; the no-preferences case is rendered by simply skipping this line
+// (P1-001). The textCoverage line is rendered independently when the buyer
+// supplied a usable query.
+function formatPreferenceCoverage(coverage: {
+  readonly matched: number;
+  readonly total: number;
+}): string {
+  if (coverage.matched === coverage.total) {
+    return `Matches all ${coverage.total} requested preference${coverage.total === 1 ? "" : "s"}.`;
+  }
+  const unmet = coverage.total - coverage.matched;
+  return `Matches ${coverage.matched} of ${coverage.total} requested preferences; ${unmet} not matched.`;
+}
+
+// Factual query-token coverage statement. Counts only — never a percentage,
+// never derived from `relevanceScore`. The contract guarantees this helper
+// is only called when the buyer supplied at least one canonical query
+// token; the no-query case is rendered by simply skipping this line.
+function formatTextCoverage(coverage: {
+  readonly matched: number;
+  readonly total: number;
+}): string {
+  if (coverage.matched === coverage.total) {
+    return `Matches all ${coverage.total} word${coverage.total === 1 ? "" : "s"} of your brief.`;
+  }
+  const unmet = coverage.total - coverage.matched;
+  return `Matches ${coverage.matched} of ${coverage.total} words from your brief; ${unmet} not matched.`;
+}
+
+// Deterministic, non-percentage qualitative-fit fallback for required-only
+// results. The service emits this branch whenever the request had no usable
+// query AND no canonical preference atoms, in which case both coverage
+// fields are omitted from the public DTO and `matchReason` falls back to
+// the deterministic service-side wording for an eligibility-only match.
+// Issue #6 requires the buyer UI to show both deterministic evidence
+// (`matchReason`) AND qualitative fit; this helper derives the
+// qualitative-fit line from the existing `matchReason` fact so no new
+// public DTO field is introduced. Mode-neutral wording ("Eligible for this
+// search.") because absence of the optional coverage fields does not by
+// itself prove the request was structured-only — `preferenceCoverage` and
+// `textCoverage` are optional in the public DTO for backward compatibility
+// and may be omitted on query- or preference-bearing searches from
+// in-flight clients. Counts-only wording, never a percentage, never
+// derived from `relevanceScore`.
+function formatRequiredOnlyFit(matchReason: string): string {
+  const trimmed = matchReason.trim();
+  if (trimmed.length === 0) {
+    return "Eligible for this search.";
+  }
+  return `Eligible for this search (${trimmed}).`;
 }
 
 // Renders "City, Region · CC" while tolerating the optional city/region fields.

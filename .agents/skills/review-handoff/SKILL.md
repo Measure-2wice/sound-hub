@@ -96,6 +96,7 @@ Use exactly this structure:
 ## P0 Critical
 
 ### P0-001 — <title>
+
 - File: `path/to/file:<line>`
 - Requirement: <requirement violated>
 - Problem: <concrete issue>
@@ -125,8 +126,8 @@ None.
 
 ## Acceptance Criteria
 
-| Criterion | Result | Evidence |
-|---|---|---|
+| Criterion   | Result                   | Evidence   |
+| ----------- | ------------------------ | ---------- |
 | <criterion> | PASS / FAIL / NOT PROVEN | <evidence> |
 
 ## Validation

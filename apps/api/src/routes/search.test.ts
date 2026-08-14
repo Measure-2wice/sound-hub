@@ -853,3 +853,502 @@ describe("POST /api/search M1.3 negative eligibility", () => {
     );
   });
 });
+
+// M1.5 preference ranking and grouping (API contract layer).
+//
+// The route-layer tests exercise the M1.5 contract guarantees against
+// the in-memory repository. They verify that:
+//   - additionalMatchingOfferings surfaces at most two entries and that
+//     every entry is a standalone purchase (purchaseMode is not asserted
+//     on the offering slot itself; the includedServices array carries the
+//     BundleOnly label).
+//   - bundle-only primary-category offerings never appear as standalone
+//     bestMatchingOffering / additionalMatchingOfferings entries.
+//   - bundle-only IncludedServices inside a presenting offering are
+//     always emitted with `purchaseMode: "BundleOnly"`.
+//   - identical requests produce identical ordering, matchReason, and
+//     bounded relevanceScore through the full Express route.
+//   - preferences affect ordering deterministically through the route.
+describe("POST /api/search M1.5 preference ranking and grouping", () => {
+  const multiOfferingFixture: InMemoryFixture = {
+    sellers: [
+      {
+        sellerId: "m15-route-multi-ht",
+        workspaceId: "ws-route-multi-ht",
+        professionalName: "M15 Multi HT",
+        bio: "Brooklyn-based Haitian producer.",
+        status: "Published",
+        basedInCity: "Brooklyn",
+        basedInRegion: "NY",
+        basedInCountryCode: "US",
+        avatarUrl: null,
+        specialtyKeys: ["Producer", "Artist"],
+        caribbeanAffiliationCodes: ["HT", "JM"],
+        workspaceStatus: "Active",
+        workspaceHasSellerCapability: true,
+        offerings: [
+          {
+            offeringId: "m15-route-production",
+            title: "Dancehall single production",
+            description: "Dancehall single production.",
+            status: "Active",
+            serviceMode: "Remote",
+            primaryCategory: {
+              key: "music-production",
+              name: "Music Production",
+              bundleOnly: false,
+            },
+            includedServices: [
+              { key: "remote-coaching", name: "Remote Coaching", purchaseMode: "BundleOnly" },
+            ],
+            genreTags: ["Dancehall"],
+            serviceAreas: [{ city: null, region: null, countryCode: "US" }],
+            pricing: {
+              kind: "StartingAt",
+              amountMinor: 60000,
+              currency: "USD",
+              unitKey: "track",
+            },
+          },
+          {
+            offeringId: "m15-route-vocals",
+            title: "Lead dancehall vocals",
+            description: "Lead vocals for dancehall tracks.",
+            status: "Active",
+            serviceMode: "Remote",
+            primaryCategory: {
+              key: "session-vocals",
+              name: "Session Vocals",
+              bundleOnly: false,
+            },
+            includedServices: [
+              { key: "remote-coaching", name: "Remote Coaching", purchaseMode: "BundleOnly" },
+            ],
+            genreTags: ["Dancehall"],
+            serviceAreas: [{ city: null, region: null, countryCode: "US" }],
+            pricing: {
+              kind: "Fixed",
+              amountMinor: 35000,
+              currency: "USD",
+              unitKey: "session",
+            },
+          },
+          {
+            offeringId: "m15-route-comp",
+            title: "Dancehall composition for picture",
+            description: "Original dancehall composition to picture.",
+            status: "Active",
+            serviceMode: "Remote",
+            primaryCategory: {
+              key: "custom-composition",
+              name: "Custom Composition",
+              bundleOnly: false,
+            },
+            includedServices: [],
+            genreTags: ["Score"],
+            serviceAreas: [{ city: null, region: null, countryCode: "US" }],
+            pricing: null,
+          },
+        ],
+      },
+      {
+        sellerId: "m15-route-bundle-only-primary",
+        workspaceId: "ws-route-bundle-only-primary",
+        professionalName: "M15 Bundle Only Primary",
+        bio: "Seller whose primary category is bundle-only.",
+        status: "Published",
+        basedInCity: "Brooklyn",
+        basedInRegion: "NY",
+        basedInCountryCode: "US",
+        avatarUrl: null,
+        specialtyKeys: ["Producer"],
+        caribbeanAffiliationCodes: ["JM"],
+        workspaceStatus: "Active",
+        workspaceHasSellerCapability: true,
+        offerings: [
+          {
+            offeringId: "m15-route-bundle-only-primary-off",
+            title: "Hidden dancehall bundle-only offering",
+            description: "Primary category is bundleOnly.",
+            status: "Active",
+            serviceMode: "Remote",
+            primaryCategory: {
+              key: "music-production",
+              name: "Music Production",
+              bundleOnly: true,
+            },
+            includedServices: [],
+            genreTags: ["Dancehall"],
+            serviceAreas: [{ city: null, region: null, countryCode: "JM" }],
+            pricing: null,
+          },
+        ],
+      },
+    ],
+    controlledKeys: {
+      serviceCategoryKeys: [
+        "music-production",
+        "songwriting",
+        "custom-composition",
+        "session-vocals",
+        "session-instrument-performance",
+        "featured-artist-performance",
+        "mixing",
+        "mastering",
+        "recording-engineering",
+        "live-performance",
+      ],
+      specialtyKeys: ["Artist", "Producer", "Musician", "Songwriter", "SoundEngineer"],
+      pricingUnitKeys: ["hour", "track", "project", "session", "event", "day"],
+    },
+  };
+
+  const m15Service = new TalentSearchService(
+    new InMemoryTalentSearchRepository(multiOfferingFixture),
+  );
+  const m15StubPrisma = new Proxy({} as never, {
+    get() {
+      throw new Error(
+        "Prisma client was invoked; the route tests must use the in-memory repository.",
+      );
+    },
+  });
+  const { app: m15App } = buildApp({ service: m15Service, prismaClient: m15StubPrisma });
+
+  test("the route returns one entry per seller with at most two additional matching offerings", async () => {
+    const response = await request(m15App)
+      .post("/api/search")
+      .set("content-type", "application/json")
+      .send({ query: "dancehall production" });
+
+    assert.equal(response.status, 200);
+    const results = response.body.results as Array<{
+      seller: { sellerId: string };
+      bestMatchingOffering: { offeringId: string };
+      additionalMatchingOfferings: Array<{ offeringId: string }>;
+      relevanceScore: number;
+    }>;
+    const sellerEntries = results.filter((r) => r.seller.sellerId === "m15-route-multi-ht");
+    assert.equal(sellerEntries.length, 1, "each seller must appear exactly once");
+    const [multi] = sellerEntries;
+    assert.ok(multi);
+    assert.equal(multi.bestMatchingOffering.offeringId, "m15-route-production");
+    assert.deepEqual(
+      multi.additionalMatchingOfferings.map((o) => o.offeringId),
+      ["m15-route-comp", "m15-route-vocals"],
+    );
+    assert.ok(multi.additionalMatchingOfferings.length <= 2);
+  });
+
+  test("the route caps additionalMatchingOfferings at the contract's two-entry maximum", async () => {
+    const response = await request(m15App)
+      .post("/api/search")
+      .set("content-type", "application/json")
+      .send({ query: "dancehall production" });
+    for (const result of response.body.results) {
+      assert.ok(
+        result.additionalMatchingOfferings.length <= 2,
+        `additionalMatchingOfferings exceeded the contract cap of two on seller ${result.seller.sellerId}`,
+      );
+    }
+  });
+
+  test("the route keeps bundle-only primary-category offerings out of best/additional slots", async () => {
+    const response = await request(m15App)
+      .post("/api/search")
+      .set("content-type", "application/json")
+      .send({ query: "dancehall" });
+
+    assert.equal(response.status, 200);
+    const serialized = JSON.stringify(response.body);
+    assert.equal(
+      serialized.includes("m15-route-bundle-only-primary-off"),
+      false,
+      "bundle-only primary-category offering must not be present in the response",
+    );
+    assert.equal(
+      serialized.includes("Hidden dancehall bundle-only offering"),
+      false,
+      "bundle-only primary-category title must not appear in the response",
+    );
+    const bundleOnlySeller = (
+      response.body.results as Array<{ seller: { sellerId: string } }>
+    ).find((r) => r.seller.sellerId === "m15-route-bundle-only-primary");
+    assert.equal(bundleOnlySeller, undefined);
+  });
+
+  test("the route labels every includedService as BundleOnly and never as a standalone purchase", async () => {
+    const response = await request(m15App)
+      .post("/api/search")
+      .set("content-type", "application/json")
+      .send({ query: "dancehall" });
+    for (const result of response.body.results) {
+      const offerings = [result.bestMatchingOffering, ...result.additionalMatchingOfferings];
+      for (const offering of offerings) {
+        for (const included of offering.includedServices) {
+          assert.equal(
+            included.purchaseMode,
+            "BundleOnly",
+            `includedService key=${included.key} must be labeled as BundleOnly`,
+          );
+          assert.equal(typeof included.key, "string");
+        }
+      }
+    }
+  });
+
+  test("the route rejects responses whose additionalMatchingOfferings would exceed the schema cap", () => {
+    const parsed = talentSearchResponseV1Schema.safeParse({
+      results: [
+        {
+          seller: {
+            sellerId: "x",
+            professionalName: "X",
+            specialties: [],
+            bio: "",
+            basedIn: { countryCode: "US" },
+            caribbeanAffiliationCodes: [],
+          },
+          bestMatchingOffering: {
+            offeringId: "o1",
+            title: "T",
+            description: "",
+            primaryCategory: { key: "music-production", name: "Music Production" },
+            includedServices: [],
+            genreTags: [],
+            serviceMode: "Remote",
+            serviceAreas: [{ countryCode: "US" }],
+          },
+          additionalMatchingOfferings: [
+            {
+              offeringId: "o2",
+              title: "T",
+              description: "",
+              primaryCategory: { key: "music-production", name: "Music Production" },
+              includedServices: [],
+              genreTags: [],
+              serviceMode: "Remote",
+              serviceAreas: [{ countryCode: "US" }],
+            },
+            {
+              offeringId: "o3",
+              title: "T",
+              description: "",
+              primaryCategory: { key: "music-production", name: "Music Production" },
+              includedServices: [],
+              genreTags: [],
+              serviceMode: "Remote",
+              serviceAreas: [{ countryCode: "US" }],
+            },
+            {
+              offeringId: "o4",
+              title: "T",
+              description: "",
+              primaryCategory: { key: "music-production", name: "Music Production" },
+              includedServices: [],
+              genreTags: [],
+              serviceMode: "Remote",
+              serviceAreas: [{ countryCode: "US" }],
+            },
+          ],
+          relevanceScore: 0.5,
+          matchReason: "matched",
+        },
+      ],
+      metadata: {
+        totalResults: 1,
+        processingTimeMs: 0,
+        strategy: "postgres-text-v1",
+        appliedRequiredCriteria: {},
+        appliedPreferredCriteria: {},
+      },
+    });
+    assert.equal(parsed.success, false, "schema must reject three additional offerings");
+  });
+
+  test("identical requests through the route produce identical ordering, matchReason, and bounded relevanceScore", async () => {
+    const a = await request(m15App)
+      .post("/api/search")
+      .set("content-type", "application/json")
+      .send({ query: "dancehall", preferred: { caribbeanAffiliationCodes: ["JM"] } });
+    const b = await request(m15App)
+      .post("/api/search")
+      .set("content-type", "application/json")
+      .send({ query: "dancehall", preferred: { caribbeanAffiliationCodes: ["JM"] } });
+    assert.equal(a.status, 200);
+    assert.equal(b.status, 200);
+    assert.deepEqual(
+      a.body.results.map(
+        (r: {
+          seller: { sellerId: string };
+          bestMatchingOffering: { offeringId: string };
+          additionalMatchingOfferings: Array<{ offeringId: string }>;
+          relevanceScore: number;
+          matchReason: string;
+        }) => ({
+          sellerId: r.seller.sellerId,
+          bestId: r.bestMatchingOffering.offeringId,
+          additionalIds: r.additionalMatchingOfferings.map((o) => o.offeringId),
+          score: r.relevanceScore,
+          reason: r.matchReason,
+        }),
+      ),
+      b.body.results.map(
+        (r: {
+          seller: { sellerId: string };
+          bestMatchingOffering: { offeringId: string };
+          additionalMatchingOfferings: Array<{ offeringId: string }>;
+          relevanceScore: number;
+          matchReason: string;
+        }) => ({
+          sellerId: r.seller.sellerId,
+          bestId: r.bestMatchingOffering.offeringId,
+          additionalIds: r.additionalMatchingOfferings.map((o) => o.offeringId),
+          score: r.relevanceScore,
+          reason: r.matchReason,
+        }),
+      ),
+    );
+    for (const result of a.body.results) {
+      assert.ok(
+        Number.isFinite(result.relevanceScore) &&
+          result.relevanceScore >= 0 &&
+          result.relevanceScore <= 1,
+      );
+    }
+  });
+
+  test("preference ordering through the route is deterministic on identical preferred inputs", async () => {
+    const a = await request(m15App)
+      .post("/api/search")
+      .set("content-type", "application/json")
+      .send({
+        query: "dancehall production",
+        preferred: { caribbeanAffiliationCodes: ["JM"] },
+      });
+    const b = await request(m15App)
+      .post("/api/search")
+      .set("content-type", "application/json")
+      .send({
+        query: "dancehall production",
+        preferred: { caribbeanAffiliationCodes: ["JM"] },
+      });
+    assert.deepEqual(
+      (a.body.results as Array<{ seller: { sellerId: string } }>).map((r) => r.seller.sellerId),
+      (b.body.results as Array<{ seller: { sellerId: string } }>).map((r) => r.seller.sellerId),
+    );
+  });
+
+  // P1-001 regression: the v1 contract states that `preferenceCoverage`
+  // is omitted whenever the buyer supplied no canonical preference atoms.
+  // This route-level test pins the omission at the HTTP boundary so the
+  // browser, the API, and the public contract cannot drift back to the
+  // unconditional-serialization behavior.
+  test("the route omits preferenceCoverage when no preferences were requested", async () => {
+    const response = await request(m15App)
+      .post("/api/search")
+      .set("content-type", "application/json")
+      .send({ query: "dancehall production" });
+    assert.equal(response.status, 200);
+    const results = response.body.results as Array<{
+      preferenceCoverage?: unknown;
+    }>;
+    assert.ok(results.length > 0, "the fixture must produce at least one result");
+    for (const result of results) {
+      assert.equal(
+        result.preferenceCoverage,
+        undefined,
+        "the route response must omit preferenceCoverage when no preferences were requested",
+      );
+    }
+  });
+
+  // P1-001 regression: when at least one canonical preference atom IS
+  // supplied, the route response must carry the factual matched/total
+  // coverage. This is the symmetric guarantee that the omission above is
+  // scoped strictly to the no-preferences case.
+  test("the route includes preferenceCoverage when preferences were requested", async () => {
+    const response = await request(m15App)
+      .post("/api/search")
+      .set("content-type", "application/json")
+      .send({
+        query: "dancehall production",
+        preferred: { caribbeanAffiliationCodes: ["JM"] },
+      });
+    assert.equal(response.status, 200);
+    const results = response.body.results as Array<{
+      preferenceCoverage?: { matched: number; total: number };
+    }>;
+    assert.ok(results.length > 0, "the fixture must produce at least one result");
+    for (const result of results) {
+      assert.ok(
+        result.preferenceCoverage !== undefined,
+        "the route response must include preferenceCoverage when preferences were requested",
+      );
+      assert.equal(
+        result.preferenceCoverage.total,
+        1,
+        "preferenceCoverage.total must equal the canonical preference-atom count",
+      );
+      assert.ok(
+        result.preferenceCoverage.matched >= 0 &&
+          result.preferenceCoverage.matched <= result.preferenceCoverage.total,
+        "preferenceCoverage.matched must be bounded by preferenceCoverage.total",
+      );
+    }
+  });
+
+  // P1-001 Codex remediation: the route response must include
+  // `textCoverage` whenever the buyer supplied a query so query-only
+  // searches still surface a non-percentage qualitative-fit line. The
+  // field counts distinct normalized query tokens matched by the best
+  // matching offering; it is bounded by `total` and is never derived
+  // from `relevanceScore`.
+  test("the route includes textCoverage when a query was supplied", async () => {
+    const response = await request(m15App)
+      .post("/api/search")
+      .set("content-type", "application/json")
+      .send({ query: "dancehall production" });
+    assert.equal(response.status, 200);
+    const results = response.body.results as Array<{
+      textCoverage?: { matched: number; total: number };
+    }>;
+    assert.ok(results.length > 0, "the fixture must produce at least one result");
+    for (const result of results) {
+      assert.ok(
+        result.textCoverage !== undefined,
+        "the route response must include textCoverage when a query was supplied",
+      );
+      assert.equal(
+        result.textCoverage.total,
+        2,
+        "textCoverage.total must equal the canonical distinct-query-token count",
+      );
+      assert.ok(
+        result.textCoverage.matched >= 0 &&
+          result.textCoverage.matched <= result.textCoverage.total,
+        "textCoverage.matched must be bounded by textCoverage.total",
+      );
+    }
+  });
+
+  // P1-001 Codex remediation: symmetric with the preference-coverage
+  // omission, the route must omit `textCoverage` when the request had
+  // no query so a "0 of 0" payload never reaches the buyer.
+  test("the route omits textCoverage when no query was supplied", async () => {
+    const response = await request(m15App)
+      .post("/api/search")
+      .set("content-type", "application/json")
+      .send({ required: { primaryCategoryKeys: ["music-production"] } });
+    assert.equal(response.status, 200);
+    const results = response.body.results as Array<{ textCoverage?: unknown }>;
+    assert.ok(results.length > 0, "the fixture must produce at least one result");
+    for (const result of results) {
+      assert.equal(
+        result.textCoverage,
+        undefined,
+        "the route response must omit textCoverage when no query was supplied",
+      );
+    }
+  });
+});

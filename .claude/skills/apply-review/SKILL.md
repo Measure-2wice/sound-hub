@@ -74,9 +74,9 @@ For each `APPLY` finding:
 
 Keep a working resolution table:
 
-| Finding | Status | Evidence |
-|---|---|---|
-| P0-001 | FIXED / DISPUTED / BLOCKED | file, test, or authoritative source |
+| Finding | Status                     | Evidence                            |
+| ------- | -------------------------- | ----------------------------------- |
+| P0-001  | FIXED / DISPUTED / BLOCKED | file, test, or authoritative source |
 
 ## 4. Validate the branch
 
