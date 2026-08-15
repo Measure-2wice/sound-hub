@@ -37,7 +37,8 @@ import assert from "node:assert/strict";
 import { describe, test } from "node:test";
 import { renderToStaticMarkup } from "react-dom/server";
 import type { TalentSearchResultV1 } from "@soundhub/types";
-import { ResultCard } from "./SearchPage";
+import { EmptySearchGuidance, ResultCard } from "./SearchPage";
+import { EMPTY_SEARCH_GUIDANCE_MESSAGE } from "../lib/talent-search-request-builder";
 
 // Stable sample so the assertions read as a single behavioral contract
 // rather than as ad-hoc strings. The values are minimal-but-valid for the
@@ -419,6 +420,70 @@ describe("SearchPage shared offering-detail markup (P2-001)", () => {
     assert.ok(
       html.includes("approved terms"),
       "the pricing disclaimer must name the approved-terms boundary",
+    );
+  });
+});
+
+// QA finding — empty talent-search submissions previously surfaced
+// a developer-centric API envelope (`<root> at least one of query,
+// required, or preferred must contain criteria`) because the page
+// dispatched every submit. The page-level guard now sets the
+// buyer-facing `emptySearchMessage` and renders it inline via
+// `EmptySearchGuidance` while skipping the API dispatch. These
+// tests pin the conditional render so a regression that either
+// shows the guidance on the happy path (which would mask real
+// errors) or hides it on an empty submission (which would let the
+// developer-centric envelope resurface) fails the suite.
+describe("EmptySearchGuidance (page-level empty-submission guard)", () => {
+  test("renders nothing when the message is null (the standard-path state)", () => {
+    const html = renderToStaticMarkup(EmptySearchGuidance({ message: null }));
+    assert.equal(html, "", "the helper must render an empty fragment when the guard is inactive");
+  });
+
+  test("renders the buyer-friendly guidance message verbatim when set", () => {
+    const html = renderToStaticMarkup(
+      EmptySearchGuidance({ message: EMPTY_SEARCH_GUIDANCE_MESSAGE }),
+    );
+
+    assert.ok(
+      html.includes('data-testid="empty-search-guidance"'),
+      "the inline guidance card must carry its data-testid so the page can target it",
+    );
+    assert.ok(
+      html.includes('data-testid="empty-search-guidance-message"'),
+      "the message paragraph must carry its data-testid so the copy can be asserted",
+    );
+    assert.ok(
+      html.includes(EMPTY_SEARCH_GUIDANCE_MESSAGE),
+      "the buyer-friendly message must round-trip verbatim from the helper",
+    );
+    assert.ok(
+      html.includes("Add a project description or choose at least one search filter."),
+      "the copy must match the QA-approved buyer-facing wording",
+    );
+    assert.equal(
+      html.includes("Request body failed schema validation."),
+      false,
+      "the developer-centric envelope copy must never appear in the empty-search guidance",
+    );
+    assert.equal(
+      html.includes("<root> at least one of query"),
+      false,
+      "the schema-level raw error fragment must never appear in the empty-search guidance",
+    );
+  });
+
+  test("uses aria-live=polite and role=status so screen readers announce the guidance immediately", () => {
+    const html = renderToStaticMarkup(
+      EmptySearchGuidance({ message: EMPTY_SEARCH_GUIDANCE_MESSAGE }),
+    );
+    assert.ok(
+      html.includes('role="status"'),
+      "the card must expose role=status so screen readers treat it as an advisory region",
+    );
+    assert.ok(
+      html.includes('aria-live="polite"'),
+      "the card must use aria-live=polite so the guidance is announced without stealing focus",
     );
   });
 });
