@@ -17,11 +17,33 @@
 //   - Success and error behavior remain identical through Express
 //     directly and the Next.js proxy.
 //
-// Each test exercises the real Next.js proxy, the real Express API,
-// the real TalentSearchService, the real Prisma adapter, and the
-// real disposable PostgreSQL when database-bound. The route-mocking
-// tests route at the Next.js proxy layer (not the Express layer) so the
-// full browser surface, including the proxy transport, is verified.
+// Most tests in this file exercise the real Next.js proxy, the real
+// Express API, the real TalentSearchService, the real Prisma adapter,
+// and the real disposable PostgreSQL end to end. The two scoped
+// exceptions permitted by `playwright.config.ts` are:
+//
+//   - The retry-button affordance test (line 92) injects the safe
+//     SEARCH_UNAVAILABLE envelope on the first attempt only and falls
+//     through to the real proxy / API for every subsequent attempt.
+//     The real PostgreSQL outage test (the last test in this file)
+//     covers the same envelope through the real Prisma + PostgreSQL
+//     path. This fault-injection mock exists because the assertion
+//     under test is the UI affordance: a retry button must appear,
+//     the buyer's brief must be preserved, and a successful retry
+//     must yield results.
+//
+//   - The concurrency test (line 164) holds the older in-flight
+//     response pending while the newer submission is sent, then
+//     releases the older response first. This time-control mock
+//     exists because the assertion under test is the
+//     `useTalentSearch` hook's monotonic requestIdRef guard, which
+//     is only observable when the older response can be made to
+//     land AFTER the newer submission is already in flight.
+//
+// Both mocks route at the Next.js proxy layer (not the Express layer)
+// so the full browser surface, including the proxy transport, is
+// verified. Both always `route.fallback()` for any request they do not
+// specifically intercept.
 //
 // The real-PostgreSQL outage test is the LAST test in this file: it
 // stops the approved disposable test container, drives a request
@@ -248,12 +270,8 @@ test.describe("M1.6: concurrent submissions preserve newest result and loading",
     // the older in-flight response overwrite the newer loading
     // state, which the assertions below catch.
     await page.evaluate(() => {
-      const input = document.querySelector(
-        '[data-testid="search-input"]',
-      ) as HTMLInputElement | null;
-      const submit = document.querySelector(
-        '[data-testid="search-submit"]',
-      ) as HTMLButtonElement | null;
+      const input = document.querySelector<HTMLInputElement>('[data-testid="search-input"]');
+      const submit = document.querySelector<HTMLButtonElement>('[data-testid="search-submit"]');
       if (input) input.disabled = false;
       if (submit) submit.disabled = false;
     });
@@ -538,16 +556,29 @@ function runDockerCompose(args: string): void {
   });
 }
 
-async function waitForDatabaseDown(timeoutMs: number): Promise<void> {
+// Poll the test database's TCP port until it reaches the desired
+// availability (true = accepting, false = refusing) or the deadline
+// elapses. The disposable PostgreSQL outage test uses this to wait
+// for the container to stop accepting connections after `docker
+// compose stop` and to wait for it to come back up after `start` /
+// `up`. The last observed socket error is reported in the timeout
+// message so a real diagnosis is visible from CI logs.
+async function waitForTcpState(
+  desiredAvailable: boolean,
+  timeoutMs: number,
+  pollIntervalMs: number,
+): Promise<void> {
   const deadline = Date.now() + timeoutMs;
+  let lastError: unknown = null;
   while (Date.now() < deadline) {
-    const ok = await new Promise<boolean>((resolve) => {
+    const reachable = await new Promise<boolean>((resolve) => {
       const socket = net.createConnection({ host: TEST_DB_HOST, port: TEST_DB_PORT }, () => {
         socket.end();
         resolve(true);
       });
-      socket.on("error", () => {
+      socket.on("error", (err) => {
         socket.destroy();
+        lastError = err;
         resolve(false);
       });
       socket.setTimeout(1_000, () => {
@@ -555,58 +586,37 @@ async function waitForDatabaseDown(timeoutMs: number): Promise<void> {
         resolve(false);
       });
     });
-    if (!ok) return;
-    await sleep(250);
+    if (reachable === desiredAvailable) return;
+    await sleep(pollIntervalMs);
   }
+  const direction = desiredAvailable ? "accept" : "stop accepting";
   throw new Error(
-    `Test database at ${TEST_DB_HOST}:${TEST_DB_PORT} did not stop accepting TCP within ${timeoutMs}ms`,
-  );
-}
-
-async function waitForDatabaseUp(timeoutMs: number): Promise<void> {
-  const deadline = Date.now() + timeoutMs;
-  let lastError: unknown = null;
-  while (Date.now() < deadline) {
-    try {
-      const ok = await new Promise<boolean>((resolve) => {
-        const socket = net.createConnection({ host: TEST_DB_HOST, port: TEST_DB_PORT }, () => {
-          socket.end();
-          resolve(true);
-        });
-        socket.on("error", (err) => {
-          socket.destroy();
-          lastError = err;
-          resolve(false);
-        });
-        socket.setTimeout(1_000, () => {
-          socket.destroy();
-          resolve(false);
-        });
-      });
-      if (ok) return;
-    } catch (err) {
-      lastError = err;
-    }
-    await sleep(500);
-  }
-  throw new Error(
-    `Test database at ${TEST_DB_HOST}:${TEST_DB_PORT} did not accept TCP within ${timeoutMs}ms (last error: ${String(
+    `Test database at ${TEST_DB_HOST}:${TEST_DB_PORT} did not ${direction} TCP within ${timeoutMs}ms (last error: ${String(
       lastError,
     )})`,
   );
+}
+
+// Bring the disposable PostgreSQL container back up and wait for it
+// to accept TCP connections. Used by both `afterAll` (to recover
+// after a passing test) and the test's `finally` block (to recover
+// after a failing test). If the container was removed entirely,
+// recreate it via `up -d` so subsequent test files still find it.
+async function restoreTestDatabase(): Promise<void> {
+  try {
+    runDockerCompose("start postgres_test");
+  } catch {
+    // If the container was removed entirely, recreate it via `up`.
+    runDockerCompose("up -d postgres_test");
+  }
+  await waitForTcpState(true, 60_000, 500);
 }
 
 test.describe.serial("M1.6: real PostgreSQL unavailability through Express and the proxy", () => {
   test.afterAll(async () => {
     // Always bring the container back up before exiting this
     // describe block, even if the test below failed.
-    try {
-      runDockerCompose("start postgres_test");
-    } catch {
-      // If the container was removed entirely, recreate it via `up`.
-      runDockerCompose("up -d postgres_test");
-    }
-    await waitForDatabaseUp(60_000);
+    await restoreTestDatabase();
   });
 
   test("stops PostgreSQL, drives a search through the proxy + Express + real Prisma, and renders SEARCH_UNAVAILABLE with a retry affordance", async ({
@@ -625,7 +635,7 @@ test.describe.serial("M1.6: real PostgreSQL unavailability through Express and t
       // client's existing pool entries get ECONNREFUSED on the
       // next query attempt.
       runDockerCompose("stop postgres_test");
-      await waitForDatabaseDown(15_000);
+      await waitForTcpState(false, 15_000, 250);
 
       // Drive a search through the browser: Next.js proxy →
       // Express → real Prisma client → PostgreSQL (down) →
@@ -663,12 +673,7 @@ test.describe.serial("M1.6: real PostgreSQL unavailability through Express and t
       // Restart the container in the finally block so a failure
       // above does not leave the database offline for the next
       // test file.
-      try {
-        runDockerCompose("start postgres_test");
-      } catch {
-        runDockerCompose("up -d postgres_test");
-      }
-      await waitForDatabaseUp(60_000);
+      await restoreTestDatabase();
     }
   });
 });

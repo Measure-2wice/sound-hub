@@ -2,7 +2,31 @@ import { defineConfig, devices } from "@playwright/test";
 
 // The Playwright happy-path tracer spins up the real Next.js dev server, the
 // real Express API, and the disposable soundhub_m1_test PostgreSQL service.
-// It must not mock fetch, the API, the repository, or the database.
+// By default it must not mock fetch, the API, the repository, or the database:
+// every request is supposed to traverse the real proxy, the real Express
+// route, and the real Prisma client so regressions in the production
+// transport path are observable.
+//
+// Two narrowly-scoped exceptions to that rule exist and are intentional:
+//
+//   1. Fault-injection mocks are permitted to inject a specific error
+//      response shape (for example the safe SEARCH_UNAVAILABLE 503 envelope)
+//      when the assertion under test is the buyer-facing UI affordance —
+//      a retry button, a preserved brief, an error card. The real
+//      PostgreSQL outage path is covered by a separate fully-unmocked
+//      test that stops the disposable container and drives the proxy,
+//      Express, and Prisma client end to end. The fault-injection mocks
+//      must always `route.fallback()` for any request they do not
+//      specifically intercept, so the real proxy and API still receive
+//      every other request unchanged.
+//
+//   2. Time/ordering-control mocks are permitted to hold specific
+//      responses pending so deterministic ordering assertions
+//      (older in-flight response cannot overwrite newer submission)
+//      can be observed. Without response-time control the real
+//      request path resolves too fast to distinguish older from newer
+//      completions. These mocks must always `route.fallback()` for any
+//      request outside the order they explicitly intend to delay.
 //
 // The setup script (e2e/global-setup.ts) ensures the test database is
 // migrated and seeded before the test session begins, then waits for the
