@@ -18,12 +18,28 @@
 //     directly and the Next.js proxy.
 //
 // Each test exercises the real Next.js proxy, the real Express API,
-// the real TalentSearchService, the real Prisma adapter, and the real
-// disposable PostgreSQL when database-bound. The route-mocking tests
-// route at the Next.js proxy layer (not the Express layer) so the
+// the real TalentSearchService, the real Prisma adapter, and the
+// real disposable PostgreSQL when database-bound. The route-mocking
+// tests route at the Next.js proxy layer (not the Express layer) so the
 // full browser surface, including the proxy transport, is verified.
+//
+// The real-PostgreSQL outage test is the LAST test in this file: it
+// stops the approved disposable test container, drives a request
+// through the proxy + Express + real Prisma client, and restarts the
+// container before returning. The single-worker, sequential
+// `playwright.config.ts` (workers: 1, fullyParallel: false) keeps
+// subsequent test files from running while the database is offline.
 
-import { test, expect, type Page } from "@playwright/test";
+import { execSync } from "node:child_process";
+import net from "node:net";
+import { setTimeout as sleep } from "node:timers/promises";
+import {
+  test,
+  expect,
+  type Page,
+  type APIRequestContext,
+  type APIResponse,
+} from "@playwright/test";
 
 async function loadHome(page: Page) {
   await page.goto("/");
@@ -67,6 +83,12 @@ test("M1.6: empty matches return 200 and a distinct empty state through the prox
 // exact same request. The fixture switches to a 200 response
 // between attempts so we can prove the retry path actually drives
 // the same payload to a fresh request.
+//
+// This test continues to mock at the Next.js proxy layer because
+// the acceptance it covers is the UI affordance: a retriable
+// envelope must produce a retry button, the brief must be
+// preserved, and a successful retry must yield results. The real
+// PostgreSQL outage path is covered by a dedicated test below.
 test("M1.6: SEARCH_UNAVAILABLE surfaces a retry button that re-submits the preserved brief", async ({
   page,
 }) => {
@@ -126,188 +148,527 @@ test("M1.6: SEARCH_UNAVAILABLE surfaces a retry button that re-submits the prese
 
 // Concurrent-request safety.
 //
-// Rapid, overlapping submissions must not corrupt UI state. The most
-// recent submission wins; older in-flight responses cannot overwrite
-// the newer result, and the loading indicator stays visible until the
-// newest response resolves.
-test("M1.6: rapid overlapping submissions never let a stale response overwrite the newest result", async ({
-  page,
-}) => {
-  // The route stalls each response long enough that two submissions
-  // can be in flight at the same time. The first request's response
-  // carries a stale seller that the second submission's response
-  // must NOT let through.
-  const staleSeller = "Stale First Response Seller";
-  const freshSeller = "Marc-André Pierre";
-  const pendingResponses: Array<() => void> = [];
+// The two subtests below control the resolution order of two
+// overlapping submissions and prove:
+//   (a) when an older in-flight response settles while a newer
+//       submission is still pending, the loading indicator stays
+//       visible and is only cleared once the newer response lands;
+//   (b) when both responses have settled, the newest submission's
+//       payload wins and the stale payload never appears in the
+//       rendered DOM.
+//
+// (a) is the regression the prior spec missed: the intermediate
+// `search-loading` state must remain visible while an older
+// response is being processed, so the buyer never sees a flicker
+// of "results, then nothing, then results again."
+test.describe("M1.6: concurrent submissions preserve newest result and loading", () => {
+  test("older in-flight response cannot overwrite the newer submission's loading state", async ({
+    page,
+  }) => {
+    // The two interceptors share the same route but expose their
+    // resolvers through distinct queues so we can settle the older
+    // submission first while the newer remains pending.
+    const staleSeller = "Stale First Response Seller";
+    const freshSeller = "Marc-André Pierre";
+    const olderResolvers: Array<() => void> = [];
+    const newerResolvers: Array<() => void> = [];
 
-  await page.route("**/api/search", async (route) => {
-    const request = route.request();
-    const body = request.postData() ?? "";
-    const isFirstRequest = body.includes("first-submission-token");
-    const waiter = new Promise<void>((resolve) => {
-      pendingResponses.push(resolve);
-    });
-    await waiter;
-    if (isFirstRequest) {
-      // The first request's stale response is held until the second
-      // request has already settled; if cancellation is correct, the
-      // stale response must not be reflected in the page.
-      void route.fulfill({
-        status: 200,
-        contentType: "application/json",
-        body: JSON.stringify({
-          results: [
-            {
-              seller: {
-                sellerId: "stale-seller",
-                professionalName: staleSeller,
-                specialties: [],
-                bio: "",
-                basedIn: { countryCode: "US" },
-                caribbeanAffiliationCodes: [],
-              },
-              bestMatchingOffering: {
-                offeringId: "stale-offering",
-                title: "Stale offering",
-                description: "",
-                primaryCategory: {
-                  key: "music-production",
-                  name: "Music Production",
-                },
-                includedServices: [],
-                genreTags: [],
-                serviceMode: "Remote",
-                serviceAreas: [{ countryCode: "US" }],
-              },
-              additionalMatchingOfferings: [],
-              relevanceScore: 1,
-              matchReason: "matched",
-            },
-          ],
-          metadata: {
-            totalResults: 1,
-            processingTimeMs: 1,
-            strategy: "postgres-text-v1",
-            appliedRequiredCriteria: {},
-            appliedPreferredCriteria: {},
-          },
-        }),
+    await page.route("**/api/search", async (route) => {
+      const request = route.request();
+      const body = request.postData() ?? "";
+      const isOlderRequest = body.includes("first-submission-token");
+      const resolverTarget = isOlderRequest ? olderResolvers : newerResolvers;
+      const waiter = new Promise<void>((resolve) => {
+        resolverTarget.push(resolve);
       });
-      return;
-    }
-    void route.fallback();
+      await waiter;
+      if (isOlderRequest) {
+        void route.fulfill({
+          status: 200,
+          contentType: "application/json",
+          body: JSON.stringify({
+            results: [
+              {
+                seller: {
+                  sellerId: "stale-seller",
+                  professionalName: staleSeller,
+                  specialties: [],
+                  bio: "",
+                  basedIn: { countryCode: "US" },
+                  caribbeanAffiliationCodes: [],
+                },
+                bestMatchingOffering: {
+                  offeringId: "stale-offering",
+                  title: "Stale offering",
+                  description: "",
+                  primaryCategory: {
+                    key: "music-production",
+                    name: "Music Production",
+                  },
+                  includedServices: [],
+                  genreTags: [],
+                  serviceMode: "Remote",
+                  serviceAreas: [{ countryCode: "US" }],
+                },
+                additionalMatchingOfferings: [],
+                relevanceScore: 1,
+                matchReason: "matched",
+              },
+            ],
+            metadata: {
+              totalResults: 1,
+              processingTimeMs: 1,
+              strategy: "postgres-text-v1",
+              appliedRequiredCriteria: {},
+              appliedPreferredCriteria: {},
+            },
+          }),
+        });
+        return;
+      }
+      // Newer submission: fall through to the real proxy/API.
+      void route.fallback();
+    });
+
+    await loadHome(page);
+
+    // First submission: a query that matches the stale fixture so the
+    // route handler can branch deterministically.
+    await page.getByTestId("search-input").fill("first-submission-token");
+    await page.getByTestId("search-submit").click();
+
+    // The buyer-facing UI disables the input AND the submit button
+    // while a request is in flight (loading=true). That UX correctly
+    // prevents the buyer from initiating two overlapping
+    // submissions through the normal form flow. For this regression
+    // test we want to inject a second submission while the first is
+    // still in flight to exercise the hook's monotonic requestIdRef
+    // guard, so we force both controls back to enabled via direct
+    // DOM manipulation. A regression that drops the guard would let
+    // the older in-flight response overwrite the newer loading
+    // state, which the assertions below catch.
+    await page.evaluate(() => {
+      const input = document.querySelector(
+        '[data-testid="search-input"]',
+      ) as HTMLInputElement | null;
+      const submit = document.querySelector(
+        '[data-testid="search-submit"]',
+      ) as HTMLButtonElement | null;
+      if (input) input.disabled = false;
+      if (submit) submit.disabled = false;
+    });
+
+    // Second submission while the first remains pending: the
+    // canonical query that matches the seeded Marc-André Pierre
+    // fixture.
+    await page.getByTestId("search-input").fill("Haitian dancehall single production");
+    await page.getByTestId("search-submit").click();
+
+    // Block until the route handler has entered BOTH waiters. This
+    // proves both submissions have actually reached the network layer
+    // and are queued behind their respective resolvers.
+    await expect.poll(() => olderResolvers.length + newerResolvers.length).toBe(2);
+
+    // The loading indicator is visible while the newer request is
+    // pending (the older request is still pending at this point).
+    await expect(page.getByTestId("search-loading")).toBeVisible({ timeout: 5_000 });
+
+    // Release the OLDER request first while the newer request remains
+    // pending. The hook's monotonic requestIdRef guard ensures this
+    // late-arriving response cannot clear the loading state.
+    olderResolvers.splice(0).forEach((resolve) => {
+      resolve();
+    });
+
+    // The loading indicator must still be visible after the older
+    // response settles: the active request is still the newer one.
+    await expect(page.getByTestId("search-loading")).toBeVisible({ timeout: 5_000 });
+
+    // The stale seller must never appear, even momentarily. No result
+    // card has rendered yet because the newer response is still
+    // pending.
+    expect(((await page.textContent("body")) ?? "").includes(staleSeller)).toBe(false);
+
+    // Release the NEWER request. Only now may the loading indicator
+    // clear and the newest result render.
+    newerResolvers.splice(0).forEach((resolve) => {
+      resolve();
+    });
+
+    await expect(page.getByTestId("result-card").first()).toBeVisible({ timeout: 15_000 });
+    await expect(page.getByTestId("search-loading")).toHaveCount(0);
+
+    const bodyText = (await page.textContent("body")) ?? "";
+    expect(bodyText).toContain(freshSeller);
+    expect(bodyText).not.toContain(staleSeller);
+    expect(bodyText).not.toContain("Stale offering");
   });
-
-  await loadHome(page);
-
-  // First submission: "first-submission-token".
-  await page.getByTestId("search-input").fill("first-submission-token");
-  await page.getByTestId("search-submit").click();
-
-  // Second submission BEFORE the first one resolves: a distinct
-  // canonical query that matches the seeded Marc-André Pierre fixture.
-  await page.getByTestId("search-input").fill("Haitian dancehall single production");
-  await page.getByTestId("search-submit").click();
-
-  // Release the second (real) request first by resolving any pending
-  // waiters. The first request's waiter is still pending at this point.
-  for (const resolve of pendingResponses.splice(0)) {
-    resolve();
-  }
-
-  // The newest result must win. The stale seller's name and offering
-  // title must NEVER appear in the rendered page.
-  await expect(page.getByTestId("result-card").first()).toBeVisible({ timeout: 15_000 });
-  const bodyText = (await page.textContent("body")) ?? "";
-  expect(bodyText).toContain(freshSeller);
-  expect(bodyText).not.toContain(staleSeller);
-  expect(bodyText).not.toContain("Stale offering");
 });
 
 // Proxy-vs-direct preservation.
 //
-// Success and error behavior must remain identical through the
-// Next.js proxy and Express directly. This test exercises both
-// paths against the same canonical fixture by sending a malformed
-// request and confirming both surfaces reject with the standard
-// INVALID_SEARCH_CRITERIA envelope and an identical request ID header.
+// The Next.js rewrite must transparently forward the buyer's POST to
+// Express: status, response body, and request ID must round-trip
+// identically. To prove the proxy preserves content rather than
+// merely self-consistently producing some valid response, we send
+// a CONTROLLED `x-request-id` header through BOTH surfaces and
+// assert the body, status, and `x-request-id` response header agree
+// across them. A proxy that rewrites or drops the header, the
+// status, or the body would cause the cross-surface equality
+// assertions to fail.
 //
-// The proxy-side test goes through the running Next.js dev server
-// (page.request); the direct-side test hits the Express API server
-// via `API_URL` (or localhost:4000 by default).
-test("M1.6: success and error envelopes are preserved identically through the proxy and Express directly", async ({
-  page,
-  request: apiRequest,
-}) => {
+// The cases cover:
+//   - INVALID_SEARCH_CRITERIA (malformed body)
+//   - Successful canonical search
+//
+// Both surfaces run in the same Playwright request context so they
+// share the same network namespace and the same `x-request-id`
+// propagation; the controlled ID is the deterministic seam that
+// makes the proxy preservation observable.
+test.describe("M1.6: success and error envelopes are preserved identically through the proxy and Express directly", () => {
   const apiBase = process.env.API_URL ?? "http://localhost:4000";
 
-  // Same malformed payload through both transports. The shared schema
-  // rejects `required.basedIn.countryCode: "12"` with INVALID_SEARCH_CRITERIA.
-  const malformed = JSON.stringify({ required: { basedIn: { countryCode: "12" } } });
+  // Strip the non-deterministic per-query `processingTimeMs` field
+  // from a parsed response body so deep equality across two parallel
+  // queries is observable. Every other field is part of the v1
+  // contract and must round-trip identically through both surfaces.
+  function stripTiming(body: unknown): unknown {
+    if (body === null || typeof body !== "object") return body;
+    if (Array.isArray(body)) return body.map(stripTiming);
+    const clone: Record<string, unknown> = {};
+    for (const [key, value] of Object.entries(body as Record<string, unknown>)) {
+      if (key === "processingTimeMs") continue;
+      clone[key] = stripTiming(value);
+    }
+    return clone;
+  }
 
-  // Proxy path: through Next.js (the browser transport).
-  const proxyResponse = await apiRequest.post("/api/search", {
-    headers: { "content-type": "application/json" },
-    data: malformed,
+  // Send the same payload through both surfaces and return both
+  // responses + parsed bodies. The caller compares them.
+  async function runCaseOnBothTransports(
+    request: APIRequestContext,
+    payload: string,
+    headers: Record<string, string>,
+  ): Promise<{
+    proxy: APIResponse;
+    direct: APIResponse;
+    proxyBody: unknown;
+    directBody: unknown;
+  }> {
+    const proxyResponse = await request.post("/api/search", {
+      headers,
+      data: payload,
+    });
+    const directResponse = await request.fetch(`${apiBase}/api/search`, {
+      method: "POST",
+      headers,
+      data: payload,
+    });
+    const proxyBody: unknown = await proxyResponse.json();
+    const directBody: unknown = await directResponse.json();
+    return {
+      proxy: proxyResponse,
+      direct: directResponse,
+      proxyBody,
+      directBody,
+    };
+  }
+
+  test("malformed body: identical status, body, and propagated request ID across proxy and direct", async ({
+    request,
+    page,
+  }) => {
+    // `required.basedIn.countryCode: "12"` is rejected by the
+    // shared schema with INVALID_SEARCH_CRITERIA. Both surfaces
+    // must surface the SAME status and envelope.
+    const malformed = JSON.stringify({ required: { basedIn: { countryCode: "12" } } });
+    const controlledRequestId = `m1-6-proxy-fidelity-error-${Date.now()}`;
+    const headers = {
+      "content-type": "application/json",
+      "x-request-id": controlledRequestId,
+    };
+
+    const { proxy, direct, proxyBody, directBody } = await runCaseOnBothTransports(
+      request,
+      malformed,
+      headers,
+    );
+
+    // Status equality. A proxy that downgraded to 200 (silent
+    // acceptance) or upgraded to 500 (extra wrapper) would diverge.
+    expect(proxy.status()).toBe(direct.status());
+    expect(proxy.status()).toBe(400);
+
+    // Body equality (deep). A proxy that injected a wrapper, dropped
+    // a field, or rewrote a value would diverge.
+    expect(proxyBody).toEqual(directBody);
+
+    const errorBody = (proxyBody as { error: { code: string; requestId: string } }).error;
+    expect(errorBody.code).toBe("INVALID_SEARCH_CRITERIA");
+
+    // Controlled request ID reached the EXPRESS handler on both
+    // surfaces AND is reflected in BOTH the body and the response
+    // header. A proxy that strips x-request-id would let Express
+    // generate a fresh one and the equality assertions below would
+    // fail.
+    expect(errorBody.requestId).toBe(controlledRequestId);
+    const directErrorBody = (directBody as { error: { code: string; requestId: string } }).error;
+    expect(directErrorBody.requestId).toBe(controlledRequestId);
+    expect(proxy.headers()["x-request-id"]).toBe(controlledRequestId);
+    expect(direct.headers()["x-request-id"]).toBe(controlledRequestId);
+
+    await loadHome(page);
   });
-  expect(proxyResponse.status()).toBe(400);
-  const proxyBody = (await proxyResponse.json()) as {
-    error: { code: string; requestId: string };
-  };
-  expect(proxyBody.error.code).toBe("INVALID_SEARCH_CRITERIA");
 
-  // Direct Express path.
-  const directResponse = await apiRequest.fetch(`${apiBase}/api/search`, {
-    method: "POST",
-    headers: { "content-type": "application/json" },
-    data: malformed,
+  test("canonical search: identical status, body, and request ID across proxy and direct", async ({
+    request,
+    page,
+  }) => {
+    const validPayload = JSON.stringify({ query: "Haitian dancehall single production" });
+    const controlledRequestId = `m1-6-proxy-fidelity-success-${Date.now()}`;
+    const headers = {
+      "content-type": "application/json",
+      "x-request-id": controlledRequestId,
+    };
+
+    const { proxy, direct, proxyBody, directBody } = await runCaseOnBothTransports(
+      request,
+      validPayload,
+      headers,
+    );
+
+    // Status equality.
+    expect(proxy.status()).toBe(direct.status());
+    expect(proxy.status()).toBe(200);
+
+    // Body equality (deep), with the non-deterministic per-query
+    // timing field excluded. `processingTimeMs` is measured at the
+    // service layer and varies by milliseconds between two parallel
+    // queries; the proxy must not be measured differently from the
+    // direct path because both routes reach the same Express
+    // service. Every other field — result order, relevance scores,
+    // normalized query, strategy, applied criteria, request ID —
+    // must round-trip byte-identically through both surfaces. A
+    // proxy that rewrote, reordered, or dropped any of those
+    // fields would diverge.
+    expect(stripTiming(proxyBody)).toEqual(stripTiming(directBody));
+
+    // Sanity: the canonical fixture is on top of the result list
+    // through both surfaces. Both surfaces produced the same
+    // body (asserted above via `expect(proxyBody).toEqual(directBody)`)
+    // so a single check against one surface is sufficient — but
+    // the per-surface checks below make the assertion intent
+    // explicit and self-documenting.
+    const proxyResults = (
+      proxyBody as {
+        results: Array<{
+          seller: { professionalName: string };
+          bestMatchingOffering: { title: string };
+        }>;
+      }
+    ).results;
+    const directResults = (
+      directBody as {
+        results: Array<{
+          seller: { professionalName: string };
+          bestMatchingOffering: { title: string };
+        }>;
+      }
+    ).results;
+    expect(proxyResults.length).toBeGreaterThan(0);
+    expect(directResults.length).toBeGreaterThan(0);
+    const proxyTop = proxyResults[0]!;
+    const directTop = directResults[0]!;
+    expect(proxyTop.seller.professionalName).toBe("Marc-André Pierre");
+    expect(proxyTop.bestMatchingOffering.title).toBe(
+      "Haitian dancehall single production — remote",
+    );
+    expect(directTop.seller.professionalName).toBe("Marc-André Pierre");
+    expect(directTop.bestMatchingOffering.title).toBe(
+      "Haitian dancehall single production — remote",
+    );
+
+    // Controlled request ID propagated through both surfaces.
+    expect(proxy.headers()["x-request-id"]).toBe(controlledRequestId);
+    expect(direct.headers()["x-request-id"]).toBe(controlledRequestId);
+
+    await loadHome(page);
   });
-  expect(directResponse.status()).toBe(400);
-  const directBody = (await directResponse.json()) as {
-    error: { code: string; requestId: string };
-  };
-  expect(directBody.error.code).toBe("INVALID_SEARCH_CRITERIA");
+});
 
-  // Both surfaces produce an identical error code and a non-empty
-  // request ID header. The exact request ID value differs (each
-  // request generates its own), but the shape is preserved.
-  const proxyRequestIdHeader = proxyResponse.headers()["x-request-id"];
-  const directRequestIdHeader = directResponse.headers()["x-request-id"];
-  expect(proxyRequestIdHeader).toBeTruthy();
-  expect(directRequestIdHeader).toBeTruthy();
-  expect(proxyRequestIdHeader).toBe(proxyBody.error.requestId);
-  expect(directRequestIdHeader).toBe(directBody.error.requestId);
+// Real PostgreSQL unavailability through Express and the proxy.
+//
+// Acceptance: "PostgreSQL unavailability returns the safe retriable
+// SEARCH_UNAVAILABLE response and UI state." The previous spec
+// fabricated the 503 at the browser route layer, which never
+// exercised PostgreSQL, Express, or the Next.js proxy at all.
+//
+// This test stops the approved disposable test container
+// (`soundhub_postgres_test` on localhost:5433) so the real Prisma
+// client held by the long-running Express process sees
+// ECONNREFUSED / P1001 on its next query. The buyer's request goes
+// through the real Next.js proxy to the real Express to the real
+// Prisma client. Express's safe-envelope path then maps the
+// Prisma connection error to SEARCH_UNAVAILABLE 503, which the
+// browser renders as a retry card with the buyer's preserved
+// brief.
+//
+// The container is restarted in `afterAll` so subsequent test files
+// in the same Playwright session (and the global teardown) run
+// against a live database. The serial ordering inside this
+// describe guarantees the stop/start operations are not interleaved
+// with other tests.
+//
+// Fail-closed guards:
+//   - The docker compose file path is hardcoded to the approved
+//     `docker-compose.test.yml` in the repo root.
+//   - The container name is the approved `postgres_test` service.
+//   - If any assertion fails, the `try/finally` restarts the
+//     container before re-throwing so the suite does not leave
+//     the database offline.
+const DOCKER_COMPOSE_FILE = `${process.cwd()}/../../docker-compose.test.yml`;
+const TEST_DB_HOST = "localhost";
+const TEST_DB_PORT = 5433;
 
-  // Successful response (canonical Haitian producer) must also
-  // round-trip identically through both surfaces.
-  const validPayload = JSON.stringify({ query: "Haitian dancehall single production" });
-  const proxyOk = await apiRequest.post("/api/search", {
-    headers: { "content-type": "application/json" },
-    data: validPayload,
+function runDockerCompose(args: string): void {
+  execSync(`docker compose -f ${DOCKER_COMPOSE_FILE} ${args}`, {
+    cwd: `${process.cwd()}/../..`,
+    stdio: "pipe",
+    timeout: 30_000,
   });
-  expect(proxyOk.status()).toBe(200);
-  const proxyOkBody = (await proxyOk.json()) as { results: Array<unknown>; metadata: object };
-  expect(proxyOkBody.results.length).toBeGreaterThan(0);
+}
 
-  const directOk = await apiRequest.fetch(`${apiBase}/api/search`, {
-    method: "POST",
-    headers: { "content-type": "application/json" },
-    data: validPayload,
+async function waitForDatabaseDown(timeoutMs: number): Promise<void> {
+  const deadline = Date.now() + timeoutMs;
+  while (Date.now() < deadline) {
+    const ok = await new Promise<boolean>((resolve) => {
+      const socket = net.createConnection({ host: TEST_DB_HOST, port: TEST_DB_PORT }, () => {
+        socket.end();
+        resolve(true);
+      });
+      socket.on("error", () => {
+        socket.destroy();
+        resolve(false);
+      });
+      socket.setTimeout(1_000, () => {
+        socket.destroy();
+        resolve(false);
+      });
+    });
+    if (!ok) return;
+    await sleep(250);
+  }
+  throw new Error(
+    `Test database at ${TEST_DB_HOST}:${TEST_DB_PORT} did not stop accepting TCP within ${timeoutMs}ms`,
+  );
+}
+
+async function waitForDatabaseUp(timeoutMs: number): Promise<void> {
+  const deadline = Date.now() + timeoutMs;
+  let lastError: unknown = null;
+  while (Date.now() < deadline) {
+    try {
+      const ok = await new Promise<boolean>((resolve) => {
+        const socket = net.createConnection({ host: TEST_DB_HOST, port: TEST_DB_PORT }, () => {
+          socket.end();
+          resolve(true);
+        });
+        socket.on("error", (err) => {
+          socket.destroy();
+          lastError = err;
+          resolve(false);
+        });
+        socket.setTimeout(1_000, () => {
+          socket.destroy();
+          resolve(false);
+        });
+      });
+      if (ok) return;
+    } catch (err) {
+      lastError = err;
+    }
+    await sleep(500);
+  }
+  throw new Error(
+    `Test database at ${TEST_DB_HOST}:${TEST_DB_PORT} did not accept TCP within ${timeoutMs}ms (last error: ${String(
+      lastError,
+    )})`,
+  );
+}
+
+test.describe.serial("M1.6: real PostgreSQL unavailability through Express and the proxy", () => {
+  test.afterAll(async () => {
+    // Always bring the container back up before exiting this
+    // describe block, even if the test below failed.
+    try {
+      runDockerCompose("start postgres_test");
+    } catch {
+      // If the container was removed entirely, recreate it via `up`.
+      runDockerCompose("up -d postgres_test");
+    }
+    await waitForDatabaseUp(60_000);
   });
-  expect(directOk.status()).toBe(200);
-  const directOkBody = (await directOk.json()) as { results: Array<unknown>; metadata: object };
-  expect(directOkBody.results.length).toBeGreaterThan(0);
 
-  // The buyer-facing top result must be the same canonical seller
-  // through both surfaces. (Both responses go through the same
-  // service + repository, so the ordering and selection are identical.)
-  // Already exercised by the metadata/strategy assertions in the
-  // existing search.test.ts; here we only need the load-bearing
-  // agreement that both surfaces return the same shape on the
-  // canonical fixture.
+  test("stops PostgreSQL, drives a search through the proxy + Express + real Prisma, and renders SEARCH_UNAVAILABLE with a retry affordance", async ({
+    page,
+    request,
+  }) => {
+    // Sanity: the database is up at the start so this test's
+    // preconditions are visible in the failure output.
+    const sanity = await request.get(
+      `${process.env.API_URL ?? "http://localhost:4000"}/api/health`,
+    );
+    expect(sanity.status()).toBe(200);
 
-  // Sanity: the page is loaded at least once so this test contributes
-  // to the e2e load without depending on its own page state.
-  await loadHome(page);
+    try {
+      // Stop the disposable PostgreSQL container. The Prisma
+      // client's existing pool entries get ECONNREFUSED on the
+      // next query attempt.
+      runDockerCompose("stop postgres_test");
+      await waitForDatabaseDown(15_000);
+
+      // Drive a search through the browser: Next.js proxy →
+      // Express → real Prisma client → PostgreSQL (down) →
+      // connection failure → safe envelope.
+      await loadHome(page);
+      const query = "Haitian dancehall single production";
+      await page.getByTestId("search-input").fill(query);
+      await page.getByTestId("search-submit").click();
+
+      // The retriable error card must appear with the safe
+      // SEARCH_UNAVAILABLE envelope.
+      const errorCard = page.getByTestId("search-error");
+      await expect(errorCard).toBeVisible({ timeout: 30_000 });
+      await expect(page.getByTestId("search-error-message")).toContainText(
+        /temporarily unavailable/i,
+      );
+      // The error envelope carries a non-empty requestId; the
+      // proxy must not have rewritten it to empty.
+      const requestIdText = (
+        (await page.getByTestId("search-error-request-id").textContent()) ?? ""
+      ).trim();
+      expect(requestIdText.length).toBeGreaterThan(0);
+
+      // The retry affordance must be visible and the buyer's
+      // brief must be preserved so the buyer can recover without
+      // retyping.
+      await expect(page.getByTestId("search-retry")).toBeVisible();
+      await expect(page.getByTestId("search-input")).toHaveValue(query);
+
+      // No result card and no empty state; the error envelope is
+      // mutually exclusive with both.
+      await expect(page.getByTestId("result-card")).toHaveCount(0);
+      await expect(page.getByTestId("search-empty")).toHaveCount(0);
+    } finally {
+      // Restart the container in the finally block so a failure
+      // above does not leave the database offline for the next
+      // test file.
+      try {
+        runDockerCompose("start postgres_test");
+      } catch {
+        runDockerCompose("up -d postgres_test");
+      }
+      await waitForDatabaseUp(60_000);
+    }
+  });
 });
