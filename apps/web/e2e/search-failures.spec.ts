@@ -25,7 +25,7 @@
 //   - The retry-button affordance test (line 92) injects the safe
 //     SEARCH_UNAVAILABLE envelope on the first attempt only and falls
 //     through to the real proxy / API for every subsequent attempt.
-//     The real PostgreSQL outage test (the last test in this file)
+//     The real PostgreSQL outage test (in search-outage.spec.ts)
 //     covers the same envelope through the real Prisma + PostgreSQL
 //     path. This fault-injection mock exists because the assertion
 //     under test is the UI affordance: a retry button must appear,
@@ -47,15 +47,6 @@
 // verified. Both always `route.fallback()` for any request they do not
 // specifically intercept.
 //
-// The real-PostgreSQL outage test is the LAST test in this file: it
-// stops the approved disposable test container, drives a request
-// through the proxy + Express + real Prisma client, and restarts the
-// container before returning. The single-worker, sequential
-// `playwright.config.ts` (workers: 1, fullyParallel: false) keeps
-// subsequent test files from running while the database is offline.
-
-import { execSync } from "node:child_process";
-import net from "node:net";
 import { setTimeout as sleep } from "node:timers/promises";
 import {
   test,
@@ -618,169 +609,5 @@ test.describe("M1.6: success and error envelopes are preserved identically throu
     expect(direct.headers()["x-request-id"]).toBe(controlledRequestId);
 
     await loadHome(page);
-  });
-});
-
-// Real PostgreSQL unavailability through Express and the proxy.
-//
-// Acceptance: "PostgreSQL unavailability returns the safe retriable
-// SEARCH_UNAVAILABLE response and UI state." The previous spec
-// fabricated the 503 at the browser route layer, which never
-// exercised PostgreSQL, Express, or the Next.js proxy at all.
-//
-// This test stops the approved disposable test container
-// (`soundhub_postgres_test` on localhost:5433) so the real Prisma
-// client held by the long-running Express process sees
-// ECONNREFUSED / P1001 on its next query. The buyer's request goes
-// through the real Next.js proxy to the real Express to the real
-// Prisma client. Express's safe-envelope path then maps the
-// Prisma connection error to SEARCH_UNAVAILABLE 503, which the
-// browser renders as a retry card with the buyer's preserved
-// brief.
-//
-// The container is restarted in `afterAll` so subsequent test files
-// in the same Playwright session (and the global teardown) run
-// against a live database. The serial ordering inside this
-// describe guarantees the stop/start operations are not interleaved
-// with other tests.
-//
-// Fail-closed guards:
-//   - The docker compose file path is hardcoded to the approved
-//     `docker-compose.test.yml` in the repo root.
-//   - The container name is the approved `postgres_test` service.
-//   - If any assertion fails, the `try/finally` restarts the
-//     container before re-throwing so the suite does not leave
-//     the database offline.
-const DOCKER_COMPOSE_FILE = `${process.cwd()}/../../docker-compose.test.yml`;
-const TEST_DB_HOST = "localhost";
-const TEST_DB_PORT = 5433;
-
-function runDockerCompose(args: string): void {
-  execSync(`docker compose -f ${DOCKER_COMPOSE_FILE} ${args}`, {
-    cwd: `${process.cwd()}/../..`,
-    stdio: "pipe",
-    timeout: 30_000,
-  });
-}
-
-// Poll the test database's TCP port until it reaches the desired
-// availability (true = accepting, false = refusing) or the deadline
-// elapses. The disposable PostgreSQL outage test uses this to wait
-// for the container to stop accepting connections after `docker
-// compose stop` and to wait for it to come back up after `start` /
-// `up`. The last observed socket error is reported in the timeout
-// message so a real diagnosis is visible from CI logs.
-async function waitForTcpState(
-  desiredAvailable: boolean,
-  timeoutMs: number,
-  pollIntervalMs: number,
-): Promise<void> {
-  const deadline = Date.now() + timeoutMs;
-  let lastError: unknown = null;
-  while (Date.now() < deadline) {
-    const reachable = await new Promise<boolean>((resolve) => {
-      const socket = net.createConnection({ host: TEST_DB_HOST, port: TEST_DB_PORT }, () => {
-        socket.end();
-        resolve(true);
-      });
-      socket.on("error", (err) => {
-        socket.destroy();
-        lastError = err;
-        resolve(false);
-      });
-      socket.setTimeout(1_000, () => {
-        socket.destroy();
-        resolve(false);
-      });
-    });
-    if (reachable === desiredAvailable) return;
-    await sleep(pollIntervalMs);
-  }
-  const direction = desiredAvailable ? "accept" : "stop accepting";
-  throw new Error(
-    `Test database at ${TEST_DB_HOST}:${TEST_DB_PORT} did not ${direction} TCP within ${timeoutMs}ms (last error: ${String(
-      lastError,
-    )})`,
-  );
-}
-
-// Bring the disposable PostgreSQL container back up and wait for it
-// to accept TCP connections. Used by both `afterAll` (to recover
-// after a passing test) and the test's `finally` block (to recover
-// after a failing test). If the container was removed entirely,
-// recreate it via `up -d` so subsequent test files still find it.
-async function restoreTestDatabase(): Promise<void> {
-  try {
-    runDockerCompose("start postgres_test");
-  } catch {
-    // If the container was removed entirely, recreate it via `up`.
-    runDockerCompose("up -d postgres_test");
-  }
-  await waitForTcpState(true, 60_000, 500);
-}
-
-test.describe.serial("M1.6: real PostgreSQL unavailability through Express and the proxy", () => {
-  test.afterAll(async () => {
-    // Always bring the container back up before exiting this
-    // describe block, even if the test below failed.
-    await restoreTestDatabase();
-  });
-
-  test("stops PostgreSQL, drives a search through the proxy + Express + real Prisma, and renders SEARCH_UNAVAILABLE with a retry affordance", async ({
-    page,
-    request,
-  }) => {
-    // Sanity: the database is up at the start so this test's
-    // preconditions are visible in the failure output.
-    const sanity = await request.get(
-      `${process.env.API_URL ?? "http://localhost:4000"}/api/health`,
-    );
-    expect(sanity.status()).toBe(200);
-
-    try {
-      // Stop the disposable PostgreSQL container. The Prisma
-      // client's existing pool entries get ECONNREFUSED on the
-      // next query attempt.
-      runDockerCompose("stop postgres_test");
-      await waitForTcpState(false, 15_000, 250);
-
-      // Drive a search through the browser: Next.js proxy →
-      // Express → real Prisma client → PostgreSQL (down) →
-      // connection failure → safe envelope.
-      await loadHome(page);
-      const query = "Haitian dancehall single production";
-      await page.getByTestId("search-input").fill(query);
-      await page.getByTestId("search-submit").click();
-
-      // The retriable error card must appear with the safe
-      // SEARCH_UNAVAILABLE envelope.
-      const errorCard = page.getByTestId("search-error");
-      await expect(errorCard).toBeVisible({ timeout: 30_000 });
-      await expect(page.getByTestId("search-error-message")).toContainText(
-        /temporarily unavailable/i,
-      );
-      // The error envelope carries a non-empty requestId; the
-      // proxy must not have rewritten it to empty.
-      const requestIdText = (
-        (await page.getByTestId("search-error-request-id").textContent()) ?? ""
-      ).trim();
-      expect(requestIdText.length).toBeGreaterThan(0);
-
-      // The retry affordance must be visible and the buyer's
-      // brief must be preserved so the buyer can recover without
-      // retyping.
-      await expect(page.getByTestId("search-retry")).toBeVisible();
-      await expect(page.getByTestId("search-input")).toHaveValue(query);
-
-      // No result card and no empty state; the error envelope is
-      // mutually exclusive with both.
-      await expect(page.getByTestId("result-card")).toHaveCount(0);
-      await expect(page.getByTestId("search-empty")).toHaveCount(0);
-    } finally {
-      // Restart the container in the finally block so a failure
-      // above does not leave the database offline for the next
-      // test file.
-      await restoreTestDatabase();
-    }
   });
 });

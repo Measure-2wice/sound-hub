@@ -84,12 +84,12 @@ test("renders real sellers and Active offerings for the M1.1 happy path", async 
   // area, and service mode must each be separately legible rather than
   // collapsed into one line.
   await expect(top.getByTestId("result-specialties")).toContainText("Producer");
-  await expect(top.getByTestId("result-category")).toHaveText("Music Production");
-  await expect(top.getByTestId("result-service-mode")).toHaveText("Remote");
+  await expect(top.getByTestId("result-offering-category")).toHaveText("Music Production");
+  await expect(top.getByTestId("result-offering-service-mode")).toHaveText("Remote");
   await expect(top.getByTestId("result-based-in")).toContainText("Brooklyn");
   await expect(top.getByTestId("result-based-in")).toContainText("US");
-  await expect(top.getByTestId("result-service-areas")).toContainText("US");
-  await expect(top.getByTestId("result-genres")).toContainText("Dancehall");
+  await expect(top.getByTestId("result-offering-service-areas")).toContainText("US");
+  await expect(top.getByTestId("result-offering-genres")).toContainText("Dancehall");
 
   // Current location and Caribbean affiliation are labeled distinctly so that
   // residence is never presented as regional connection.
@@ -99,9 +99,13 @@ test("renders real sellers and Active offerings for the M1.1 happy path", async 
   expect(cardText).toMatch(/Service area:/);
 
   // Structured, non-binding pricing.
-  await expect(top.getByTestId("result-pricing")).toHaveText("Starting at 600.00 USD/track");
-  await expect(top.getByTestId("result-pricing-disclaimer")).toContainText("non-binding");
-  await expect(top.getByTestId("result-pricing-disclaimer")).toContainText("approved terms");
+  await expect(top.getByTestId("result-offering-pricing")).toHaveText(
+    "Starting at 600.00 USD/track",
+  );
+  await expect(top.getByTestId("result-offering-pricing-disclaimer")).toContainText("non-binding");
+  await expect(top.getByTestId("result-offering-pricing-disclaimer")).toContainText(
+    "approved terms",
+  );
 });
 
 test("presents every pricing presentation as non-binding, including offerings with no advertised price", async ({
@@ -120,10 +124,14 @@ test("presents every pricing presentation as non-binding, including offerings wi
 
   const mastering = cards.filter({ hasText: "Streaming-ready mastering" }).first();
   await expect(mastering).toBeVisible();
-  await expect(mastering.getByTestId("result-pricing")).toHaveText("Not advertised");
-  await expect(mastering.getByTestId("result-pricing-disclaimer")).toContainText("non-binding");
-  await expect(mastering.getByTestId("result-pricing-disclaimer")).toContainText("approved terms");
-  await expect(mastering.getByTestId("result-category")).toHaveText("Mastering");
+  await expect(mastering.getByTestId("result-offering-pricing")).toHaveText("Not advertised");
+  await expect(mastering.getByTestId("result-offering-pricing-disclaimer")).toContainText(
+    "non-binding",
+  );
+  await expect(mastering.getByTestId("result-offering-pricing-disclaimer")).toContainText(
+    "approved terms",
+  );
+  await expect(mastering.getByTestId("result-offering-category")).toHaveText("Mastering");
 
   // relevanceScore still never surfaces as buyer-facing confidence.
   const bodyText = (await page.textContent("body")) ?? "";
@@ -149,9 +157,15 @@ test("presents Fixed pricing and the approved optional seller avatar", async ({ 
 
   // Fixed pricing renders with the currency's own minor-unit exponent
   // (USD has two), and is still framed as non-binding.
-  await expect(topline.getByTestId("result-pricing")).toHaveText("Fixed 1200.00 USD/track");
-  await expect(topline.getByTestId("result-pricing-disclaimer")).toContainText("non-binding");
-  await expect(topline.getByTestId("result-pricing-disclaimer")).toContainText("approved terms");
+  await expect(topline.getByTestId("result-offering-pricing")).toHaveText(
+    "Fixed 1200.00 USD/track",
+  );
+  await expect(topline.getByTestId("result-offering-pricing-disclaimer")).toContainText(
+    "non-binding",
+  );
+  await expect(topline.getByTestId("result-offering-pricing-disclaimer")).toContainText(
+    "approved terms",
+  );
 
   // The approved optional public professional identity includes the avatar.
   // The fixture URL points to a deterministic SVG served from the web app's
@@ -186,9 +200,11 @@ test("presents ContactForQuote pricing as non-binding", async ({ page }) => {
 
   const live = cards.filter({ hasText: "Bachata and merengue live performance" }).first();
   await expect(live).toBeVisible();
-  await expect(live.getByTestId("result-pricing")).toHaveText("Contact for quote");
-  await expect(live.getByTestId("result-pricing-disclaimer")).toContainText("non-binding");
-  await expect(live.getByTestId("result-pricing-disclaimer")).toContainText("approved terms");
+  await expect(live.getByTestId("result-offering-pricing")).toHaveText("Contact for quote");
+  await expect(live.getByTestId("result-offering-pricing-disclaimer")).toContainText("non-binding");
+  await expect(live.getByTestId("result-offering-pricing-disclaimer")).toContainText(
+    "approved terms",
+  );
 
   // Sellers with no avatar render no image rather than a broken one.
   await expect(live.getByTestId("result-seller-avatar")).toHaveCount(0);

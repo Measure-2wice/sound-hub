@@ -59,6 +59,16 @@ export default defineConfig({
   projects: [
     {
       name: "chromium",
+      testIgnore: "search-outage.spec.ts",
+      use: { ...devices["Desktop Chrome"] },
+    },
+    {
+      // The outage test deliberately interrupts PostgreSQL and can leave the
+      // long-lived API process's Prisma pool unable to serve later requests.
+      // Run it only after every ordinary browser test has completed.
+      name: "chromium-outage",
+      testMatch: "search-outage.spec.ts",
+      dependencies: ["chromium"],
       use: { ...devices["Desktop Chrome"] },
     },
   ],
