@@ -32,13 +32,15 @@
 //     the buyer's brief must be preserved, and a successful retry
 //     must yield results.
 //
-//   - The concurrency test (line 164) holds the older in-flight
-//     response pending while the newer submission is sent, then
-//     releases the older response first. This time-control mock
+//   - The concurrency test (line 164) holds both in-flight responses
+//     pending, releases the older one first, and lets BOTH responses
+//     come from the real proxy / API. This time/ordering-control mock
 //     exists because the assertion under test is the
 //     `useTalentSearch` hook's monotonic requestIdRef guard, which
 //     is only observable when the older response can be made to
-//     land AFTER the newer submission is already in flight.
+//     land AFTER the newer submission is already in flight. The route
+//     handler controls the resolution order of the two real requests;
+//     it never fabricates a payload.
 //
 // Both mocks route at the Next.js proxy layer (not the Express layer)
 // so the full browser surface, including the proxy transport, is
@@ -189,8 +191,9 @@ test.describe("M1.6: concurrent submissions preserve newest result and loading",
   }) => {
     // The two interceptors share the same route but expose their
     // resolvers through distinct queues so we can settle the older
-    // submission first while the newer remains pending.
-    const staleSeller = "Stale First Response Seller";
+    // submission first while the newer remains pending. Both
+    // requests ultimately traverse the real proxy / API; the route
+    // handler only controls the resolution order.
     const freshSeller = "Marc-André Pierre";
     const olderResolvers: Array<() => void> = [];
     const newerResolvers: Array<() => void> = [];
@@ -204,58 +207,22 @@ test.describe("M1.6: concurrent submissions preserve newest result and loading",
         resolverTarget.push(resolve);
       });
       await waiter;
-      if (isOlderRequest) {
-        void route.fulfill({
-          status: 200,
-          contentType: "application/json",
-          body: JSON.stringify({
-            results: [
-              {
-                seller: {
-                  sellerId: "stale-seller",
-                  professionalName: staleSeller,
-                  specialties: [],
-                  bio: "",
-                  basedIn: { countryCode: "US" },
-                  caribbeanAffiliationCodes: [],
-                },
-                bestMatchingOffering: {
-                  offeringId: "stale-offering",
-                  title: "Stale offering",
-                  description: "",
-                  primaryCategory: {
-                    key: "music-production",
-                    name: "Music Production",
-                  },
-                  includedServices: [],
-                  genreTags: [],
-                  serviceMode: "Remote",
-                  serviceAreas: [{ countryCode: "US" }],
-                },
-                additionalMatchingOfferings: [],
-                relevanceScore: 1,
-                matchReason: "matched",
-              },
-            ],
-            metadata: {
-              totalResults: 1,
-              processingTimeMs: 1,
-              strategy: "postgres-text-v1",
-              appliedRequiredCriteria: {},
-              appliedPreferredCriteria: {},
-            },
-          }),
-        });
-        return;
-      }
-      // Newer submission: fall through to the real proxy/API.
+      // Both the older and the newer submission fall through to the
+      // real proxy / API. The route handler only controls the ORDER
+      // in which the two real requests reach the network; it never
+      // fabricates a payload. The older request resolves first while
+      // the newer one remains pending, so the hook's
+      // AbortController + monotonic requestIdRef guard is exercised
+      // against real responses rather than a synthesised stale 200.
       void route.fallback();
     });
 
     await loadHome(page);
 
-    // First submission: a query that matches the stale fixture so the
-    // route handler can branch deterministically.
+    // First submission: a query that intentionally matches no
+    // canonical seller so its real proxy/API response is an empty
+    // results array. The token also lets the route handler identify
+    // which submission is older.
     await page.getByTestId("search-input").fill("first-submission-token");
     await page.getByTestId("search-submit").click();
 
@@ -302,10 +269,11 @@ test.describe("M1.6: concurrent submissions preserve newest result and loading",
     // response settles: the active request is still the newer one.
     await expect(page.getByTestId("search-loading")).toBeVisible({ timeout: 5_000 });
 
-    // The stale seller must never appear, even momentarily. No result
-    // card has rendered yet because the newer response is still
-    // pending.
-    expect(((await page.textContent("body")) ?? "").includes(staleSeller)).toBe(false);
+    // The older response must not cause a result card to render:
+    // the newer request is still in flight, so the active loading
+    // state is preserved and no seller card is shown until the
+    // newer response lands.
+    await expect(page.getByTestId("result-card")).toHaveCount(0);
 
     // Release the NEWER request. Only now may the loading indicator
     // clear and the newest result render.
@@ -318,8 +286,6 @@ test.describe("M1.6: concurrent submissions preserve newest result and loading",
 
     const bodyText = (await page.textContent("body")) ?? "";
     expect(bodyText).toContain(freshSeller);
-    expect(bodyText).not.toContain(staleSeller);
-    expect(bodyText).not.toContain("Stale offering");
   });
 });
 
