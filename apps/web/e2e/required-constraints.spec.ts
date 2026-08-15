@@ -300,8 +300,8 @@ test("M1.4: required constraints compound (category AND service mode are both en
   expect(count).toBeGreaterThan(0);
   for (let i = 0; i < count; i += 1) {
     const card = cards.nth(i);
-    await expect(card.getByTestId("result-category")).toHaveText("Music Production");
-    await expect(card.getByTestId("result-service-mode")).toHaveText("Remote");
+    await expect(card.getByTestId("result-offering-category")).toHaveText("Music Production");
+    await expect(card.getByTestId("result-offering-service-mode")).toHaveText("Remote");
   }
 });
 

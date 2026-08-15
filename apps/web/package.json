@@ -4,13 +4,13 @@
   "private": true,
   "type": "module",
   "scripts": {
-    "dev": "next dev -p 3000",
+    "dev": "next dev -p ${PORT_WEB:-3000}",
     "build": "next build",
     "start": "next start",
     "lint": "eslint .",
     "type-check": "tsc --noEmit",
     "test:e2e": "playwright test",
-    "test": "TSX_TSCONFIG_PATH=tsconfig.test.json node --import tsx --test src/app/lib/talent-search-request-builder.test.ts src/app/lib/field-error-paths.test.ts src/app/components/SearchPage.test.ts"
+    "test": "TSX_TSCONFIG_PATH=tsconfig.test.json node --import tsx --test src/app/lib/talent-search-request-builder.test.ts src/app/lib/field-error-paths.test.ts src/app/hooks/useSearch.test.ts src/app/components/SearchPage.test.ts"
   },
   "dependencies": {
     "@soundhub/types": "workspace:*",

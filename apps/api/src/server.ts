@@ -4,7 +4,7 @@
 import { buildApp } from "./index.js";
 
 const { app } = buildApp();
-const port = Number(process.env.PORT ?? 4000);
+const port = Number(process.env.PORT_API ?? process.env.PORT ?? 4000);
 app.listen(port, () => {
   console.log(`🚀 SoundHub API server running on http://localhost:${port}`);
   console.log(`📊 Health check: http://localhost:${port}/api/health`);

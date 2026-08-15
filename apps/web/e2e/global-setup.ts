@@ -66,6 +66,11 @@ export default async function globalSetup(): Promise<void> {
     "apps/api/node_modules/.bin/tsx scripts/db-test-cycle.mjs",
     {
       TEST_DATABASE_URL: "postgresql://soundhub:password@localhost:5433/soundhub_m1_test",
+      // The seed stores the canonical seller avatar as an absolute URL.
+      // Playwright's `webServer.env` is not applied to global setup, so
+      // propagate the configured browser origin into the database cycle
+      // explicitly instead of falling back to localhost:3000.
+      PUBLIC_FIXTURE_ORIGIN: WEB_URL,
       NODE_ENV: "test",
     },
   );
