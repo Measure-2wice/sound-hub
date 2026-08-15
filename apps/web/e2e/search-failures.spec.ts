@@ -193,85 +193,118 @@ test("M1.6: SEARCH_UNAVAILABLE surfaces a retry button that re-submits the prese
 // is observable, and so a successful overwrite would be visible
 // as either a removed result card or the appearance of an
 // unexpected seller card.
+//
+// The shared submission/route-waiter orchestration lives in
+// `setupConcurrencyHarness` below. Each subtest provides its own
+// queries, token, release order, and assertions.
+
+interface ConcurrencyHarness {
+  readonly releaseOlder: () => void;
+  readonly releaseNewer: () => void;
+}
+
+// Set up two overlapping submissions routed through the real proxy
+// and Express. The route handler installs body-token detection so
+// the older and newer requests land in separate resolver queues
+// (which lets each test settle them in its own chosen order). Both
+// requests `route.fallback()` to the real proxy / API; the harness
+// only controls the resolution ORDER of the two real requests, not
+// their content.
+//
+// The buyer-facing UX disables the input and submit button while a
+// request is in flight. That is correct production behaviour but
+// blocks the second submission. The harness re-enables both
+// controls via direct DOM manipulation so a regression test can
+// inject the second submission while the first is still pending.
+// This mirrors the same escape hatch the original spec used and is
+// necessary to exercise the hook's monotonic requestIdRef guard.
+async function setupConcurrencyHarness(
+  page: Page,
+  options: {
+    olderQuery: string;
+    newerQuery: string;
+    olderToken: string;
+  },
+): Promise<ConcurrencyHarness> {
+  const olderResolvers: Array<() => void> = [];
+  const newerResolvers: Array<() => void> = [];
+
+  await page.route("**/api/search", async (route) => {
+    const request = route.request();
+    const body = request.postData() ?? "";
+    const isOlderRequest = body.includes(options.olderToken);
+    const resolverTarget = isOlderRequest ? olderResolvers : newerResolvers;
+    const waiter = new Promise<void>((resolve) => {
+      resolverTarget.push(resolve);
+    });
+    await waiter;
+    void route.fallback();
+  });
+
+  await loadHome(page);
+
+  // First submission (older).
+  await page.getByTestId("search-input").fill(options.olderQuery);
+  await page.getByTestId("search-submit").click();
+
+  // Force form controls back to enabled so the second submission
+  // can be injected while the first is still pending.
+  await page.evaluate(() => {
+    const input = document.querySelector<HTMLInputElement>('[data-testid="search-input"]');
+    const submit = document.querySelector<HTMLButtonElement>('[data-testid="search-submit"]');
+    if (input) input.disabled = false;
+    if (submit) submit.disabled = false;
+  });
+
+  // Second submission (newer).
+  await page.getByTestId("search-input").fill(options.newerQuery);
+  await page.getByTestId("search-submit").click();
+
+  // Block until the route handler has entered BOTH waiters. This
+  // proves both submissions have actually reached the network
+  // layer and are queued behind their respective resolvers.
+  await expect.poll(() => olderResolvers.length + newerResolvers.length).toBe(2);
+
+  // Arrow functions so destructured callers cannot lose `this`
+  // binding; the closures capture the resolver queues above.
+  return {
+    releaseOlder: () => {
+      olderResolvers.splice(0).forEach((resolve) => {
+        resolve();
+      });
+    },
+    releaseNewer: () => {
+      newerResolvers.splice(0).forEach((resolve) => {
+        resolve();
+      });
+    },
+  };
+}
+
 test.describe("M1.6: concurrent submissions preserve newest result and loading", () => {
   test("older in-flight response cannot overwrite the newer submission's loading state", async ({
     page,
   }) => {
-    // The two interceptors share the same route but expose their
-    // resolvers through distinct queues so we can settle the older
-    // submission first while the newer remains pending. Both
-    // requests ultimately traverse the real proxy / API; the route
-    // handler only controls the resolution order.
-    const freshSeller = "Marc-André Pierre";
-    const olderResolvers: Array<() => void> = [];
-    const newerResolvers: Array<() => void> = [];
-
-    await page.route("**/api/search", async (route) => {
-      const request = route.request();
-      const body = request.postData() ?? "";
-      const isOlderRequest = body.includes("first-submission-token");
-      const resolverTarget = isOlderRequest ? olderResolvers : newerResolvers;
-      const waiter = new Promise<void>((resolve) => {
-        resolverTarget.push(resolve);
-      });
-      await waiter;
-      // Both the older and the newer submission fall through to the
-      // real proxy / API. The route handler only controls the ORDER
-      // in which the two real requests reach the network; it never
-      // fabricates a payload. The older request resolves first while
-      // the newer one remains pending, so the hook's
-      // AbortController + monotonic requestIdRef guard is exercised
-      // against real responses rather than a synthesised stale 200.
-      void route.fallback();
-    });
-
-    await loadHome(page);
-
-    // First submission: a query that intentionally matches no
+    // The older submission's query intentionally matches no
     // canonical seller so its real proxy/API response is an empty
-    // results array. The token also lets the route handler identify
-    // which submission is older.
-    await page.getByTestId("search-input").fill("first-submission-token");
-    await page.getByTestId("search-submit").click();
-
-    // The buyer-facing UI disables the input AND the submit button
-    // while a request is in flight (loading=true). That UX correctly
-    // prevents the buyer from initiating two overlapping
-    // submissions through the normal form flow. For this regression
-    // test we want to inject a second submission while the first is
-    // still in flight to exercise the hook's monotonic requestIdRef
-    // guard, so we force both controls back to enabled via direct
-    // DOM manipulation. A regression that drops the guard would let
-    // the older in-flight response overwrite the newer loading
-    // state, which the assertions below catch.
-    await page.evaluate(() => {
-      const input = document.querySelector<HTMLInputElement>('[data-testid="search-input"]');
-      const submit = document.querySelector<HTMLButtonElement>('[data-testid="search-submit"]');
-      if (input) input.disabled = false;
-      if (submit) submit.disabled = false;
+    // results array. The newer submission's query matches the
+    // seeded Marc-André Pierre fixture.
+    const freshSeller = "Marc-André Pierre";
+    const { releaseOlder, releaseNewer } = await setupConcurrencyHarness(page, {
+      olderQuery: "first-submission-token",
+      newerQuery: "Haitian dancehall single production",
+      olderToken: "first-submission-token",
     });
-
-    // Second submission while the first remains pending: the
-    // canonical query that matches the seeded Marc-André Pierre
-    // fixture.
-    await page.getByTestId("search-input").fill("Haitian dancehall single production");
-    await page.getByTestId("search-submit").click();
-
-    // Block until the route handler has entered BOTH waiters. This
-    // proves both submissions have actually reached the network layer
-    // and are queued behind their respective resolvers.
-    await expect.poll(() => olderResolvers.length + newerResolvers.length).toBe(2);
 
     // The loading indicator is visible while the newer request is
     // pending (the older request is still pending at this point).
     await expect(page.getByTestId("search-loading")).toBeVisible({ timeout: 5_000 });
 
-    // Release the OLDER request first while the newer request remains
-    // pending. The hook's monotonic requestIdRef guard ensures this
-    // late-arriving response cannot clear the loading state.
-    olderResolvers.splice(0).forEach((resolve) => {
-      resolve();
-    });
+    // Release the OLDER request first while the newer request
+    // remains pending. The hook's monotonic requestIdRef guard
+    // ensures this late-arriving response cannot clear the
+    // loading state.
+    releaseOlder();
 
     // The loading indicator must still be visible after the older
     // response settles: the active request is still the newer one.
@@ -283,11 +316,9 @@ test.describe("M1.6: concurrent submissions preserve newest result and loading",
     // newer response lands.
     await expect(page.getByTestId("result-card")).toHaveCount(0);
 
-    // Release the NEWER request. Only now may the loading indicator
-    // clear and the newest result render.
-    newerResolvers.splice(0).forEach((resolve) => {
-      resolve();
-    });
+    // Release the NEWER request. Only now may the loading
+    // indicator clear and the newest result render.
+    releaseNewer();
 
     await expect(page.getByTestId("result-card").first()).toBeVisible({ timeout: 15_000 });
     await expect(page.getByTestId("search-loading")).toHaveCount(0);
@@ -317,62 +348,14 @@ test.describe("M1.6: concurrent submissions preserve newest result and loading",
   }) => {
     const newerSeller = "Marc-André Pierre";
     const olderSeller = "Keisha Williams";
-    const olderResolvers: Array<() => void> = [];
-    const newerResolvers: Array<() => void> = [];
-
-    await page.route("**/api/search", async (route) => {
-      const request = route.request();
-      const body = request.postData() ?? "";
-      // The older submission's query carries a unique token so the
-      // route handler can route its resolver independently of the
-      // newer one. The newer submission's query does NOT carry the
-      // token, so it lands in the newer queue. Both fall through to
-      // the real proxy / API; the route handler only controls the
-      // resolution order of the two real requests.
-      const isOlderRequest = body.includes("older-stale-overwrite-token");
-      const resolverTarget = isOlderRequest ? olderResolvers : newerResolvers;
-      const waiter = new Promise<void>((resolve) => {
-        resolverTarget.push(resolve);
-      });
-      await waiter;
-      void route.fallback();
+    const { releaseOlder, releaseNewer } = await setupConcurrencyHarness(page, {
+      // The token identifies the older request to the route
+      // handler but is not itself a search token; the canonical
+      // "Afrobeats topline writing" tokens carry the match.
+      olderQuery: "older-stale-overwrite-token Afrobeats topline writing",
+      newerQuery: "Haitian dancehall single production",
+      olderToken: "older-stale-overwrite-token",
     });
-
-    await loadHome(page);
-
-    // First submission (older): a real, distinct, non-empty query
-    // that matches the seeded Keisha Williams fixture. The token
-    // identifies the request to the route handler but is not
-    // itself a search token; the canonical "Afrobeats topline
-    // writing" tokens carry the match.
-    await page
-      .getByTestId("search-input")
-      .fill("older-stale-overwrite-token Afrobeats topline writing");
-    await page.getByTestId("search-submit").click();
-
-    // Force the form controls back to enabled so the second
-    // submission can be injected while the first is still pending.
-    // The production UX correctly disables the form during a
-    // loading state; this re-enable mirrors the same direct-DOM
-    // escape hatch the sibling subtest uses and is necessary to
-    // exercise the hook's monotonic requestIdRef guard against
-    // overlapping real submissions.
-    await page.evaluate(() => {
-      const input = document.querySelector<HTMLInputElement>('[data-testid="search-input"]');
-      const submit = document.querySelector<HTMLButtonElement>('[data-testid="search-submit"]');
-      if (input) input.disabled = false;
-      if (submit) submit.disabled = false;
-    });
-
-    // Second submission (newer): the canonical query that matches
-    // the seeded Marc-André Pierre fixture.
-    await page.getByTestId("search-input").fill("Haitian dancehall single production");
-    await page.getByTestId("search-submit").click();
-
-    // Block until the route handler has entered BOTH waiters. This
-    // proves both submissions have actually reached the network
-    // layer and are queued behind their respective resolvers.
-    await expect.poll(() => olderResolvers.length + newerResolvers.length).toBe(2);
 
     // Release the NEWER request FIRST. The newer response reaches
     // the hook while the older request is still pending, so the
@@ -381,9 +364,7 @@ test.describe("M1.6: concurrent submissions preserve newest result and loading",
     // visible before the older response is released so the
     // assertion below has a concrete "newer rendered result" to
     // protect from overwrite.
-    newerResolvers.splice(0).forEach((resolve) => {
-      resolve();
-    });
+    releaseNewer();
 
     const newerCard = page.getByTestId("result-card").filter({ hasText: newerSeller }).first();
     await expect(newerCard).toBeVisible({ timeout: 15_000 });
@@ -396,7 +377,6 @@ test.describe("M1.6: concurrent submissions preserve newest result and loading",
     // that drops the `requestIdRef` guard would let the older
     // response clobber the rendered state and any of these three
     // snapshots would diverge.
-    const newerVisibleBefore = await newerCard.isVisible();
     const totalCountBefore = await page.getByTestId("result-card").count();
 
     // Release the OLDER request AFTER the newer result has
@@ -407,9 +387,7 @@ test.describe("M1.6: concurrent submissions preserve newest result and loading",
     // results, the newer one carries Marc-André Pierre results
     // — so an unguarded overwrite would surface as a Keisha
     // Williams card appearing in the same DOM the buyer sees.
-    olderResolvers.splice(0).forEach((resolve) => {
-      resolve();
-    });
+    releaseOlder();
 
     // Allow the older response time to settle. If the hook drops
     // the stale response correctly, the DOM is unchanged. If a
@@ -422,7 +400,6 @@ test.describe("M1.6: concurrent submissions preserve newest result and loading",
     // The newer card must still be visible — the older response
     // must not have cleared it.
     await expect(newerCard).toBeVisible();
-    expect(await newerCard.isVisible()).toBe(newerVisibleBefore);
 
     // The result list must still belong to the newer submission:
     // Marc-André Pierre is rendered, and Keisha Williams (the

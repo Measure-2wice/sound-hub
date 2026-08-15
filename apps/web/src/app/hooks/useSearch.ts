@@ -120,80 +120,42 @@ export function useSearch(): UseSearchReturn {
     setErrorCode(null);
     setFieldErrors([]);
 
-    try {
-      const response = await fetch("/api/search", {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify(request),
-        signal: abortController.signal,
-      });
-      const responseRequestId = response.headers.get("x-request-id") ?? "";
-
-      if (!response.ok) {
-        const errorJson: unknown = await response.json().catch(() => null);
-        const parsedError = apiErrorResponseV1Schema.safeParse(errorJson);
-        if (parsedError.success) {
-          if (requestIdRef.current !== currentRequest) return;
-          setError(parsedError.data.error.message);
-          setErrorCode(parsedError.data.error.code);
-          setRequestId(parsedError.data.error.requestId);
-          // Field-level errors power the per-control validation feedback.
-          // The contract caps them at 50 entries; the page renders them
-          // beside the named path.
-          setFieldErrors(parsedError.data.error.fields ?? []);
+    await dispatchSearch(
+      request,
+      abortController.signal,
+      () => requestIdRef.current !== currentRequest,
+      {
+        // Bind to `globalThis` so the destructured `fetch` retains
+        // its `this` binding when called from the helper. Without
+        // the bind, `deps.fetch(...)` would throw `Illegal invocation`
+        // because `Window.fetch` requires its receiver.
+        fetch: fetch.bind(globalThis),
+        parseSuccess: (data) => {
+          const parsed = talentSearchResponseV1Schema.safeParse(data);
+          return parsed.success ? parsed.data : null;
+        },
+        parseError: (data) => {
+          const parsed = apiErrorResponseV1Schema.safeParse(data);
+          return parsed.success ? parsed.data.error : null;
+        },
+      },
+      {
+        onResults: (results, responseRequestId) => {
+          setResults(results);
+          setRequestId(responseRequestId);
+        },
+        onError: ({ message, code, requestId: errorRequestId, fields }) => {
+          setError(message);
+          setErrorCode(code);
+          setRequestId(errorRequestId);
+          setFieldErrors(fields);
           setResults(null);
-          return;
-        }
-        if (requestIdRef.current !== currentRequest) return;
-        setError(`Search failed: ${response.statusText || "unknown error"}`);
-        setErrorCode("SEARCH_FAILED");
-        setRequestId(responseRequestId);
-        setFieldErrors([]);
-        setResults(null);
-        return;
-      }
-
-      const data: unknown = await response.json();
-      const validated = talentSearchResponseV1Schema.safeParse(data);
-      if (!validated.success) {
-        if (requestIdRef.current !== currentRequest) return;
-        setError("Search returned an unexpected response shape.");
-        setErrorCode("SEARCH_FAILED");
-        setRequestId(responseRequestId);
-        setFieldErrors([]);
-        setResults(null);
-        return;
-      }
-      if (requestIdRef.current !== currentRequest) return;
-      setResults(validated.data);
-      setRequestId(responseRequestId);
-    } catch (err) {
-      // An aborted fetch is the expected outcome when the buyer starts
-      // a new search. Treat it as a silent no-op so the new request's
-      // loading state stays intact; the new request's own success or
-      // error path will set the terminal state.
-      if (err instanceof DOMException && err.name === "AbortError") {
-        return;
-      }
-      if (requestIdRef.current !== currentRequest) return;
-      const message =
-        err instanceof Error ? (err.name === "AbortError" ? null : err.message) : "Network error";
-      if (message !== null) {
-        setError(message);
-        setErrorCode("SEARCH_FAILED");
-        setRequestId(null);
-        setFieldErrors([]);
-        setResults(null);
-      }
-    } finally {
-      // Only clear the loading indicator if no newer request has taken
-      // over. A stale resolution must never clear the loading state of
-      // the active request, satisfying the "stale responses cannot
-      // clear the current loading state" contract.
-      if (requestIdRef.current === currentRequest) {
-        setIsLoading(false);
-      }
-    }
+        },
+        onLoadingChange: (loading) => {
+          setIsLoading(loading);
+        },
+      },
+    );
   }, []);
 
   const retry = useCallback(async () => {
@@ -238,4 +200,125 @@ export function useSearch(): UseSearchReturn {
 export function isRetriableErrorCode(code: string | null): boolean {
   if (code === null) return false;
   return RETRIABLE_ERROR_CODES.has(code);
+}
+
+// Pipeline extracted from `useSearch` so the request-id stale-response
+// guard can be exercised in a Node test without rendering React or
+// depending on `AbortController` actually aborting the underlying
+// fetch. The hook owns the React orchestration (counter, abort
+// controller, state setters); this helper owns the fetch + parse +
+// stale-check + dispatch pipeline that the same orchestration drives.
+//
+// Every state-mutating branch is gated by `isStale()`. The hook passes
+// a closure over its monotonic counter so a later resolution that
+// arrives after a newer request has taken over is dropped before any
+// callback fires. Aborting the fetch is the FIRST line of defence
+// (cancels the browser-side body read), but it is NOT sufficient on
+// its own — a fetch that already settled before abort was observed,
+// or a fetch run in a stub that ignores abort, can still produce a
+// response that reaches this pipeline. The stale-check is the
+// authoritative guard for the "older response cannot overwrite newer
+// results" contract; cancelling is a resource optimisation on top of
+// it.
+export interface DispatchSearchCallbacks {
+  onResults: (results: TalentSearchResponseV1, responseRequestId: string) => void;
+  onError: (params: {
+    message: string;
+    code: string;
+    requestId: string | null;
+    fields: readonly ApiFieldErrorV1[];
+  }) => void;
+  onLoadingChange: (loading: boolean) => void;
+}
+
+export interface DispatchSearchDeps {
+  fetch: typeof fetch;
+  parseSuccess: (data: unknown) => TalentSearchResponseV1 | null;
+  parseError: (data: unknown) => {
+    code: string;
+    message: string;
+    requestId: string;
+    fields?: readonly ApiFieldErrorV1[];
+  } | null;
+}
+
+export async function dispatchSearch(
+  payload: unknown,
+  abortSignal: AbortSignal,
+  isStale: () => boolean,
+  deps: DispatchSearchDeps,
+  callbacks: DispatchSearchCallbacks,
+): Promise<void> {
+  try {
+    const response = await deps.fetch("/api/search", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(payload),
+      signal: abortSignal,
+    });
+    const responseRequestId = response.headers.get("x-request-id") ?? "";
+
+    if (!response.ok) {
+      const errorJson: unknown = await response.json().catch(() => null);
+      const parsedError = deps.parseError(errorJson);
+      if (parsedError) {
+        if (isStale()) return;
+        callbacks.onError({
+          message: parsedError.message,
+          code: parsedError.code,
+          requestId: parsedError.requestId,
+          fields: parsedError.fields ?? [],
+        });
+        return;
+      }
+      if (isStale()) return;
+      callbacks.onError({
+        message: `Search failed: ${response.statusText || "unknown error"}`,
+        code: "SEARCH_FAILED",
+        requestId: responseRequestId,
+        fields: [],
+      });
+      return;
+    }
+
+    const data: unknown = await response.json();
+    const validated = deps.parseSuccess(data);
+    if (!validated) {
+      if (isStale()) return;
+      callbacks.onError({
+        message: "Search returned an unexpected response shape.",
+        code: "SEARCH_FAILED",
+        requestId: responseRequestId,
+        fields: [],
+      });
+      return;
+    }
+    if (isStale()) return;
+    callbacks.onResults(validated, responseRequestId);
+  } catch (err) {
+    // An aborted fetch is the expected outcome when the buyer starts
+    // a new search. Treat it as a silent no-op so the new request's
+    // loading state stays intact; the new request's own success or
+    // error path will set the terminal state.
+    if (err instanceof DOMException && err.name === "AbortError") {
+      return;
+    }
+    if (isStale()) return;
+    const message =
+      err instanceof Error ? (err.name === "AbortError" ? null : err.message) : "Network error";
+    if (message !== null) {
+      callbacks.onError({
+        message,
+        code: "SEARCH_FAILED",
+        requestId: null,
+        fields: [],
+      });
+    }
+  } finally {
+    // Only clear the loading indicator if no newer request has taken
+    // over. A stale resolution must never clear the loading state of
+    // the active request, satisfying the "stale responses cannot
+    // clear the current loading state" contract.
+    if (!isStale()) callbacks.onLoadingChange(false);
+  }
 }
