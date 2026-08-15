@@ -96,10 +96,12 @@ const STEPS = [
     env: {},
   },
   {
-    label: "tests (API service + route + repository + web unit)",
-    // The workspace test script composes API, web, and repository
-    // tests so step 6 covers privacy, deterministic ordering,
-    // strict validation, and lifecycle eligibility assertions.
+    label: "tests (API service + route + repository + web unit + forbidden-deps scanner)",
+    // The workspace test script composes API, web, repository,
+    // and forbidden-deps scanner tests so step 6 covers privacy,
+    // deterministic ordering, strict validation, lifecycle
+    // eligibility assertions, and the pnpm-v9 lockfile matcher
+    // regression suite (P1-001 Codex remediation).
     command: "pnpm",
     args: ["test"],
     cwd: REPO_ROOT,
