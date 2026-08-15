@@ -1,7 +1,7 @@
 "use client";
 
 import { useEffect, useMemo, useState, type FormEvent } from "react";
-import { useSearch } from "../hooks/useSearch";
+import { isRetriableErrorCode, useSearch } from "../hooks/useSearch";
 import { hasUsableCriteria, type RequiredFiltersValue } from "../lib/talent-search-request-builder";
 import { isControlledRequiredPath } from "../lib/field-error-paths";
 import { Card } from "./ui/Card";
@@ -24,7 +24,8 @@ export function SearchPage() {
     basedIn: { city: "", region: "", countryCode: "" },
     serviceArea: { city: "", region: "", countryCode: "" },
   });
-  const { results, isLoading, error, errorCode, fieldErrors, requestId, search } = useSearch();
+  const { results, isLoading, error, errorCode, fieldErrors, requestId, search, retry } =
+    useSearch();
 
   // Canonical categories are fetched from the public metadata seam
   // (`GET /api/metadata/categories`) so the browser never holds a
@@ -167,6 +168,18 @@ export function SearchPage() {
               <p className="mt-2 text-sm text-red-700">
                 The brief is preserved. You can retry without retyping it.
               </p>
+            )}
+            {isRetriableErrorCode(errorCode) && !isLoading && (
+              <button
+                type="button"
+                onClick={() => {
+                  void retry();
+                }}
+                data-testid="search-retry"
+                className="mt-3 inline-flex items-center gap-1 bg-red-600 text-white py-2 px-4 rounded-md text-sm font-medium hover:bg-red-700 focus:outline-none focus:ring-2 focus:ring-red-500 focus:ring-offset-2 transition-colors"
+              >
+                Retry search
+              </button>
             )}
             {unmatchedFieldErrors.length > 0 && (
               <ul className="mt-3 space-y-1" data-testid="search-error-fields">
