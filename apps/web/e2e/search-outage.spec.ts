@@ -4,7 +4,7 @@
 // the disposable service for later commands, but the test does not assume the
 // already-running API process can recover its existing Prisma connection pool.
 
-import { execSync } from "node:child_process";
+import { execFileSync } from "node:child_process";
 import net from "node:net";
 import { setTimeout as sleep } from "node:timers/promises";
 import { expect, test, type Page } from "@playwright/test";
@@ -18,8 +18,8 @@ async function loadHome(page: Page) {
   await expect(page.getByRole("heading", { name: "Find Caribbean talent" })).toBeVisible();
 }
 
-function runDockerCompose(args: string): void {
-  execSync(`docker compose -f ${DOCKER_COMPOSE_FILE} ${args}`, {
+function runDockerCompose(args: readonly string[]): void {
+  execFileSync("docker", ["compose", "-f", DOCKER_COMPOSE_FILE, ...args], {
     cwd: `${process.cwd()}/../..`,
     stdio: "pipe",
     timeout: 30_000,
@@ -62,9 +62,9 @@ async function waitForTcpState(
 
 async function restoreTestDatabase(): Promise<void> {
   try {
-    runDockerCompose("start postgres_test");
+    runDockerCompose(["start", "postgres_test"]);
   } catch {
-    runDockerCompose("up -d postgres_test");
+    runDockerCompose(["up", "-d", "postgres_test"]);
   }
   await waitForTcpState(true, 60_000, 500);
 }
@@ -84,7 +84,7 @@ test.describe.serial("M1.6: real PostgreSQL unavailability through Express and t
     expect(sanity.status()).toBe(200);
 
     try {
-      runDockerCompose("stop postgres_test");
+      runDockerCompose(["stop", "postgres_test"]);
       await waitForTcpState(false, 15_000, 250);
 
       await loadHome(page);
