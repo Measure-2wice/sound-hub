@@ -14,16 +14,15 @@
 // Scope:
 //   - Every workspace `package.json` (root, apps/*, packages/*).
 //   - `pnpm-lock.yaml` resolved dependency declarations.
-//   - TypeScript and JavaScript source files under apps/*/src and
-//     packages/*/src.
+//   - TypeScript and JavaScript source files under apps/*/src,
+//     packages/*/src, packages/*/prisma/, and scripts/.
 //
 // Out of scope:
 //   - Files in `node_modules/`, `dist/`, `.next/`, `.next-dev/`,
 //     `test-results/`, and `playwright-report/` (build artefacts).
 //   - Generated Prisma client output (`packages/db/src/generated/`).
-//   - Files explicitly allow-listed via the FORBIDDEN_DEPS_ALLOWLIST
-//     env var (comma-separated file paths, used only for tests of
-//     this script).
+//   - Files explicitly allow-listed via the SOURCE_ALLOWLIST set
+//     below (used only for tests of this script).
 
 import { readFileSync, readdirSync, statSync } from "node:fs";
 import { extname, join, relative, resolve } from "node:path";
@@ -119,9 +118,15 @@ const SOURCE_ALLOWLIST = new Set([
   // must not be scanned against its own literal identifiers. Without
   // this entry, the scanner would report every forbidden name in the
   // FORBIDDEN_PACKAGES / FORBIDDEN_IMPORT_SPECIFIERS constants as a
-  // self-violation. The allow-list is a forward-looking hook for any
-  // future test fixture that legitimately exercises the scanner.
+  // self-violation. The regression-test suite deliberately writes
+  // `import openai from "openai"` style fixtures into tmp files to
+  // prove the scanner detects them; the test runner is allowed to
+  // mention those literal identifiers in source comments and
+  // strings so the fixtures can be human-readable. Both entries
+  // are forward-looking hooks for any future test fixture that
+  // legitimately exercises the scanner.
   "scripts/check-forbidden-deps.mjs",
+  "scripts/check-forbidden-deps.test.mjs",
 ]);
 
 function listJsonFiles(root) {
@@ -199,9 +204,95 @@ function packageMatchesForbidden(name, forbidden) {
   return false;
 }
 
-function reportPackageJsonViolations() {
+// Pnpm lockfile v9 records a package entry as a YAML map key whose
+// value is a string of the form `<name>@<version>` (scoped packages
+// look like `@scope/name@<version>`, with the `@scope/` prefix
+// preserved). The key line is indented at least two spaces under
+// `packages:`. There is no leading slash; the leading-slash format
+// used by lockfile v6+ was removed in v9.
+//
+// The `importers:` block records direct dependencies with the bare
+// package name as the key (the resolved version sits on a child
+// `version:` line), optionally quoted for scoped packages. Both
+// shapes must be recognized so the scanner catches direct
+// declarations AND transitive resolutions.
+//
+// The matcher therefore uses two patterns: one for the
+// `name@version:` shape used in `packages:`, and one for the
+// bare-name shape used in `importers:`. Wildcard families
+// (`@pinecone-database/*`) translate to a wildcard segment that
+// matches any unscoped name in the family.
+function pnpmV9KeyPatterns(forbidden) {
+  const patterns = [];
+  if (forbidden.name.startsWith("@")) {
+    const slash = forbidden.name.indexOf("/");
+    if (slash < 0) throw new Error(`malformed scoped forbidden name: ${forbidden.name}`);
+    const scope = forbidden.name.slice(0, slash + 1); // "@scope/"
+    const leaf = forbidden.name.slice(slash + 1); // "name" or "*"
+    const leafPattern = leaf === "*" ? "[^@:/\\s]+" : escapeRegex(leaf);
+    // packages: block — key is `"@scope/name@version":` (scoped
+    // names are quoted in the pnpm v9 packages section).
+    patterns.push(new RegExp(`^([ \t]+)"?${escapeRegex(scope)}${leafPattern}@[^:\\s]+"?:$`, "m"));
+    // importers: block — key is `"@scope/name":` (quoted).
+    patterns.push(new RegExp(`^([ \t]+)"${escapeRegex(scope)}${leafPattern}":$`, "m"));
+  } else {
+    patterns.push(new RegExp(`^([ \t]+)${escapeRegex(forbidden.name)}@[^:\\s]+:`, "m"));
+    patterns.push(new RegExp(`^([ \t]+)${escapeRegex(forbidden.name)}:$`, "m"));
+  }
+  return patterns;
+}
+
+function escapeRegex(s) {
+  return s.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+}
+
+// Scan a pnpm-lock.yaml buffer for forbidden package keys under
+// `importers:` and `packages:`. Returns violations with the actual
+// 1-based line number in the file so the diagnostic points to the
+// key line a developer would see in their editor.
+//
+// The earlier implementation assumed a leading-slash key format that
+// pnpm v9 dropped; that matcher could not detect any resolved or
+// transitive forbidden package, and the green gate did not prove
+// AC#5. The v9 anchors (`^(indent)<name>@<version>:` in the
+// `packages:` block, `^(indent)<name>:` or
+// `^(indent)"<name>":` in the `importers:` block) and the
+// non-version-character class are the load-bearing fix.
+export function scanLockfile(lockfilePath) {
   const violations = [];
-  for (const pkgPath of listJsonFiles(REPO_ROOT)) {
+  let raw;
+  try {
+    raw = readFileSync(lockfilePath, "utf8");
+  } catch (err) {
+    if (err && err.code === "ENOENT") return violations;
+    throw err;
+  }
+  const lines = raw.split(/\r?\n/);
+  for (const forbidden of FORBIDDEN_PACKAGES) {
+    const patterns = pnpmV9KeyPatterns(forbidden);
+    let reported = false;
+    for (let i = 0; i < lines.length; i += 1) {
+      if (!/^[ \t]+/.test(lines[i])) continue; // not a YAML map entry
+      for (const pattern of patterns) {
+        if (pattern.test(lines[i])) {
+          violations.push({
+            file: relative(REPO_ROOT, lockfilePath),
+            line: i + 1,
+            evidence: `forbidden dependency "${forbidden.name}" appears in the resolved lockfile: ${forbidden.reason}`,
+          });
+          reported = true;
+          break;
+        }
+      }
+      if (reported) break;
+    }
+  }
+  return violations;
+}
+
+export function scanPackageJsonFiles(jsonPaths) {
+  const violations = [];
+  for (const pkgPath of jsonPaths) {
     if (PACKAGE_JSON_ALLOWLIST.has(relative(REPO_ROOT, pkgPath))) continue;
     let pkg;
     try {
@@ -218,10 +309,15 @@ function reportPackageJsonViolations() {
     for (const forbidden of FORBIDDEN_PACKAGES) {
       for (const depName of names) {
         if (packageMatchesForbidden(depName, forbidden)) {
+          // When a wildcard pattern matches (e.g. `@polkadot/*`
+          // matches `@polkadot/api`), include the matched pattern
+          // in the evidence so the developer can distinguish the
+          // exact-match case from the family case.
+          const patternNote = forbidden.name === depName ? "" : ` (matched by "${forbidden.name}")`;
           violations.push({
             file: relative(REPO_ROOT, pkgPath),
             line: 0,
-            evidence: `forbidden dependency "${depName}" declared in ${forbidden.section ?? "dependencies"}: ${forbidden.reason}`,
+            evidence: `forbidden dependency "${depName}" declared in ${forbidden.section ?? "dependencies"}: ${forbidden.reason}${patternNote}`,
           });
         }
       }
@@ -230,109 +326,12 @@ function reportPackageJsonViolations() {
   return violations;
 }
 
-function reportLockfileViolations() {
-  const lockPath = join(REPO_ROOT, "pnpm-lock.yaml");
+function scanSourceFilesImpl(repoRoot, sourceRoots) {
   const violations = [];
-  let raw;
-  try {
-    raw = readFileSync(lockPath, "utf8");
-  } catch (err) {
-    if (err && err.code === "ENOENT") return violations;
-    throw err;
-  }
-  // Scan the raw lockfile (not a sliced block) so the reported
-  // line number matches the actual file. The earlier block-based
-  // approach produced a 1-based offset within the accumulator that
-  // did not correspond to the line a developer would see when
-  // jumping to the violation in their editor.
-  //
-  // We restrict the scan to the `importers:` and `packages:`
-  // sections because those are the only places where pnpm records
-  // dependency declarations. Other top-level keys (`lockfileVersion`,
-  // `settings`, `snapshots`, etc.) cannot carry a forbidden package
-  // declaration; scanning them would risk false positives from
-  // unrelated strings.
-  const lines = raw.split(/\r?\n/);
-  for (const forbidden of FORBIDDEN_PACKAGES) {
-    // The pnpm lockfile key format is `/<name>@<version>` for
-    // unscoped packages and `/<name>@<version>` for scoped packages
-    // (e.g. `/@pinecone-database/pinecone@1.2.3`). The leading
-    // slash + the `@`-separated name is the canonical pattern.
-    const escapedName = forbidden.name
-      .replace(/[.*+?^${}()|[\]\\]/g, "\\$&")
-      .replace(/\\\*$/, ".*");
-    const regex = new RegExp(`/${escapedName}@`, "m");
-    const match = regex.exec(raw);
-    if (match && match.index !== undefined) {
-      // Walk the lines until the cumulative length passes the
-      // match offset; the 1-based line number is the line that
-      // contains the violation.
-      let consumed = 0;
-      let lineNumber = 0;
-      for (let i = 0; i < lines.length; i += 1) {
-        const segment = `${lines[i]}\n`;
-        if (consumed + segment.length > match.index) {
-          lineNumber = i + 1;
-          break;
-        }
-        consumed += segment.length;
-      }
-      if (lineNumber === 0) {
-        lineNumber = raw.slice(0, match.index).split(/\r?\n/).length;
-      }
-      violations.push({
-        file: "pnpm-lock.yaml",
-        line: lineNumber,
-        evidence: `forbidden dependency "${forbidden.name}" appears in the resolved lockfile: ${forbidden.reason}`,
-      });
-    }
-  }
-  return violations;
-}
-
-function reportSourceViolations() {
-  const violations = [];
-  const sourceRoots = [];
-  // Scan apps/*/src and packages/*/src.
-  for (const entry of readdirSync(join(REPO_ROOT, "apps"), { withFileTypes: true })) {
-    if (entry.isDirectory()) {
-      const src = join(REPO_ROOT, "apps", entry.name, "src");
-      try {
-        if (statSync(src).isDirectory()) sourceRoots.push(src);
-      } catch (err) {
-        if (err && err.code !== "ENOENT") throw err;
-      }
-    }
-  }
-  for (const entry of readdirSync(join(REPO_ROOT, "packages"), { withFileTypes: true })) {
-    if (entry.isDirectory()) {
-      const src = join(REPO_ROOT, "packages", entry.name, "src");
-      try {
-        if (statSync(src).isDirectory()) sourceRoots.push(src);
-      } catch (err) {
-        if (err && err.code !== "ENOENT") throw err;
-      }
-      // The Prisma seed lives at `packages/db/prisma/seed.ts`
-      // rather than under `src/`. Without an explicit entry
-      // here, a forbidden import added to the seed would evade
-      // the scanner entirely. The `generated/` subdirectory is
-      // already excluded via EXCLUDED_DIRS so the generated
-      // Prisma client is not scanned.
-      const prismaDir = join(REPO_ROOT, "packages", entry.name, "prisma");
-      try {
-        if (statSync(prismaDir).isDirectory()) sourceRoots.push(prismaDir);
-      } catch (err) {
-        if (err && err.code !== "ENOENT") throw err;
-      }
-    }
-  }
-  // Also scan scripts/ (used for the operational scripts that drive
-  // the disposable test database and the acceptance gate).
-  sourceRoots.push(join(REPO_ROOT, "scripts"));
 
   for (const root of sourceRoots) {
     for (const file of listSourceFiles(root)) {
-      const rel = relative(REPO_ROOT, file);
+      const rel = relative(repoRoot, file);
       if (SOURCE_ALLOWLIST.has(rel)) continue;
       const raw = readFileSync(file, "utf8");
       const lines = raw.split(/\r?\n/);
@@ -381,12 +380,78 @@ function reportSourceViolations() {
   return violations;
 }
 
-function main() {
-  const violations = [
-    ...reportPackageJsonViolations(),
-    ...reportLockfileViolations(),
-    ...reportSourceViolations(),
+// Compute the standard source roots for a workspace: every
+// `apps/*/src`, every `packages/*/src`, every `packages/*/prisma`,
+// and the top-level `scripts/`. Exposed so the regression suite
+// can compare the workspace roots against a synthetic fixture.
+export function workspaceSourceRoots(repoRoot) {
+  const roots = [];
+  for (const entry of readdirSync(join(repoRoot, "apps"), { withFileTypes: true })) {
+    if (entry.isDirectory()) {
+      const src = join(repoRoot, "apps", entry.name, "src");
+      try {
+        if (statSync(src).isDirectory()) roots.push(src);
+      } catch (err) {
+        if (err && err.code !== "ENOENT") throw err;
+      }
+    }
+  }
+  for (const entry of readdirSync(join(repoRoot, "packages"), { withFileTypes: true })) {
+    if (entry.isDirectory()) {
+      const src = join(repoRoot, "packages", entry.name, "src");
+      try {
+        if (statSync(src).isDirectory()) roots.push(src);
+      } catch (err) {
+        if (err && err.code !== "ENOENT") throw err;
+      }
+      // The Prisma seed lives at `packages/db/prisma/seed.ts`
+      // rather than under `src/`. Without an explicit entry
+      // here, a forbidden import added to the seed would evade
+      // the scanner entirely. The `generated/` subdirectory is
+      // already excluded via EXCLUDED_DIRS so the generated
+      // Prisma client is not scanned.
+      const prismaDir = join(repoRoot, "packages", entry.name, "prisma");
+      try {
+        if (statSync(prismaDir).isDirectory()) roots.push(prismaDir);
+      } catch (err) {
+        if (err && err.code !== "ENOENT") throw err;
+      }
+    }
+  }
+  roots.push(join(repoRoot, "scripts"));
+  return roots;
+}
+
+// Run the full workspace scan. Returns every violation found
+// across package.json files, the lockfile, and source files.
+export function scanSourceFiles(repoRoot, sourceRoots) {
+  if (sourceRoots === undefined) {
+    return scanSourceFilesImpl(repoRoot, workspaceSourceRoots(repoRoot));
+  }
+  return scanSourceFilesImpl(repoRoot, sourceRoots);
+}
+
+export function runWorkspaceScan(repoRoot = REPO_ROOT) {
+  return [
+    ...scanPackageJsonFiles(listJsonFiles(repoRoot)),
+    ...scanLockfile(join(repoRoot, "pnpm-lock.yaml")),
+    ...scanSourceFilesImpl(repoRoot, workspaceSourceRoots(repoRoot)),
   ];
+}
+
+// Only run the script's main() when this file is invoked directly,
+// not when it is imported by another module (e.g. the
+// regression-test suite). The seed.ts pattern is the same: check
+// whether the entry script ends with this file's basename.
+const isDirectInvocation = (() => {
+  if (typeof process === "undefined") return false;
+  const entry = process.argv[1];
+  if (!entry) return false;
+  return entry.endsWith("/check-forbidden-deps.mjs") || entry.endsWith("/check-forbidden-deps.js");
+})();
+
+function main() {
+  const violations = runWorkspaceScan();
   if (violations.length === 0) {
     console.log(
       "✅ Forbidden-dependency check passed: no OpenAI, Pinecone, Redis, storage, wallet, or blockchain references in the M1.7 slice.",
@@ -404,4 +469,6 @@ function main() {
   process.exit(1);
 }
 
-main();
+if (isDirectInvocation) {
+  main();
+}

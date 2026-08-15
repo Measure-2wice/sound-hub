@@ -34,7 +34,7 @@
 import { spawn } from "node:child_process";
 import { setTimeout as sleep } from "node:timers/promises";
 import { resolveApprovedTestDatabaseUrl } from "../apps/api/src/lib/test-database.js";
-import { loadTestDatabaseEnv, repoRoot } from "./db-test-env.mjs";
+import { appsApiTsx, loadTestDatabaseEnv, repoRoot } from "./db-test-env.mjs";
 
 // The disposable test target may live in `.env.test` instead of the
 // current process environment. Load it explicitly so this script can
@@ -48,14 +48,24 @@ const TEST_DATABASE_URL =
 const API_PORT = Number(process.env.PORT_API ?? 4000);
 const FAILING_API_PORT = API_PORT + 1;
 const WEB_PORT = Number(process.env.PORT_WEB ?? 3000);
+const FAILING_WEB_PORT = WEB_PORT + 1;
 
 const API_URL = `http://127.0.0.1:${API_PORT}`;
 const FAILING_API_URL = `http://127.0.0.1:${FAILING_API_PORT}`;
 const WEB_URL = `http://127.0.0.1:${WEB_PORT}`;
+// A second Next.js dev server whose `API_URL` rewrites to the
+// failing API instance. Case 4 hits this proxy so the
+// "all four cases through the browser proxy" claim in the
+// acceptance evidence is literally exercised instead of bypassed
+// (P1-002 Codex remediation). The proxy is otherwise identical
+// to the main one: same Next.js source, same `rewrites()` config,
+// only the upstream `API_URL` differs.
+const FAILING_WEB_URL = `http://127.0.0.1:${FAILING_WEB_PORT}`;
 
 let apiProcess = null;
 let failingApiProcess = null;
 let webProcess = null;
+let failingWebProcess = null;
 let shuttingDown = false;
 
 function startChild(label, command, args, env, cwd) {
@@ -81,6 +91,24 @@ function startChild(label, command, args, env, cwd) {
   return child;
 }
 
+// Run a fail-closed db-test-* wrapper to completion and propagate
+// its exit code. Used to re-cycle the disposable test database
+// after the Playwright outage test wipes the tmpfs-backed schema.
+function runChild(wrapperName, env) {
+  return new Promise((resolveRun, rejectRun) => {
+    const child = spawn(appsApiTsx, [`scripts/${wrapperName}.mjs`], {
+      cwd: repoRoot,
+      stdio: "inherit",
+      env: { ...process.env, ...env },
+    });
+    child.on("error", rejectRun);
+    child.on("exit", (code) => {
+      if (code === 0) resolveRun();
+      else rejectRun(new Error(`${wrapperName} exited with code ${code}`));
+    });
+  });
+}
+
 async function waitForHttp(url, label, timeoutMs) {
   const deadline = Date.now() + timeoutMs;
   while (Date.now() < deadline) {
@@ -99,7 +127,7 @@ async function waitForHttp(url, label, timeoutMs) {
 
 async function shutdown() {
   shuttingDown = true;
-  for (const child of [apiProcess, failingApiProcess, webProcess]) {
+  for (const child of [apiProcess, failingApiProcess, webProcess, failingWebProcess]) {
     if (!child) continue;
     if (!child.killed) {
       try {
@@ -111,7 +139,7 @@ async function shutdown() {
   }
   // Give processes a moment to flush, then SIGKILL any survivors.
   await sleep(500);
-  for (const child of [apiProcess, failingApiProcess, webProcess]) {
+  for (const child of [apiProcess, failingApiProcess, webProcess, failingWebProcess]) {
     if (!child) continue;
     if (child.exitCode === null && !child.killed) {
       try {
@@ -158,6 +186,31 @@ async function main() {
   console.log(
     `▶ Approved disposable test target: ${target.host}:${target.port}/${target.database}`,
   );
+
+  // Re-apply the reviewed migration and seed before booting the
+  // API. The earlier playwright step (`pnpm test:e2e`) includes
+  // an outage test that stops and restarts the disposable
+  // PostgreSQL container; the test container uses an ephemeral
+  // tmpfs volume, so restarting it wipes the schema. Without
+  // this re-cycle, the API process started below would query a
+  // database with no `pricing_units` table and Case 1 would
+  // return SEARCH_FAILED 500 instead of the documented 200. The
+  // cycle uses the fail-closed wrappers from `scripts/db-test-*`
+  // and runs the reviewed migration against the approved target
+  // only — never the developer database.
+  console.log("▶ Re-applying reviewed migration and seed before API boot (post-Playwright reset)");
+  await runChild("db-test-reset", {
+    DATABASE_URL: target.url,
+    TEST_DATABASE_URL: target.url,
+  });
+  await runChild("db-test-migrate", {
+    DATABASE_URL: target.url,
+    TEST_DATABASE_URL: target.url,
+  });
+  await runChild("db-test-seed", {
+    DATABASE_URL: target.url,
+    TEST_DATABASE_URL: target.url,
+  });
 
   // Case 4 uses an unreachable PostgreSQL URL so we exercise the
   // real SEARCH_UNAVAILABLE envelope without disturbing the
@@ -213,10 +266,33 @@ async function main() {
     repoRoot,
   );
 
-  // Wait for both API instances and the Next.js dev server to come up.
+  failingWebProcess = startChild(
+    "failing-web",
+    "pnpm",
+    ["--filter", "@soundhub/web", "dev"],
+    {
+      // The second proxy points at the failing API instance so
+      // Case 4 can drive an unavailability path THROUGH the
+      // browser proxy (P1-002 Codex remediation). All other env
+      // vars mirror the main web so Next.js boots with the same
+      // fixture origin and the same database target.
+      PORT_WEB: String(FAILING_WEB_PORT),
+      PORT_API: String(FAILING_API_PORT),
+      API_URL: FAILING_API_URL,
+      DATABASE_URL: TEST_DATABASE_URL,
+      TEST_DATABASE_URL,
+      NODE_ENV: "test",
+      FRONTEND_URL: FAILING_WEB_URL,
+      PUBLIC_FIXTURE_ORIGIN: FAILING_WEB_URL,
+    },
+    repoRoot,
+  );
+
+  // Wait for both API instances and both Next.js dev servers to come up.
   await waitForHttp(`${API_URL}/api/health`, "real API", 30_000);
   await waitForHttp(`${FAILING_API_URL}/api/health`, "failing API", 30_000);
   await waitForHttp(WEB_URL, "Next.js dev server", 60_000);
+  await waitForHttp(FAILING_WEB_URL, "failing-proxy Next.js dev server", 60_000);
 
   try {
     // Case 1 — successful search through the Next.js proxy.
@@ -287,18 +363,19 @@ async function main() {
       },
     );
 
-    // Case 4 — failing API instance pointed at an unreachable
-    // PostgreSQL returns the safe SEARCH_UNAVAILABLE envelope when
-    // the buyer reaches it directly. We hit the FAILING_API_URL
-    // (not the proxy) for this case because the proxy is wired to
-    // the real API; the failing API's contract is identical to the
-    // real one, so reaching it exercises the same Express route
-    // and the same Prisma client. The proxy-vs-direct preservation
-    // is asserted separately by `search-failures.spec.ts`.
+    // Case 4 — second Next.js dev server whose `API_URL` rewrites
+    // to the failing API instance (whose DATABASE_URL points at an
+    // unreachable port). Drives the unavailability path THROUGH
+    // the browser proxy so the "all four cases through the
+    // browser proxy" claim in the acceptance evidence is literally
+    // exercised (P1-002 Codex remediation). The proxy transport
+    // must preserve the safe SEARCH_UNAVAILABLE envelope end to
+    // end without leaking the underlying Prisma error or dropping
+    // the request ID.
     await runCase(
-      "Case 4 (unavailable): unreachable PostgreSQL returns 503 + SEARCH_UNAVAILABLE through the failing API",
+      "Case 4 (unavailable): unreachable PostgreSQL returns 503 + SEARCH_UNAVAILABLE through the failing proxy",
       async () => {
-        const response = await postJson(`${FAILING_API_URL}/api/search`, {
+        const response = await postJson(`${FAILING_WEB_URL}/api/search`, {
           query: "Haitian dancehall single production",
         });
         if (response.status !== 503) {

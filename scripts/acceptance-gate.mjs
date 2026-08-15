@@ -11,23 +11,30 @@
 //      in package.json, the lockfile, and TypeScript source).
 //   2. full disposable test database cycle (clean → migrate →
 //      seed twice → snapshot equality) — AC#1.
-//   3. format check, lint, type-check, full test suite, and
-//      build — AC#3.
-//   4. browser proxy runtime smoke (successful, invalid, empty,
-//      unavailable) — AC#2.
+//   3. format check, lint, type-check, full test suite, build,
+//      Playwright browser suite (stale-request + concurrency +
+//      outage), and runtime smoke — AC#2, AC#3, AC#4.
+//
+// AC#5 (no external credentials) is enforced fail-closed by step
+// 1 before any other step runs.
 //
 // AC#4 (privacy, deterministic ordering, strict validation,
 // lifecycle eligibility, and stale-request assertions) is
-// covered by the workspace test suite run in step 3, which
-// includes the API contract tests, the repository integration
-// tests, the in-memory repository service tests, and the
-// Playwright browser concurrency tests. None of those tests
-// require external credentials; step 1 enforces that no
-// forbidden dependency ever reaches this gate.
+// covered by:
+//   - the unit/integration test suite run in step 6 (privacy,
+//     deterministic ordering, strict validation, lifecycle
+//     eligibility via API contract + service + repository tests
+//     and the web-side `useSearch` stale-response unit tests);
+//   - the Playwright browser suite run in step 8 (browser-side
+//     stale-request and concurrency assertions, plus the real
+//     PostgreSQL outage path through the proxy).
+// None of those tests require external credentials; step 1
+// enforces that no forbidden dependency ever reaches this gate.
 //
 // The gate is intentionally a thin wrapper around the existing
-// scripts (db-test-cycle, pnpm check, runtime-smoke) so every
-// step can also be run individually during development.
+// scripts (db-test-cycle, pnpm check, pnpm test:e2e,
+// runtime-smoke) so every step can also be run individually
+// during development.
 
 import { spawn } from "node:child_process";
 import { existsSync } from "node:fs";
@@ -113,12 +120,40 @@ const STEPS = [
     env: {},
   },
   {
+    label: "Playwright browser suite (stale-request + concurrency + outage through the proxy)",
+    // P1-003 (Codex review) flagged that the cited browser
+    // stale-request and concurrency assertions live in the
+    // Playwright suite and were not executed by the gate. Step 8
+    // invokes `pnpm test:e2e`, which boots its own API + web
+    // via Playwright's `webServer` config and tears them down on
+    // exit. The disposable PostgreSQL on port 5433 must be
+    // reachable; the global-setup script runs the full
+    // `pnpm db:test:cycle` before the browser tests start so the
+    // suite operates against a clean canonical state. The
+    // chromium-outage project stops and restarts the disposable
+    // PostgreSQL container during the outage test; the
+    // `test.afterAll` hook restores the container so subsequent
+    // steps in the gate still find it reachable.
+    command: "pnpm",
+    args: ["test:e2e"],
+    cwd: REPO_ROOT,
+    env: {
+      TEST_DATABASE_URL:
+        process.env.TEST_DATABASE_URL ??
+        "postgresql://soundhub:password@localhost:5433/soundhub_m1_test",
+      DATABASE_URL:
+        process.env.DATABASE_URL ??
+        "postgresql://soundhub:password@localhost:5433/soundhub_m1_test",
+    },
+  },
+  {
     label: "runtime smoke through the Next.js proxy (successful, invalid, empty, unavailable)",
     // The runtime-smoke script boots its own API + web instances
-    // and tears them down on exit. It is the lightest end-to-end
-    // check of the four proxy cases; the heavier Playwright
-    // browser state coverage lives in `pnpm test:e2e` and is
-    // invoked separately by the M1.6 contract tests.
+    // (a real one and a failing one whose DATABASE_URL points at
+    // an unreachable port) and tears them down on exit. The
+    // successful, invalid, empty, and unavailable cases all drive
+    // through the browser proxy so the four-case claim is
+    // literally exercised (P1-002 Codex remediation).
     command: TSX_BIN,
     args: ["scripts/runtime-smoke.mjs"],
     cwd: REPO_ROOT,
