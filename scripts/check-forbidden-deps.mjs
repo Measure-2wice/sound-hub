@@ -240,47 +240,46 @@ function reportLockfileViolations() {
     if (err && err.code === "ENOENT") return violations;
     throw err;
   }
+  // Scan the raw lockfile (not a sliced block) so the reported
+  // line number matches the actual file. The earlier block-based
+  // approach produced a 1-based offset within the accumulator that
+  // did not correspond to the line a developer would see when
+  // jumping to the violation in their editor.
+  //
+  // We restrict the scan to the `importers:` and `packages:`
+  // sections because those are the only places where pnpm records
+  // dependency declarations. Other top-level keys (`lockfileVersion`,
+  // `settings`, `snapshots`, etc.) cannot carry a forbidden package
+  // declaration; scanning them would risk false positives from
+  // unrelated strings.
   const lines = raw.split(/\r?\n/);
-  // Resolve the `importers.<pkg>:` block to scope the check to
-  // workspace packages only. The lockfile also records transitive
-  // resolutions under `packages:`; the M1.7 contract requires the
-  // workspace dependency graph to contain none of the forbidden
-  // packages at any depth, so both lists must be free of violations.
-  let block = "";
-  let inImporters = false;
-  let inPackages = false;
-  for (const line of lines) {
-    if (/^importers:\s*$/.test(line)) {
-      inImporters = true;
-      block += `${line}\n`;
-      continue;
-    }
-    if (/^packages:\s*$/.test(line)) {
-      inImporters = false;
-      inPackages = true;
-      block += `${line}\n`;
-      continue;
-    }
-    if (inImporters && /^[a-zA-Z]/.test(line) && !/^\s/.test(line)) {
-      inImporters = false;
-    }
-    if (inPackages && /^[a-zA-Z]/.test(line) && !/^\s/.test(line)) {
-      inPackages = false;
-    }
-    if (inImporters || inPackages) block += `${line}\n`;
-  }
-  // Scan both blocks for forbidden package keys like `/openai@1.2.3`
-  // or `/@pinecone-database/pinecone@1.2.3`. The leading slash + the
-  // `@`-separated name is the canonical pnpm key format.
   for (const forbidden of FORBIDDEN_PACKAGES) {
-    const prefix = forbidden.name.startsWith("@")
-      ? `/${forbidden.name.replace(/\*/g, ".*")}@`
-      : `/${forbidden.name.replace(/\*/g, ".*")}@`;
-    const regex = new RegExp(prefix, "m");
-    const match = regex.exec(block);
-    if (match) {
-      const idx = block.indexOf(match[0]);
-      const lineNumber = block.slice(0, idx).split(/\r?\n/).length - 1;
+    // The pnpm lockfile key format is `/<name>@<version>` for
+    // unscoped packages and `/<name>@<version>` for scoped packages
+    // (e.g. `/@pinecone-database/pinecone@1.2.3`). The leading
+    // slash + the `@`-separated name is the canonical pattern.
+    const escapedName = forbidden.name
+      .replace(/[.*+?^${}()|[\]\\]/g, "\\$&")
+      .replace(/\\\*$/, ".*");
+    const regex = new RegExp(`/${escapedName}@`, "m");
+    const match = regex.exec(raw);
+    if (match && match.index !== undefined) {
+      // Walk the lines until the cumulative length passes the
+      // match offset; the 1-based line number is the line that
+      // contains the violation.
+      let consumed = 0;
+      let lineNumber = 0;
+      for (let i = 0; i < lines.length; i += 1) {
+        const segment = `${lines[i]}\n`;
+        if (consumed + segment.length > match.index) {
+          lineNumber = i + 1;
+          break;
+        }
+        consumed += segment.length;
+      }
+      if (lineNumber === 0) {
+        lineNumber = raw.slice(0, match.index).split(/\r?\n/).length;
+      }
       violations.push({
         file: "pnpm-lock.yaml",
         line: lineNumber,
@@ -310,6 +309,18 @@ function reportSourceViolations() {
       const src = join(REPO_ROOT, "packages", entry.name, "src");
       try {
         if (statSync(src).isDirectory()) sourceRoots.push(src);
+      } catch (err) {
+        if (err && err.code !== "ENOENT") throw err;
+      }
+      // The Prisma seed lives at `packages/db/prisma/seed.ts`
+      // rather than under `src/`. Without an explicit entry
+      // here, a forbidden import added to the seed would evade
+      // the scanner entirely. The `generated/` subdirectory is
+      // already excluded via EXCLUDED_DIRS so the generated
+      // Prisma client is not scanned.
+      const prismaDir = join(REPO_ROOT, "packages", entry.name, "prisma");
+      try {
+        if (statSync(prismaDir).isDirectory()) sourceRoots.push(prismaDir);
       } catch (err) {
         if (err && err.code !== "ENOENT") throw err;
       }

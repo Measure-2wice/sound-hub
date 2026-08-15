@@ -180,6 +180,6 @@ async function main() {
 }
 
 main().catch((err) => {
-  console.error("� Acceptance gate errored:", err);
+  console.error("❌ Acceptance gate errored:", err);
   process.exit(1);
 });
