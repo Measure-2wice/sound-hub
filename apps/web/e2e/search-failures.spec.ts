@@ -177,14 +177,22 @@ test("M1.6: SEARCH_UNAVAILABLE surfaces a retry button that re-submits the prese
 //   (a) when an older in-flight response settles while a newer
 //       submission is still pending, the loading indicator stays
 //       visible and is only cleared once the newer response lands;
-//   (b) when both responses have settled, the newest submission's
-//       payload wins and the stale payload never appears in the
-//       rendered DOM.
+//   (b) when an older in-flight response settles AFTER the newer
+//       submission has already rendered, the stale response cannot
+//       overwrite the rendered newer result.
 //
-// (a) is the regression the prior spec missed: the intermediate
+// (a) is the loading-state regression: the intermediate
 // `search-loading` state must remain visible while an older
 // response is being processed, so the buyer never sees a flicker
 // of "results, then nothing, then results again."
+//
+// (b) is the result-overwrite regression: a late-arriving older
+// response must not clobber the rendered DOM with the older
+// submission's payload. Both subtests use two DISTINCT, real,
+// non-empty queries so the rendered result for the newer request
+// is observable, and so a successful overwrite would be visible
+// as either a removed result card or the appearance of an
+// unexpected seller card.
 test.describe("M1.6: concurrent submissions preserve newest result and loading", () => {
   test("older in-flight response cannot overwrite the newer submission's loading state", async ({
     page,
@@ -286,6 +294,162 @@ test.describe("M1.6: concurrent submissions preserve newest result and loading",
 
     const bodyText = (await page.textContent("body")) ?? "";
     expect(bodyText).toContain(freshSeller);
+  });
+
+  // The result-overwrite half of the concurrency contract. The
+  // prior subtest above only proved that the loading indicator
+  // survives an early-arriving older response; it never let an
+  // older response land AFTER the newer results had rendered, so
+  // it could not detect a regression that lets the older payload
+  // overwrite the rendered newer DOM. This subtest deliberately
+  // releases the NEWER response first, waits for the newer
+  // result card to render, and THEN releases the older response
+  // — exercising the same `requestIdRef` guard against the
+  // concrete post-render overwrite path.
+  //
+  // Both queries are DISTINCT and both match real canonical
+  // sellers so the rendered result is non-empty for the newer
+  // request and so an overwrite would manifest as either the
+  // newer seller card disappearing or the older seller card
+  // appearing in the same DOM the buyer is looking at.
+  test("older in-flight response cannot overwrite the newer submission's rendered result", async ({
+    page,
+  }) => {
+    const newerSeller = "Marc-André Pierre";
+    const olderSeller = "Keisha Williams";
+    const olderResolvers: Array<() => void> = [];
+    const newerResolvers: Array<() => void> = [];
+
+    await page.route("**/api/search", async (route) => {
+      const request = route.request();
+      const body = request.postData() ?? "";
+      // The older submission's query carries a unique token so the
+      // route handler can route its resolver independently of the
+      // newer one. The newer submission's query does NOT carry the
+      // token, so it lands in the newer queue. Both fall through to
+      // the real proxy / API; the route handler only controls the
+      // resolution order of the two real requests.
+      const isOlderRequest = body.includes("older-stale-overwrite-token");
+      const resolverTarget = isOlderRequest ? olderResolvers : newerResolvers;
+      const waiter = new Promise<void>((resolve) => {
+        resolverTarget.push(resolve);
+      });
+      await waiter;
+      void route.fallback();
+    });
+
+    await loadHome(page);
+
+    // First submission (older): a real, distinct, non-empty query
+    // that matches the seeded Keisha Williams fixture. The token
+    // identifies the request to the route handler but is not
+    // itself a search token; the canonical "Afrobeats topline
+    // writing" tokens carry the match.
+    await page
+      .getByTestId("search-input")
+      .fill("older-stale-overwrite-token Afrobeats topline writing");
+    await page.getByTestId("search-submit").click();
+
+    // Force the form controls back to enabled so the second
+    // submission can be injected while the first is still pending.
+    // The production UX correctly disables the form during a
+    // loading state; this re-enable mirrors the same direct-DOM
+    // escape hatch the sibling subtest uses and is necessary to
+    // exercise the hook's monotonic requestIdRef guard against
+    // overlapping real submissions.
+    await page.evaluate(() => {
+      const input = document.querySelector<HTMLInputElement>('[data-testid="search-input"]');
+      const submit = document.querySelector<HTMLButtonElement>('[data-testid="search-submit"]');
+      if (input) input.disabled = false;
+      if (submit) submit.disabled = false;
+    });
+
+    // Second submission (newer): the canonical query that matches
+    // the seeded Marc-André Pierre fixture.
+    await page.getByTestId("search-input").fill("Haitian dancehall single production");
+    await page.getByTestId("search-submit").click();
+
+    // Block until the route handler has entered BOTH waiters. This
+    // proves both submissions have actually reached the network
+    // layer and are queued behind their respective resolvers.
+    await expect.poll(() => olderResolvers.length + newerResolvers.length).toBe(2);
+
+    // Release the NEWER request FIRST. The newer response reaches
+    // the hook while the older request is still pending, so the
+    // hook renders the newer results and clears its loading
+    // indicator. The Marc-André Pierre result card must be
+    // visible before the older response is released so the
+    // assertion below has a concrete "newer rendered result" to
+    // protect from overwrite.
+    newerResolvers.splice(0).forEach((resolve) => {
+      resolve();
+    });
+
+    const newerCard = page.getByTestId("result-card").filter({ hasText: newerSeller }).first();
+    await expect(newerCard).toBeVisible({ timeout: 15_000 });
+    await expect(page.getByTestId("search-loading")).toHaveCount(0);
+
+    // Snapshot the rendered DOM after the newer result lands so
+    // any overwrite caused by the older response would be visible
+    // as either the newer card disappearing, the older card
+    // appearing, or the total card count shifting. A regression
+    // that drops the `requestIdRef` guard would let the older
+    // response clobber the rendered state and any of these three
+    // snapshots would diverge.
+    const newerVisibleBefore = await newerCard.isVisible();
+    const totalCountBefore = await page.getByTestId("result-card").count();
+
+    // Release the OLDER request AFTER the newer result has
+    // rendered. The hook's monotonic requestIdRef guard must
+    // observe that the older request's id is stale and drop the
+    // older response without touching React state. Both
+    // responses are real — the older one carries Keisha Williams
+    // results, the newer one carries Marc-André Pierre results
+    // — so an unguarded overwrite would surface as a Keisha
+    // Williams card appearing in the same DOM the buyer sees.
+    olderResolvers.splice(0).forEach((resolve) => {
+      resolve();
+    });
+
+    // Allow the older response time to settle. If the hook drops
+    // the stale response correctly, the DOM is unchanged. If a
+    // regression lets the older response through, one of the
+    // assertions below will fail: either the newer card
+    // disappears or a Keisha Williams card appears.
+    await sleep(500);
+    await page.waitForLoadState("networkidle");
+
+    // The newer card must still be visible — the older response
+    // must not have cleared it.
+    await expect(newerCard).toBeVisible();
+    expect(await newerCard.isVisible()).toBe(newerVisibleBefore);
+
+    // The result list must still belong to the newer submission:
+    // Marc-André Pierre is rendered, and Keisha Williams (the
+    // older submission's match) is NOT rendered. The exact card
+    // count parity proves no row was inserted by the older
+    // response.
+    const newerCount = await page
+      .getByTestId("result-card")
+      .filter({ hasText: newerSeller })
+      .count();
+    const olderCount = await page
+      .getByTestId("result-card")
+      .filter({ hasText: olderSeller })
+      .count();
+    expect(newerCount).toBeGreaterThan(0);
+    expect(olderCount).toBe(0);
+    // No row was inserted by the older response: the total card
+    // count is unchanged from the snapshot taken before the older
+    // response settled. A regression that lets the older response
+    // through would either replace the rendered list with the
+    // older payload (changing the count) or append a Keisha
+    // Williams card (changing the count upward).
+    expect(await page.getByTestId("result-card").count()).toBe(totalCountBefore);
+
+    const bodyText = (await page.textContent("body")) ?? "";
+    expect(bodyText).toContain(newerSeller);
+    expect(bodyText).not.toContain(olderSeller);
   });
 });
 
