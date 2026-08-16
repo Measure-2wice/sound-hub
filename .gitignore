@@ -37,3 +37,7 @@ pnpm-debug.log*
 .claude/settings.local.json
 
 .reviews
+
+# SoundHub Ralph runtime state
+.ralph/state/*
+!.ralph/state/.gitkeep
