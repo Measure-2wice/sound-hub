@@ -17,7 +17,7 @@
 --   3. Every canonical ServiceOffering gets one initial published
 --      ServiceOfferingRevision (revisionNumber = 1, kind = Published),
 --      including its pricing fields (denormalized for an immutable
---      record) and service-area rows.
+--      record), service-area rows, and bundled included-service rows.
 --
 -- The seed owns the M1.1 fixtures; M2 structures are owned by this
 -- migration. Re-running the seed does not change the M2 backfill
@@ -78,6 +78,23 @@ ALTER TABLE "user_accounts" ADD COLUMN     "closureState" "UserAccountClosureSta
 
 -- AlterTable
 ALTER TABLE "workspaces" ADD COLUMN     "closureState" "WorkspaceClosureState" NOT NULL DEFAULT 'None';
+
+-- DropForeignKey
+-- The M1.1 `workspaces.ownerUserId` foreign-key constraint made the
+-- singular owner reference an authority pointer. The M2 model
+-- (ADR 0001, Milestone 2 spec) requires Active WorkspaceMembership
+-- to be the sole source of current Workspace authority. The FK
+-- constraint is dropped so the column carries no DB-level authority
+-- semantics. The column is preserved as a correspondence / display
+-- field for M1.1 fixtures and search-result presentation; no
+-- authorization decision may consult it.
+ALTER TABLE "workspaces" DROP CONSTRAINT IF EXISTS "workspaces_ownerUserId_fkey";
+
+-- Promote ownerUserId to nullable. The legacy reference is no
+-- longer authoritative and the column may be cleared by retention
+-- processing without nullifying the active Owner membership that
+-- actually grants authority.
+ALTER TABLE "workspaces" ALTER COLUMN "ownerUserId" DROP NOT NULL;
 
 -- AlterTable
 -- Add the new authority column as NULLABLE first so the backfill can
@@ -483,6 +500,28 @@ SELECT
 FROM "service_offerings" "so"
 JOIN "offering_service_areas" "sa" ON "sa"."offeringId" = "so"."id";
 
+-- Backfill the included-service rows for each initial published
+-- revision. The M1.1 `included_services` table already represents
+-- the canonical bundle children (category and purchaseMode per
+-- offering). The immutable revision must mirror the same set so
+-- the complete revision graph is reconstructable from the
+-- published record alone. Offerings with no bundled
+-- `included_services` rows produce no `included_services` rows in
+-- the revision graph; the migration preserves the empty relation.
+INSERT INTO "service_offering_revision_included_services" (
+    "id",
+    "serviceOfferingRevisionId",
+    "categoryId",
+    "purchaseMode"
+)
+SELECT
+    'rev-' || "so"."id" || '-1-' || "is"."id",
+    'rev-' || "so"."id" || '-1',
+    "is"."categoryId",
+    "is"."purchaseMode"
+FROM "service_offerings" "so"
+JOIN "included_services" "is" ON "is"."offeringId" = "so"."id";
+
 -- CreateIndex
 CREATE INDEX "authentication_identities_userAccountId_idx" ON "authentication_identities"("userAccountId");
 
@@ -667,7 +706,126 @@ ALTER TABLE "workspace_closures" ADD CONSTRAINT "workspace_closures_workspaceId_
 ALTER TABLE "workspace_invitations" ADD CONSTRAINT "workspace_invitations_workspaceId_fkey" FOREIGN KEY ("workspaceId") REFERENCES "workspaces"("id") ON DELETE CASCADE ON UPDATE CASCADE;
 
 -- AddForeignKey
-ALTER TABLE "acceptances" ADD CONSTRAINT "acceptances_userAccountId_fkey" FOREIGN KEY ("userAccountId") REFERENCES "user_accounts"("id") ON DELETE CASCADE ON UPDATE CASCADE;
+-- M2.0A: change Acceptance.userAccountId to ON DELETE RESTRICT so
+-- cascading account deletion does not destroy versioned acceptance
+-- evidence (ADR 0006). Account closure is a state transition, not
+-- a deletion; the application anonymizes or replaces the user
+-- reference through an explicit retention flow so the attestation
+-- record and its exact document version remain preserved.
+ALTER TABLE "acceptances" ADD CONSTRAINT "acceptances_userAccountId_fkey" FOREIGN KEY ("userAccountId") REFERENCES "user_accounts"("id") ON DELETE RESTRICT ON UPDATE CASCADE;
 
 -- AddForeignKey
 ALTER TABLE "acceptances" ADD CONSTRAINT "acceptances_documentVersionId_fkey" FOREIGN KEY ("documentVersionId") REFERENCES "document_versions"("id") ON DELETE RESTRICT ON UPDATE CASCADE;
+
+-- =========================================================================
+--   Immutability and append-only enforcement (ADR 0005)
+--
+--   Published SellerProfileRevision and ServiceOfferingRevision rows
+--   are immutable evidence per ADR 0005. AuditEvent rows are append-only
+--   per the Audit section of the M2 spec. Both guarantees are enforced
+--   at the database layer so the persistence boundary cannot silently
+--   rewrite or remove evidence. The triggers RAISE EXCEPTION on any
+--   UPDATE or DELETE through supported persistence paths.
+-- =========================================================================
+
+-- Enforce append-only on audit_events (BEFORE UPDATE / DELETE).
+CREATE OR REPLACE FUNCTION audit_events_append_only()
+RETURNS TRIGGER AS $$
+BEGIN
+  RAISE EXCEPTION 'audit_events is append-only (operation % rejected)', TG_OP
+    USING ERRCODE = 'restrict_violation';
+END;
+$$ LANGUAGE plpgsql;
+
+CREATE TRIGGER audit_events_no_update
+  BEFORE UPDATE ON "audit_events"
+  FOR EACH ROW EXECUTE FUNCTION audit_events_append_only();
+
+CREATE TRIGGER audit_events_no_delete
+  BEFORE DELETE ON "audit_events"
+  FOR EACH ROW EXECUTE FUNCTION audit_events_append_only();
+
+-- Enforce immutability on published SellerProfileRevision rows.
+-- Working (draft) revisions remain mutable in principle; the published
+-- kind is the historical record and is rejected for UPDATE or DELETE.
+CREATE OR REPLACE FUNCTION seller_profile_revisions_published_immutable()
+RETURNS TRIGGER AS $$
+BEGIN
+  IF (TG_OP = 'DELETE' AND OLD."kind" = 'Published') THEN
+    RAISE EXCEPTION 'seller_profile_revisions.published revisions are immutable (DELETE rejected)'
+      USING ERRCODE = 'restrict_violation';
+  END IF;
+  IF (TG_OP = 'UPDATE' AND OLD."kind" = 'Published') THEN
+    RAISE EXCEPTION 'seller_profile_revisions.published revisions are immutable (UPDATE rejected)'
+      USING ERRCODE = 'restrict_violation';
+  END IF;
+  IF (TG_OP = 'DELETE') THEN
+    RETURN OLD;
+  END IF;
+  RETURN NEW;
+END;
+$$ LANGUAGE plpgsql;
+
+CREATE TRIGGER seller_profile_revisions_no_delete_published
+  BEFORE DELETE ON "seller_profile_revisions"
+  FOR EACH ROW EXECUTE FUNCTION seller_profile_revisions_published_immutable();
+
+CREATE TRIGGER seller_profile_revisions_no_update_published
+  BEFORE UPDATE ON "seller_profile_revisions"
+  FOR EACH ROW EXECUTE FUNCTION seller_profile_revisions_published_immutable();
+
+-- Enforce immutability on published ServiceOfferingRevision rows.
+CREATE OR REPLACE FUNCTION service_offering_revisions_published_immutable()
+RETURNS TRIGGER AS $$
+BEGIN
+  IF (TG_OP = 'DELETE' AND OLD."kind" = 'Published') THEN
+    RAISE EXCEPTION 'service_offering_revisions.published revisions are immutable (DELETE rejected)'
+      USING ERRCODE = 'restrict_violation';
+  END IF;
+  IF (TG_OP = 'UPDATE' AND OLD."kind" = 'Published') THEN
+    RAISE EXCEPTION 'service_offering_revisions.published revisions are immutable (UPDATE rejected)'
+      USING ERRCODE = 'restrict_violation';
+  END IF;
+  IF (TG_OP = 'DELETE') THEN
+    RETURN OLD;
+  END IF;
+  RETURN NEW;
+END;
+$$ LANGUAGE plpgsql;
+
+CREATE TRIGGER service_offering_revisions_no_delete_published
+  BEFORE DELETE ON "service_offering_revisions"
+  FOR EACH ROW EXECUTE FUNCTION service_offering_revisions_published_immutable();
+
+CREATE TRIGGER service_offering_revisions_no_update_published
+  BEFORE UPDATE ON "service_offering_revisions"
+  FOR EACH ROW EXECUTE FUNCTION service_offering_revisions_published_immutable();
+
+-- Enforce immutability on snapshot children of a published
+-- ServiceOfferingRevision. The bundled IncludedService rows are part
+-- of the immutable published record.
+CREATE OR REPLACE FUNCTION service_offering_revision_included_services_published_immutable()
+RETURNS TRIGGER AS $$
+DECLARE
+  rev_kind TEXT;
+BEGIN
+  SELECT "kind" INTO rev_kind FROM "service_offering_revisions"
+    WHERE "id" = COALESCE(NEW."serviceOfferingRevisionId", OLD."serviceOfferingRevisionId");
+  IF rev_kind = 'Published' THEN
+    RAISE EXCEPTION 'service_offering_revision_included_services rows belonging to a published revision are immutable (%)', TG_OP
+      USING ERRCODE = 'restrict_violation';
+  END IF;
+  IF (TG_OP = 'DELETE') THEN
+    RETURN OLD;
+  END IF;
+  RETURN NEW;
+END;
+$$ LANGUAGE plpgsql;
+
+CREATE TRIGGER service_offering_revision_included_services_no_delete_published
+  BEFORE DELETE ON "service_offering_revision_included_services"
+  FOR EACH ROW EXECUTE FUNCTION service_offering_revision_included_services_published_immutable();
+
+CREATE TRIGGER service_offering_revision_included_services_no_update_published
+  BEFORE UPDATE ON "service_offering_revision_included_services"
+  FOR EACH ROW EXECUTE FUNCTION service_offering_revision_included_services_published_immutable();

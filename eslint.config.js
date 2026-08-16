@@ -49,6 +49,7 @@ export default [
             "packages/db/prisma/seed.test.ts",
             "packages/db/prisma/snapshot-probe.ts",
             "packages/db/prisma/m2-foundation.test.ts",
+            "packages/db/prisma/m2-foundation-transition.test.ts",
           ],
         },
         tsconfigRootDir: import.meta.dirname,

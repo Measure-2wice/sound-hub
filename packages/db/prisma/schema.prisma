@@ -208,11 +208,21 @@ model Workspace {
   // M2.0A addition: closure state is independent from suspension. The
   // value `None` is the initial default for active workspaces.
   closureState WorkspaceClosureState @default(None)
-  ownerUserId  String
+  // M2.0A: `ownerUserId` is a *correspondence* field, not an authority
+  // pointer. Active WorkspaceMembership rows with `authority = Owner`
+  // are the sole source of current Workspace authority (ADR 0001 and
+  // the M2 spec). The column is preserved because M1.1 fixtures and
+  // search-result presentation code reference it as a denormalized
+  // display field, but it does NOT have a foreign-key constraint to
+  // `user_accounts` and it MUST NOT be consulted by any authorization
+  // decision. The migration drops the M1.1 foreign-key constraint so
+  // the field carries no DB-level authority semantics.
+  ownerUserId  String?
   createdAt    DateTime             @default(now())
   updatedAt    DateTime             @updatedAt
 
-  owner           UserAccount             @relation("WorkspaceOwner", fields: [ownerUserId], references: [id], onDelete: Restrict)
+  // No FK constraint on ownerUserId. Membership authority is canonical.
+  owner           UserAccount?            @relation("WorkspaceOwner", fields: [ownerUserId], references: [id], onDelete: SetNull)
   memberships     WorkspaceMembership[]
   capabilities    WorkspaceCapability[]
   sellerProfile   SellerProfile?
@@ -854,6 +864,13 @@ model DocumentVersion {
 // accepted the referenced DocumentVersion. Acceptance references the
 // exact version presented so the record remains truthful after the
 // document wording changes.
+//
+// M2.0A: the FK `Acceptance.userAccountId` is ON DELETE RESTRICT
+// (not CASCADE) per ADR 0006. Versioned acceptance evidence must
+// survive account closure and retention processing where policy
+// requires it. The application anonymizes or replaces the user
+// reference through an explicit retention flow rather than cascading
+// deletion of the attestation record.
 model Acceptance {
   id                String        @id @default(cuid())
   userAccountId     String
@@ -861,7 +878,7 @@ model Acceptance {
   kind              AcceptanceKind
   acceptedAt        DateTime      @default(now())
 
-  userAccount     UserAccount     @relation(fields: [userAccountId], references: [id], onDelete: Cascade)
+  userAccount     UserAccount     @relation(fields: [userAccountId], references: [id], onDelete: Restrict)
   documentVersion DocumentVersion @relation(fields: [documentVersionId], references: [id], onDelete: Restrict)
 
   @@index([userAccountId, kind, acceptedAt])
