@@ -304,11 +304,21 @@ describe("M1.1 seed regression coverage", () => {
     // test only moved the canonical Marc-André Pierre offering.
     // Without moving all of them, the service_category foreign key
     // would reject the delete.
+    //
+    // M2.0A also backfills one published ServiceOfferingRevision per
+    // offering (ADR 0005). Each revision carries the same
+    // primaryCategoryId reference as its parent offering; the
+    // RESTRICT foreign key on service_offering_revisions.primaryCategoryId
+    // therefore requires the same move-then-delete treatment.
     const other = await prisma.serviceCategory.findFirst({
       where: { key: { not: "music-production" } },
     });
     assert.ok(other);
     await prisma.serviceOffering.updateMany({
+      where: { primaryCategoryId: category.id },
+      data: { primaryCategoryId: other.id },
+    });
+    await prisma.serviceOfferingRevision.updateMany({
       where: { primaryCategoryId: category.id },
       data: { primaryCategoryId: other.id },
     });

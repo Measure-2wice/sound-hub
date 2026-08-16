@@ -893,8 +893,23 @@ async function applySellerGraph(
 
   await tx.workspaceMembership.upsert({
     where: { userId_workspaceId: { userId: owner.id, workspaceId: workspace.id } },
-    create: { userId: owner.id, workspaceId: workspace.id, role: "Owner" },
-    update: { role: "Owner" },
+    create: {
+      userId: owner.id,
+      workspaceId: workspace.id,
+      role: "Owner",
+      // M2.0A: the canonical authority is now `authority` (Owner | Editor).
+      // Every canonical M1.1 fixture is owned by the seller themselves, so
+      // the membership authority is `Owner`. The migration backfills this
+      // for existing rows; new memberships created by the seed must supply
+      // it explicitly.
+      authority: "Owner",
+    },
+    update: {
+      role: "Owner",
+      // Restore the canonical authority on every run so a stale mutation
+      // (e.g. a test that flipped it to Editor) cannot persist.
+      authority: "Owner",
+    },
   });
 
   // Replace the canonical capability set so re-running the seed
@@ -1045,6 +1060,123 @@ async function applySellerGraph(
     // Reset bundle-only IncludedServices (M1.1 ships with no bundles;
     // future tickets will add them).
     await tx.includedService.deleteMany({ where: { offeringId: persisted.id } });
+
+    // M2.0A: upsert the initial published SellerProfileRevision and
+    // ServiceOfferingRevision for this canonical fixture. The migration
+    // backfills the same state when run against an already-populated M1.1
+    // database; the test environment starts empty and the seed is the
+    // authoritative source of the canonical fixture. Re-running the seed
+    // converges on the same deterministic revision id
+    // (`rev-{parentId}-1`) and the same immutable Published kind so the
+    // canonical state is reproducible across runs.
+    await applyInitialPublishedRevisions(tx, profile.id, persisted.id, seller, offering);
+  }
+}
+
+// applyInitialPublishedRevisions: create the canonical initial
+// published revision (revisionNumber = 1, kind = "Published") for a
+// canonical SellerProfile / ServiceOffering pair. Mirrors the migration
+// backfill SQL so the canonical fixture in the test environment matches
+// the post-migration canonical state of a populated production
+// database.
+async function applyInitialPublishedRevisions(
+  tx: Prisma.TransactionClient,
+  sellerProfileId: string,
+  serviceOfferingId: string,
+  seller: SellerGraphSeed,
+  offering: OfferingSeed,
+): Promise<void> {
+  const profile = await tx.sellerProfile.findUniqueOrThrow({
+    where: { id: sellerProfileId },
+  });
+  const revisionId = `rev-${sellerProfileId}-1`;
+  // Resolve primary category id for the offering.
+  const primaryCategory = await tx.serviceCategory.findUniqueOrThrow({
+    where: { key: offering.primaryCategoryKey },
+  });
+  // Resolve pricing unit id (if any).
+  let pricingUnitId: string | null = null;
+  if (offering.pricing?.unitKey) {
+    const unit = await tx.pricingUnit.findUniqueOrThrow({
+      where: { key: offering.pricing.unitKey },
+    });
+    pricingUnitId = unit.id;
+  }
+
+  // SellerProfileRevision (replace + recreate).
+  await tx.sellerProfileRevision.deleteMany({ where: { sellerProfileId } });
+  await tx.sellerProfileRevision.create({
+    data: {
+      id: revisionId,
+      sellerProfileId,
+      revisionNumber: 1,
+      kind: "Published",
+      professionalName: profile.professionalName,
+      bio: profile.bio,
+      basedInCity: profile.basedInCity,
+      basedInRegion: profile.basedInRegion,
+      basedInCountryCode: profile.basedInCountryCode,
+      avatarUrl: profile.avatarUrl,
+      publishedAt: new Date(),
+    },
+  });
+
+  // Replace the canonical specialty set on the initial revision.
+  await tx.sellerProfileRevisionSpecialty.deleteMany({
+    where: { sellerProfileRevisionId: revisionId },
+  });
+  for (const specialtyKey of seller.specialtyKeys) {
+    const specialty = await tx.specialty.findUniqueOrThrow({ where: { key: specialtyKey } });
+    await tx.sellerProfileRevisionSpecialty.create({
+      data: { sellerProfileRevisionId: revisionId, specialtyId: specialty.id },
+    });
+  }
+
+  // Replace the canonical Caribbean affiliation set on the initial revision.
+  await tx.sellerProfileRevisionCaribbeanAffiliation.deleteMany({
+    where: { sellerProfileRevisionId: revisionId },
+  });
+  for (const countryCode of seller.caribbeanAffiliationCodes) {
+    await tx.sellerProfileRevisionCaribbeanAffiliation.create({
+      data: { sellerProfileRevisionId: revisionId, countryCode },
+    });
+  }
+
+  // ServiceOfferingRevision (replace + recreate).
+  const offeringRevisionId = `rev-${serviceOfferingId}-1`;
+  await tx.serviceOfferingRevision.deleteMany({ where: { serviceOfferingId } });
+  await tx.serviceOfferingRevision.create({
+    data: {
+      id: offeringRevisionId,
+      serviceOfferingId,
+      revisionNumber: 1,
+      kind: "Published",
+      title: offering.title,
+      description: offering.description,
+      serviceMode: offering.serviceMode,
+      primaryCategoryId: primaryCategory.id,
+      genreTags: [...offering.genreTags],
+      pricingKind: offering.pricing?.kind ?? null,
+      pricingAmountMinor: offering.pricing?.amountMinor ?? null,
+      pricingCurrency: offering.pricing?.currency ?? null,
+      pricingUnitId,
+      publishedAt: new Date(),
+    },
+  });
+
+  // Replace the canonical service-area set on the initial revision.
+  await tx.serviceOfferingRevisionServiceArea.deleteMany({
+    where: { serviceOfferingRevisionId: offeringRevisionId },
+  });
+  for (const area of offering.serviceAreas) {
+    await tx.serviceOfferingRevisionServiceArea.create({
+      data: {
+        serviceOfferingRevisionId: offeringRevisionId,
+        city: area.city ?? null,
+        region: area.region ?? null,
+        countryCode: area.countryCode,
+      },
+    });
   }
 }
 

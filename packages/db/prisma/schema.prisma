@@ -1,11 +1,16 @@
-// SoundHub Milestone 1 foundation schema.
+// SoundHub foundation schema.
 //
-// This is the complete structural foundation for issues #2 through #8. It
-// replaces the pre-release Role/ProducerProfile/MusicTrack scaffold. The
-// closed behavior states are modeled as Prisma enums (see `enum` declarations
-// below); the extensible taxonomies (ServiceCategory, Specialty, PricingUnit)
-// are seeded records with stable `key` columns and are not enums. Public DTOs
-// never expose raw Prisma models.
+// This is the structural foundation for Milestones 1 and 2. It establishes the
+// M1.1 search foundation (UserAccount, Workspace, WorkspaceMembership,
+// SellerProfile, ServiceOffering, taxonomies) and the additive M2 structures
+// introduced by Gate 0 (M2.0A — Expand the M1.1 foundation for M2). The M2
+// expansion adds authority, revision, authentication-identity, security,
+// audit, enforcement, closure, and idempotency structures BESIDE the M1.1
+// model without removing or repurposing the M1.1 structures still used by
+// search. The closed behavior states are modeled as Prisma enums (see `enum`
+// declarations below); the extensible taxonomies (ServiceCategory, Specialty,
+// PricingUnit) are seeded records with stable `key` columns and are not enums.
+// Public DTOs never expose raw Prisma models.
 
 generator client {
   provider = "prisma-client"
@@ -68,44 +73,179 @@ enum PurchaseMode {
   BundleOnly
 }
 
+// ---------- M2 closed behavior states (added by Gate 0 / M2.0A) ----------
+//
+// The M2 expansion adds the following closed behavior enums alongside the
+// M1.1 enums above. Each enum represents a finite, behavior-bearing state set
+// that the application services depend on. No M1.1 enum is altered or
+// repurposed; the new enums live beside the M1.1 ones.
+
+enum WorkspaceMembershipAuthority {
+  Owner
+  Editor
+}
+
+enum AuthenticationProvider {
+  MagicLink
+}
+
+enum WorkspaceClosureState {
+  None
+  PendingClosure
+  Closed
+}
+
+enum UserAccountClosureState {
+  None
+  PendingClosure
+  Closed
+}
+
+enum MarketplaceReportStatus {
+  Open
+  UnderReview
+  Resolved
+}
+
+enum MarketplaceReportReason {
+  Impersonation
+  Fraud
+  Misrepresentation
+  HarmfulContent
+}
+
+enum AcceptanceKind {
+  Terms
+  Privacy
+  SellerTerms
+  AuthorityAttestation
+  EditorAuthorityAttestation
+}
+
+enum DocumentKind {
+  Terms
+  Privacy
+  SellerTerms
+  AuthorityRepresentation
+}
+
+enum PolicyUpdateClass {
+  Editorial
+  NoticeRequired
+  ReconsentRequired
+}
+
+enum RetentionClass {
+  Security
+  Governance
+  Publication
+  Enforcement
+}
+
+enum AuditEventOutcome {
+  Success
+  Failure
+}
+
+enum WorkspaceControlFreezeState {
+  Active
+  Lifted
+}
+
+enum IdempotencyStatus {
+  InProgress
+  Completed
+  Failed
+}
+
+enum SellerProfileRevisionKind {
+  Working
+  Published
+}
+
+enum ServiceOfferingRevisionKind {
+  Working
+  Published
+}
+
+enum WorkspaceInvitationStatus {
+  Pending
+  Accepted
+  Revoked
+  Expired
+  Failed
+}
+
 // ---------- Identity and authority ----------
 
 model UserAccount {
-  id        String   @id @default(cuid())
-  email     String   @unique
-  createdAt DateTime @default(now())
-  updatedAt DateTime @updatedAt
+  id           String                 @id @default(cuid())
+  email        String                 @unique
+  // M2.0A addition: closure state is independent from authentication. The
+  // value `None` is the initial default for active accounts.
+  closureState UserAccountClosureState @default(None)
+  createdAt    DateTime               @default(now())
+  updatedAt    DateTime               @updatedAt
 
-  memberships         WorkspaceMembership[]
-  ownedWorkspaces     Workspace[]            @relation("WorkspaceOwner")
+  memberships             WorkspaceMembership[]
+  ownedWorkspaces         Workspace[]             @relation("WorkspaceOwner")
+  authenticationIdentities AuthenticationIdentity[]
+  security                UserAccountSecurity?
+  sessions                Session[]
+  acceptances             Acceptance[]
+  auditEvents             AuditEvent[]            @relation("AuditActorUserAccount")
+  reportsFiled            MarketplaceReport[]     @relation("ReportFilerUserAccount")
 
   @@map("user_accounts")
 }
 
 model Workspace {
-  id          String          @id @default(cuid())
-  slug        String          @unique
-  name        String
-  type        WorkspaceType
-  status      WorkspaceStatus @default(Active)
-  ownerUserId String
-  createdAt   DateTime        @default(now())
-  updatedAt   DateTime        @updatedAt
+  id           String               @id @default(cuid())
+  slug         String               @unique
+  name         String
+  type         WorkspaceType
+  status       WorkspaceStatus      @default(Active)
+  // M2.0A addition: closure state is independent from suspension. The
+  // value `None` is the initial default for active workspaces.
+  closureState WorkspaceClosureState @default(None)
+  ownerUserId  String
+  createdAt    DateTime             @default(now())
+  updatedAt    DateTime             @updatedAt
 
-  owner         UserAccount           @relation("WorkspaceOwner", fields: [ownerUserId], references: [id], onDelete: Restrict)
-  memberships   WorkspaceMembership[]
-  capabilities  WorkspaceCapability[]
-  sellerProfile SellerProfile?
+  owner           UserAccount             @relation("WorkspaceOwner", fields: [ownerUserId], references: [id], onDelete: Restrict)
+  memberships     WorkspaceMembership[]
+  capabilities    WorkspaceCapability[]
+  sellerProfile   SellerProfile?
+  invitations     WorkspaceInvitation[]
+  controlFreeze   WorkspaceControlFreeze?
+  closure         WorkspaceClosure?
+  auditEvents     AuditEvent[]            @relation("AuditActingWorkspace")
+  reportsAgainst  MarketplaceReport[]     @relation("ReportWorkspace")
+  idpIdentities   AuthenticationIdentity[]
 
   @@map("workspaces")
 }
 
 model WorkspaceMembership {
-  id          String                  @id @default(cuid())
+  id          String                       @id @default(cuid())
   userId      String
   workspaceId String
+  // M1.1 column preserved (Owner | Admin | Member). The new `authority`
+  // column is the canonical authority source going forward and is the
+  // target of the M2 backfill. The M1.1 column is retained for the M1.1
+  // search path; it is not consulted for any M2 authorization decision.
   role        WorkspaceMembershipRole
-  createdAt   DateTime                @default(now())
+  // M2.0A addition: the canonical authority exposed by Milestone 2 is
+  // Owner | Editor. Backfilled from `role` (Owner → Owner, Admin →
+  // Editor, Member → Editor). Personal Workspaces must have exactly one
+  // Owner and no invitations; the application enforces that invariant.
+  authority   WorkspaceMembershipAuthority
+  // M2.0A addition: revocation timestamp. Active memberships have
+  // `removedAt = NULL`; revoked memberships carry the timestamp of the
+  // authoritative removal. Active membership requires both `removedAt =
+  // NULL` and a non-`Closed` Workspace.closureState.
+  removedAt   DateTime?
+  createdAt   DateTime                     @default(now())
 
   user      UserAccount @relation(fields: [userId], references: [id], onDelete: Cascade)
   workspace Workspace   @relation(fields: [workspaceId], references: [id], onDelete: Cascade)
@@ -144,6 +284,7 @@ model SellerProfile {
   specialties            SellerProfileSpecialty[]
   caribbeanAffiliations  CaribbeanAffiliation[]
   offerings              ServiceOffering[]
+  revisions              SellerProfileRevision[]
 
   @@map("seller_profiles")
 }
@@ -153,7 +294,8 @@ model Specialty {
   key  String @unique
   name String
 
-  profiles SellerProfileSpecialty[]
+  profiles             SellerProfileSpecialty[]
+  revisionSpecialties  SellerProfileRevisionSpecialty[]
 
   @@map("specialties")
 }
@@ -194,8 +336,10 @@ model ServiceCategory {
   bundleOnly  Boolean  @default(false)
   createdAt   DateTime @default(now())
 
-  primaryOfferings            ServiceOffering[]      @relation("PrimaryCategory")
-  includedServiceOfferings    IncludedService[]
+  primaryOfferings             ServiceOffering[]                  @relation("PrimaryCategory")
+  includedServiceOfferings     IncludedService[]
+  revisionPrimaryCategories    ServiceOfferingRevision[]
+  revisionIncludedServices     ServiceOfferingRevisionIncludedService[]
 
   @@map("service_categories")
 }
@@ -206,7 +350,8 @@ model PricingUnit {
   name      String
   createdAt DateTime @default(now())
 
-  pricingOptions ServiceOfferingPricing[]
+  pricingOptions         ServiceOfferingPricing[]
+  revisionPricingUnits   ServiceOfferingRevision[]
 
   @@map("pricing_units")
 }
@@ -231,6 +376,7 @@ model ServiceOffering {
   includedServices IncludedService[]
   serviceAreas     ServiceOfferingServiceArea[]
   pricing          ServiceOfferingPricing?
+  revisions        ServiceOfferingRevision[]
 
   @@index([sellerProfileId])
   @@index([primaryCategoryId])
@@ -277,4 +423,473 @@ model ServiceOfferingPricing {
   unit     PricingUnit?    @relation(fields: [unitId], references: [id], onDelete: Restrict)
 
   @@map("offering_pricing")
+}
+
+// =========================================================================
+//   M2 expansion (Gate 0 / M2.0A)
+//
+//   The models below are added BESIDE the M1.1 model. The M1.1 search path
+//   does not depend on any of them; their presence is forward-compatible and
+//   their semantics are owned by later M2 tickets. No M1.1 model or enum is
+//   altered, renamed, or repurposed by the additions below.
+// =========================================================================
+
+// ---------- Authentication identity (ADR 0004) ----------
+
+// Provider/subject mapping. SoundHub owns stable UserAccount IDs; a separate
+// unique provider-and-subject mapping represents external credentials.
+// Replacing the provider may invalidate sessions but does not change
+// UserAccount, Workspace, membership, seller, or marketplace identifiers.
+// Provider subjects, roles, and metadata never authorize a Workspace.
+model AuthenticationIdentity {
+  id            String                @id @default(cuid())
+  userAccountId String
+  workspaceId   String?
+  provider      AuthenticationProvider
+  subject       String
+  createdAt     DateTime              @default(now())
+  lastLinkedAt  DateTime              @default(now())
+
+  userAccount UserAccount @relation(fields: [userAccountId], references: [id], onDelete: Cascade)
+  workspace   Workspace?  @relation(fields: [workspaceId], references: [id], onDelete: SetNull)
+
+  // Provider + subject is unique across the entire database so the same
+  // provider subject cannot be silently re-bound to a different
+  // UserAccount. Application services verify the UserAccount is active
+  // before honoring the identity.
+  @@unique([provider, subject])
+  @@index([userAccountId])
+  @@map("authentication_identities")
+}
+
+// Magic-link challenge records. The tokenHash is the only thing stored;
+// raw tokens are never persisted. `consumedAt` records first-use; a
+// consumed challenge cannot be reused. `expiresAt` enforces short
+// expiration. Rate-limit and abuse-control signals live on the
+// application boundary, not in canonical state.
+model MagicLinkChallenge {
+  id         String    @id @default(cuid())
+  email      String
+  tokenHash  String    @unique
+  createdAt  DateTime  @default(now())
+  expiresAt  DateTime
+  consumedAt DateTime?
+
+  @@index([email])
+  @@index([expiresAt])
+  @@map("magic_link_challenges")
+}
+
+// ---------- Account security ----------
+
+// Account-level security state. One row per UserAccount. The M1.1
+// search path does not consult this table; it exists so future M2
+// tickets can read recent-auth, account-level revocation, and
+// inactivity without a schema change.
+model UserAccountSecurity {
+  id                    String    @id @default(cuid())
+  userAccountId         String    @unique
+  // `revokedAt` is set when the account holder or an operator
+  // invokes "log out all devices" or an equivalent revocation event.
+  // A non-null `revokedAt` blocks authenticated actions issued under
+  // session state older than the revocation timestamp.
+  revokedAt             DateTime?
+  revocationReason      String?
+  // `recentAuthenticationAt` is the timestamp of the most recent
+  // authenticated action that satisfied the recent-auth requirement.
+  // Sensitive actions read this value at the application boundary.
+  recentAuthenticationAt DateTime?
+  createdAt             DateTime  @default(now())
+  updatedAt             DateTime  @updatedAt
+
+  userAccount UserAccount @relation(fields: [userAccountId], references: [id], onDelete: Cascade)
+
+  @@map("user_account_security")
+}
+
+// Renewable session record. Sessions are created after a successful
+// authentication and are referenced by short-lived access tokens at
+// the application boundary. The M1.1 search path does not consult
+// this table.
+model Session {
+  id            String    @id @default(cuid())
+  userAccountId String
+  createdAt     DateTime  @default(now())
+  // `expiresAt` is the absolute lifetime boundary (ninety days for
+  // ordinary sessions per the M2 spec). After this timestamp, the
+  // session cannot authorize any action regardless of recent use.
+  expiresAt     DateTime
+  // `lastUsedAt` tracks activity for inactivity expiry (thirty days).
+  lastUsedAt    DateTime  @default(now())
+  // `revokedAt` records explicit revocation (sign-out, account-level
+  // revocation, suspicious activity).
+  revokedAt     DateTime?
+
+  userAccount UserAccount @relation(fields: [userAccountId], references: [id], onDelete: Cascade)
+
+  @@index([userAccountId])
+  @@index([expiresAt])
+  @@map("sessions")
+}
+
+// ---------- Immutable revisions (ADR 0005) ----------
+//
+// Working drafts are private and editable; published revisions are
+// immutable and form the public record. Each revision carries a
+// monotonic `revisionNumber` per parent and a `kind` discriminator.
+// Publishing validates and promotes one complete revision atomically
+// without changing the stable SellerProfile / ServiceOffering identity.
+
+// Immutable revision of a SellerProfile. ADR 0005: published revisions
+// are append-only and never updated. Working revisions are private and
+// mutable; publishing promotes them to a new immutable revision. The
+// canonical M1.1 SellerProfile row continues to be the stable identity
+// referenced by search.
+model SellerProfileRevision {
+  id                 String                     @id @default(cuid())
+  sellerProfileId    String
+  revisionNumber     Int
+  kind               SellerProfileRevisionKind
+  professionalName   String
+  bio                String
+  basedInCity        String?
+  basedInRegion      String?
+  basedInCountryCode String
+  avatarUrl          String?
+  // `publishedAt` is set when the revision is published. Working
+  // revisions have `publishedAt = NULL`.
+  publishedAt        DateTime?
+  createdAt          DateTime                   @default(now())
+  createdByUserId    String?
+
+  sellerProfile SellerProfile @relation(fields: [sellerProfileId], references: [id], onDelete: Cascade)
+  specialties   SellerProfileRevisionSpecialty[]
+  affiliations  SellerProfileRevisionCaribbeanAffiliation[]
+
+  @@unique([sellerProfileId, revisionNumber])
+  @@index([sellerProfileId])
+  @@index([kind])
+  @@map("seller_profile_revisions")
+}
+
+model SellerProfileRevisionSpecialty {
+  sellerProfileRevisionId String
+  specialtyId             String
+
+  sellerProfileRevision SellerProfileRevision @relation(fields: [sellerProfileRevisionId], references: [id], onDelete: Cascade)
+  specialty             Specialty             @relation(fields: [specialtyId], references: [id], onDelete: Restrict)
+
+  @@id([sellerProfileRevisionId, specialtyId])
+  @@map("seller_profile_revision_specialties")
+}
+
+model SellerProfileRevisionCaribbeanAffiliation {
+  id                       String @id @default(cuid())
+  sellerProfileRevisionId String
+  countryCode              String
+
+  sellerProfileRevision SellerProfileRevision @relation(fields: [sellerProfileRevisionId], references: [id], onDelete: Cascade)
+
+  @@unique([sellerProfileRevisionId, countryCode])
+  @@index([countryCode])
+  @@map("seller_profile_revision_caribbean_affiliations")
+}
+
+// Immutable revision of a ServiceOffering. Same semantics as
+// SellerProfileRevision: published revisions are append-only, working
+// revisions are private, and the canonical M1.1 ServiceOffering row
+// continues to be the stable identity referenced by search.
+model ServiceOfferingRevision {
+  id                String                       @id @default(cuid())
+  serviceOfferingId String
+  revisionNumber    Int
+  kind              ServiceOfferingRevisionKind
+  title             String
+  description       String
+  serviceMode       ServiceMode
+  primaryCategoryId String
+  genreTags         String[]
+  // Pricing fields are denormalized into the revision so an immutable
+  // published record preserves the exact advertised amount.
+  pricingKind       PricingKind?
+  pricingAmountMinor Int?
+  pricingCurrency   String?
+  pricingUnitId     String?
+  publishedAt       DateTime?
+  createdAt         DateTime                     @default(now())
+  createdByUserId   String?
+
+  serviceOffering  ServiceOffering              @relation(fields: [serviceOfferingId], references: [id], onDelete: Cascade)
+  primaryCategory  ServiceCategory              @relation(fields: [primaryCategoryId], references: [id], onDelete: Restrict)
+  pricingUnit      PricingUnit?                 @relation(fields: [pricingUnitId], references: [id], onDelete: SetNull)
+  serviceAreas     ServiceOfferingRevisionServiceArea[]
+  includedServices ServiceOfferingRevisionIncludedService[]
+
+  @@unique([serviceOfferingId, revisionNumber])
+  @@index([serviceOfferingId])
+  @@index([kind])
+  @@map("service_offering_revisions")
+}
+
+model ServiceOfferingRevisionServiceArea {
+  id                       String  @id @default(cuid())
+  serviceOfferingRevisionId String
+  city                     String?
+  region                   String?
+  countryCode              String
+
+  serviceOfferingRevision ServiceOfferingRevision @relation(fields: [serviceOfferingRevisionId], references: [id], onDelete: Cascade)
+
+  @@index([serviceOfferingRevisionId])
+  @@index([countryCode])
+  @@map("service_offering_revision_service_areas")
+}
+
+model ServiceOfferingRevisionIncludedService {
+  id                       String       @id @default(cuid())
+  serviceOfferingRevisionId String
+  categoryId               String
+  purchaseMode             PurchaseMode
+
+  serviceOfferingRevision ServiceOfferingRevision @relation(fields: [serviceOfferingRevisionId], references: [id], onDelete: Cascade)
+  category               ServiceCategory          @relation(fields: [categoryId], references: [id], onDelete: Restrict)
+
+  @@unique([serviceOfferingRevisionId, categoryId])
+  @@map("service_offering_revision_included_services")
+}
+
+// ---------- Audit (immutable append-only log) ----------
+//
+// AuditEvent records are append-only. They identify the human actor
+// (when applicable), the acting Workspace (when applicable), the
+// action, the subject, the request ID, the outcome, the retention
+// class, and a safe human-readable summary. Provider subjects, private
+// email where not allowed, raw magic-link tokens, other members'
+// security events, internal moderation notes, and Prisma-only fields
+// MUST NOT appear here. Owner-visible activity views read these
+// records through an allow-listed contract.
+model AuditEvent {
+  id                 String              @id @default(cuid())
+  // `actorUserId` is the human who triggered the action. NULL for
+  // actions that have no human actor (e.g., automated jobs).
+  actorUserId        String?
+  // `actingWorkspaceId` is the Workspace the action was performed
+  // for. NULL for actions outside any Workspace context.
+  actingWorkspaceId  String?
+  action             String
+  subjectType        String
+  subjectId          String?
+  // `requestId` is the application-boundary correlation identifier,
+  // NOT an idempotency key.
+  requestId          String
+  occurredAt         DateTime            @default(now())
+  outcome            AuditEventOutcome
+  retentionClass     RetentionClass
+  summary            String
+  // Optional structured evidence that does not contain secrets, raw
+  // tokens, or restricted fields. The application decides what is
+  // safe to persist.
+  evidence           Json?
+
+  actorUserAccount UserAccount? @relation("AuditActorUserAccount", fields: [actorUserId], references: [id], onDelete: SetNull)
+  actingWorkspace  Workspace?   @relation("AuditActingWorkspace", fields: [actingWorkspaceId], references: [id], onDelete: SetNull)
+
+  @@index([actorUserId, occurredAt])
+  @@index([actingWorkspaceId, occurredAt])
+  @@index([action, occurredAt])
+  @@index([subjectType, subjectId])
+  @@index([occurredAt])
+  @@map("audit_events")
+}
+
+// ---------- Enforcement ----------
+
+// Contested-control freeze blocks Owner and membership changes,
+// invitations, capability changes, publication changes, and offering
+// activation/reactivation/archiving. Public content remains visible
+// unless a separate safety suspension is justified.
+model WorkspaceControlFreeze {
+  id                  String                       @id @default(cuid())
+  workspaceId         String                       @unique
+  state               WorkspaceControlFreezeState
+  placedAt            DateTime                     @default(now())
+  placedByOperatorId  String?
+  reason              String
+  liftedAt            DateTime?
+  liftedByOperatorId  String?
+  liftedReason        String?
+
+  workspace Workspace @relation(fields: [workspaceId], references: [id], onDelete: Cascade)
+
+  @@map("workspace_control_freezes")
+}
+
+// Public marketplace reports. A report preserves review evidence but
+// is not itself a block, finding, or enforcement action. Reports
+// trigger human review rather than automatic suspension.
+model MarketplaceReport {
+  id                    String                  @id @default(cuid())
+  reportedWorkspaceId   String
+  // `reporterUserId` is NULL for anonymous reports; set for reports
+  // filed by an authenticated reporter.
+  reporterUserId        String?
+  reason                MarketplaceReportReason
+  // `description` is bounded free text. The application enforces
+  // abuse-control limits at the request boundary.
+  description           String
+  // `contactEmail` is optional and only retained for follow-up. It is
+  // not exposed publicly.
+  contactEmail          String?
+  status                MarketplaceReportStatus @default(Open)
+  createdAt             DateTime                @default(now())
+  resolvedAt            DateTime?
+  resolutionSummary     String?
+
+  reportedWorkspace Workspace    @relation("ReportWorkspace", fields: [reportedWorkspaceId], references: [id], onDelete: Cascade)
+  reporterUserAccount UserAccount? @relation("ReportFilerUserAccount", fields: [reporterUserId], references: [id], onDelete: SetNull)
+
+  @@index([reportedWorkspaceId, status])
+  @@index([status, createdAt])
+  @@map("marketplace_reports")
+}
+
+// ---------- Closure (ADR 0006) ----------
+
+// Workspace-level closure record. A non-null row records that the
+// Workspace entered a closure sequence. `closesAt` is the planned
+// finalization timestamp after which the Workspace becomes terminal.
+// The M1.1 search path does not consult this table.
+model WorkspaceClosure {
+  id               String    @id @default(cuid())
+  workspaceId      String    @unique
+  initiatedBy      String
+  initiatedAt      DateTime  @default(now())
+  // `closesAt` is the planned finalization timestamp. During the
+  // restoration window (now → closesAt), the closure is reversible.
+  closesAt         DateTime
+  restoredAt       DateTime?
+  restoredBy       String?
+  finalReason      String?
+
+  workspace Workspace @relation(fields: [workspaceId], references: [id], onDelete: Cascade)
+
+  @@index([closesAt])
+  @@map("workspace_closures")
+}
+
+// UserAccount-level closure record. A non-null row records that the
+// account entered a closure sequence. Closure revokes sessions,
+// disables authentication, and is reversible during the restoration
+// window.
+model UserAccountClosure {
+  id               String    @id @default(cuid())
+  userAccountId    String    @unique
+  initiatedBy      String
+  initiatedAt      DateTime  @default(now())
+  closesAt         DateTime
+  restoredAt       DateTime?
+  restoredBy       String?
+  finalReason      String?
+
+  @@index([closesAt])
+  @@map("user_account_closures")
+}
+
+// ---------- Invitations ----------
+
+// Workspace membership invitation. Invitations specify Owner or Editor
+// authority, target one normalized email, expire, may be revoked, and
+// require successful authentication as that email plus explicit
+// acceptance. The M1.1 search path does not consult this table.
+model WorkspaceInvitation {
+  id                String                    @id @default(cuid())
+  workspaceId       String
+  email             String
+  authority         WorkspaceMembershipAuthority
+  status            WorkspaceInvitationStatus  @default(Pending)
+  invitedByUserId   String
+  invitedAt         DateTime                  @default(now())
+  expiresAt         DateTime
+  acceptedAt        DateTime?
+  acceptedByUserId  String?
+  revokedAt         DateTime?
+  revokedByUserId   String?
+  failureReason     String?
+
+  workspace Workspace @relation(fields: [workspaceId], references: [id], onDelete: Cascade)
+
+  @@index([workspaceId, status])
+  @@index([email])
+  @@index([expiresAt])
+  @@map("workspace_invitations")
+}
+
+// ---------- Terms / Acceptances ----------
+
+// Append-only document version. Terms, notices, and attestations use
+// append-only document versions and acceptance events. Updates are
+// classified as editorial, notice-required, or reconsent-required.
+// Only affected consequential actions are gated.
+model DocumentVersion {
+  id                 String              @id @default(cuid())
+  kind               DocumentKind
+  version            String
+  title              String
+  // `contentHash` is the canonical hash of the document body. The
+  // application decides what to do with the body (typically stored
+  // outside the database or in an object store).
+  contentHash        String
+  publishedAt        DateTime            @default(now())
+  policyUpdateClass  PolicyUpdateClass   @default(Editorial)
+  summaryOfChanges   String?
+
+  acceptances Acceptance[]
+
+  @@unique([kind, version])
+  @@index([kind, publishedAt])
+  @@map("document_versions")
+}
+
+// Acceptance event. A non-null row records that the UserAccount
+// accepted the referenced DocumentVersion. Acceptance references the
+// exact version presented so the record remains truthful after the
+// document wording changes.
+model Acceptance {
+  id                String        @id @default(cuid())
+  userAccountId     String
+  documentVersionId String
+  kind              AcceptanceKind
+  acceptedAt        DateTime      @default(now())
+
+  userAccount     UserAccount     @relation(fields: [userAccountId], references: [id], onDelete: Cascade)
+  documentVersion DocumentVersion @relation(fields: [documentVersionId], references: [id], onDelete: Restrict)
+
+  @@index([userAccountId, kind, acceptedAt])
+  @@index([documentVersionId])
+  @@map("acceptances")
+}
+
+// ---------- Idempotency ----------
+//
+// Consequential commands are transactional and idempotent using a
+// dedicated idempotency key. Request IDs are correlation identifiers
+// and are never treated as idempotency keys. A different idempotency
+// key represents a new intentional command. The `requestHash` binds
+// the idempotency record to the exact request payload; a conflicting
+// payload under the same (scope, key) is rejected.
+model IdempotencyKey {
+  id                String           @id @default(cuid())
+  scope             String
+  key               String
+  actorUserId       String?
+  actingWorkspaceId String?
+  requestHash       String
+  status            IdempotencyStatus @default(InProgress)
+  responseSnapshot  Json?
+  createdAt         DateTime         @default(now())
+  completedAt       DateTime?
+
+  @@unique([scope, key])
+  @@index([status, createdAt])
+  @@map("idempotency_keys")
 }
