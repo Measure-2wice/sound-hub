@@ -1,7 +1,4 @@
-import * as fs from "fs";
-import * as path from "path";
 import * as crypto from "crypto";
-import { fileURLToPath } from "url";
 
 import { ApiPromise, WsProvider } from "@polkadot/api";
 import { Keyring } from "@polkadot/keyring";
@@ -10,22 +7,15 @@ import type { AbiMessage, AbiConstructor } from "@polkadot/api-contract/types";
 import type { KeyringPair } from "@polkadot/keyring/types";
 import process from "process";
 
-const __filename = fileURLToPath(import.meta.url);
-const __dirname = path.dirname(__filename);
-
-const projectRoot = path.resolve(__dirname, "../..");
+import contractMetadataRaw from "./contract-metadata.json" assert { type: "json" };
 
 let api: ApiPromise;
 let contractAddress: string;
 let arbitratorAddress: string;
-let contractMetadata: any;
+let contractMetadata: any = contractMetadataRaw;
 let abi: Abi;
 let signer: KeyringPair;
 let signerAddress: string;
-
-function resolveProjectPath(filePath: string): string {
-    return path.isAbsolute(filePath) ? filePath : path.resolve(projectRoot, filePath);
-}
 
 function requireEnv(name: string, fallbackValue: string): string {
     const value = process.env[name] || fallbackValue;
@@ -102,7 +92,6 @@ async function signAndSend(tx: any, options: SignAndSendOptions = { extractAddre
 
 export async function init(): Promise<void> {
     const wsProvider = requireEnv("WS_PROVIDER", "ws://127.0.0.1:9944");
-    const metadataFile = requireEnv("METADATA", "../backend/target/ink/backend.contract");
     contractAddress = requireEnv("CONTRACT", "0x48550a4bb374727186c55365b7c9c0a1a31bdafe");
     const mnemonic = requireEnv("MNEMONIC", "//Alice");
 
@@ -111,12 +100,6 @@ export async function init(): Promise<void> {
         noInitWarn: true
     });
 
-    const metadataPath = resolveProjectPath(metadataFile);
-    if (!fs.existsSync(metadataPath)) {
-        throw new Error(`Contract metadata file not found: ${metadataPath}`);
-    }
-
-    contractMetadata = JSON.parse(fs.readFileSync(metadataPath, "utf8"));
     abi = new Abi(contractMetadata);
 
     const keyring = new Keyring({ type: "sr25519" });
@@ -182,7 +165,7 @@ export async function queryMessage(methodName: string, args: any[] = [], options
     }
 
     return {
-        gasRequired: dryRunResult.weightRequired,
+        gasRequired: dryRunResult.weightRequired || dryRunResult.gasRequired,
         storageDeposit: dryRunResult.storageDeposit,
         output: dryRunResult.result.asOk.data
     };
@@ -254,9 +237,10 @@ export async function createEscrow(provider: string, arbitrator: string, duratio
         throw new Error(`Instantiate DryRun Failed: ${dryRunResult.result.asErr.toString()}`);
     }
 
+    const requiredGas = dryRunResult.weightRequired || dryRunResult.gasRequired;
     const gasLimit = api.registry.createType("Weight", {
-        refTime: (BigInt(dryRunResult.weightRequired.refTime.toString()) * 12n) / 10n,
-        proofSize: (BigInt(dryRunResult.weightRequired.proofSize.toString()) * 12n) / 10n
+        refTime: (BigInt(requiredGas.refTime.toString()) * 12n) / 10n,
+        proofSize: (BigInt(requiredGas.proofSize.toString()) * 12n) / 10n
     });
 
     const tx = api.tx.revive.instantiateWithCode(
