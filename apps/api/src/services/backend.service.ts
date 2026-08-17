@@ -107,14 +107,14 @@ export async function init(): Promise<void> {
 
     console.log(`Substrate Address: ${signer.address}`);
 
-    signerAddress = ((await api.call.reviveApi.address(signer.address)) as any).toString();
+    signerAddress = ((await (api.call as any).reviveApi.address(signer.address)) as any).toString();
     console.log(`Signer Address: ${signerAddress}`);
-    const originalAccount = await api.query.revive.originalAccount(signerAddress);
+    const originalAccount = await (api.query as any).revive.originalAccount(signerAddress);
 
-    if (originalAccount.isNone) {
+    if ((originalAccount as any).isNone) {
         console.log("Sending mapping transaction...");
-        await signAndSend(api.tx.revive.mapAccount());
-        signerAddress = ((await api.call.reviveApi.address(signer.address)) as any).toString();
+        await signAndSend((api.tx as any).revive.mapAccount());
+        signerAddress = ((await (api.call as any).reviveApi.address(signer.address)) as any).toString();
     }
 }
 
@@ -141,7 +141,7 @@ export async function queryMessage(methodName: string, args: any[] = [], options
 
     const inputData = `0x${selectorHex}${argsHex}`;
 
-    const dryRunResult: any = await api.call.reviveApi.call(
+    const dryRunResult: any = await (api.call as any).reviveApi.call(
         signer.address,
         contractAddress,
         0, // value
@@ -193,7 +193,7 @@ export async function sendMessage(methodName: string, args: any[] = [], options:
         proofSize: (BigInt(gasRequired.proofSize.toString()) * 12n) / 10n
     });
 
-    const tx = api.tx.revive.call(
+    const tx = (api.tx as any).revive.call(
         contractAddress,
         0, // value
         gasLimit,
@@ -223,7 +223,7 @@ export async function createEscrow(provider: string, arbitrator: string, duratio
     const randomSalt = '0x' + crypto.randomBytes(32).toString('hex');
 
     // Dry-run instantiate to get gas limits
-    const dryRunResult: any = await api.call.reviveApi.instantiate(
+    const dryRunResult: any = await (api.call as any).reviveApi.instantiate(
         signer.address,
         value,
         null, // gas
@@ -243,7 +243,7 @@ export async function createEscrow(provider: string, arbitrator: string, duratio
         proofSize: (BigInt(requiredGas.proofSize.toString()) * 12n) / 10n
     });
 
-    const tx = api.tx.revive.instantiateWithCode(
+    const tx = (api.tx as any).revive.instantiateWithCode(
         value,
         gasLimit,
         dryRunResult.storageDeposit.asCharge || (1n << 128n) - 1n,
