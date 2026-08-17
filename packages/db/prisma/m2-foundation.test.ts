@@ -36,6 +36,7 @@
 
 import assert from "node:assert/strict";
 import { spawn } from "node:child_process";
+import { readFileSync } from "node:fs";
 import { after, before, describe, test } from "node:test";
 import { PrismaPg } from "@prisma/adapter-pg";
 import { PrismaClient } from "../src/generated/client.js";
@@ -742,11 +743,11 @@ describe("M2.0A Gate 0 schema expand coverage", () => {
     // idiom). Without this cleanup, a subsequent test:db run that
     // invokes the canonical "exactly one revision" assertion would
     // observe the leaking revisionNumber=2 row.
-    await withTriggerBypass(prisma, async () => {
-      await prisma.sellerProfileRevision.delete({
+    await withTriggerBypass(prisma, async (tx) => {
+      await tx.sellerProfileRevision.delete({
         where: { id: laterRevision.id },
       });
-      await prisma.serviceOfferingRevision.delete({
+      await tx.serviceOfferingRevision.delete({
         where: { id: laterOfferingRevision.id },
       });
     });
@@ -1070,8 +1071,8 @@ describe("M2.0A Gate 0 schema expand coverage", () => {
         },
       },
     });
-    await withTriggerBypass(prisma, async () => {
-      await prisma.sellerProfileRevision.delete({ where: { id: synthetic.id } });
+    await withTriggerBypass(prisma, async (tx) => {
+      await tx.sellerProfileRevision.delete({ where: { id: synthetic.id } });
     });
   });
 
@@ -1155,8 +1156,8 @@ describe("M2.0A Gate 0 schema expand coverage", () => {
     await prisma.serviceOfferingRevisionServiceArea.delete({
       where: { id: workingArea.id },
     });
-    await withTriggerBypass(prisma, async () => {
-      await prisma.serviceOfferingRevision.delete({ where: { id: synthetic.id } });
+    await withTriggerBypass(prisma, async (tx) => {
+      await tx.serviceOfferingRevision.delete({ where: { id: synthetic.id } });
     });
   });
 
@@ -1270,8 +1271,8 @@ describe("M2.0A Gate 0 schema expand coverage", () => {
       where: { workspaceId: workspace.id },
     });
     if (existingFreeze) {
-      await withTriggerBypass(prisma, async () => {
-        await prisma.workspaceControlFreeze.delete({ where: { id: existingFreeze.id } });
+      await withTriggerBypass(prisma, async (tx) => {
+        await tx.workspaceControlFreeze.delete({ where: { id: existingFreeze.id } });
       });
     }
     const freeze = await prisma.workspaceControlFreeze.create({
@@ -1285,8 +1286,8 @@ describe("M2.0A Gate 0 schema expand coverage", () => {
       where: { workspaceId: workspace.id },
     });
     if (existingClosure) {
-      await withTriggerBypass(prisma, async () => {
-        await prisma.workspaceClosure.delete({ where: { id: existingClosure.id } });
+      await withTriggerBypass(prisma, async (tx) => {
+        await tx.workspaceClosure.delete({ where: { id: existingClosure.id } });
       });
     }
     const report = await prisma.marketplaceReport.create({
@@ -1351,11 +1352,11 @@ describe("M2.0A Gate 0 schema expand coverage", () => {
 
     // Cleanup: bypass the FKs explicitly so the canonical seed for
     // subsequent tests sees the canonical workspace.
-    await withTriggerBypass(prisma, async () => {
-      await prisma.workspaceControlFreeze.delete({ where: { id: freeze.id } });
-      await prisma.marketplaceReport.delete({ where: { id: report.id } });
-      await prisma.workspaceClosure.delete({ where: { id: closure.id } });
-      await prisma.workspaceInvitation.delete({ where: { id: invitation.id } });
+    await withTriggerBypass(prisma, async (tx) => {
+      await tx.workspaceControlFreeze.delete({ where: { id: freeze.id } });
+      await tx.marketplaceReport.delete({ where: { id: report.id } });
+      await tx.workspaceClosure.delete({ where: { id: closure.id } });
+      await tx.workspaceInvitation.delete({ where: { id: invitation.id } });
     });
   });
 
@@ -1461,8 +1462,8 @@ describe("M2.0A Gate 0 schema expand coverage", () => {
       !names.includes("workspaceId"),
       "information_schema must not list a workspaceId column",
     );
-    await withTriggerBypass(prisma, async () => {
-      await prisma.authenticationIdentity.delete({ where: { id: id.id } });
+    await withTriggerBypass(prisma, async (tx) => {
+      await tx.authenticationIdentity.delete({ where: { id: id.id } });
     });
   });
 
@@ -1504,5 +1505,216 @@ describe("M2.0A Gate 0 schema expand coverage", () => {
     `;
     assert.equal(columnInfo[0]?.is_nullable, "YES", "ownerUserId must be nullable");
     assert.equal(columnInfo[0]?.data_type, "text");
+  });
+
+  test("canonical Prisma schema and deployed migration agree on RESTRICT for evidence-bearing relations (P1-001)", async () => {
+    // Review 9 P1-001: the reviewed migration installs ON DELETE
+    // RESTRICT for the six evidence-bearing parent FKs. The Prisma
+    // schema must agree; otherwise a future schema-derived migration
+    // would silently revert the constraints to CASCADE and undo the
+    // evidence-retention guarantee. This test proves both sides
+    // agree and would fail if either side drifts.
+    //
+    // The six evidence-bearing parent relations are:
+    //   - SellerProfileRevision.sellerProfile -> SellerProfile
+    //   - ServiceOfferingRevision.serviceOffering -> ServiceOffering
+    //   - WorkspaceControlFreeze.workspace -> Workspace
+    //   - MarketplaceReport.reportedWorkspace -> Workspace
+    //   - WorkspaceClosure.workspace -> Workspace
+    //   - WorkspaceInvitation.workspace -> Workspace
+    const schemaSource = readFileSync(new URL("./schema.prisma", import.meta.url).pathname, "utf8");
+    // Locate the @relation declaration for the parent model that
+    // backs each evidence-bearing constraint. The relation must be
+    // scoped to the correct `model X { ... }` block because several
+    // models share the same field declaration (e.g. four models
+    // declare `sellerProfile SellerProfile @relation(fields:
+    // [sellerProfileId]...)` with different onDelete actions).
+    const parentModelByConstraint: Record<string, { model: string; field: string; fk: string }> = {
+      seller_profile_revisions_sellerProfileId_fkey: {
+        model: "SellerProfileRevision",
+        field: "sellerProfileId",
+        fk: "SellerProfile",
+      },
+      service_offering_revisions_serviceOfferingId_fkey: {
+        model: "ServiceOfferingRevision",
+        field: "serviceOfferingId",
+        fk: "ServiceOffering",
+      },
+      workspace_control_freezes_workspaceId_fkey: {
+        model: "WorkspaceControlFreeze",
+        field: "workspaceId",
+        fk: "Workspace",
+      },
+      marketplace_reports_reportedWorkspaceId_fkey: {
+        model: "MarketplaceReport",
+        field: "reportedWorkspaceId",
+        fk: "Workspace",
+      },
+      workspace_closures_workspaceId_fkey: {
+        model: "WorkspaceClosure",
+        field: "workspaceId",
+        fk: "Workspace",
+      },
+      workspace_invitations_workspaceId_fkey: {
+        model: "WorkspaceInvitation",
+        field: "workspaceId",
+        fk: "Workspace",
+      },
+    };
+    for (const [constraint, { model, field, fk }] of Object.entries(parentModelByConstraint)) {
+      // Isolate the body of the parent model block. A model block
+      // opens with `model Name {` and closes at the next line whose
+      // first non-whitespace character is `}`. The body contains
+      // the @relation declaration that maps to the deployed FK.
+      const blockMatch = schemaSource.match(
+        new RegExp(`model ${model} \\{[^\\n]*\\n(?:[\\s\\S]*?\\n)?\\}`, "m"),
+      );
+      assert.ok(blockMatch, `could not isolate the body of model ${model}`);
+      const block = blockMatch[0];
+      const relationPattern = new RegExp(
+        `@relation[^\\n]*?fields: \\[${field}\\][^\\n]*?onDelete: (Restrict|Cascade)`,
+      );
+      const relationMatch = block.match(relationPattern);
+      assert.ok(
+        relationMatch,
+        `model ${model} must declare an @relation for ${field} -> ${fk} with an explicit onDelete action`,
+      );
+      assert.equal(
+        relationMatch[1],
+        "Restrict",
+        `Prisma model ${model}.${field} -> ${fk} must declare onDelete: Restrict to match the reviewed migration; saw onDelete: ${relationMatch[1]}`,
+      );
+
+      // Deployed side: query pg_constraint for the FK action. The
+      // canonical constraint name is a stable identifier that the
+      // reviewed migration installs. The action code 'r' means
+      // RESTRICT in PostgreSQL's pg_constraint catalog. Cast to
+      // text so the result deserializes through Prisma's adapter.
+      const fkAction = await prisma.$queryRaw<Array<{ confdeltype: string }>>`
+        SELECT confdeltype::text AS confdeltype FROM pg_constraint WHERE conname = ${constraint}
+      `;
+      assert.ok(
+        fkAction.length === 1,
+        `deployed constraint ${constraint} must exist exactly once; found ${fkAction.length}`,
+      );
+      assert.equal(
+        fkAction[0]?.confdeltype,
+        "r",
+        `deployed ${constraint} must be ON DELETE RESTRICT; saw confdeltype=${fkAction[0]?.confdeltype}`,
+      );
+    }
+  });
+
+  test("withTriggerBypass pins session_replication_role to one connection and restores on success and throw (P2-001)", async () => {
+    // Review 9 P2-001: the previous withTriggerBypass issued three
+    // independent $executeRawUnsafe calls. The Prisma connection
+    // pool could pick different connections for the opening SET,
+    // the callback, and the closing SET, leaving some connections
+    // stuck in replica mode and others (which run the actual
+    // mutations) in origin mode where triggers fire. The fixed
+    // helper wraps the SET, the callback, and the implicit
+    // restoration in one prisma.$transaction so every query shares
+    // a single backend connection; SET LOCAL reverts on COMMIT/
+    // ROLLBACK so the connection is restored to origin even if the
+    // callback throws.
+    const readRole = async (client: { $queryRaw: <T>(q: TemplateStringsArray) => Promise<T> }) => {
+      const rows = await client.$queryRaw<Array<{ role: string }>>`
+        SELECT setting AS role FROM pg_settings WHERE name = 'session_replication_role'
+      `;
+      return rows[0]?.role;
+    };
+
+    // Baseline: the connection starts in origin mode. The pool may
+    // be in any state from prior tests, so this is a per-test
+    // observation rather than a global invariant.
+    const before = await readRole(prisma);
+    assert.equal(before, "origin", "baseline session_replication_role must be origin");
+
+    // Success path: the callback observes replica; after the helper
+    // returns, the role is origin again. Both observations are
+    // issued through the same client to prove session affinity.
+    let insideRole: string | undefined;
+    await withTriggerBypass(prisma, async (tx) => {
+      insideRole = await readRole(tx);
+    });
+    assert.equal(insideRole, "replica", "callback must observe session_replication_role = replica");
+    const afterSuccess = await readRole(prisma);
+    assert.equal(
+      afterSuccess,
+      "origin",
+      "session_replication_role must restore to origin after a successful callback",
+    );
+
+    // Throw path: a callback that observes the role and then throws
+    // must still restore the role. SET LOCAL reverts on the
+    // transaction ROLLBACK that the throw triggers, so the
+    // connection is back to origin even though the callback raised.
+    let threw = false;
+    let insideRoleThrow: string | undefined;
+    try {
+      await withTriggerBypass(prisma, async (tx) => {
+        insideRoleThrow = await readRole(tx);
+        throw new Error("forced callback failure for restoration regression test");
+      });
+    } catch {
+      threw = true;
+    }
+    assert.ok(threw, "an exception inside the callback must propagate out of withTriggerBypass");
+    assert.equal(
+      insideRoleThrow,
+      "replica",
+      "callback must observe session_replication_role = replica even on the throw path",
+    );
+    const afterThrow = await readRole(prisma);
+    assert.equal(
+      afterThrow,
+      "origin",
+      "session_replication_role must restore to origin after a thrown callback",
+    );
+
+    // Mutations on the helper's transaction client bypass triggers
+    // because the SET LOCAL has already flipped the connection to
+    // replica. A direct UPDATE on audit_events (which the
+    // append-only trigger would otherwise reject) succeeds inside
+    // the callback and the row survives, proving the bypass is
+    // active on the SAME connection that runs the mutation.
+    const probeId = `audit-probe-${Date.now()}`;
+    await prisma.$executeRawUnsafe(
+      `INSERT INTO audit_events (id, "actorUserId", "actingWorkspaceId", action, "subjectType", "subjectId", "requestId", outcome, "retentionClass", summary) VALUES ($1, NULL, NULL, 'p2-001-probe', 'Probe', NULL, $1, 'Success', 'Governance', 'P2-001 session affinity probe')`,
+      probeId,
+    );
+    let updatedInside = false;
+    await withTriggerBypass(prisma, async (tx) => {
+      const updated = await tx.$executeRawUnsafe(
+        `UPDATE audit_events SET summary = 'updated inside bypass' WHERE id = $1`,
+        probeId,
+      );
+      updatedInside = updated === 1;
+    });
+    assert.ok(updatedInside, "UPDATE inside the helper must affect exactly one audit_events row");
+    // The append-only trigger is active again outside the helper,
+    // so any further UPDATE on this row must be rejected.
+    let blockedOutside = false;
+    try {
+      await prisma.$executeRawUnsafe(
+        `UPDATE audit_events SET summary = 'blocked outside bypass' WHERE id = $1`,
+        probeId,
+      );
+    } catch (err) {
+      blockedOutside = true;
+      assert.ok(
+        err instanceof Error ? err.message.includes("append-only") : false,
+        `UPDATE outside the helper must be rejected by the append-only trigger; got ${String(err)}`,
+      );
+    }
+    assert.ok(
+      blockedOutside,
+      "session_replication_role must be origin again after the helper returns so the append-only trigger fires",
+    );
+    // Cleanup the probe row using the helper so the canonical seed
+    // for the next test sees the canonical audit_events state.
+    await withTriggerBypass(prisma, async (tx) => {
+      await tx.$executeRawUnsafe(`DELETE FROM audit_events WHERE id = $1`, probeId);
+    });
   });
 });

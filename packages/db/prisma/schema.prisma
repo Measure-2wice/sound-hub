@@ -591,7 +591,11 @@ model SellerProfileRevision {
   createdAt          DateTime                   @default(now())
   createdByUserId    String?
 
-  sellerProfile SellerProfile @relation(fields: [sellerProfileId], references: [id], onDelete: Cascade)
+  // ADR 0006: published revisions are evidence-bearing. The FK is
+  // RESTRICT so direct parent deletion cannot silently erase a
+  // SellerProfileRevision; an authorized retention flow is the only
+  // path that removes the revision (after triggers are bypassed).
+  sellerProfile SellerProfile @relation(fields: [sellerProfileId], references: [id], onDelete: Restrict)
   specialties   SellerProfileRevisionSpecialty[]
   affiliations  SellerProfileRevisionCaribbeanAffiliation[]
 
@@ -648,7 +652,11 @@ model ServiceOfferingRevision {
   createdAt         DateTime                     @default(now())
   createdByUserId   String?
 
-  serviceOffering  ServiceOffering              @relation(fields: [serviceOfferingId], references: [id], onDelete: Cascade)
+  // ADR 0006: ServiceOfferingRevision is evidence-bearing; the FK is
+  // RESTRICT so direct parent deletion cannot erase a revision. An
+  // authorized retention flow (with trigger bypass) is the only path
+  // that removes a revision.
+  serviceOffering  ServiceOffering              @relation(fields: [serviceOfferingId], references: [id], onDelete: Restrict)
   primaryCategory  ServiceCategory              @relation(fields: [primaryCategoryId], references: [id], onDelete: Restrict)
   pricingUnit      PricingUnit?                 @relation(fields: [pricingUnitId], references: [id], onDelete: SetNull)
   serviceAreas     ServiceOfferingRevisionServiceArea[]
@@ -748,7 +756,10 @@ model WorkspaceControlFreeze {
   liftedByOperatorId  String?
   liftedReason        String?
 
-  workspace Workspace @relation(fields: [workspaceId], references: [id], onDelete: Cascade)
+  // ADR 0006: workspace_control_freezes is evidence-bearing; only
+  // retention processing may remove a freeze row, never a parent
+  // Workspace cascade.
+  workspace Workspace @relation(fields: [workspaceId], references: [id], onDelete: Restrict)
 
   @@map("workspace_control_freezes")
 }
@@ -774,7 +785,10 @@ model MarketplaceReport {
   resolvedAt            DateTime?
   resolutionSummary     String?
 
-  reportedWorkspace Workspace    @relation("ReportWorkspace", fields: [reportedWorkspaceId], references: [id], onDelete: Cascade)
+  // ADR 0006: marketplace_reports preserve review evidence; a report
+  // survives parent Workspace deletion so the review trail remains
+  // auditable.
+  reportedWorkspace Workspace    @relation("ReportWorkspace", fields: [reportedWorkspaceId], references: [id], onDelete: Restrict)
   reporterUserAccount UserAccount? @relation("ReportFilerUserAccount", fields: [reporterUserId], references: [id], onDelete: SetNull)
 
   @@index([reportedWorkspaceId, status])
@@ -800,7 +814,10 @@ model WorkspaceClosure {
   restoredBy       String?
   finalReason      String?
 
-  workspace Workspace @relation(fields: [workspaceId], references: [id], onDelete: Cascade)
+  // ADR 0006: workspace_closures is evidence-bearing; only retention
+  // processing may remove the record, never a parent Workspace
+  // cascade.
+  workspace Workspace @relation(fields: [workspaceId], references: [id], onDelete: Restrict)
 
   @@index([closesAt])
   @@map("workspace_closures")
@@ -845,7 +862,10 @@ model WorkspaceInvitation {
   revokedByUserId   String?
   failureReason     String?
 
-  workspace Workspace @relation(fields: [workspaceId], references: [id], onDelete: Cascade)
+  // ADR 0006: workspace_invitations document governance history; an
+  // invitation survives parent Workspace deletion so the invitation
+  // trail remains auditable.
+  workspace Workspace @relation(fields: [workspaceId], references: [id], onDelete: Restrict)
 
   @@index([workspaceId, status])
   @@index([email])

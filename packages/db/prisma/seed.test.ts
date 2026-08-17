@@ -251,25 +251,25 @@ describe("M1.1 seed regression coverage", () => {
     // never flips the session role. The session setting is restored
     // immediately after the cleanup so the next test sees the
     // triggers active.
-    await withTriggerBypass(prisma, async () => {
-      await prisma.serviceOfferingPricing.deleteMany({
+    await withTriggerBypass(prisma, async (tx) => {
+      await tx.serviceOfferingPricing.deleteMany({
         where: { offeringId: { in: offeringIds } },
       });
-      await prisma.serviceOfferingServiceArea.deleteMany({
+      await tx.serviceOfferingServiceArea.deleteMany({
         where: { offeringId: { in: offeringIds } },
       });
-      await prisma.includedService.deleteMany({ where: { offeringId: { in: offeringIds } } });
-      await prisma.serviceOffering.deleteMany({ where: { id: { in: offeringIds } } });
-      await prisma.sellerProfileSpecialty.deleteMany({ where: { sellerProfileId: profileId } });
-      await prisma.caribbeanAffiliation.deleteMany({ where: { sellerProfileId: profileId } });
-      await prisma.sellerProfile.delete({ where: { id: profileId } });
+      await tx.includedService.deleteMany({ where: { offeringId: { in: offeringIds } } });
+      await tx.serviceOffering.deleteMany({ where: { id: { in: offeringIds } } });
+      await tx.sellerProfileSpecialty.deleteMany({ where: { sellerProfileId: profileId } });
+      await tx.caribbeanAffiliation.deleteMany({ where: { sellerProfileId: profileId } });
+      await tx.sellerProfile.delete({ where: { id: profileId } });
       for (const m of memberships) {
-        await prisma.workspaceMembership.delete({ where: { id: m.id } });
+        await tx.workspaceMembership.delete({ where: { id: m.id } });
       }
       for (const c of capabilities) {
-        await prisma.workspaceCapability.delete({ where: { id: c.id } });
+        await tx.workspaceCapability.delete({ where: { id: c.id } });
       }
-      await prisma.workspace.delete({ where: { id: workspace.id } });
+      await tx.workspace.delete({ where: { id: workspace.id } });
     });
 
     await runSeed();
@@ -338,8 +338,8 @@ describe("M1.1 seed regression coverage", () => {
       where: { primaryCategoryId: category.id },
       data: { primaryCategoryId: other.id },
     });
-    await withTriggerBypass(prisma, async () => {
-      await prisma.serviceOfferingRevision.updateMany({
+    await withTriggerBypass(prisma, async (tx) => {
+      await tx.serviceOfferingRevision.updateMany({
         where: { primaryCategoryId: category.id },
         data: { primaryCategoryId: other.id },
       });
@@ -365,8 +365,8 @@ describe("M1.1 seed regression coverage", () => {
     // consistent offering/revision/primaryCategoryId graph. The
     // bypass is a test-only idiom; production migrations and the
     // seed never flip the session role.
-    await withTriggerBypass(prisma, async () => {
-      await prisma.serviceOfferingRevision.updateMany({
+    await withTriggerBypass(prisma, async (tx) => {
+      await tx.serviceOfferingRevision.updateMany({
         where: { primaryCategoryId: other.id },
         data: { primaryCategoryId: restored.id },
       });
