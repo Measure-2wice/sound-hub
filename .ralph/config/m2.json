@@ -1,0 +1,45 @@
+{
+  "id": "m2",
+  "name": "Authenticated Workspaces and Seller Onboarding",
+  "repository": "Measure-2wice/sound-hub",
+  "parentIssue": 12,
+
+  "integration": {
+    "branch": "ralph/m2",
+    "ticketBranchPrefix": "ralph/m2-",
+    "strategy": "merge-no-ff",
+    "pushAfterIntegration": true,
+    "closeIssueAfterIntegration": true,
+    "deleteTicketWorktreeAfterIntegration": true,
+    "deleteLocalTicketBranchAfterIntegration": true,
+    "deleteRemoteTicketBranchAfterIntegration": true,
+    "mergeToMain": false
+  },
+
+  "execution": {
+    "mode": "sequential",
+    "freshContextPerIteration": true,
+    "maxImplementationIterations": 2,
+    "maxReviewCycles": 2,
+    "maxReviewFixIterations": 2,
+    "requireCodexApproval": true,
+    "requireAutomatedQaBeforeIntegration": true,
+    "requireHumanQaBeforeFinalMerge": true
+  },
+
+  "selection": {
+    "requiredLabel": "ready-for-ralph",
+    "skipLabels": [
+      "supervised-agent",
+      "needs-reshaping"
+    ]
+  },
+
+  "safety": {
+    "allowPushTicketBranches": true,
+    "allowPushIntegrationBranch": true,
+    "allowCloseIntegratedIssues": true,
+    "allowMergeToMain": false,
+    "allowForcePush": false
+  }
+}
