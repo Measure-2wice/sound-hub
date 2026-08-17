@@ -6,20 +6,21 @@
 //
 // The transition test proves the M2 expand migration by
 // independently constructing the M1.1 baseline (schema and
-// representative pre-expand data), applying the reviewed migration
-// SQL, and observing the backfill. The other tests in
-// m2-foundation.test.ts inspect the post-migration state; this
-// file proves the migration itself is the path that produces the
-// post-migration state.
+// representative pre-expand data) from the APPROVED M1.1 migration
+// history on disk, applying the reviewed M2 migration SQL, and
+// observing the backfill. The other tests in m2-foundation.test.ts
+// inspect the post-migration state; this file proves the migration
+// itself is the path that produces the post-migration state.
 //
 // The test runs against the disposable test database
-// (TEST_DATABASE_URL, soundhub_m1_test@localhost:5433) and uses
-// raw SQL to drop the M2-only schema, re-create the M1.1 + M2
-// state, and verify the transition. The Suite's `before` hook
-// drops the M2-only artifacts, then the test cases apply the
-// reviewed migration SQL and observe the backfill.
+// (TEST_DATABASE_URL, soundhub_m1_test@localhost:5433). The M1.1
+// baseline is established by reading the approved
+// 20260808114423_m1_foundation and 20260808120000_drop_seed_markers
+// migration SQL files from disk and applying them directly — not by
+// reconstructing an approximate baseline with hand-written drops. The
+// reviewed M2 migration SQL is then applied and its backfill observed.
 //
-// The negative case proves the suite fails when the migration SQL
+// The negative case proves the suite fails when the M2 migration SQL
 // is intentionally broken: it removes the Admin/Member -> Editor
 // backfill UPDATE, applies the remainder, and asserts that the
 // canonical assertion detects the missing Editor mapping.
@@ -152,141 +153,51 @@ function loadMigrationSql(): string {
   );
 }
 
-// applyMigrationSql: execute the M2 migration SQL and ignore the
-// "already exists" errors that come from attempting to drop
-// constraints that are not present in the M1.1 baseline. The
-// dominant outcome is the add-DDL + backfill + trigger DDL.
+// loadM11MigrationSqls: read the approved M1.1 migration SQL files
+// in the order they must be applied. The transition suite applies the
+// M1.1 history directly from disk so the baseline cannot drift from
+// the approved source.
+function loadM11MigrationSqls(): string[] {
+  return [
+    readFileSync(
+      new URL("./migrations/20260808114423_m1_foundation/migration.sql", import.meta.url).pathname,
+      "utf8",
+    ),
+    readFileSync(
+      new URL("./migrations/20260808120000_drop_seed_markers/migration.sql", import.meta.url)
+        .pathname,
+      "utf8",
+    ),
+  ];
+}
+
+// resetToM11Baseline: snap the database to a fresh M1.1 baseline by
+// dropping the public schema and applying the approved M1.1 migration
+// history in order. This is the authoritative source of the M1.1
+// schema; the test never reconstructs it from hand-written drops.
+async function resetToM11Baseline(): Promise<void> {
+  await prisma.$executeRawUnsafe('DROP SCHEMA IF EXISTS "public" CASCADE; CREATE SCHEMA "public";');
+  for (const sql of loadM11MigrationSqls()) {
+    await prisma.$executeRawUnsafe(sql);
+  }
+}
+
+// applyMigrationSql: execute the M2 migration SQL. The dominant
+// outcome is the add-DDL + backfill + trigger DDL. Existing-M2
+// "already exists" errors do not arise because resetToM11Baseline
+// drops the schema first.
 async function applyMigrationSql(sql: string): Promise<void> {
   await prisma.$executeRawUnsafe(sql);
-}
-
-// dropM2Schema: snap the public schema back to the M1.1 baseline.
-// Drops M2 tables (CASCADE handles FKs and triggers), M2 columns
-// on existing M1.1 tables, and M2 enums. The M1.1 baseline
-// (`m1_foundation` + `drop_seed_markers` migrations) is preserved
-// as the starting point so the migration can be applied from the
-// exact M1.1 state.
-async function dropM2Schema(): Promise<void> {
-  // Drop M2-only tables. CASCADE handles FKs (including the M2
-  // RESTRICT FK on acceptances.userAccountId) and triggers on the
-  // dropped tables.
-  const m2Tables = [
-    "idempotency_keys",
-    "acceptances",
-    "document_versions",
-    "workspace_invitations",
-    "user_account_closures",
-    "workspace_closures",
-    "marketplace_reports",
-    "workspace_control_freezes",
-    "audit_events",
-    "service_offering_revision_included_services",
-    "service_offering_revision_service_areas",
-    "service_offering_revisions",
-    "seller_profile_revision_caribbean_affiliations",
-    "seller_profile_revision_specialties",
-    "seller_profile_revisions",
-    "sessions",
-    "user_account_security",
-    "magic_link_challenges",
-    "authentication_identities",
-  ];
-  for (const table of m2Tables) {
-    await prisma.$executeRawUnsafe(`DROP TABLE IF EXISTS "${table}" CASCADE;`);
-  }
-  // Drop the M2-only ownerUserId FK constraint that the migration
-  // drops. The CASCADE on the M2 table drops above already removed
-  // the trigger functions, but the workspaces.ownerUserId FK
-  // belongs to the M1.1 table and must be dropped explicitly.
-  await prisma.$executeRawUnsafe(
-    `ALTER TABLE "workspaces" DROP CONSTRAINT IF EXISTS "workspaces_ownerUserId_fkey";`,
-  );
-  // Drop M2 columns on existing M1.1 tables.
-  await prisma.$executeRawUnsafe(
-    `ALTER TABLE "user_accounts" DROP COLUMN IF EXISTS "closureState";`,
-  );
-  await prisma.$executeRawUnsafe(`ALTER TABLE "workspaces" DROP COLUMN IF EXISTS "closureState";`);
-  // Note: workspace_memberships.authority and removedAt are dropped
-  // by the next DROP COLUMN call. The CASCADE on the M2 table
-  // drops above does not affect these because workspace_memberships
-  // is an M1.1 table.
-  await prisma.$executeRawUnsafe(
-    `ALTER TABLE "workspace_memberships" DROP COLUMN IF EXISTS "authority";`,
-  );
-  await prisma.$executeRawUnsafe(
-    `ALTER TABLE "workspace_memberships" DROP COLUMN IF EXISTS "removedAt";`,
-  );
-  // Drop M2-only enums.
-  const m2Enums = [
-    "WorkspaceMembershipAuthority",
-    "AuthenticationProvider",
-    "WorkspaceClosureState",
-    "UserAccountClosureState",
-    "MarketplaceReportStatus",
-    "MarketplaceReportReason",
-    "AcceptanceKind",
-    "DocumentKind",
-    "PolicyUpdateClass",
-    "RetentionClass",
-    "AuditEventOutcome",
-    "WorkspaceControlFreezeState",
-    "IdempotencyStatus",
-    "SellerProfileRevisionKind",
-    "ServiceOfferingRevisionKind",
-    "WorkspaceInvitationStatus",
-  ];
-  for (const enumName of m2Enums) {
-    await prisma.$executeRawUnsafe(`DROP TYPE IF EXISTS "${enumName}";`);
-  }
-  // Drop M2-only stored functions (the migration re-creates them).
-  // CREATE OR REPLACE FUNCTION inside the migration handles
-  // re-creation idempotently, but the function references must be
-  // cleared if the migration is re-applied after the function was
-  // already created.
-  await prisma.$executeRawUnsafe(`DROP FUNCTION IF EXISTS audit_events_append_only();`);
-  await prisma.$executeRawUnsafe(
-    `DROP FUNCTION IF EXISTS seller_profile_revisions_published_immutable();`,
-  );
-  await prisma.$executeRawUnsafe(
-    `DROP FUNCTION IF EXISTS service_offering_revisions_published_immutable();`,
-  );
-  await prisma.$executeRawUnsafe(
-    `DROP FUNCTION IF EXISTS service_offering_revision_included_services_published_immutable();`,
-  );
-}
-
-// truncateM1Fixtures: clear the M1.1 tables so the test starts
-// from an empty M1.1 baseline. The migration's backfill statements
-// read from these tables and populate the M2 revisions, so the
-// tables must be empty at the start of the test.
-async function truncateM1Fixtures(): Promise<void> {
-  await prisma.$executeRawUnsafe(`SET session_replication_role = "replica";`);
-  try {
-    await prisma.$executeRawUnsafe(`TRUNCATE TABLE "offering_pricing" CASCADE;`);
-    await prisma.$executeRawUnsafe(`TRUNCATE TABLE "offering_service_areas" CASCADE;`);
-    await prisma.$executeRawUnsafe(`TRUNCATE TABLE "included_services" CASCADE;`);
-    await prisma.$executeRawUnsafe(`TRUNCATE TABLE "service_offerings" CASCADE;`);
-    await prisma.$executeRawUnsafe(`TRUNCATE TABLE "service_categories" CASCADE;`);
-    await prisma.$executeRawUnsafe(`TRUNCATE TABLE "specialties" CASCADE;`);
-    await prisma.$executeRawUnsafe(`TRUNCATE TABLE "seller_profile_specialties" CASCADE;`);
-    await prisma.$executeRawUnsafe(`TRUNCATE TABLE "caribbean_affiliations" CASCADE;`);
-    await prisma.$executeRawUnsafe(`TRUNCATE TABLE "seller_profiles" CASCADE;`);
-    await prisma.$executeRawUnsafe(`TRUNCATE TABLE "workspace_memberships" CASCADE;`);
-    await prisma.$executeRawUnsafe(`TRUNCATE TABLE "workspace_capabilities" CASCADE;`);
-    await prisma.$executeRawUnsafe(`TRUNCATE TABLE "workspaces" CASCADE;`);
-    await prisma.$executeRawUnsafe(`TRUNCATE TABLE "user_accounts" CASCADE;`);
-  } finally {
-    await prisma.$executeRawUnsafe(`SET session_replication_role = "origin";`);
-  }
 }
 
 // loadM11Fixtures: insert a representative M1.1 baseline using raw
 // SQL. The fixtures cover every M1.1 surface used by the
 // migration's backfill statements (Admin and Member roles, bundled
 // IncludedService rows) so the backfill can be observed end to
-// end. Raw SQL is required because the test runs AFTER dropM2Schema
-// has removed M2 columns; the Prisma client expects the post-
-// migration schema, so .create() would fail with column-not-found.
+// end. Raw SQL is used because the test runs AFTER resetToM11Baseline
+// has reset the schema to M1.1 only; the Prisma client expects the
+// post-migration schema, so .create() would fail with
+// column-not-found.
 async function loadM11Fixtures(): Promise<{
   workspaceAId: string;
   workspaceBId: string;
@@ -400,10 +311,10 @@ async function loadM11Fixtures(): Promise<{
 
 describe("M2.0A Gate 0 M1.1 -> M2 transition coverage", () => {
   test("the M2 migration creates every M2 table and enum from the M1.1 baseline", async () => {
-    // Snap the public schema back to the M1.1 baseline so the
-    // migration is the path that creates the M2 DDL.
-    await dropM2Schema();
-    await truncateM1Fixtures();
+    // Build the M1.1 baseline from the approved M1.1 migration
+    // history. The migration under test must be the path that
+    // creates the M2 DDL from that authoritative source.
+    await resetToM11Baseline();
     await loadM11Fixtures();
 
     // Pre-migration: no M2 tables exist.
@@ -489,8 +400,7 @@ describe("M2.0A Gate 0 M1.1 -> M2 transition coverage", () => {
   });
 
   test("the M2 migration backfills WorkspaceMembership.authority for Owner, Admin, and Member roles", async () => {
-    await dropM2Schema();
-    await truncateM1Fixtures();
+    await resetToM11Baseline();
     await loadM11Fixtures();
 
     // Pre-migration: the memberships have only `role`; `authority`
@@ -543,8 +453,7 @@ describe("M2.0A Gate 0 M1.1 -> M2 transition coverage", () => {
   });
 
   test("the M2 migration backfills canonical SellerProfileRevision and ServiceOfferingRevision records", async () => {
-    await dropM2Schema();
-    await truncateM1Fixtures();
+    await resetToM11Baseline();
     const ids = await loadM11Fixtures();
 
     await applyMigrationSql(loadMigrationSql());
@@ -613,8 +522,7 @@ describe("M2.0A Gate 0 M1.1 -> M2 transition coverage", () => {
   });
 
   test("the M2 migration drops the M1.1 workspaces.ownerUserId foreign key constraint", async () => {
-    await dropM2Schema();
-    await truncateM1Fixtures();
+    await resetToM11Baseline();
     await loadM11Fixtures();
 
     // The M1.1 migration creates the FK constraint. The expanded
@@ -641,8 +549,7 @@ describe("M2.0A Gate 0 M1.1 -> M2 transition coverage", () => {
   });
 
   test("the M2 migration installs append-only triggers on audit_events and the immutability triggers on revisions", async () => {
-    await dropM2Schema();
-    await truncateM1Fixtures();
+    await resetToM11Baseline();
     await loadM11Fixtures();
     await applyMigrationSql(loadMigrationSql());
 
@@ -687,8 +594,7 @@ describe("M2.0A Gate 0 M1.1 -> M2 transition coverage", () => {
     // it to NOT NULL only if every row has a value). The test
     // therefore catches the regression by observing the NULL
     // authority on the Admin row.
-    await dropM2Schema();
-    await truncateM1Fixtures();
+    await resetToM11Baseline();
     await loadM11Fixtures();
 
     // Build a broken migration: remove the Admin/Member UPDATE

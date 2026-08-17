@@ -408,29 +408,71 @@ describe("PrismaTalentSearchRepository", () => {
         where: { slug: "creole-beats-brooklyn" },
       });
       assert.ok(target);
-      // Wipe the entire seller graph.
-      await prisma.serviceOfferingPricing.deleteMany({
-        where: { offering: { sellerProfile: { workspaceId: target.id } } },
+      // Wipe the entire seller graph. M2.0A installs RESTRICT FKs
+      // from seller_profile_revisions and service_offering_revisions
+      // to their parents, immutability triggers on published
+      // revisions and their snapshot children (ADR 0006), and
+      // append-only triggers on audit_events. The destructive test
+      // setup must bypass every trigger in a single transaction so
+      // the cascades on `prisma.workspace.delete()` (which SET NULL
+      // the audit_events.actingWorkspaceId FK) can update append-only
+      // rows. session_replication_role = "replica" disables every
+      // trigger for the duration of the transaction; SET LOCAL means
+      // the role reverts to "origin" on COMMIT/ROLLBACK so the next
+      // test sees the triggers active again. All DELETEs run inside
+      // the same transaction so they share a single connection.
+      await prisma.$transaction(async (tx) => {
+        await tx.$executeRawUnsafe('SET LOCAL session_replication_role = "replica"');
+        // Delete child snapshot rows first so the immutability triggers
+        // do not reject the cascade deletes that follow.
+        await tx.$executeRawUnsafe(
+          `DELETE FROM seller_profile_revision_specialties WHERE "sellerProfileRevisionId" IN (SELECT id FROM seller_profile_revisions WHERE "sellerProfileId" IN (SELECT id FROM seller_profiles WHERE "workspaceId" = $1))`,
+          target.id,
+        );
+        await tx.$executeRawUnsafe(
+          `DELETE FROM seller_profile_revision_caribbean_affiliations WHERE "sellerProfileRevisionId" IN (SELECT id FROM seller_profile_revisions WHERE "sellerProfileId" IN (SELECT id FROM seller_profiles WHERE "workspaceId" = $1))`,
+          target.id,
+        );
+        await tx.$executeRawUnsafe(
+          `DELETE FROM service_offering_revision_service_areas WHERE "serviceOfferingRevisionId" IN (SELECT id FROM service_offering_revisions WHERE "serviceOfferingId" IN (SELECT id FROM service_offerings WHERE "sellerProfileId" IN (SELECT id FROM seller_profiles WHERE "workspaceId" = $1)))`,
+          target.id,
+        );
+        await tx.$executeRawUnsafe(
+          `DELETE FROM service_offering_revision_included_services WHERE "serviceOfferingRevisionId" IN (SELECT id FROM service_offering_revisions WHERE "serviceOfferingId" IN (SELECT id FROM service_offerings WHERE "sellerProfileId" IN (SELECT id FROM seller_profiles WHERE "workspaceId" = $1)))`,
+          target.id,
+        );
+        await tx.sellerProfileRevision.deleteMany({
+          where: { sellerProfile: { workspaceId: target.id } },
+        });
+        await tx.serviceOfferingRevision.deleteMany({
+          where: { serviceOffering: { sellerProfile: { workspaceId: target.id } } },
+        });
+        await tx.serviceOfferingPricing.deleteMany({
+          where: { offering: { sellerProfile: { workspaceId: target.id } } },
+        });
+        await tx.serviceOfferingServiceArea.deleteMany({
+          where: { offering: { sellerProfile: { workspaceId: target.id } } },
+        });
+        await tx.includedService.deleteMany({
+          where: { offering: { sellerProfile: { workspaceId: target.id } } },
+        });
+        await tx.serviceOffering.deleteMany({
+          where: { sellerProfile: { workspaceId: target.id } },
+        });
+        await tx.sellerProfileSpecialty.deleteMany({
+          where: { sellerProfile: { workspaceId: target.id } },
+        });
+        await tx.caribbeanAffiliation.deleteMany({
+          where: { sellerProfile: { workspaceId: target.id } },
+        });
+        await tx.sellerProfile.deleteMany({ where: { workspaceId: target.id } });
+        await tx.workspaceMembership.deleteMany({ where: { workspaceId: target.id } });
+        await tx.workspaceCapability.deleteMany({ where: { workspaceId: target.id } });
+        // Workspace delete cascades SET NULL on
+        // audit_events.actingWorkspaceId; the append-only trigger
+        // would otherwise reject that UPDATE.
+        await tx.workspace.delete({ where: { id: target.id } });
       });
-      await prisma.serviceOfferingServiceArea.deleteMany({
-        where: { offering: { sellerProfile: { workspaceId: target.id } } },
-      });
-      await prisma.includedService.deleteMany({
-        where: { offering: { sellerProfile: { workspaceId: target.id } } },
-      });
-      await prisma.serviceOffering.deleteMany({
-        where: { sellerProfile: { workspaceId: target.id } },
-      });
-      await prisma.sellerProfileSpecialty.deleteMany({
-        where: { sellerProfile: { workspaceId: target.id } },
-      });
-      await prisma.caribbeanAffiliation.deleteMany({
-        where: { sellerProfile: { workspaceId: target.id } },
-      });
-      await prisma.sellerProfile.deleteMany({ where: { workspaceId: target.id } });
-      await prisma.workspaceMembership.deleteMany({ where: { workspaceId: target.id } });
-      await prisma.workspaceCapability.deleteMany({ where: { workspaceId: target.id } });
-      await prisma.workspace.delete({ where: { id: target.id } });
     } finally {
       await prisma.$disconnect();
     }

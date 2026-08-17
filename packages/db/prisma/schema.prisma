@@ -176,6 +176,11 @@ enum WorkspaceInvitationStatus {
   Failed
 }
 
+enum SellerEnforcementState {
+  None
+  Suspended
+}
+
 // ---------- Identity and authority ----------
 
 model UserAccount {
@@ -188,7 +193,6 @@ model UserAccount {
   updatedAt    DateTime               @updatedAt
 
   memberships             WorkspaceMembership[]
-  ownedWorkspaces         Workspace[]             @relation("WorkspaceOwner")
   authenticationIdentities AuthenticationIdentity[]
   security                UserAccountSecurity?
   sessions                Session[]
@@ -217,12 +221,17 @@ model Workspace {
   // `user_accounts` and it MUST NOT be consulted by any authorization
   // decision. The migration drops the M1.1 foreign-key constraint so
   // the field carries no DB-level authority semantics.
+  //
+  // M2.0A review fix (P1-005): the Prisma schema no longer declares a
+  // `@relation` for `ownerUserId`. A Prisma relation declaration would
+  // imply a database foreign-key constraint that the migration has
+  // dropped; the model therefore represents the column as a plain
+  // nullable String with a documentation comment. No Prisma-level
+  // integrity enforcement is implied.
   ownerUserId  String?
   createdAt    DateTime             @default(now())
   updatedAt    DateTime             @updatedAt
 
-  // No FK constraint on ownerUserId. Membership authority is canonical.
-  owner           UserAccount?            @relation("WorkspaceOwner", fields: [ownerUserId], references: [id], onDelete: SetNull)
   memberships     WorkspaceMembership[]
   capabilities    WorkspaceCapability[]
   sellerProfile   SellerProfile?
@@ -231,7 +240,6 @@ model Workspace {
   closure         WorkspaceClosure?
   auditEvents     AuditEvent[]            @relation("AuditActingWorkspace")
   reportsAgainst  MarketplaceReport[]     @relation("ReportWorkspace")
-  idpIdentities   AuthenticationIdentity[]
 
   @@map("workspaces")
 }
@@ -287,6 +295,14 @@ model SellerProfile {
   basedInRegion      String?
   basedInCountryCode String
   avatarUrl          String?
+  // M2.0A addition: independent seller-enforcement dimension.
+  // Platform suspension is separate from publication intent: the M1.1
+  // `status` field encodes publication state (Draft | Published) for
+  // the search path; this field encodes whether the seller profile is
+  // currently platform-suspended. Future M2 suspension/restoration
+  // flows will write this column while leaving `status` untouched so a
+  // later restoration recovers the seller's exact prior publication.
+  sellerEnforcementState SellerEnforcementState @default(None)
   createdAt          DateTime            @default(now())
   updatedAt          DateTime            @updatedAt
 
@@ -451,17 +467,20 @@ model ServiceOfferingPricing {
 // Replacing the provider may invalidate sessions but does not change
 // UserAccount, Workspace, membership, seller, or marketplace identifiers.
 // Provider subjects, roles, and metadata never authorize a Workspace.
+//
+// M2.0A review fix (P1-004): the speculative `workspaceId` column was
+// removed so an AuthenticationIdentity cannot represent an
+// external-credential-to-Workspace association. Workspace authority
+// derives exclusively from active WorkspaceMembership.
 model AuthenticationIdentity {
   id            String                @id @default(cuid())
   userAccountId String
-  workspaceId   String?
   provider      AuthenticationProvider
   subject       String
   createdAt     DateTime              @default(now())
   lastLinkedAt  DateTime              @default(now())
 
   userAccount UserAccount @relation(fields: [userAccountId], references: [id], onDelete: Cascade)
-  workspace   Workspace?  @relation(fields: [workspaceId], references: [id], onDelete: SetNull)
 
   // Provider + subject is unique across the entire database so the same
   // provider subject cannot be silently re-bound to a different

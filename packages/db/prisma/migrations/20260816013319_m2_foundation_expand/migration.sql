@@ -71,6 +71,16 @@ CREATE TYPE "ServiceOfferingRevisionKind" AS ENUM ('Working', 'Published');
 -- CreateEnum
 CREATE TYPE "WorkspaceInvitationStatus" AS ENUM ('Pending', 'Accepted', 'Revoked', 'Expired', 'Failed');
 
+-- CreateEnum
+-- Seller enforcement is independent from publication intent. The M1.1
+-- `SellerProfileStatus` enum continues to encode publication state
+-- (Draft | Published) for the search path. Platform suspension is
+-- represented separately here so future M2 suspension/restoration
+-- flows can change visibility without overwriting the seller's
+-- publication choices (ADR: separate seller publication and
+-- platform enforcement dimensions; M2 spec Implementation Decisions).
+CREATE TYPE "SellerEnforcementState" AS ENUM ('None', 'Suspended');
+
 -- AlterTable
 -- closureState columns have a default of 'None', so existing M1.1 rows
 -- do not violate NOT NULL during the alteration.
@@ -78,6 +88,14 @@ ALTER TABLE "user_accounts" ADD COLUMN     "closureState" "UserAccountClosureSta
 
 -- AlterTable
 ALTER TABLE "workspaces" ADD COLUMN     "closureState" "WorkspaceClosureState" NOT NULL DEFAULT 'None';
+
+-- AlterTable
+-- Add an independent seller-enforcement dimension alongside the M1.1
+-- `SellerProfileStatus` publication field. The M1.1 search path still
+-- reads `status` directly; future M2 suspension/restoration flows will
+-- read this column. Default 'None' keeps every canonical M1.1 row
+-- untouched by the alteration.
+ALTER TABLE "seller_profiles" ADD COLUMN     "sellerEnforcementState" "SellerEnforcementState" NOT NULL DEFAULT 'None';
 
 -- DropForeignKey
 -- The M1.1 `workspaces.ownerUserId` foreign-key constraint made the
@@ -118,10 +136,14 @@ WHERE "role" IN ('Admin', 'Member');
 ALTER TABLE "workspace_memberships" ALTER COLUMN "authority" SET NOT NULL;
 
 -- CreateTable
+-- ADR 0004: provider identity is a credential mapping to a SoundHub
+-- UserAccount only. The M2.0A revision removes the speculative
+-- `workspaceId` column so the table cannot represent an
+-- external-credential-to-Workspace association. Workspace authority
+-- derives exclusively from active WorkspaceMembership.
 CREATE TABLE "authentication_identities" (
     "id" TEXT NOT NULL,
     "userAccountId" TEXT NOT NULL,
-    "workspaceId" TEXT,
     "provider" "AuthenticationProvider" NOT NULL,
     "subject" TEXT NOT NULL,
     "createdAt" TIMESTAMP(3) NOT NULL DEFAULT CURRENT_TIMESTAMP,
@@ -646,28 +668,38 @@ CREATE UNIQUE INDEX "idempotency_keys_scope_key_key" ON "idempotency_keys"("scop
 ALTER TABLE "authentication_identities" ADD CONSTRAINT "authentication_identities_userAccountId_fkey" FOREIGN KEY ("userAccountId") REFERENCES "user_accounts"("id") ON DELETE CASCADE ON UPDATE CASCADE;
 
 -- AddForeignKey
-ALTER TABLE "authentication_identities" ADD CONSTRAINT "authentication_identities_workspaceId_fkey" FOREIGN KEY ("workspaceId") REFERENCES "workspaces"("id") ON DELETE SET NULL ON UPDATE CASCADE;
-
--- AddForeignKey
 ALTER TABLE "user_account_security" ADD CONSTRAINT "user_account_security_userAccountId_fkey" FOREIGN KEY ("userAccountId") REFERENCES "user_accounts"("id") ON DELETE CASCADE ON UPDATE CASCADE;
 
 -- AddForeignKey
 ALTER TABLE "sessions" ADD CONSTRAINT "sessions_userAccountId_fkey" FOREIGN KEY ("userAccountId") REFERENCES "user_accounts"("id") ON DELETE CASCADE ON UPDATE CASCADE;
 
 -- AddForeignKey
-ALTER TABLE "seller_profile_revisions" ADD CONSTRAINT "seller_profile_revisions_sellerProfileId_fkey" FOREIGN KEY ("sellerProfileId") REFERENCES "seller_profiles"("id") ON DELETE CASCADE ON UPDATE CASCADE;
+-- ADR 0006: published revisions are evidence-bearing and must survive
+-- parent deletion. The FK from seller_profile_revisions to
+-- seller_profiles is RESTRICT (not CASCADE) so direct parent deletion
+-- cannot erase the immutable record; an explicit retention flow is the
+-- only path that removes a revision.
+ALTER TABLE "seller_profile_revisions" ADD CONSTRAINT "seller_profile_revisions_sellerProfileId_fkey" FOREIGN KEY ("sellerProfileId") REFERENCES "seller_profiles"("id") ON DELETE RESTRICT ON UPDATE CASCADE;
 
 -- AddForeignKey
 ALTER TABLE "seller_profile_revision_specialties" ADD CONSTRAINT "seller_profile_revision_specialties_specialtyId_fkey" FOREIGN KEY ("specialtyId") REFERENCES "specialties"("id") ON DELETE RESTRICT ON UPDATE CASCADE;
 
 -- AddForeignKey
+-- The child FK is CASCADE so that an authorized retention flow can
+-- remove a revision and its snapshot children atomically. The
+-- immutability triggers (installed later in this migration) reject
+-- UPDATE and DELETE on snapshot children of a Published revision,
+-- so the cascade only succeeds when the session role permits
+-- trigger bypass (test-only escape hatch).
 ALTER TABLE "seller_profile_revision_specialties" ADD CONSTRAINT "seller_profile_revision_specialties_sellerProfileRevisionI_fkey" FOREIGN KEY ("sellerProfileRevisionId") REFERENCES "seller_profile_revisions"("id") ON DELETE CASCADE ON UPDATE CASCADE;
 
 -- AddForeignKey
 ALTER TABLE "seller_profile_revision_caribbean_affiliations" ADD CONSTRAINT "seller_profile_revision_caribbean_affiliations_sellerProfi_fkey" FOREIGN KEY ("sellerProfileRevisionId") REFERENCES "seller_profile_revisions"("id") ON DELETE CASCADE ON UPDATE CASCADE;
 
 -- AddForeignKey
-ALTER TABLE "service_offering_revisions" ADD CONSTRAINT "service_offering_revisions_serviceOfferingId_fkey" FOREIGN KEY ("serviceOfferingId") REFERENCES "service_offerings"("id") ON DELETE CASCADE ON UPDATE CASCADE;
+-- Same retention guarantee as the SellerProfile revisions: published
+-- offering revisions are evidence-bearing.
+ALTER TABLE "service_offering_revisions" ADD CONSTRAINT "service_offering_revisions_serviceOfferingId_fkey" FOREIGN KEY ("serviceOfferingId") REFERENCES "service_offerings"("id") ON DELETE RESTRICT ON UPDATE CASCADE;
 
 -- AddForeignKey
 ALTER TABLE "service_offering_revisions" ADD CONSTRAINT "service_offering_revisions_primaryCategoryId_fkey" FOREIGN KEY ("primaryCategoryId") REFERENCES "service_categories"("id") ON DELETE RESTRICT ON UPDATE CASCADE;
@@ -676,6 +708,11 @@ ALTER TABLE "service_offering_revisions" ADD CONSTRAINT "service_offering_revisi
 ALTER TABLE "service_offering_revisions" ADD CONSTRAINT "service_offering_revisions_pricingUnitId_fkey" FOREIGN KEY ("pricingUnitId") REFERENCES "pricing_units"("id") ON DELETE SET NULL ON UPDATE CASCADE;
 
 -- AddForeignKey
+-- The child FK is CASCADE so that an authorized retention flow can
+-- remove a revision and its snapshot children atomically. The
+-- immutability triggers reject UPDATE and DELETE on snapshot
+-- children of a Published revision; the cascade only succeeds when
+-- the session role permits trigger bypass.
 ALTER TABLE "service_offering_revision_service_areas" ADD CONSTRAINT "service_offering_revision_service_areas_serviceOfferingRev_fkey" FOREIGN KEY ("serviceOfferingRevisionId") REFERENCES "service_offering_revisions"("id") ON DELETE CASCADE ON UPDATE CASCADE;
 
 -- AddForeignKey
@@ -691,19 +728,28 @@ ALTER TABLE "audit_events" ADD CONSTRAINT "audit_events_actorUserId_fkey" FOREIG
 ALTER TABLE "audit_events" ADD CONSTRAINT "audit_events_actingWorkspaceId_fkey" FOREIGN KEY ("actingWorkspaceId") REFERENCES "workspaces"("id") ON DELETE SET NULL ON UPDATE CASCADE;
 
 -- AddForeignKey
-ALTER TABLE "workspace_control_freezes" ADD CONSTRAINT "workspace_control_freezes_workspaceId_fkey" FOREIGN KEY ("workspaceId") REFERENCES "workspaces"("id") ON DELETE CASCADE ON UPDATE CASCADE;
+-- ADR 0006: control freezes are evidence-bearing. A non-null freeze
+-- row survives parent Workspace deletion; only retention processing
+-- can remove the record after the freeze is lifted.
+ALTER TABLE "workspace_control_freezes" ADD CONSTRAINT "workspace_control_freezes_workspaceId_fkey" FOREIGN KEY ("workspaceId") REFERENCES "workspaces"("id") ON DELETE RESTRICT ON UPDATE CASCADE;
 
 -- AddForeignKey
-ALTER TABLE "marketplace_reports" ADD CONSTRAINT "marketplace_reports_reportedWorkspaceId_fkey" FOREIGN KEY ("reportedWorkspaceId") REFERENCES "workspaces"("id") ON DELETE CASCADE ON UPDATE CASCADE;
+-- ADR 0006: marketplace reports preserve review evidence. A non-null
+-- report row survives parent Workspace deletion.
+ALTER TABLE "marketplace_reports" ADD CONSTRAINT "marketplace_reports_reportedWorkspaceId_fkey" FOREIGN KEY ("reportedWorkspaceId") REFERENCES "workspaces"("id") ON DELETE RESTRICT ON UPDATE CASCADE;
 
 -- AddForeignKey
 ALTER TABLE "marketplace_reports" ADD CONSTRAINT "marketplace_reports_reporterUserId_fkey" FOREIGN KEY ("reporterUserId") REFERENCES "user_accounts"("id") ON DELETE SET NULL ON UPDATE CASCADE;
 
 -- AddForeignKey
-ALTER TABLE "workspace_closures" ADD CONSTRAINT "workspace_closures_workspaceId_fkey" FOREIGN KEY ("workspaceId") REFERENCES "workspaces"("id") ON DELETE CASCADE ON UPDATE CASCADE;
+-- ADR 0006: closure records are evidence-bearing; only retention
+-- processing may remove them.
+ALTER TABLE "workspace_closures" ADD CONSTRAINT "workspace_closures_workspaceId_fkey" FOREIGN KEY ("workspaceId") REFERENCES "workspaces"("id") ON DELETE RESTRICT ON UPDATE CASCADE;
 
 -- AddForeignKey
-ALTER TABLE "workspace_invitations" ADD CONSTRAINT "workspace_invitations_workspaceId_fkey" FOREIGN KEY ("workspaceId") REFERENCES "workspaces"("id") ON DELETE CASCADE ON UPDATE CASCADE;
+-- ADR 0006: invitations document governance history. Their rows survive
+-- Workspace deletion so the invitation history remains auditable.
+ALTER TABLE "workspace_invitations" ADD CONSTRAINT "workspace_invitations_workspaceId_fkey" FOREIGN KEY ("workspaceId") REFERENCES "workspaces"("id") ON DELETE RESTRICT ON UPDATE CASCADE;
 
 -- AddForeignKey
 -- M2.0A: change Acceptance.userAccountId to ON DELETE RESTRICT so
@@ -829,3 +875,89 @@ CREATE TRIGGER service_offering_revision_included_services_no_delete_published
 CREATE TRIGGER service_offering_revision_included_services_no_update_published
   BEFORE UPDATE ON "service_offering_revision_included_services"
   FOR EACH ROW EXECUTE FUNCTION service_offering_revision_included_services_published_immutable();
+
+-- Enforce immutability on snapshot children of a published
+-- SellerProfileRevision (specialties). Working-revision children
+-- remain editable; published-revision children cannot be silently
+-- rewritten or removed because the parent revision is immutable.
+CREATE OR REPLACE FUNCTION seller_profile_revision_specialties_published_immutable()
+RETURNS TRIGGER AS $$
+DECLARE
+  rev_kind TEXT;
+BEGIN
+  SELECT "kind" INTO rev_kind FROM "seller_profile_revisions"
+    WHERE "id" = COALESCE(NEW."sellerProfileRevisionId", OLD."sellerProfileRevisionId");
+  IF rev_kind = 'Published' THEN
+    RAISE EXCEPTION 'seller_profile_revision_specialties rows belonging to a published revision are immutable (%)', TG_OP
+      USING ERRCODE = 'restrict_violation';
+  END IF;
+  IF (TG_OP = 'DELETE') THEN
+    RETURN OLD;
+  END IF;
+  RETURN NEW;
+END;
+$$ LANGUAGE plpgsql;
+
+CREATE TRIGGER seller_profile_revision_specialties_no_delete_published
+  BEFORE DELETE ON "seller_profile_revision_specialties"
+  FOR EACH ROW EXECUTE FUNCTION seller_profile_revision_specialties_published_immutable();
+
+CREATE TRIGGER seller_profile_revision_specialties_no_update_published
+  BEFORE UPDATE ON "seller_profile_revision_specialties"
+  FOR EACH ROW EXECUTE FUNCTION seller_profile_revision_specialties_published_immutable();
+
+-- Enforce immutability on snapshot children of a published
+-- SellerProfileRevision (Caribbean affiliations).
+CREATE OR REPLACE FUNCTION seller_profile_revision_caribbean_affiliations_published_immutable()
+RETURNS TRIGGER AS $$
+DECLARE
+  rev_kind TEXT;
+BEGIN
+  SELECT "kind" INTO rev_kind FROM "seller_profile_revisions"
+    WHERE "id" = COALESCE(NEW."sellerProfileRevisionId", OLD."sellerProfileRevisionId");
+  IF rev_kind = 'Published' THEN
+    RAISE EXCEPTION 'seller_profile_revision_caribbean_affiliations rows belonging to a published revision are immutable (%)', TG_OP
+      USING ERRCODE = 'restrict_violation';
+  END IF;
+  IF (TG_OP = 'DELETE') THEN
+    RETURN OLD;
+  END IF;
+  RETURN NEW;
+END;
+$$ LANGUAGE plpgsql;
+
+CREATE TRIGGER seller_profile_revision_caribbean_affiliations_no_delete_published
+  BEFORE DELETE ON "seller_profile_revision_caribbean_affiliations"
+  FOR EACH ROW EXECUTE FUNCTION seller_profile_revision_caribbean_affiliations_published_immutable();
+
+CREATE TRIGGER seller_profile_revision_caribbean_affiliations_no_update_published
+  BEFORE UPDATE ON "seller_profile_revision_caribbean_affiliations"
+  FOR EACH ROW EXECUTE FUNCTION seller_profile_revision_caribbean_affiliations_published_immutable();
+
+-- Enforce immutability on snapshot children of a published
+-- ServiceOfferingRevision (service areas).
+CREATE OR REPLACE FUNCTION service_offering_revision_service_areas_published_immutable()
+RETURNS TRIGGER AS $$
+DECLARE
+  rev_kind TEXT;
+BEGIN
+  SELECT "kind" INTO rev_kind FROM "service_offering_revisions"
+    WHERE "id" = COALESCE(NEW."serviceOfferingRevisionId", OLD."serviceOfferingRevisionId");
+  IF rev_kind = 'Published' THEN
+    RAISE EXCEPTION 'service_offering_revision_service_areas rows belonging to a published revision are immutable (%)', TG_OP
+      USING ERRCODE = 'restrict_violation';
+  END IF;
+  IF (TG_OP = 'DELETE') THEN
+    RETURN OLD;
+  END IF;
+  RETURN NEW;
+END;
+$$ LANGUAGE plpgsql;
+
+CREATE TRIGGER service_offering_revision_service_areas_no_delete_published
+  BEFORE DELETE ON "service_offering_revision_service_areas"
+  FOR EACH ROW EXECUTE FUNCTION service_offering_revision_service_areas_published_immutable();
+
+CREATE TRIGGER service_offering_revision_service_areas_no_update_published
+  BEFORE UPDATE ON "service_offering_revision_service_areas"
+  FOR EACH ROW EXECUTE FUNCTION service_offering_revision_service_areas_published_immutable();

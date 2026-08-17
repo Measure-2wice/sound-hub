@@ -1093,7 +1093,7 @@ async function applySellerGraph(
     // seed creates the initial revision only when absent and leaves
     // the row (and its snapshot children) untouched on every
     // subsequent run.
-    await applyInitialPublishedOfferingRevision(tx, profile.id, persisted.id, seller, offering);
+    await applyInitialPublishedOfferingRevision(tx, persisted.id, offering);
   }
 }
 
@@ -1187,9 +1187,7 @@ async function applyInitialPublishedSellerProfileRevision(
 // across runs.
 async function applyInitialPublishedOfferingRevision(
   tx: Prisma.TransactionClient,
-  _sellerProfileId: string,
   serviceOfferingId: string,
-  _seller: SellerGraphSeed,
   offering: OfferingSeed,
 ): Promise<void> {
   const offeringRevisionId = `rev-${serviceOfferingId}-1`;

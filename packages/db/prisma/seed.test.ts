@@ -19,6 +19,7 @@ import { existsSync } from "node:fs";
 import { after, before, describe, test } from "node:test";
 import { PrismaPg } from "@prisma/adapter-pg";
 import { PrismaClient } from "../src/generated/client.js";
+import { withTriggerBypass } from "./test-helpers.js";
 
 const APPROVED_DATABASE = "soundhub_m1_test";
 const APPROVED_PORT = 5433;
@@ -250,8 +251,7 @@ describe("M1.1 seed regression coverage", () => {
     // never flips the session role. The session setting is restored
     // immediately after the cleanup so the next test sees the
     // triggers active.
-    await prisma.$executeRawUnsafe('SET session_replication_role = "replica";');
-    try {
+    await withTriggerBypass(prisma, async () => {
       await prisma.serviceOfferingPricing.deleteMany({
         where: { offeringId: { in: offeringIds } },
       });
@@ -270,9 +270,7 @@ describe("M1.1 seed regression coverage", () => {
         await prisma.workspaceCapability.delete({ where: { id: c.id } });
       }
       await prisma.workspace.delete({ where: { id: workspace.id } });
-    } finally {
-      await prisma.$executeRawUnsafe('SET session_replication_role = "origin";');
-    }
+    });
 
     await runSeed();
 
@@ -340,15 +338,12 @@ describe("M1.1 seed regression coverage", () => {
       where: { primaryCategoryId: category.id },
       data: { primaryCategoryId: other.id },
     });
-    await prisma.$executeRawUnsafe('SET session_replication_role = "replica";');
-    try {
+    await withTriggerBypass(prisma, async () => {
       await prisma.serviceOfferingRevision.updateMany({
         where: { primaryCategoryId: category.id },
         data: { primaryCategoryId: other.id },
       });
-    } finally {
-      await prisma.$executeRawUnsafe('SET session_replication_role = "origin";');
-    }
+    });
     await prisma.serviceCategory.delete({ where: { key: "music-production" } });
 
     await runSeed();
@@ -370,15 +365,12 @@ describe("M1.1 seed regression coverage", () => {
     // consistent offering/revision/primaryCategoryId graph. The
     // bypass is a test-only idiom; production migrations and the
     // seed never flip the session role.
-    await prisma.$executeRawUnsafe('SET session_replication_role = "replica";');
-    try {
+    await withTriggerBypass(prisma, async () => {
       await prisma.serviceOfferingRevision.updateMany({
         where: { primaryCategoryId: other.id },
         data: { primaryCategoryId: restored.id },
       });
-    } finally {
-      await prisma.$executeRawUnsafe('SET session_replication_role = "origin";');
-    }
+    });
   });
 
   test("replaces a stale Caribbean affiliation membership set with the canonical set", async () => {

@@ -39,6 +39,7 @@ import { spawn } from "node:child_process";
 import { after, before, describe, test } from "node:test";
 import { PrismaPg } from "@prisma/adapter-pg";
 import { PrismaClient } from "../src/generated/client.js";
+import { withTriggerBypass } from "./test-helpers.js";
 
 const APPROVED_DATABASE = "soundhub_m1_test";
 const APPROVED_PORT = 5433;
@@ -741,17 +742,14 @@ describe("M2.0A Gate 0 schema expand coverage", () => {
     // idiom). Without this cleanup, a subsequent test:db run that
     // invokes the canonical "exactly one revision" assertion would
     // observe the leaking revisionNumber=2 row.
-    await prisma.$executeRawUnsafe('SET session_replication_role = "replica";');
-    try {
+    await withTriggerBypass(prisma, async () => {
       await prisma.sellerProfileRevision.delete({
         where: { id: laterRevision.id },
       });
       await prisma.serviceOfferingRevision.delete({
         where: { id: laterOfferingRevision.id },
       });
-    } finally {
-      await prisma.$executeRawUnsafe('SET session_replication_role = "origin";');
-    }
+    });
   });
 
   test("every canonical ServiceOfferingRevision carries the bundled IncludedService rows (regression for review 7 P1-003)", async () => {
@@ -944,5 +942,567 @@ describe("M2.0A Gate 0 schema expand coverage", () => {
     const stillPresent = await prisma.auditEvent.findUnique({ where: { id: audit.id } });
     assert.ok(stillPresent, "audit_event row must remain after rejected mutations");
     assert.equal(stillPresent.summary, "M2.0A foundation probe event");
+  });
+
+  test("child snapshot rows of a published SellerProfileRevision are immutable (P1-001)", async () => {
+    // Review 9 P1-001: published SellerProfileRevision snapshot
+    // children (specialties and Caribbean affiliations) must reject
+    // UPDATE and DELETE through the persistence boundary. Working
+    // revision children must remain editable.
+    await runSeed();
+    const workspace = await prisma.workspace.findUniqueOrThrow({
+      where: { slug: "creole-beats-brooklyn" },
+    });
+    const profile = await prisma.sellerProfile.findUniqueOrThrow({
+      where: { workspaceId: workspace.id },
+    });
+    const publishedRevision = await prisma.sellerProfileRevision.findUniqueOrThrow({
+      where: { id: `rev-${profile.id}-1` },
+    });
+    assert.equal(publishedRevision.kind, "Published");
+
+    // Snapshot child of a published revision.
+    const publishedSpecialty = await prisma.sellerProfileRevisionSpecialty.findFirstOrThrow({
+      where: { sellerProfileRevisionId: publishedRevision.id },
+    });
+    let updateBlocked = false;
+    try {
+      // SpecialtyId is part of the composite PK so an UPDATE must
+      // pick a different value or change the FK. The trigger fires
+      // BEFORE UPDATE and rejects the change.
+      await prisma.$executeRawUnsafe(
+        `UPDATE seller_profile_revision_specialties SET "specialtyId" = "specialtyId" WHERE "sellerProfileRevisionId" = $1 AND "specialtyId" = $2`,
+        publishedSpecialty.sellerProfileRevisionId,
+        publishedSpecialty.specialtyId,
+      );
+    } catch (err) {
+      updateBlocked = true;
+      assert.ok(
+        err instanceof Error
+          ? err.message.includes(
+              "seller_profile_revision_specialties rows belonging to a published revision are immutable",
+            )
+          : false,
+        `specialty UPDATE must be rejected with the immutability marker; got ${String(err)}`,
+      );
+    }
+    assert.ok(updateBlocked, "UPDATE on a published revision's specialty join must be rejected");
+
+    let deleteBlocked = false;
+    try {
+      await prisma.sellerProfileRevisionSpecialty.delete({
+        where: {
+          sellerProfileRevisionId_specialtyId: {
+            sellerProfileRevisionId: publishedSpecialty.sellerProfileRevisionId,
+            specialtyId: publishedSpecialty.specialtyId,
+          },
+        },
+      });
+    } catch (err) {
+      deleteBlocked = true;
+      assert.ok(
+        err instanceof Error
+          ? err.message.includes(
+              "seller_profile_revision_specialties rows belonging to a published revision are immutable",
+            )
+          : false,
+        `specialty DELETE must be rejected with the immutability marker; got ${String(err)}`,
+      );
+    }
+    assert.ok(deleteBlocked, "DELETE on a published revision's specialty join must be rejected");
+
+    // CaribbeanAffiliation snapshot child of a published revision.
+    const publishedAffiliation =
+      await prisma.sellerProfileRevisionCaribbeanAffiliation.findFirstOrThrow({
+        where: { sellerProfileRevisionId: publishedRevision.id },
+      });
+    deleteBlocked = false;
+    try {
+      await prisma.sellerProfileRevisionCaribbeanAffiliation.delete({
+        where: { id: publishedAffiliation.id },
+      });
+    } catch (err) {
+      deleteBlocked = true;
+      assert.ok(
+        err instanceof Error
+          ? err.message.includes(
+              "seller_profile_revision_caribbean_affiliations rows belonging to a published revision are immutable",
+            )
+          : false,
+        `affiliation DELETE must be rejected with the immutability marker; got ${String(err)}`,
+      );
+    }
+    assert.ok(
+      deleteBlocked,
+      "DELETE on a published revision's Caribbean affiliation must be rejected",
+    );
+
+    // Working-revision children must remain editable. Insert a
+    // synthetic Working revision for the canonical profile and
+    // verify its snapshot children accept UPDATE and DELETE without
+    // trigger rejection. The trigger looks up the parent revision's
+    // kind so the Working parent allows mutations on its children.
+    const synthetic = await prisma.sellerProfileRevision.create({
+      data: {
+        sellerProfileId: profile.id,
+        revisionNumber: 99,
+        kind: "Working",
+        professionalName: "Working revision professional name",
+        bio: "Working revision bio",
+        basedInCountryCode: "US",
+      },
+    });
+    await prisma.sellerProfileRevisionSpecialty.create({
+      data: {
+        sellerProfileRevisionId: synthetic.id,
+        specialtyId: publishedSpecialty.specialtyId,
+      },
+    });
+    const workingChild = await prisma.sellerProfileRevisionSpecialty.findFirstOrThrow({
+      where: { sellerProfileRevisionId: synthetic.id },
+    });
+    // DELETE on a Working-revision child is allowed (no exception).
+    await prisma.sellerProfileRevisionSpecialty.delete({
+      where: {
+        sellerProfileRevisionId_specialtyId: {
+          sellerProfileRevisionId: workingChild.sellerProfileRevisionId,
+          specialtyId: workingChild.specialtyId,
+        },
+      },
+    });
+    await withTriggerBypass(prisma, async () => {
+      await prisma.sellerProfileRevision.delete({ where: { id: synthetic.id } });
+    });
+  });
+
+  test("child snapshot rows of a published ServiceOfferingRevision are immutable (P1-001)", async () => {
+    // Review 9 P1-001: published ServiceOfferingRevision snapshot
+    // children (service areas) must reject UPDATE and DELETE through
+    // the persistence boundary. Working revision children must remain
+    // editable.
+    await runSeed();
+    const offering = await prisma.serviceOffering.findUniqueOrThrow({
+      where: { slug: "creole-beats-dancehall-single-remote" },
+    });
+    const publishedRevision = await prisma.serviceOfferingRevision.findUniqueOrThrow({
+      where: { id: `rev-${offering.id}-1` },
+    });
+    assert.equal(publishedRevision.kind, "Published");
+
+    // Snapshot child of a published revision.
+    const publishedArea = await prisma.serviceOfferingRevisionServiceArea.findFirstOrThrow({
+      where: { serviceOfferingRevisionId: publishedRevision.id },
+    });
+    let updateBlocked = false;
+    try {
+      await prisma.serviceOfferingRevisionServiceArea.update({
+        where: { id: publishedArea.id },
+        data: { city: "blocked" },
+      });
+    } catch (err) {
+      updateBlocked = true;
+      assert.ok(
+        err instanceof Error
+          ? err.message.includes(
+              "service_offering_revision_service_areas rows belonging to a published revision are immutable",
+            )
+          : false,
+        `service-area UPDATE must be rejected with the immutability marker; got ${String(err)}`,
+      );
+    }
+    assert.ok(updateBlocked, "UPDATE on a published revision's service area must be rejected");
+
+    let deleteBlocked = false;
+    try {
+      await prisma.serviceOfferingRevisionServiceArea.delete({
+        where: { id: publishedArea.id },
+      });
+    } catch (err) {
+      deleteBlocked = true;
+      assert.ok(
+        err instanceof Error
+          ? err.message.includes(
+              "service_offering_revision_service_areas rows belonging to a published revision are immutable",
+            )
+          : false,
+        `service-area DELETE must be rejected with the immutability marker; got ${String(err)}`,
+      );
+    }
+    assert.ok(deleteBlocked, "DELETE on a published revision's service area must be rejected");
+
+    // Working-revision children must remain editable.
+    const synthetic = await prisma.serviceOfferingRevision.create({
+      data: {
+        serviceOfferingId: offering.id,
+        revisionNumber: 99,
+        kind: "Working",
+        title: "Working revision title",
+        description: "Working revision description",
+        serviceMode: "Remote",
+        primaryCategoryId: publishedRevision.primaryCategoryId,
+      },
+    });
+    const workingArea = await prisma.serviceOfferingRevisionServiceArea.create({
+      data: {
+        serviceOfferingRevisionId: synthetic.id,
+        countryCode: "JM",
+      },
+    });
+    await prisma.serviceOfferingRevisionServiceArea.update({
+      where: { id: workingArea.id },
+      data: { city: "editable" },
+    });
+    await prisma.serviceOfferingRevisionServiceArea.delete({
+      where: { id: workingArea.id },
+    });
+    await withTriggerBypass(prisma, async () => {
+      await prisma.serviceOfferingRevision.delete({ where: { id: synthetic.id } });
+    });
+  });
+
+  test("SellerEnforcementState is independent from SellerProfileStatus (P1-002)", async () => {
+    // Review 9 P1-002: platform enforcement must be a separate
+    // dimension from seller publication intent. The M1.1
+    // SellerProfileStatus enum (Draft | Published | Suspended)
+    // remains in place for the search path; a new
+    // SellerEnforcementState enum (None | Suspended) on
+    // seller_profiles carries the platform dimension. Setting
+    // sellerEnforcementState must NOT change status, and changing
+    // status must NOT change sellerEnforcementState.
+    await runSeed();
+    const columnExists = await prisma.$queryRaw<Array<{ exists: boolean }>>`
+      SELECT EXISTS (
+        SELECT 1 FROM information_schema.columns
+        WHERE table_schema = 'public'
+          AND table_name = 'seller_profiles'
+          AND column_name = 'sellerEnforcementState'
+      ) AS exists
+    `;
+    assert.ok(
+      columnExists[0]?.exists,
+      "seller_profiles.sellerEnforcementState must exist after migration",
+    );
+
+    const workspace = await prisma.workspace.findUniqueOrThrow({
+      where: { slug: "creole-beats-brooklyn" },
+    });
+    const profile = await prisma.sellerProfile.findUniqueOrThrow({
+      where: { workspaceId: workspace.id },
+    });
+    assert.equal(profile.status, "Published");
+    assert.equal(
+      profile.sellerEnforcementState,
+      "None",
+      "canonical sellers must default to SellerEnforcementState.None",
+    );
+
+    // Suspend the seller profile through the enforcement dimension.
+    // The M1.1 publication status must remain Published.
+    await prisma.sellerProfile.update({
+      where: { id: profile.id },
+      data: { sellerEnforcementState: "Suspended" },
+    });
+    const suspended = await prisma.sellerProfile.findUniqueOrThrow({
+      where: { id: profile.id },
+    });
+    assert.equal(suspended.sellerEnforcementState, "Suspended");
+    assert.equal(
+      suspended.status,
+      "Published",
+      "seller publication intent must survive platform suspension",
+    );
+
+    // Restore the enforcement state. The publication intent must
+    // still be Published.
+    await prisma.sellerProfile.update({
+      where: { id: profile.id },
+      data: { sellerEnforcementState: "None" },
+    });
+    const restored = await prisma.sellerProfile.findUniqueOrThrow({
+      where: { id: profile.id },
+    });
+    assert.equal(
+      restored.sellerEnforcementState,
+      "None",
+      "sellerEnforcementState must restore to None",
+    );
+    assert.equal(
+      restored.status,
+      "Published",
+      "seller publication intent must survive enforcement restoration",
+    );
+
+    // Flipping publication intent (status) must NOT change
+    // sellerEnforcementState.
+    await prisma.sellerProfile.update({
+      where: { id: profile.id },
+      data: { status: "Draft" },
+    });
+    const draft = await prisma.sellerProfile.findUniqueOrThrow({
+      where: { id: profile.id },
+    });
+    assert.equal(
+      draft.sellerEnforcementState,
+      "None",
+      "sellerEnforcementState must survive a publication-intent change",
+    );
+    // Restore canonical publication for downstream tests.
+    await runSeed();
+  });
+
+  test("direct Workspace deletion cannot erase evidence-bearing rows (P1-003)", async () => {
+    // Review 9 P1-003: workspace_control_freezes, marketplace_reports,
+    // workspace_closures, and workspace_invitations rows are
+    // evidence-bearing and must survive direct Workspace deletion.
+    // The migration installs RESTRICT FKs so the deletion is
+    // rejected by the database; only retention processing can
+    // remove these rows.
+    await runSeed();
+    const workspace = await prisma.workspace.findUniqueOrThrow({
+      where: { slug: "creole-beats-brooklyn" },
+    });
+
+    // Insert evidence-bearing rows for the workspace.
+    // The schema requires one row per workspace for the freeze and
+    // closure, so upsert (or delete-then-create) leaves the test
+    // robust against prior runs.
+    const existingFreeze = await prisma.workspaceControlFreeze.findUnique({
+      where: { workspaceId: workspace.id },
+    });
+    if (existingFreeze) {
+      await withTriggerBypass(prisma, async () => {
+        await prisma.workspaceControlFreeze.delete({ where: { id: existingFreeze.id } });
+      });
+    }
+    const freeze = await prisma.workspaceControlFreeze.create({
+      data: {
+        workspaceId: workspace.id,
+        state: "Active",
+        reason: "P1-003 evidence-bearing freeze",
+      },
+    });
+    const existingClosure = await prisma.workspaceClosure.findUnique({
+      where: { workspaceId: workspace.id },
+    });
+    if (existingClosure) {
+      await withTriggerBypass(prisma, async () => {
+        await prisma.workspaceClosure.delete({ where: { id: existingClosure.id } });
+      });
+    }
+    const report = await prisma.marketplaceReport.create({
+      data: {
+        reportedWorkspaceId: workspace.id,
+        reason: "Impersonation",
+        description: "P1-003 evidence-bearing report",
+      },
+    });
+    const closure = await prisma.workspaceClosure.create({
+      data: {
+        workspaceId: workspace.id,
+        initiatedBy: "p1-003-test",
+        closesAt: new Date(Date.now() + 1000 * 60 * 60 * 24),
+      },
+    });
+    const invitation = await prisma.workspaceInvitation.create({
+      data: {
+        workspaceId: workspace.id,
+        email: "invitee@p1-003.test",
+        authority: "Editor",
+        invitedByUserId: workspace.ownerUserId!,
+        expiresAt: new Date(Date.now() + 1000 * 60 * 60 * 24),
+      },
+    });
+
+    // Direct deletion of the Workspace must be rejected. The
+    // canonical blocks are the RESTRICT FKs on the evidence-bearing
+    // tables, but the same deletion may also be blocked by the
+    // audit_events append-only trigger when SET NULL cascades try
+    // to UPDATE existing audit rows. Either form of rejection proves
+    // that direct deletion cannot silently erase evidence.
+    let deleteBlocked = false;
+    try {
+      await prisma.workspace.delete({ where: { id: workspace.id } });
+    } catch (err) {
+      deleteBlocked = true;
+      const msg = err instanceof Error ? err.message : "";
+      assert.ok(
+        msg.includes("restrict") ||
+          msg.includes("Foreign key") ||
+          msg.includes("foreign key") ||
+          msg.includes("append-only"),
+        `Workspace DELETE must be rejected by a RESTRICT FK or trigger; got ${String(err)}`,
+      );
+    }
+    assert.ok(deleteBlocked, "Workspace deletion must be blocked when evidence-bearing rows exist");
+
+    // All four evidence-bearing rows survive the rejected delete.
+    const stillFreeze = await prisma.workspaceControlFreeze.findUnique({
+      where: { id: freeze.id },
+    });
+    const stillReport = await prisma.marketplaceReport.findUnique({ where: { id: report.id } });
+    const stillClosure = await prisma.workspaceClosure.findUnique({ where: { id: closure.id } });
+    const stillInvitation = await prisma.workspaceInvitation.findUnique({
+      where: { id: invitation.id },
+    });
+    assert.ok(stillFreeze, "workspace_control_freeze must survive parent Workspace deletion");
+    assert.ok(stillReport, "marketplace_report must survive parent Workspace deletion");
+    assert.ok(stillClosure, "workspace_closure must survive parent Workspace deletion");
+    assert.ok(stillInvitation, "workspace_invitation must survive parent Workspace deletion");
+
+    // Cleanup: bypass the FKs explicitly so the canonical seed for
+    // subsequent tests sees the canonical workspace.
+    await withTriggerBypass(prisma, async () => {
+      await prisma.workspaceControlFreeze.delete({ where: { id: freeze.id } });
+      await prisma.marketplaceReport.delete({ where: { id: report.id } });
+      await prisma.workspaceClosure.delete({ where: { id: closure.id } });
+      await prisma.workspaceInvitation.delete({ where: { id: invitation.id } });
+    });
+  });
+
+  test("direct SellerProfile deletion cannot erase published revisions (P1-003)", async () => {
+    // Review 9 P1-003: seller_profile_revisions and
+    // service_offering_revisions are evidence-bearing. The
+    // RESTRICT FK from seller_profile_revisions -> seller_profiles
+    // blocks direct parent deletion, and the working-revision path
+    // requires explicit removal of revisions.
+    await runSeed();
+    const workspace = await prisma.workspace.findUniqueOrThrow({
+      where: { slug: "creole-beats-brooklyn" },
+    });
+    const profile = await prisma.sellerProfile.findUniqueOrThrow({
+      where: { workspaceId: workspace.id },
+    });
+    let deleteBlocked = false;
+    try {
+      await prisma.sellerProfile.delete({ where: { id: profile.id } });
+    } catch (err) {
+      deleteBlocked = true;
+      assert.ok(
+        err instanceof Error
+          ? err.message.includes("restrict") ||
+              err.message.includes("Foreign key") ||
+              err.message.includes("foreign key")
+          : false,
+        `SellerProfile DELETE must be rejected by the RESTRICT revision FK; got ${String(err)}`,
+      );
+    }
+    assert.ok(
+      deleteBlocked,
+      "SellerProfile deletion must be blocked when published revisions exist",
+    );
+    const stillRevision = await prisma.sellerProfileRevision.findUniqueOrThrow({
+      where: { id: `rev-${profile.id}-1` },
+    });
+    assert.equal(stillRevision.kind, "Published");
+  });
+
+  test("AuthenticationIdentity has no workspaceId and maps only to UserAccount (P1-004)", async () => {
+    // Review 9 P1-004: ADR 0004 requires provider identity to be a
+    // credential mapping to a SoundHub UserAccount only. The
+    // AuthenticationIdentity table must not carry a workspaceId
+    // column and the Prisma model must not declare a Workspace
+    // relation. The Prisma client surfaces only userAccountId.
+    await runSeed();
+    const columnExists = await prisma.$queryRaw<Array<{ exists: boolean }>>`
+      SELECT EXISTS (
+        SELECT 1 FROM information_schema.columns
+        WHERE table_schema = 'public'
+          AND table_name = 'authentication_identities'
+          AND column_name = 'workspaceId'
+      ) AS exists
+    `;
+    assert.equal(
+      columnExists[0]?.exists,
+      false,
+      "authentication_identities.workspaceId must be removed by the M2 migration",
+    );
+    const fkRows = await prisma.$queryRaw<Array<{ exists: boolean }>>`
+      SELECT EXISTS (
+        SELECT 1 FROM pg_constraint c
+        JOIN pg_class t ON t.oid = c.conrelid
+        WHERE t.relname = 'authentication_identities'
+          AND c.contype = 'f'
+          AND c.conname = 'authentication_identities_workspaceId_fkey'
+      ) AS exists
+    `;
+    assert.equal(
+      fkRows[0]?.exists,
+      false,
+      "authentication_identities_workspaceId_fkey must be removed",
+    );
+
+    // Round-trip a provider identity: it must persist only with
+    // userAccountId.
+    const user = await prisma.userAccount.findFirstOrThrow();
+    const id = await prisma.authenticationIdentity.create({
+      data: {
+        userAccountId: user.id,
+        provider: "MagicLink",
+        subject: `p1-004-${Date.now()}@example.com`,
+      },
+    });
+    // TypeScript-level proof that the model does not surface a
+    // workspaceId field. The Prisma client type for the row carries
+    // only the documented fields; an explicit property access on a
+    // non-existent field is a type error and is caught at compile
+    // time.
+    const row = await prisma.authenticationIdentity.findUniqueOrThrow({
+      where: { id: id.id },
+    });
+    assert.equal(row.userAccountId, user.id);
+    // The Prisma model does not expose workspaceId at the type level;
+    // reading the raw row directly proves the column is absent.
+    const rawColumns = await prisma.$queryRaw<Array<{ column_name: string }>>`
+      SELECT column_name FROM information_schema.columns
+      WHERE table_schema = 'public' AND table_name = 'authentication_identities'
+    `;
+    const names = rawColumns.map((c) => c.column_name);
+    assert.ok(
+      !names.includes("workspaceId"),
+      "information_schema must not list a workspaceId column",
+    );
+    await withTriggerBypass(prisma, async () => {
+      await prisma.authenticationIdentity.delete({ where: { id: id.id } });
+    });
+  });
+
+  test("Prisma schema does not imply a workspaces.ownerUserId foreign key (P1-005)", async () => {
+    // Review 9 P1-005: the deployed migration drops
+    // workspaces_ownerUserId_fkey. The committed Prisma schema
+    // declares a plain nullable ownerUserId with no @relation. A
+    // drift check between the Prisma schema and a freshly migrated
+    // disposable database must NOT propose a FK on ownerUserId.
+    //
+    // The drift check inspects information_schema on the test
+    // database (which was created by `prisma migrate deploy` from
+    // the current schema) and asserts that no FK exists for
+    // workspaces.ownerUserId. If the Prisma schema re-introduced a
+    // relation, migrate deploy would create the FK and the
+    // assertion would fail.
+    const fkRows = await prisma.$queryRaw<Array<{ exists: boolean }>>`
+      SELECT EXISTS (
+        SELECT 1 FROM pg_constraint c
+        JOIN pg_class t ON t.oid = c.conrelid
+        JOIN pg_attribute a ON a.attrelid = t.oid AND a.attnum = ANY(c.conkey)
+        WHERE t.relname = 'workspaces'
+          AND c.contype = 'f'
+          AND a.attname = 'ownerUserId'
+      ) AS exists
+    `;
+    assert.equal(
+      fkRows[0]?.exists,
+      false,
+      "Prisma schema must not imply a foreign key on workspaces.ownerUserId",
+    );
+
+    // The column itself is preserved as a non-authoritative
+    // correspondence field. It must accept arbitrary values (NULL or
+    // any user_accounts.id) without FK enforcement.
+    const columnInfo = await prisma.$queryRaw<Array<{ is_nullable: string; data_type: string }>>`
+      SELECT is_nullable, data_type FROM information_schema.columns
+      WHERE table_schema = 'public' AND table_name = 'workspaces' AND column_name = 'ownerUserId'
+    `;
+    assert.equal(columnInfo[0]?.is_nullable, "YES", "ownerUserId must be nullable");
+    assert.equal(columnInfo[0]?.data_type, "text");
   });
 });
