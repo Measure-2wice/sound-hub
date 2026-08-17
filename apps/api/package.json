@@ -11,7 +11,9 @@
     "test": "TEST_DATABASE_URL=postgresql://soundhub:password@localhost:5433/soundhub_m1_test node --import tsx --test src/services/talent-search.service.test.ts src/lib/enum-drift.test.ts src/lib/test-database.test.ts src/routes/search.test.ts src/routes/metadata.test.ts",
     "test:repository": "TEST_DATABASE_URL=postgresql://soundhub:password@localhost:5433/soundhub_m1_test node --import tsx --test src/repositories/prisma-talent-search.repository.test.ts",
     "test:db": "TEST_DATABASE_URL=postgresql://soundhub:password@localhost:5433/soundhub_m1_test tsx ../../packages/db/prisma/seed.test.ts",
-    "test:full": "npm run test:db && npm run test:repository"
+    "test:db:m2": "TEST_DATABASE_URL=postgresql://soundhub:password@localhost:5433/soundhub_m1_test tsx ../../packages/db/prisma/m2-foundation.test.ts",
+    "test:db:m2:transition": "TEST_DATABASE_URL=postgresql://soundhub:password@localhost:5433/soundhub_m1_test tsx ../../packages/db/prisma/m2-foundation-transition.test.ts",
+    "test:full": "npm run test:db && npm run test:db:m2:transition && npm run test:db:m2 && npm run test:repository"
   },
   "dependencies": {
     "express": "^4.19.0",

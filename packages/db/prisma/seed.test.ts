@@ -19,6 +19,7 @@ import { existsSync } from "node:fs";
 import { after, before, describe, test } from "node:test";
 import { PrismaPg } from "@prisma/adapter-pg";
 import { PrismaClient } from "../src/generated/client.js";
+import { withTriggerBypass } from "./test-helpers.js";
 
 const APPROVED_DATABASE = "soundhub_m1_test";
 const APPROVED_PORT = 5433;
@@ -243,25 +244,33 @@ describe("M1.1 seed regression coverage", () => {
     const offeringIds = (workspace.sellerProfile?.offerings ?? []).map((o) => o.id);
     assert.ok(profileId);
 
-    // Wipe the seller and its entire graph.
-    await prisma.serviceOfferingPricing.deleteMany({
-      where: { offeringId: { in: offeringIds } },
+    // Wipe the seller and its entire graph. M2.0A enforces
+    // immutability on published revisions and append-only on audit
+    // events via database triggers. The test setup must bypass the
+    // triggers to perform the destructive cleanup; production code
+    // never flips the session role. The session setting is restored
+    // immediately after the cleanup so the next test sees the
+    // triggers active.
+    await withTriggerBypass(prisma, async (tx) => {
+      await tx.serviceOfferingPricing.deleteMany({
+        where: { offeringId: { in: offeringIds } },
+      });
+      await tx.serviceOfferingServiceArea.deleteMany({
+        where: { offeringId: { in: offeringIds } },
+      });
+      await tx.includedService.deleteMany({ where: { offeringId: { in: offeringIds } } });
+      await tx.serviceOffering.deleteMany({ where: { id: { in: offeringIds } } });
+      await tx.sellerProfileSpecialty.deleteMany({ where: { sellerProfileId: profileId } });
+      await tx.caribbeanAffiliation.deleteMany({ where: { sellerProfileId: profileId } });
+      await tx.sellerProfile.delete({ where: { id: profileId } });
+      for (const m of memberships) {
+        await tx.workspaceMembership.delete({ where: { id: m.id } });
+      }
+      for (const c of capabilities) {
+        await tx.workspaceCapability.delete({ where: { id: c.id } });
+      }
+      await tx.workspace.delete({ where: { id: workspace.id } });
     });
-    await prisma.serviceOfferingServiceArea.deleteMany({
-      where: { offeringId: { in: offeringIds } },
-    });
-    await prisma.includedService.deleteMany({ where: { offeringId: { in: offeringIds } } });
-    await prisma.serviceOffering.deleteMany({ where: { id: { in: offeringIds } } });
-    await prisma.sellerProfileSpecialty.deleteMany({ where: { sellerProfileId: profileId } });
-    await prisma.caribbeanAffiliation.deleteMany({ where: { sellerProfileId: profileId } });
-    await prisma.sellerProfile.delete({ where: { id: profileId } });
-    for (const m of memberships) {
-      await prisma.workspaceMembership.delete({ where: { id: m.id } });
-    }
-    for (const c of capabilities) {
-      await prisma.workspaceCapability.delete({ where: { id: c.id } });
-    }
-    await prisma.workspace.delete({ where: { id: workspace.id } });
 
     await runSeed();
 
@@ -304,6 +313,23 @@ describe("M1.1 seed regression coverage", () => {
     // test only moved the canonical Marc-André Pierre offering.
     // Without moving all of them, the service_category foreign key
     // would reject the delete.
+    //
+    // M2.0A also backfills one published ServiceOfferingRevision per
+    // offering (ADR 0005). Each revision carries the same
+    // primaryCategoryId reference as its parent offering; the
+    // RESTRICT foreign key on service_offering_revisions.primaryCategoryId
+    // therefore requires the same move-then-delete treatment.
+    //
+    // M2.0A enforces immutability on published revisions via a
+    // database trigger. Because the test scenario must move the
+    // published revision's primaryCategoryId to delete the
+    // service_category row, the trigger is bypassed for the duration
+    // of THIS test setup using `session_replication_role = replica`,
+    // which is a PostgreSQL escape hatch suppressed by the trigger
+    // owner. The session setting is restored immediately after the
+    // setup so the next test sees the trigger active. This is a
+    // test-only idiom; production migrations and the seed never
+    // flip the session role.
     const other = await prisma.serviceCategory.findFirst({
       where: { key: { not: "music-production" } },
     });
@@ -311,6 +337,12 @@ describe("M1.1 seed regression coverage", () => {
     await prisma.serviceOffering.updateMany({
       where: { primaryCategoryId: category.id },
       data: { primaryCategoryId: other.id },
+    });
+    await withTriggerBypass(prisma, async (tx) => {
+      await tx.serviceOfferingRevision.updateMany({
+        where: { primaryCategoryId: category.id },
+        data: { primaryCategoryId: other.id },
+      });
     });
     await prisma.serviceCategory.delete({ where: { key: "music-production" } });
 
@@ -324,6 +356,21 @@ describe("M1.1 seed regression coverage", () => {
       include: { primaryCategory: true },
     });
     assert.equal(restoredOffering?.primaryCategory.key, "music-production");
+
+    // The seed recreates the canonical category with a new id (the
+    // old row was deleted). The published revision's
+    // primaryCategoryId is immutable per the M2 trigger, so the
+    // test must also restore the revision's primaryCategoryId via
+    // the trigger-bypass session so subsequent tests see a
+    // consistent offering/revision/primaryCategoryId graph. The
+    // bypass is a test-only idiom; production migrations and the
+    // seed never flip the session role.
+    await withTriggerBypass(prisma, async (tx) => {
+      await tx.serviceOfferingRevision.updateMany({
+        where: { primaryCategoryId: other.id },
+        data: { primaryCategoryId: restored.id },
+      });
+    });
   });
 
   test("replaces a stale Caribbean affiliation membership set with the canonical set", async () => {

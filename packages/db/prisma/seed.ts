@@ -83,6 +83,19 @@ const FIXTURE_ORIGIN = resolveFixtureOrigin();
 
 const prisma = new PrismaClient({
   adapter: new PrismaPg({ connectionString }),
+  // The M2.0A schema adds many tables, enums, and append-only /
+  // immutability triggers. The seed's transaction iterates over
+  // every canonical seller and every negative fixture, applying
+  // upserts, deletes, and refresh-on-conflict inserts. The default
+  // 5-second transaction timeout is too aggressive for the
+  // expanded schema; the seed's transaction can take longer on
+  // cold caches. Allow up to 60 seconds so the seed never
+  // spuriously fails while the canonical restore still completes
+  // quickly on warm caches.
+  transactionOptions: {
+    maxWait: 60_000,
+    timeout: 60_000,
+  },
 });
 
 // Exported for the snapshot-probe regression test (see
@@ -893,8 +906,23 @@ async function applySellerGraph(
 
   await tx.workspaceMembership.upsert({
     where: { userId_workspaceId: { userId: owner.id, workspaceId: workspace.id } },
-    create: { userId: owner.id, workspaceId: workspace.id, role: "Owner" },
-    update: { role: "Owner" },
+    create: {
+      userId: owner.id,
+      workspaceId: workspace.id,
+      role: "Owner",
+      // M2.0A: the canonical authority is now `authority` (Owner | Editor).
+      // Every canonical M1.1 fixture is owned by the seller themselves, so
+      // the membership authority is `Owner`. The migration backfills this
+      // for existing rows; new memberships created by the seed must supply
+      // it explicitly.
+      authority: "Owner",
+    },
+    update: {
+      role: "Owner",
+      // Restore the canonical authority on every run so a stale mutation
+      // (e.g. a test that flipped it to Editor) cannot persist.
+      authority: "Owner",
+    },
   });
 
   // Replace the canonical capability set so re-running the seed
@@ -961,6 +989,16 @@ async function applySellerGraph(
       update: {},
     });
   }
+
+  // M2.0A: idempotently create the initial published
+  // SellerProfileRevision for this canonical seller. The migration
+  // backfills the same state when run against an already-populated
+  // M1.1 database; the test environment starts empty and the seed
+  // is the authoritative source of the canonical fixture. Published
+  // revisions are immutable per ADR 0005, so the seed creates the
+  // initial revision only when absent and leaves the row (and its
+  // snapshot children) untouched on every subsequent run.
+  await applyInitialPublishedSellerProfileRevision(tx, profile.id, seller);
 
   for (const offering of seller.offerings) {
     const category = await tx.serviceCategory.findUnique({
@@ -1045,6 +1083,172 @@ async function applySellerGraph(
     // Reset bundle-only IncludedServices (M1.1 ships with no bundles;
     // future tickets will add them).
     await tx.includedService.deleteMany({ where: { offeringId: persisted.id } });
+
+    // M2.0A: idempotently create the initial published
+    // ServiceOfferingRevision for this canonical offering. The
+    // migration backfills the same state when run against an
+    // already-populated M1.1 database; the test environment starts
+    // empty and the seed is the authoritative source of the canonical
+    // fixture. Published revisions are immutable per ADR 0005, so the
+    // seed creates the initial revision only when absent and leaves
+    // the row (and its snapshot children) untouched on every
+    // subsequent run.
+    await applyInitialPublishedOfferingRevision(tx, persisted.id, offering);
+  }
+}
+
+// applyInitialPublishedSellerProfileRevision: idempotently create the
+// canonical initial published SellerProfileRevision (revisionNumber =
+// 1, kind = "Published") for a canonical SellerProfile. Mirrors the
+// migration backfill SQL so the canonical fixture in the test
+// environment matches the post-migration canonical state of a
+// populated production database.
+//
+// Published revisions are immutable per ADR 0005. The seed must NOT
+// delete or recreate an existing revision: doing so would overwrite
+// the immutable `publishedAt` and any snapshot children (specialties,
+// affiliations) that a later M2 publishing workflow added. If the
+// initial revision already exists, the seed is a no-op for that
+// parent so the authoritative timestamp is preserved across runs.
+async function applyInitialPublishedSellerProfileRevision(
+  tx: Prisma.TransactionClient,
+  sellerProfileId: string,
+  seller: SellerGraphSeed,
+): Promise<void> {
+  const revisionId = `rev-${sellerProfileId}-1`;
+  const existing = await tx.sellerProfileRevision.findUnique({ where: { id: revisionId } });
+  if (existing) {
+    // The initial published revision for this seller profile is
+    // already persisted. Leave it and its snapshot children
+    // untouched so the immutable `publishedAt` and any
+    // operator-edited affiliations/specialties remain authoritative
+    // across seed runs.
+    return;
+  }
+
+  const profile = await tx.sellerProfile.findUniqueOrThrow({
+    where: { id: sellerProfileId },
+  });
+
+  // Create the initial published SellerProfileRevision. Do NOT use
+  // deleteMany: published revisions are immutable, and the migration
+  // backfill has already inserted this row with the authoritative
+  // `publishedAt`. The seed's job is to create the row only when it
+  // is absent so a clean database without M2 backfill can be
+  // populated deterministically.
+  await tx.sellerProfileRevision.create({
+    data: {
+      id: revisionId,
+      sellerProfileId,
+      revisionNumber: 1,
+      kind: "Published",
+      professionalName: profile.professionalName,
+      bio: profile.bio,
+      basedInCity: profile.basedInCity,
+      basedInRegion: profile.basedInRegion,
+      basedInCountryCode: profile.basedInCountryCode,
+      avatarUrl: profile.avatarUrl,
+      publishedAt: new Date(),
+    },
+  });
+
+  // Create the canonical specialty set on the initial revision. Like
+  // the parent revision, these rows are never deleted by the seed.
+  for (const specialtyKey of seller.specialtyKeys) {
+    const specialty = await tx.specialty.findUniqueOrThrow({ where: { key: specialtyKey } });
+    await tx.sellerProfileRevisionSpecialty.create({
+      data: { sellerProfileRevisionId: revisionId, specialtyId: specialty.id },
+    });
+  }
+
+  // Create the canonical Caribbean affiliation set on the initial
+  // revision. No deleteMany: the seed never overwrites immutable
+  // snapshot children.
+  for (const countryCode of seller.caribbeanAffiliationCodes) {
+    await tx.sellerProfileRevisionCaribbeanAffiliation.create({
+      data: { sellerProfileRevisionId: revisionId, countryCode },
+    });
+  }
+}
+
+// applyInitialPublishedOfferingRevision: idempotently create the
+// canonical initial published ServiceOfferingRevision (revisionNumber
+// = 1, kind = "Published") for a canonical ServiceOffering. Mirrors
+// the migration backfill SQL so the canonical fixture in the test
+// environment matches the post-migration canonical state of a
+// populated production database.
+//
+// Published revisions are immutable per ADR 0005. The seed must NOT
+// delete or recreate an existing revision: doing so would overwrite
+// the immutable `publishedAt` and any snapshot children (service
+// areas, included services) that a later M2 publishing workflow
+// added. If the initial revision already exists, the seed is a no-op
+// for that offering so the authoritative timestamp is preserved
+// across runs.
+async function applyInitialPublishedOfferingRevision(
+  tx: Prisma.TransactionClient,
+  serviceOfferingId: string,
+  offering: OfferingSeed,
+): Promise<void> {
+  const offeringRevisionId = `rev-${serviceOfferingId}-1`;
+  const existingOfferingRevision = await tx.serviceOfferingRevision.findUnique({
+    where: { id: offeringRevisionId },
+  });
+  if (existingOfferingRevision) {
+    // The initial published revision for this offering is already
+    // persisted. Leave it and its snapshot children untouched so the
+    // immutable `publishedAt` and any operator-edited service
+    // areas/included services remain authoritative across seed runs.
+    return;
+  }
+
+  // Resolve primary category id for the offering.
+  const primaryCategory = await tx.serviceCategory.findUniqueOrThrow({
+    where: { key: offering.primaryCategoryKey },
+  });
+  // Resolve pricing unit id (if any).
+  let pricingUnitId: string | null = null;
+  if (offering.pricing?.unitKey) {
+    const unit = await tx.pricingUnit.findUniqueOrThrow({
+      where: { key: offering.pricing.unitKey },
+    });
+    pricingUnitId = unit.id;
+  }
+
+  // Create the initial published ServiceOfferingRevision. Do NOT
+  // use deleteMany: published revisions are immutable, and the
+  // migration backfill has already inserted this row with the
+  // authoritative `publishedAt` for a populated production database.
+  await tx.serviceOfferingRevision.create({
+    data: {
+      id: offeringRevisionId,
+      serviceOfferingId,
+      revisionNumber: 1,
+      kind: "Published",
+      title: offering.title,
+      description: offering.description,
+      serviceMode: offering.serviceMode,
+      primaryCategoryId: primaryCategory.id,
+      genreTags: [...offering.genreTags],
+      pricingKind: offering.pricing?.kind ?? null,
+      pricingAmountMinor: offering.pricing?.amountMinor ?? null,
+      pricingCurrency: offering.pricing?.currency ?? null,
+      pricingUnitId,
+      publishedAt: new Date(),
+    },
+  });
+
+  // Create the canonical service-area set on the initial revision.
+  // No deleteMany: snapshot children are immutable.
+  for (const area of offering.serviceAreas) {
+    await tx.serviceOfferingRevisionServiceArea.create({
+      data: {
+        serviceOfferingRevisionId: offeringRevisionId,
+        city: area.city ?? null,
+        region: area.region ?? null,
+        countryCode: area.countryCode,
+      },
+    });
   }
 }
 
