@@ -41,3 +41,9 @@ pnpm-debug.log*
 # SoundHub Ralph runtime state
 .ralph/state/*
 !.ralph/state/.gitkeep
+# Python virtual environments
+.venv/
+
+# Python bytecode
+__pycache__/
+*.py[cod]
