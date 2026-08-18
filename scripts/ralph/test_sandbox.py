@@ -49,6 +49,25 @@ class TenkiSandboxTests(unittest.TestCase):
         self.assertEqual(command.stdout, "hello\n")
         self.assertEqual(command.stderr, "")
 
+    @patch("scripts.ralph.sandbox.Sandbox")
+    def test_passes_github_token_to_tenki(self, sandbox):
+        instance = MagicMock()
+        sandbox.create.return_value = instance
+
+        with TenkiSandbox(
+            name="ticket-16",
+            github_token="ghs_test",
+        ):
+            pass
+
+        sandbox.create.assert_called_once_with(
+            name="ticket-16",
+            cpu_cores=2,
+            memory_mb=4096,
+            allow_outbound=True,
+            github_token="ghs_test",
+        )
+
 
 if __name__ == "__main__":
     unittest.main()

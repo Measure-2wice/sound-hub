@@ -16,19 +16,27 @@ class TenkiSandbox:
         name: str,
         cpu_cores: int = 2,
         memory_mb: int = 4096,
+        github_token: str | None = None,
     ):
         self.name = name
         self.cpu_cores = cpu_cores
         self.memory_mb = memory_mb
+        self.github_token = github_token
         self._sandbox = None
 
     def __enter__(self):
-        self._sandbox = Sandbox.create(
-            name=self.name,
-            cpu_cores=self.cpu_cores,
-            memory_mb=self.memory_mb,
-            allow_outbound=True,
-        )
+        options = {
+            "name": self.name,
+            "cpu_cores": self.cpu_cores,
+            "memory_mb": self.memory_mb,
+            "allow_outbound": True,
+        }
+
+        if self.github_token is not None:
+            options["github_token"] = self.github_token
+
+        self._sandbox = Sandbox.create(**options)
+
         return self
 
     def __exit__(self, exc_type, exc_value, traceback):

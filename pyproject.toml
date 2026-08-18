@@ -3,5 +3,7 @@ name = "soundhub-ralph-runner"
 version = "0.1.0"
 requires-python = ">=3.12"
 dependencies = [
+    "cryptography>=50.0.0",
+    "pyjwt>=2.13.0",
     "tenki>=1.0.0",
 ]
