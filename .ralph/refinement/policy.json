@@ -1,0 +1,75 @@
+{
+  "version": 2,
+
+  "goal": "A Ralph-ready ticket must be independently understandable, implementable, verifiable, and reviewable by a fresh agent.",
+
+  "executionBudget": {
+    "preferredImplementationIterations": 1,
+    "maximumImplementationIterations": 2,
+    "preferredReviewCycles": 1,
+    "maximumReviewCycles": 2,
+    "maximumReviewFixIterations": 2
+  },
+
+  "readyCriteria": [
+    "One coherent primary responsibility or architectural seam",
+    "Acceptance criteria are objectively verifiable",
+    "Required product and architecture decisions are already resolved",
+    "Dependencies are explicit",
+    "The ticket can be implemented without redesigning unrelated domains",
+    "The ticket has a focused validation strategy for its primary responsibility",
+    "A fresh agent can reconstruct necessary context from current authoritative repository and GitHub artifacts",
+    "Completion produces a meaningful independently reviewable increment"
+  ],
+
+  "acceptanceCriterionDispositions": [
+    "IMPLEMENT",
+    "PROVEN",
+    "VALIDATION",
+    "BLOCKED"
+  ],
+
+  "alreadySatisfiedSignals": [
+    "All current acceptance criteria are demonstrably satisfied by already-integrated work",
+    "No independently meaningful implementation delta remains",
+    "Implementing the ticket would duplicate or conflict with existing integrated behavior"
+  ],
+
+  "reshapeSignals": [
+    "Combines multiple independently meaningful architectural responsibilities",
+    "Requires several unrelated schema, service, API, UI, or migration changes",
+    "Contains multiple independent migrations or backfills with separate invariants",
+    "Mixes foundation work with unrelated application behavior",
+    "Contains acceptance criteria that represent independently implementable and reviewable behaviors",
+    "Likely requires repeated long-context resumptions because several distinct responsibilities must be completed",
+    "An adversarial reviewer would need to evaluate several mostly independent implementation concerns"
+  ],
+
+  "supervisedSignals": [
+    "A required product or architecture decision is unresolved",
+    "The current issue conflicts with an accepted specification or ADR",
+    "Autonomous implementation would require choosing among materially different valid behaviors",
+    "Meaningful decomposition would create unsafe or misleading intermediate states"
+  ],
+
+  "cohesionRules": [
+    "Multiple fixtures, edge cases, or tests proving the same invariant remain one responsibility",
+    "Retry and recovery proof for the same migration or state transition remain part of that responsibility",
+    "Existing tests that must remain green are regression validation, not a separate implementation slice",
+    "Validation occurring at multiple levels does not by itself require decomposition"
+  ],
+
+  "badSplitSignals": [
+    "Split is based only on files",
+    "Split creates changes with no independently meaningful behavior or invariant",
+    "A child ticket cannot be safely integrated before its siblings",
+    "A child ticket has no independent validation strategy"
+  ],
+
+  "verdicts": [
+    "RALPH_READY",
+    "RESHAPE_REQUIRED",
+    "ALREADY_SATISFIED",
+    "SUPERVISED_REQUIRED"
+  ]
+}
