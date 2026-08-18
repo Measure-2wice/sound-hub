@@ -47,11 +47,15 @@ class TenkiSandbox:
     def exec(
         self,
         *command: str,
+        env: dict[str, str] | None = None,
     ) -> SandboxCommandResult:
         if self._sandbox is None:
             raise RuntimeError("Sandbox is not running")
 
-        result = self._sandbox.exec(*command)
+        result = self._sandbox.exec(
+            *command,
+            env=env,
+        )
 
         return SandboxCommandResult(
             exit_code=result.exit_code,

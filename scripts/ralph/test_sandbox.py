@@ -68,6 +68,34 @@ class TenkiSandboxTests(unittest.TestCase):
             github_token="ghs_test",
         )
 
+    @patch("scripts.ralph.sandbox.Sandbox")
+    def test_exec_passes_environment(self, sandbox):
+        instance = MagicMock()
+
+        result = MagicMock()
+        result.exit_code = 0
+        result.stdout_text = ""
+        result.stderr_text = ""
+
+        instance.exec.return_value = result
+        sandbox.create.return_value = instance
+
+        with TenkiSandbox("ticket-16") as sb:
+            sb.exec(
+                "git",
+                "status",
+                env={
+                    "EXAMPLE_SECRET": "secret-value",
+                },
+            )
+
+        instance.exec.assert_called_once_with(
+            "git",
+            "status",
+            env={
+                "EXAMPLE_SECRET": "secret-value",
+            },
+        )
 
 if __name__ == "__main__":
     unittest.main()
