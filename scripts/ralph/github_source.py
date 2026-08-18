@@ -12,6 +12,9 @@ DEPENDENCY_SECTION_RE = re.compile(
 
 ISSUE_REFERENCE_RE = re.compile(r"#(\d+)")
 
+class DependencyDeclarationError(ValueError):
+    """The GitHub issue does not contain a valid Ralph dependency declaration."""
+
 
 @dataclass(frozen=True)
 class GitHubTask:
@@ -29,24 +32,40 @@ class GitHubTask:
 
 def parse_dependencies(body: str) -> tuple[int, ...]:
     """
-    Parse issue dependencies only from the explicit `## Dependencies` section.
+    Parse dependencies from the required `## Dependencies` section.
 
-    References elsewhere in the issue body, such as the parent specification,
-    must not accidentally become blockers.
+    Ralph fails closed when the dependency declaration is missing or malformed.
     """
     match = DEPENDENCY_SECTION_RE.search(body or "")
+
     if not match:
-        return ()
+        raise DependencyDeclarationError(
+            "missing required `## Dependencies` section"
+        )
 
     section = match.group(1)
 
-    if re.search(r"Blocked by:\s*None\b", section, re.IGNORECASE):
+    if not re.search(r"\bBlocked by\s*:", section, re.IGNORECASE):
+        raise DependencyDeclarationError(
+            "missing required `Blocked by:` declaration"
+        )
+
+    if re.search(
+        r"Blocked by\s*:\s*None\b",
+        section,
+        re.IGNORECASE,
+    ):
         return ()
 
     dependencies = {
         int(number)
         for number in ISSUE_REFERENCE_RE.findall(section)
     }
+
+    if not dependencies:
+        raise DependencyDeclarationError(
+            "`Blocked by:` must declare `None` or at least one #issue"
+        )
 
     return tuple(sorted(dependencies))
 
@@ -66,12 +85,21 @@ def _label_names(raw_labels: Iterable[object]) -> frozenset[str]:
 
 
 def task_from_gh_json(raw: dict) -> GitHubTask:
+    try:
+        dependencies = parse_dependencies(
+            raw.get("body") or ""
+        )
+    except DependencyDeclarationError as error:
+        raise DependencyDeclarationError(
+            f"Issue #{raw.get('number', '?')}: {error}"
+        ) from error
+
     return GitHubTask(
         number=int(raw["number"]),
         title=str(raw["title"]),
         state=str(raw["state"]).upper(),
         labels=_label_names(raw.get("labels") or []),
-        dependencies=parse_dependencies(raw.get("body") or ""),
+        dependencies=dependencies,
         body=raw.get("body") or "",
     )
 
@@ -113,35 +141,22 @@ class GitHubTaskSource:
 
         raw_tasks = json.loads(result.stdout)
 
+        if self.parent_issue is not None:
+            raw_tasks = [
+                raw
+                for raw in raw_tasks
+                if int(raw["number"]) != self.parent_issue
+            ]
+
         tasks = [
             task_from_gh_json(raw)
             for raw in raw_tasks
         ]
 
-        tasks = exclude_parent_issue(
-            tasks,
-            self.parent_issue,
-        )
-
         return sorted(
             tasks,
             key=lambda task: task.number,
         )
-
-def exclude_parent_issue(
-    tasks: Iterable[GitHubTask],
-    parent_issue: Optional[int],
-) -> List[GitHubTask]:
-    tasks = list(tasks)
-
-    if parent_issue is None:
-        return tasks
-
-    return [
-        task
-        for task in tasks
-        if task.number != parent_issue
-    ]
 
 
 def dependency_frontier(tasks: Iterable[GitHubTask]) -> List[GitHubTask]:
