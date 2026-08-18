@@ -13,6 +13,8 @@ class TicketWorkspace:
     integration_branch: str
     ticket_branch: str
     base_sha: str
+    ticket_sha: str
+    resumed: bool
 
 
 class WorkspacePreparationError(RuntimeError):
@@ -64,9 +66,19 @@ class TicketWorkspaceManager:
             "RALPH_BASE_SHA",
         )
 
+        ticket_sha = self._extract_value(
+            result,
+            "RALPH_TICKET_SHA",
+        )
+
         branch = self._extract_value(
             result,
             "RALPH_TICKET_BRANCH",
+        )
+
+        mode = self._extract_value(
+            result,
+            "RALPH_WORKSPACE_MODE",
         )
 
         if branch != ticket_branch:
@@ -75,11 +87,18 @@ class TicketWorkspaceManager:
                 f"expected ticket branch: {branch}"
             )
 
+        if mode not in {"CREATED", "RESUMED"}:
+            raise WorkspacePreparationError(
+                f"Unknown Ralph workspace mode: {mode}"
+            )
+
         return TicketWorkspace(
             repository_path=self.repository_path,
             integration_branch=self.integration_branch,
             ticket_branch=ticket_branch,
             base_sha=base_sha,
+            ticket_sha=ticket_sha,
+            resumed=(mode == "RESUMED"),
         )
 
     def _prepare_script(
@@ -110,7 +129,32 @@ if [ -n "{expected}" ] && [ "$base_sha" != "{expected}" ]; then
   exit 42
 fi
 
-git switch -c {ticket_branch}
+if git ls-remote \
+  --exit-code \
+  --heads \
+  origin \
+  "refs/heads/{ticket_branch}" \
+  >/dev/null 2>&1
+then
+  git remote set-branches \
+    --add \
+    origin \
+    "{ticket_branch}"
+
+  git fetch \
+    origin \
+    "{ticket_branch}"
+
+  git switch \
+    --track \
+    -c "{ticket_branch}" \
+    "origin/{ticket_branch}"
+
+  workspace_mode="RESUMED"
+else
+  git switch -c "{ticket_branch}"
+  workspace_mode="CREATED"
+fi
 
 corepack enable
 pnpm install --frozen-lockfile
@@ -123,8 +167,12 @@ if [ -n "$(git status --porcelain)" ]; then
   exit 43
 fi
 
+ticket_sha="$(git rev-parse HEAD)"
+
 echo "RALPH_BASE_SHA=$base_sha"
+echo "RALPH_TICKET_SHA=$ticket_sha"
 echo "RALPH_TICKET_BRANCH=$(git branch --show-current)"
+echo "RALPH_WORKSPACE_MODE=$workspace_mode"
 """
 
     @staticmethod
