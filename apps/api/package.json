@@ -13,7 +13,8 @@
     "test:db": "TEST_DATABASE_URL=postgresql://soundhub:password@localhost:5433/soundhub_m1_test tsx ../../packages/db/prisma/seed.test.ts",
     "test:db:m2": "TEST_DATABASE_URL=postgresql://soundhub:password@localhost:5433/soundhub_m1_test tsx ../../packages/db/prisma/m2-foundation.test.ts",
     "test:db:m2:transition": "TEST_DATABASE_URL=postgresql://soundhub:password@localhost:5433/soundhub_m1_test tsx ../../packages/db/prisma/m2-foundation-transition.test.ts",
-    "test:full": "npm run test:db && npm run test:db:m2:transition && npm run test:db:m2 && npm run test:repository"
+    "test:db:m2:reconciliation": "TEST_DATABASE_URL=postgresql://soundhub:password@localhost:5433/soundhub_m1_test tsx ../../packages/db/prisma/m2-workspace-owner-reconciliation-transition.test.ts",
+    "test:full": "npm run test:db && npm run test:db:m2:transition && npm run test:db:m2 && npm run test:db:m2:reconciliation && npm run test:repository"
   },
   "dependencies": {
     "express": "^4.19.0",

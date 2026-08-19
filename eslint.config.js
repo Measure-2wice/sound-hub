@@ -50,6 +50,7 @@ export default [
             "packages/db/prisma/snapshot-probe.ts",
             "packages/db/prisma/m2-foundation.test.ts",
             "packages/db/prisma/m2-foundation-transition.test.ts",
+            "packages/db/prisma/m2-workspace-owner-reconciliation-transition.test.ts",
             "packages/db/prisma/test-helpers.ts",
           ],
         },
