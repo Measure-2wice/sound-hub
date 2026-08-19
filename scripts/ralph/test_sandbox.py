@@ -92,9 +92,36 @@ class TenkiSandboxTests(unittest.TestCase):
         instance.exec.assert_called_once_with(
             "git",
             "status",
+            cwd=None,
             env={
                 "EXAMPLE_SECRET": "secret-value",
             },
+        )
+
+    @patch("scripts.ralph.sandbox.Sandbox")
+    def test_exec_passes_working_directory(self, sandbox):
+        instance = MagicMock()
+
+        result = MagicMock()
+        result.exit_code = 0
+        result.stdout_text = ""
+        result.stderr_text = ""
+
+        instance.exec.return_value = result
+        sandbox.create.return_value = instance
+
+        with TenkiSandbox("ticket-16") as sb:
+            sb.exec(
+                "git",
+                "status",
+                cwd="/tmp/sound-hub",
+            )
+
+        instance.exec.assert_called_once_with(
+            "git",
+            "status",
+            cwd="/tmp/sound-hub",
+            env=None,
         )
 
 if __name__ == "__main__":

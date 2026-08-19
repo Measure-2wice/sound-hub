@@ -47,6 +47,7 @@ class TenkiSandbox:
     def exec(
         self,
         *command: str,
+        cwd: str | None = None,
         env: dict[str, str] | None = None,
     ) -> SandboxCommandResult:
         if self._sandbox is None:
@@ -54,6 +55,7 @@ class TenkiSandbox:
 
         result = self._sandbox.exec(
             *command,
+            cwd=cwd,
             env=env,
         )
 
