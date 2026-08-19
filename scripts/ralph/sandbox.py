@@ -49,6 +49,7 @@ class TenkiSandbox:
         *command: str,
         cwd: str | None = None,
         env: dict[str, str] | None = None,
+        input: str | bytes | None = None,
     ) -> SandboxCommandResult:
         if self._sandbox is None:
             raise RuntimeError("Sandbox is not running")
@@ -57,6 +58,7 @@ class TenkiSandbox:
             *command,
             cwd=cwd,
             env=env,
+            input=input,
         )
 
         return SandboxCommandResult(
