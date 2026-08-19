@@ -34,11 +34,16 @@ class ImplementationRunnerTests(unittest.TestCase):
             exit_code=0,
             stdout=json.dumps(
                 {
+                    "type": "result",
+                    "subtype": "success",
                     "is_error": False,
                     "session_id": "session-123",
-                    "num_turns": 12,
-                    "stop_reason": "end_turn",
-                    "result": "Implemented issue.",
+                    "num_turns": 4,
+                    "stop_reason": None,
+                    "terminal_reason": "completed",
+                    "result": (
+                        "Implementation complete."
+                    ),
                 }
             ),
             stderr="",
@@ -51,11 +56,14 @@ class ImplementationRunnerTests(unittest.TestCase):
 
         self.assertFalse(parsed.is_error)
         self.assertFalse(parsed.exhausted)
-        self.assertEqual(parsed.session_id, "session-123")
-        self.assertEqual(parsed.num_turns, 12)
         self.assertEqual(
-            parsed.changed_files,
-            ("file.py",),
+            parsed.terminal_reason,
+            "completed",
+        )
+        self.assertEqual(parsed.num_turns, 4)
+        self.assertEqual(
+            parsed.result_text,
+            "Implementation complete.",
         )
 
     def test_detects_max_turn_exhaustion(self):
@@ -63,10 +71,14 @@ class ImplementationRunnerTests(unittest.TestCase):
             exit_code=1,
             stdout=json.dumps(
                 {
+                    "type": "result",
+                    "subtype": "error_max_turns",
                     "is_error": True,
                     "terminal_reason": "max_turns",
-                    "num_turns": 60,
+                    "stop_reason": "tool_use",
+                    "num_turns": 3,
                     "session_id": "session-456",
+                    "result": None,
                 }
             ),
             stderr="",
@@ -79,7 +91,15 @@ class ImplementationRunnerTests(unittest.TestCase):
 
         self.assertTrue(parsed.is_error)
         self.assertTrue(parsed.exhausted)
-        self.assertEqual(parsed.num_turns, 60)
+        self.assertEqual(parsed.num_turns, 3)
+        self.assertEqual(
+            parsed.terminal_reason,
+            "max_turns",
+        )
+        self.assertEqual(
+            parsed.stop_reason,
+            "tool_use",
+        )
 
     def test_prompt_forbids_git_persistence(self):
         prompt = self.runner._build_prompt(
