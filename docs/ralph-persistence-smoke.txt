@@ -1,0 +1,10 @@
+Ralph persistence smoke test.
+
+This file exists only to prove:
+- commit creation
+- authenticated ticket-branch push
+- pull request creation
+- crash-safe commit recovery
+- pull request recovery
+
+This PR must not be merged.
