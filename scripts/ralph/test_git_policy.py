@@ -28,6 +28,13 @@ class GitPushPolicyTests(unittest.TestCase):
             issue_number=16,
         )
 
+    def test_ticket_branch_allowed_after_automated_qa(self):
+        self.policy.assert_push_allowed(
+            branch="ralph/m2-17",
+            state=TicketState.AUTOMATED_QA,
+            issue_number=17,
+        )
+
     def test_wrong_ticket_branch_is_denied(self):
         with self.assertRaises(GitPolicyError):
             self.policy.assert_push_allowed(

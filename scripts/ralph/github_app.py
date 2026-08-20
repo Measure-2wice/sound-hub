@@ -63,6 +63,7 @@ class GitHubAppAuthenticator:
                 "permissions": {
                     "contents": "write",
                     "issues": "write",
+                    "pull_requests": "write",
                 },
             },
         )

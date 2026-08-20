@@ -42,11 +42,12 @@ class GitPushPolicy:
             if state not in {
                 TicketState.IMPLEMENTING,
                 TicketState.FIXING,
+                TicketState.AUTOMATED_QA,
             }:
                 raise GitPolicyError(
                     "Ticket-branch push is only allowed while "
-                    f"IMPLEMENTING or FIXING; current state is "
-                    f"{state.value}."
+                    "IMPLEMENTING, FIXING, or AUTOMATED_QA; "
+                    f"current state is {state.value}."
                 )
 
             return

@@ -90,6 +90,7 @@ class GitHubAppAuthenticatorTests(unittest.TestCase):
                 "permissions": {
                     "contents": "write",
                     "issues": "write",
+                    "pull_requests": "write",
                 },
             },
         )
