@@ -97,6 +97,7 @@ class TenkiSandboxTests(unittest.TestCase):
                 "EXAMPLE_SECRET": "secret-value",
             },
             input=None,
+            timeout=None,
         )
 
     @patch("scripts.ralph.sandbox.Sandbox")
@@ -124,6 +125,7 @@ class TenkiSandboxTests(unittest.TestCase):
             cwd="/tmp/sound-hub",
             env=None,
             input=None,
+            timeout=None,
         )
 
     @patch("scripts.ralph.sandbox.Sandbox")
@@ -153,6 +155,35 @@ class TenkiSandboxTests(unittest.TestCase):
             cwd=None,
             env=None,
             input="example patch",
+            timeout=None,
+        )
+
+    @patch("scripts.ralph.sandbox.Sandbox")
+    def test_exec_passes_timeout(self, sandbox):
+        instance = MagicMock()
+
+        result = MagicMock()
+        result.exit_code = 0
+        result.stdout_text = ""
+        result.stderr_text = ""
+
+        instance.exec.return_value = result
+        sandbox.create.return_value = instance
+
+        with TenkiSandbox("ticket-16") as sb:
+            sb.exec(
+                "sleep",
+                "1",
+                timeout=123,
+            )
+
+        instance.exec.assert_called_once_with(
+            "sleep",
+            "1",
+            cwd=None,
+            env=None,
+            input=None,
+            timeout=123,
         )
 
 if __name__ == "__main__":

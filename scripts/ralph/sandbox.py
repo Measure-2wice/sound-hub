@@ -50,6 +50,7 @@ class TenkiSandbox:
         cwd: str | None = None,
         env: dict[str, str] | None = None,
         input: str | bytes | None = None,
+        timeout: float | int | None = None,
     ) -> SandboxCommandResult:
         if self._sandbox is None:
             raise RuntimeError("Sandbox is not running")
@@ -59,6 +60,7 @@ class TenkiSandbox:
             cwd=cwd,
             env=env,
             input=input,
+            timeout=timeout,
         )
 
         return SandboxCommandResult(
