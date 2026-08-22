@@ -378,10 +378,27 @@ class Orchestrator:
         config_path: str,
         checkpoint_path: Path,
         callbacks: Optional[ConductorCallbacks] = None,
+        expected_issue_number: Optional[int] = None,
     ):
         self.config_path = config_path
         self.checkpoint_path = checkpoint_path
         self.callbacks = callbacks or ConductorCallbacks()
+        # ``expected_issue_number`` is the OPTIONAL outer
+        # ticket identity requested by an external
+        # orchestrator (e.g. ``MilestoneRunner``).  When
+        # set AND there is no existing durable ticket
+        # checkpoint, the Orchestrator MUST execute that
+        # exact issue or fail closed (BLOCKED_FOR_HUMAN
+        # via ``ISSUE_NOT_ELIGIBLE``) if the issue is no
+        # longer currently eligible.  When ``None``
+        # (the default), the Orchestrator's existing
+        # selection rule applies: take ``eligible[0]``
+        # from a fresh execution-frontier computation.
+        # This keeps the default ``--next`` behavior
+        # unchanged.
+        self.expected_issue_number = (
+            expected_issue_number
+        )
 
     def run(self) -> TicketState:
         config = load_config(self.config_path)
@@ -417,6 +434,9 @@ class Orchestrator:
             tasks_by_number=tasks_by_number,
             config=config,
             store=store,
+            expected_issue_number=(
+                self.expected_issue_number
+            ),
         )
 
         if task is None:
@@ -511,12 +531,20 @@ class Orchestrator:
         tasks_by_number: dict[int, GitHubTask],
         config: dict,
         store: CheckpointStore,
+        expected_issue_number: Optional[int] = None,
     ) -> tuple[
         TicketCheckpoint,
         Optional[GitHubTask],
     ]:
         integration = config["integration"]
 
+        # 1. Existing durable checkpoint wins.  The
+        # Orchestrator owns checkpoint recovery; the
+        # outer layer (MilestoneRunner) cannot bypass
+        # it.  This branch runs FIRST regardless of any
+        # pinned identity because the on-disk ticket
+        # checkpoint is the most authoritative identity
+        # Ralph has.
         if existing is not None:
             task = tasks_by_number.get(
                 existing.issue_number
@@ -536,6 +564,93 @@ class Orchestrator:
 
             return existing, task
 
+        # 2. Pinned identity validation.  When the outer
+        # orchestrator (MilestoneRunner) pinned a
+        # specific issue, we MUST execute that exact
+        # issue or fail closed — BEFORE the generic
+        # empty-frontier sentinel below can fire.  This
+        # ordering prevents a concurrent GitHub change
+        # that empties the entire frontier from
+        # short-circuiting the pinned validation.
+        if expected_issue_number is not None:
+            pinned_task = tasks_by_number.get(
+                expected_issue_number
+            )
+
+            if pinned_task is None:
+                # Pinned issue disappeared from the
+                # current discovery.
+                checkpoint = TicketCheckpoint(
+                    milestone_id=config["id"],
+                    issue_number=expected_issue_number,
+                    state=TicketState.BLOCKED_FOR_HUMAN,
+                    integration_branch=integration[
+                        "branch"
+                    ],
+                    ticket_branch=(
+                        f"{integration['ticketBranchPrefix']}"
+                        f"{expected_issue_number}"
+                    ),
+                    last_error=_terminal_message(
+                        TerminalReason
+                        .ISSUE_NO_LONGER_PRESENT
+                    ),
+                )
+                store.save(checkpoint)
+                return checkpoint, None
+
+            eligible = execution_frontier(
+                tasks,
+                required_label=config["selection"][
+                    "requiredLabel"
+                ],
+                skip_labels=config["selection"][
+                    "skipLabels"
+                ],
+            )
+
+            if pinned_task not in eligible:
+                # Pinned issue is present but no longer
+                # currently eligible (closed externally,
+                # lost required label, gained skip label,
+                # not dependency-ready, etc.).
+                checkpoint = TicketCheckpoint(
+                    milestone_id=config["id"],
+                    issue_number=expected_issue_number,
+                    state=TicketState.BLOCKED_FOR_HUMAN,
+                    integration_branch=integration[
+                        "branch"
+                    ],
+                    ticket_branch=(
+                        f"{integration['ticketBranchPrefix']}"
+                        f"{expected_issue_number}"
+                    ),
+                    last_error=_terminal_message(
+                        TerminalReason
+                        .ISSUE_NOT_ELIGIBLE
+                    ),
+                )
+                store.save(checkpoint)
+                return checkpoint, None
+
+            checkpoint = TicketCheckpoint(
+                milestone_id=config["id"],
+                issue_number=pinned_task.number,
+                state=TicketState.READY,
+                integration_branch=integration[
+                    "branch"
+                ],
+                ticket_branch=(
+                    f"{integration['ticketBranchPrefix']}"
+                    f"{pinned_task.number}"
+                ),
+            )
+            store.save(checkpoint)
+            return checkpoint, pinned_task
+
+        # 3. Legacy --next path.  No pinned identity,
+        # no existing checkpoint.  Apply the generic
+        # execution-frontier policy.
         eligible = execution_frontier(
             tasks,
             required_label=config["selection"][
@@ -2271,6 +2386,16 @@ def main(argv: Optional[list[str]] = None) -> int:
     )
 
     parser.add_argument(
+        "--milestone",
+        action="store_true",
+        help=(
+            "Execute every execution-frontier ticket in the "
+            "configured milestone sequentially by reusing the "
+            "single-ticket Ralph Orchestrator."
+        ),
+    )
+
+    parser.add_argument(
         "--config",
         default=".ralph/config/m2.json",
         help="Path to the Ralph milestone config.",
@@ -2284,9 +2409,17 @@ def main(argv: Optional[list[str]] = None) -> int:
 
     args = parser.parse_args(argv)
 
-    if not args.next:
+    if args.next and args.milestone:
+        parser.error(
+            "--next and --milestone are mutually exclusive."
+        )
+
+    if not args.next and not args.milestone:
         parser.print_help()
         return 0
+
+    if args.milestone:
+        return _run_milestone(args)
 
     orchestrator = Orchestrator(
         config_path=args.config,
@@ -2310,6 +2443,47 @@ def main(argv: Optional[list[str]] = None) -> int:
         TicketState.INFRA_FAILURE,
         TicketState.AGENT_FAILURE,
     }:
+        return 0
+
+    return 1
+
+
+def _run_milestone(args) -> int:
+    """Dispatch the ``--milestone`` mode to ``MilestoneRunner``.
+
+    Imported lazily so the single-ticket ``--next`` CLI does
+    not pay the milestone module's import cost.
+    """
+    from scripts.ralph.checkpoint import CheckpointError
+    from scripts.ralph.milestone import (
+        MilestoneRunner,
+        MilestoneStatus,
+    )
+
+    runner = MilestoneRunner(
+        config_path=args.config,
+        checkpoint_path=Path(args.checkpoint),
+    )
+
+    try:
+        result = runner.run()
+    except OrchestratorError:
+        # The milestone runner already printed a static
+        # Ralph-owned line.  Return a non-zero exit
+        # WITHOUT printing arbitrary exception text.
+        return 1
+    except CheckpointError:
+        # Defensive: should not reach here because the
+        # milestone runner catches ``CheckpointError``
+        # itself, but if it ever escapes we MUST NOT
+        # leak arbitrary checkpoint text.
+        print(
+            "RALPH MILESTONE: "
+            "checkpoint infrastructure failure"
+        )
+        return 1
+
+    if result.status == MilestoneStatus.COMPLETE:
         return 0
 
     return 1
