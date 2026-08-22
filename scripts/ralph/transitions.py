@@ -38,6 +38,7 @@ ALLOWED_TICKET_TRANSITIONS: dict[TicketState, set[TicketState]] = {
 
     TicketState.AUTOMATED_QA: {
         TicketState.INTEGRATING,
+        TicketState.FIXING,
         TicketState.BLOCKED_FOR_HUMAN,
         TicketState.INFRA_FAILURE,
     },

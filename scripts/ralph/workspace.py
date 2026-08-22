@@ -22,6 +22,21 @@ class WorkspacePreparationError(RuntimeError):
 
 
 class TicketWorkspaceManager:
+    """Prepare a fresh Ralph ticket workspace inside a Tenki sandbox.
+
+    Authentication invariant:
+
+    - The git remote is private and must be cloned/fetched using the
+      GitHub App installation token minted at the boundary, never
+      via the human's ambient credentials.
+    - The token never appears in command text or in any logged
+      ``env`` payload — it is delivered through an ephemeral
+      ``GIT_ASKPASS`` helper that the script writes and removes
+      inside the sandbox.
+    - ``GIT_TERMINAL_PROMPT=0`` is set so git never falls back to
+      interactive prompts.
+    """
+
     def __init__(
         self,
         sandbox: TenkiSandbox,
@@ -40,6 +55,8 @@ class TicketWorkspaceManager:
         self,
         issue_number: int,
         expected_base_sha: Optional[str] = None,
+        *,
+        github_token: Optional[str] = None,
     ) -> TicketWorkspace:
         ticket_branch = (
             f"{self.ticket_branch_prefix}{issue_number}"
@@ -52,6 +69,7 @@ class TicketWorkspaceManager:
                 ticket_branch=ticket_branch,
                 expected_base_sha=expected_base_sha,
             ),
+            env=self._auth_env(github_token=github_token),
         )
 
         if result.exit_code != 0:
@@ -101,6 +119,27 @@ class TicketWorkspaceManager:
             resumed=(mode == "RESUMED"),
         )
 
+    def _auth_env(
+        self,
+        *,
+        github_token: Optional[str],
+    ) -> dict[str, str]:
+        """Environment for the prepare script.
+
+        The token is delivered through an ephemeral askpass helper.
+        ``GIT_TERMINAL_PROMPT=0`` blocks interactive fallback so
+        a wrong/missing token fails closed rather than hanging.
+        """
+        env = {
+            "GIT_TERMINAL_PROMPT": "0",
+            "GIT_ASKPASS": "/tmp/ralph-git-askpass",
+        }
+
+        if github_token:
+            env["RALPH_GITHUB_TOKEN"] = github_token
+
+        return env
+
     def _prepare_script(
         self,
         ticket_branch: str,
@@ -111,13 +150,49 @@ class TicketWorkspaceManager:
         return f"""
 set -euo pipefail
 
+# --- Ephemeral git credential helper -------------------------------
+# Writes a per-invocation askpass that returns the installation token
+# when git asks for it. Removed on exit so the token is never left
+# behind in the sandbox filesystem.
+
+cat > /tmp/ralph-git-askpass <<'EOF'
+#!/bin/sh
+case "$1" in
+    *Username*)
+        printf '%s\n' "x-access-token"
+        ;;
+    *Password*)
+        if [ -n "${{RALPH_GITHUB_TOKEN:-}}" ]; then
+            printf '%s\n' "$RALPH_GITHUB_TOKEN"
+        else
+            exit 1
+        fi
+        ;;
+    *)
+        exit 1
+        ;;
+esac
+EOF
+
+chmod 700 /tmp/ralph-git-askpass
+
+cleanup() {{
+    rm -f /tmp/ralph-git-askpass
+}}
+
+trap cleanup EXIT
+
+# -------------------------------------------------------------------
+
 rm -rf {self.repository_path}
 
-git clone \
-  --branch {self.integration_branch} \
-  --single-branch \
-  {self.repository_url} \
-  {self.repository_path}
+git -c credential.helper= \
+    -c core.askPass=/tmp/ralph-git-askpass \
+    clone \
+      --branch {self.integration_branch} \
+      --single-branch \
+      {self.repository_url} \
+      {self.repository_path}
 
 cd {self.repository_path}
 
@@ -141,9 +216,11 @@ then
     origin \
     "{ticket_branch}"
 
-  git fetch \
-    origin \
-    "{ticket_branch}"
+  git -c credential.helper= \
+      -c core.askPass=/tmp/ralph-git-askpass \
+      fetch \
+      origin \
+      "{ticket_branch}"
 
   git switch \
     --track \

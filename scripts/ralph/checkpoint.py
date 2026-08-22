@@ -4,10 +4,11 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Optional
 
+from scripts.ralph.review import ReviewStage
 from scripts.ralph.states import TicketState
 
 
-CHECKPOINT_SCHEMA_VERSION = 1
+CHECKPOINT_SCHEMA_VERSION = 2
 
 
 class CheckpointError(RuntimeError):
@@ -29,9 +30,21 @@ class TicketCheckpoint:
     implementation_session_id: Optional[str] = None
 
     review_attempts: int = 0
+    review_cycles_consumed: int = 0
     qa_attempts: int = 0
+    implementation_attempts: int = 0
+    fix_attempts: int = 0
+
+    persisted_commit_sha: Optional[str] = None
 
     pull_request_number: Optional[int] = None
+
+    review_stage: ReviewStage = ReviewStage.PRE_QA
+    qa_evidence: Optional[str] = None
+
+    pre_qa_findings: Optional[str] = None
+    qa_failure_evidence: Optional[str] = None
+    pre_persistence_findings: Optional[str] = None
 
     last_error: Optional[str] = None
 
@@ -56,10 +69,14 @@ class CheckpointStore:
                 "Unable to read Ralph checkpoint."
             ) from error
 
-        if (
-            payload.get("schema_version")
-            != CHECKPOINT_SCHEMA_VERSION
-        ):
+        schema_version = payload.get(
+            "schema_version"
+        )
+
+        if schema_version not in {
+            CHECKPOINT_SCHEMA_VERSION,
+            1,
+        }:
             raise CheckpointError(
                 "Unsupported Ralph checkpoint schema."
             )
@@ -94,14 +111,53 @@ class CheckpointStore:
                         0,
                     )
                 ),
+                review_cycles_consumed=int(
+                    payload.get(
+                        "review_cycles_consumed",
+                        0,
+                    )
+                ),
                 qa_attempts=int(
                     payload.get(
                         "qa_attempts",
                         0,
                     )
                 ),
+                implementation_attempts=int(
+                    payload.get(
+                        "implementation_attempts",
+                        0,
+                    )
+                ),
+                fix_attempts=int(
+                    payload.get(
+                        "fix_attempts",
+                        0,
+                    )
+                ),
+                persisted_commit_sha=payload.get(
+                    "persisted_commit_sha"
+                ),
                 pull_request_number=payload.get(
                     "pull_request_number"
+                ),
+                review_stage=ReviewStage(
+                    payload.get(
+                        "review_stage",
+                        ReviewStage.PRE_QA.value,
+                    )
+                ),
+                qa_evidence=payload.get(
+                    "qa_evidence"
+                ),
+                pre_qa_findings=payload.get(
+                    "pre_qa_findings"
+                ),
+                qa_failure_evidence=payload.get(
+                    "qa_failure_evidence"
+                ),
+                pre_persistence_findings=payload.get(
+                    "pre_persistence_findings"
                 ),
                 last_error=payload.get(
                     "last_error"
@@ -146,10 +202,28 @@ class CheckpointStore:
                 checkpoint.implementation_session_id,
             "review_attempts":
                 checkpoint.review_attempts,
+            "review_cycles_consumed":
+                checkpoint.review_cycles_consumed,
             "qa_attempts":
                 checkpoint.qa_attempts,
+            "implementation_attempts":
+                checkpoint.implementation_attempts,
+            "fix_attempts":
+                checkpoint.fix_attempts,
+            "persisted_commit_sha":
+                checkpoint.persisted_commit_sha,
             "pull_request_number":
                 checkpoint.pull_request_number,
+            "review_stage":
+                checkpoint.review_stage.value,
+            "qa_evidence":
+                checkpoint.qa_evidence,
+            "pre_qa_findings":
+                checkpoint.pre_qa_findings,
+            "qa_failure_evidence":
+                checkpoint.qa_failure_evidence,
+            "pre_persistence_findings":
+                checkpoint.pre_persistence_findings,
             "last_error":
                 checkpoint.last_error,
         }

@@ -1,5 +1,6 @@
 import json
 from dataclasses import dataclass
+from enum import Enum
 from typing import Optional
 from urllib.parse import quote
 
@@ -13,6 +14,33 @@ class PersistenceError(RuntimeError):
     pass
 
 
+class PersistenceRecoveryDisposition(str, Enum):
+    """Explicit three-valued result of the conductor's
+    persistence-recovery step.  Replaces an ambiguous boolean.
+
+      NOT_APPLICABLE:
+        No recovered persistence requires continuation.  The
+        caller may proceed through normal persistence logic.
+
+      READY_TO_INTEGRATE:
+        Recovery and/or the COMMIT_ONLY continuation succeeded.
+        Verified persisted commit + PR are checkpointed.  The
+        caller may transition to INTEGRATING.
+
+      TERMINAL:
+        Recovery or the COMMIT_ONLY continuation detected an
+        unsafe/ambiguous condition.  A terminal
+        ``BLOCKED_FOR_HUMAN`` checkpoint has already been saved
+        by the recovery path.  The caller MUST return
+        immediately — no persistence retry, no INTEGRATING
+        transition, no IntegrationRunner invocation.
+    """
+
+    NOT_APPLICABLE = "NOT_APPLICABLE"
+    READY_TO_INTEGRATE = "READY_TO_INTEGRATE"
+    TERMINAL = "TERMINAL"
+
+
 @dataclass(frozen=True)
 class PersistenceResult:
     commit_sha: str
@@ -21,6 +49,22 @@ class PersistenceResult:
     pull_request_number: int
     pull_request_url: str
     pull_request_created: bool
+
+
+@dataclass(frozen=True)
+class CommitOnlyContinuationResult:
+    """Outcome of ``ensure_pull_request_for_persisted_commit``.
+
+    Either an existing exact PR was recovered or a new PR was
+    created.  ``pull_request_created=False`` means Ralph did NOT
+    push, force-push, or create any new commits.
+    """
+
+    pull_request_number: int
+    pull_request_url: str
+    pull_request_created: bool
+    commit_sha: str
+    remote_sha: str
 
 
 class PersistenceRunner:
@@ -92,6 +136,170 @@ class PersistenceRunner:
             pull_request_created=pull_request_created,
         )
 
+    def ensure_pull_request_for_persisted_commit(
+        self,
+        *,
+        issue_number: int,
+        recovered_sha: str,
+        original_ticket_sha: Optional[str],
+        pull_request_title: str,
+        pull_request_body: str,
+    ) -> CommitOnlyContinuationResult:
+        """Recover an already-durable commit by creating only the
+        missing pull request.
+
+        This is the COMMIT_ONLY restart path:
+
+          1. ``recovered_sha`` is the durable SHA the conductor
+             received from ``reconcile_persistence``.  The
+             runner treats it as the AUTHORITATIVE identity for
+             the durable commit and requires it to equal the
+             local HEAD and the remote ticket branch HEAD.
+
+             The runner does NOT derive the durable commit
+             identity from ``workspace.ticket_sha`` — that
+             value may reflect the HEAD of a resumed remote
+             branch and is not the authoritative recovery
+             identity.
+
+          2. verify ``recovered_sha != original_ticket_sha``
+             (i.e., it is not the pre-implementation baseline)
+
+          3. verify the current local branch is the expected
+             Ralph ticket branch
+
+          4. read local HEAD independently and require
+             ``local_head == recovered_sha``
+
+          5. read remote ticket branch HEAD independently and
+             require ``remote_sha == recovered_sha``
+
+          6. require ``local_head == remote_sha`` (proves the
+             local workspace and the remote durable state
+             agree)
+
+          7. perform NO new git commit
+
+          8. perform NO SHA-changing push
+
+          9. perform NO force push
+
+         10. find an existing exact PR if one appeared meanwhile
+             (a race between recovery and continuation)
+
+         11. otherwise create exactly one PR from the expected
+             ticket branch into the expected integration branch
+
+         12. return the SHA that was actually verified (NOT the
+             input — the input was checked but the result
+             contains the SHA the runner independently
+             confirmed via local + remote reads).  The
+             conductor MUST checkpoint the SHA from the result,
+             never from the unverified input.
+
+        Failure cases — all fail closed before any PR operation:
+
+          - ``recovered_sha`` is empty or otherwise invalid
+          - ``recovered_sha == original_ticket_sha``
+          - local HEAD cannot be read
+          - local HEAD != ``recovered_sha``
+          - remote HEAD cannot be read
+          - remote HEAD != ``recovered_sha``
+          - local HEAD != remote HEAD
+        """
+        self._assert_ticket_branch()
+
+        expected_branch = self.git_policy.ticket_branch(
+            issue_number
+        )
+
+        if self.workspace.ticket_branch != expected_branch:
+            raise PersistenceError(
+                "Workspace ticket branch does not match "
+                "expected Ralph ticket branch: "
+                f"{self.workspace.ticket_branch!r} vs "
+                f"{expected_branch!r}."
+            )
+
+        # Validate the recovered SHA parameter itself before
+        # any local/remote verification.
+        if not recovered_sha or not isinstance(
+            recovered_sha, str
+        ):
+            raise PersistenceError(
+                "Recovered persisted commit SHA must be a "
+                "non-empty string."
+            )
+
+        if (
+            original_ticket_sha
+            and recovered_sha == original_ticket_sha
+        ):
+            raise PersistenceError(
+                "Recovered persisted commit SHA matches "
+                "the original pre-implementation baseline; "
+                "no durable commit exists beyond baseline."
+            )
+
+        # Independent local verification: do NOT trust
+        # workspace.ticket_sha.  Read HEAD afresh from git.
+        local_head = self._local_head_sha()
+
+        if local_head != recovered_sha:
+            raise PersistenceError(
+                "Local ticket branch HEAD does not match "
+                "the recovered persisted commit SHA.\n"
+                f"local:   {local_head}\n"
+                f"recovered: {recovered_sha}"
+            )
+
+        # Independent remote verification: a read-only
+        # ``git ls-remote`` against origin.  No push, no
+        # commit, no force.
+        remote_sha = self._read_remote_ticket_head(
+            ticket_branch=self.workspace.ticket_branch,
+        )
+
+        if remote_sha != recovered_sha:
+            raise PersistenceError(
+                "Remote ticket branch HEAD does not match "
+                "the recovered persisted commit SHA.\n"
+                f"remote:  {remote_sha}\n"
+                f"recovered: {recovered_sha}"
+            )
+
+        # Final invariant: local and remote agree on the
+        # authoritative recovered SHA.
+        if local_head != remote_sha:
+            raise PersistenceError(
+                "Local and remote ticket branch HEADs disagree.\n"
+                f"local:   {local_head}\n"
+                f"remote:  {remote_sha}"
+            )
+
+        # Find an existing exact PR or create exactly one.
+        # Never modify the git history.
+        (
+            pull_request_number,
+            pull_request_url,
+            pull_request_created,
+        ) = self._create_or_recover_pull_request(
+            title=pull_request_title,
+            body=pull_request_body,
+        )
+
+        # Return the SHA the runner ACTUALLY verified (local
+        # HEAD, which equals remote HEAD, which equals the
+        # input recovered_sha).  The conductor MUST checkpoint
+        # this returned SHA — never the unverified input.
+        return CommitOnlyContinuationResult(
+            pull_request_number=pull_request_number,
+            pull_request_url=pull_request_url,
+            pull_request_created=pull_request_created,
+            commit_sha=remote_sha,
+            remote_sha=remote_sha,
+        )
+
     def _assert_ticket_branch(self) -> None:
         result = self.sandbox.exec(
             "git",
@@ -116,6 +324,112 @@ class PersistenceRunner:
                 f"{branch!r}; expected "
                 f"{self.workspace.ticket_branch!r}."
             )
+
+    def _local_head_sha(self) -> str:
+        result = self.sandbox.exec(
+            "git",
+            "-C",
+            self.workspace.repository_path,
+            "rev-parse",
+            "HEAD",
+        )
+
+        if result.exit_code != 0:
+            raise PersistenceError(
+                "Unable to read local Git HEAD.\n"
+                f"stdout:\n{result.stdout}\n"
+                f"stderr:\n{result.stderr}"
+            )
+
+        head = result.stdout.strip()
+
+        if not head:
+            raise PersistenceError(
+                "Local Git HEAD was empty."
+            )
+
+        return head
+
+    def _read_remote_ticket_head(
+        self,
+        *,
+        ticket_branch: str,
+    ) -> str:
+        """Read-only verification of the remote ticket branch HEAD.
+
+        This performs NO push, NO commit, NO force operation.  It
+        is a plain ``git ls-remote`` against origin.  Used by the
+        COMMIT_ONLY restart path to confirm a recoverable SHA is
+        still present on the remote.
+        """
+        result = self.sandbox.exec(
+            "bash",
+            "-lc",
+            r"""
+set -euo pipefail
+
+cat > /tmp/ralph-git-askpass <<'EOF'
+#!/bin/sh
+
+case "$1" in
+    *Username*)
+        printf '%s\n' "$RALPH_GIT_USERNAME"
+        ;;
+    *Password*)
+        printf '%s\n' "$RALPH_GITHUB_TOKEN"
+        ;;
+    *)
+        exit 1
+        ;;
+esac
+EOF
+
+chmod 700 /tmp/ralph-git-askpass
+
+cleanup() {
+    rm -f /tmp/ralph-git-askpass
+}
+
+trap cleanup EXIT
+
+remote_sha="$(
+    git ls-remote \
+      origin \
+      "refs/heads/$RALPH_TICKET_BRANCH" \
+    | awk '{print $1}'
+)"
+
+test -n "$remote_sha"
+
+echo "RALPH_REMOTE_SHA=$remote_sha"
+""",
+            env={
+                "RALPH_TICKET_BRANCH":
+                    ticket_branch,
+                "RALPH_GIT_USERNAME":
+                    "x-access-token",
+                "RALPH_GITHUB_TOKEN":
+                    self.github_token,
+                "GIT_ASKPASS":
+                    "/tmp/ralph-git-askpass",
+                "GIT_TERMINAL_PROMPT":
+                    "0",
+            },
+            timeout=120,
+        )
+
+        if result.exit_code != 0:
+            raise PersistenceError(
+                "Unable to read remote ticket branch HEAD.\n"
+                f"exit_code: {result.exit_code}\n"
+                f"stdout:\n{result.stdout}\n"
+                f"stderr:\n{result.stderr}"
+            )
+
+        return self._extract_marker(
+            result.stdout,
+            "RALPH_REMOTE_SHA",
+        )
 
     def _commit_or_resume(
         self,

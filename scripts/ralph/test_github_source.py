@@ -1,3 +1,4 @@
+import os
 import unittest
 
 from unittest.mock import patch
@@ -248,6 +249,72 @@ class GitHubTaskSourceTests(unittest.TestCase):
             [task.number for task in tasks],
             [15],
         )
+
+    @patch("scripts.ralph.github_source.subprocess.run")
+    def test_inherits_path_from_caller_environment(
+        self,
+        run,
+    ):
+        """GH_TOKEN must overlay the inherited environment so PATH
+        and other ambient variables remain available to ``gh``."""
+        run.return_value.stdout = "[]"
+
+        saved_path = os.environ.get("PATH")
+        os.environ["PATH"] = "/usr/local/bin:/usr/bin"
+
+        try:
+            source = GitHubTaskSource(
+                repository="Measure-2wice/sound-hub",
+                milestone="M2",
+                github_token="ghs_secret",
+            )
+
+            source.list_tasks()
+        finally:
+            if saved_path is None:
+                os.environ.pop("PATH", None)
+            else:
+                os.environ["PATH"] = saved_path
+
+        env = run.call_args.kwargs["env"]
+
+        self.assertEqual(
+            env["GH_TOKEN"],
+            "ghs_secret",
+        )
+        self.assertIn("PATH", env)
+        self.assertEqual(
+            env["PATH"],
+            "/usr/local/bin:/usr/bin",
+        )
+
+    @patch("scripts.ralph.github_source.subprocess.run")
+    def test_token_never_appears_in_command_args(
+        self,
+        run,
+    ):
+        """The token must not appear in the subprocess command."""
+        run.return_value.stdout = "[]"
+
+        source = GitHubTaskSource(
+            repository="Measure-2wice/sound-hub",
+            milestone="M2",
+            github_token="ghs_should_not_leak",
+        )
+
+        source.list_tasks()
+
+        env = run.call_args.kwargs["env"]
+        self.assertEqual(
+            env["GH_TOKEN"],
+            "ghs_should_not_leak",
+        )
+        for arg in run.call_args.args[0]:
+            self.assertNotIn(
+                "ghs_should_not_leak",
+                str(arg),
+            )
+
 
 if __name__ == "__main__":
     unittest.main()

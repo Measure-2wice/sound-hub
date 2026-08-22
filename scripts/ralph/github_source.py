@@ -1,4 +1,5 @@
 import json
+import os
 import re
 import subprocess
 from dataclasses import dataclass
@@ -110,10 +111,12 @@ class GitHubTaskSource:
         repository: str,
         milestone: str,
         parent_issue: Optional[int] = None,
+        github_token: Optional[str] = None,
     ):
         self.repository = repository
         self.milestone = milestone
         self.parent_issue = parent_issue
+        self.github_token = github_token
 
     def list_tasks(self) -> List[GitHubTask]:
         command = [
@@ -132,11 +135,21 @@ class GitHubTaskSource:
             "number,title,state,labels,body",
         ]
 
+        # Overlay the inherited environment so PATH and other
+        # ambient variables (locale, etc.) remain available to the
+        # ``gh`` binary. The token is added on top — never the only
+        # key, since that would lose PATH.
+        env = os.environ.copy()
+
+        if self.github_token is not None:
+            env["GH_TOKEN"] = self.github_token
+
         result = subprocess.run(
             command,
             check=True,
             capture_output=True,
             text=True,
+            env=env,
         )
 
         raw_tasks = json.loads(result.stdout)

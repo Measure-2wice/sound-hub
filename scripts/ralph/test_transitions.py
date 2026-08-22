@@ -61,6 +61,14 @@ class TicketTransitionTests(unittest.TestCase):
             )
         )
 
+    def test_failed_qa_can_return_to_fixing(self):
+        self.assertTrue(
+            can_transition(
+                TicketState.AUTOMATED_QA,
+                TicketState.FIXING,
+            )
+        )
+
     def test_ralph_cannot_jump_directly_to_integrated(self):
         self.assertFalse(
             can_transition(

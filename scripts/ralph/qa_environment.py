@@ -1,5 +1,5 @@
 from dataclasses import dataclass
-from typing import Mapping, Optional
+from typing import Optional
 
 from scripts.ralph.sandbox import (
     SandboxCommandResult,
@@ -14,7 +14,7 @@ class QaEnvironmentError(RuntimeError):
 @dataclass(frozen=True)
 class QaEnvironment:
     database_url: str
-    env: Mapping[str, str]
+    env: dict[str, str]
 
 
 class PostgresQaEnvironment:
@@ -25,6 +25,12 @@ class PostgresQaEnvironment:
     directory so PostgreSQL never reaches for /var/run/postgresql.
 
     Authentication is local trust only. No password is fabricated.
+
+    Lifecycle invariant: once ``_start_cluster`` succeeds, ``_started`` is
+    ``True`` and ``stop()`` will tear the cluster down. If anything after
+    the cluster start (createdb, SQL verification, readiness verification,
+    etc.) fails, the error escapes only after ``stop()`` has run in the
+    ``finally`` block, so the postgres process cannot leak.
     """
 
     def __init__(
@@ -50,12 +56,24 @@ class PostgresQaEnvironment:
         self._bindir = self._locate_bindir()
         self._prepare_directories()
         self._init_cluster()
-        self._start_cluster()
-        self._create_database()
-        self._verify_sql()
-        self._verify_readiness()
+        try:
+            self._start_cluster()
+        except BaseException:
+            self._safe_stop()
+            raise
 
+        # From this point forward the cluster is running; if anything
+        # below fails, ``stop()`` MUST be invoked before the error
+        # escapes so the postgres process is not leaked.
         self._started = True
+
+        try:
+            self._create_database()
+            self._verify_sql()
+            self._verify_readiness()
+        except BaseException:
+            self._safe_stop()
+            raise
 
         database_url = (
             f"postgresql://tenki@127.0.0.1:"
@@ -85,6 +103,13 @@ class PostgresQaEnvironment:
                 pass
 
         self._started = False
+
+    def _safe_stop(self) -> None:
+        """Best-effort stop used in failure paths. Never re-raises."""
+        try:
+            self.stop()
+        except Exception:
+            pass
 
     def _install_postgres(self) -> None:
         self._run(["sudo", "apt-get", "update"])

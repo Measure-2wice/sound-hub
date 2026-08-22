@@ -200,6 +200,101 @@ class PostgresQaEnvironmentTests(unittest.TestCase):
                     text,
                 )
 
+    def test_partial_start_stop_still_called_when_createdb_fails(
+        self,
+    ):
+        """If pg_ctl start succeeds but createdb fails, stop() must
+        still run so the postgres process is not leaked.
+
+        The lifecycle invariant: _started must flip to True the
+        instant pg_ctl start succeeds, and any later failure must
+        trigger stop() before the exception escapes.
+        """
+
+        def _exec_fail_createdb(*args, **kwargs):
+            if (
+                len(args) >= 1
+                and args[0]
+                == f"{self.environment._bindir}/createdb"
+            ):
+                return SandboxCommandResult(
+                    exit_code=1,
+                    stdout="",
+                    stderr="createdb: database creation failed",
+                )
+
+            return _exec_ok(*args, **kwargs)
+
+        self.sandbox.exec.side_effect = _exec_fail_createdb
+
+        with self.assertRaises(QaEnvironmentError):
+            self.environment.start()
+
+        stop_calls = self._find_calls("pg_ctl", "stop")
+        self.assertGreaterEqual(
+            len(stop_calls),
+            1,
+            "pg_ctl stop was not invoked when post-start work failed",
+        )
+
+    def test_partial_start_stop_still_called_when_sql_verify_fails(
+        self,
+    ):
+        def _exec_fail_sql(*args, **kwargs):
+            if (
+                len(args) >= 1
+                and args[0]
+                == f"{self.environment._bindir}/psql"
+            ):
+                return SandboxCommandResult(
+                    exit_code=1,
+                    stdout="",
+                    stderr="psql: connection to server failed",
+                )
+
+            return _exec_ok(*args, **kwargs)
+
+        self.sandbox.exec.side_effect = _exec_fail_sql
+
+        with self.assertRaises(QaEnvironmentError):
+            self.environment.start()
+
+        stop_calls = self._find_calls("pg_ctl", "stop")
+        self.assertGreaterEqual(
+            len(stop_calls),
+            1,
+            "pg_ctl stop was not invoked when SQL verify failed",
+        )
+
+    def test_partial_start_stop_still_called_when_readiness_fails(
+        self,
+    ):
+        def _exec_fail_ready(*args, **kwargs):
+            if (
+                len(args) >= 1
+                and args[0]
+                == f"{self.environment._bindir}/pg_isready"
+            ):
+                return SandboxCommandResult(
+                    exit_code=2,
+                    stdout="",
+                    stderr="pg_isready: no response",
+                )
+
+            return _exec_ok(*args, **kwargs)
+
+        self.sandbox.exec.side_effect = _exec_fail_ready
+
+        with self.assertRaises(QaEnvironmentError):
+            self.environment.start()
+
+        stop_calls = self._find_calls("pg_ctl", "stop")
+        self.assertGreaterEqual(
+            len(stop_calls),
+            1,
+            "pg_ctl stop was not invoked when readiness verify failed",
+        )
+
 
 if __name__ == "__main__":
     unittest.main()
