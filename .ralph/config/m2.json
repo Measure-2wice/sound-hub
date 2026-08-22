@@ -36,10 +36,7 @@
 
   "selection": {
     "requiredLabel": "ready-for-ralph",
-    "skipLabels": [
-      "supervised-agent",
-      "needs-reshaping"
-    ]
+    "skipLabels": ["supervised-agent", "needs-reshaping"]
   },
 
   "qa": {

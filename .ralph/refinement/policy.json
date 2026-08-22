@@ -22,12 +22,7 @@
     "Completion produces a meaningful independently reviewable increment"
   ],
 
-  "acceptanceCriterionDispositions": [
-    "IMPLEMENT",
-    "PROVEN",
-    "VALIDATION",
-    "BLOCKED"
-  ],
+  "acceptanceCriterionDispositions": ["IMPLEMENT", "PROVEN", "VALIDATION", "BLOCKED"],
 
   "alreadySatisfiedSignals": [
     "All current acceptance criteria are demonstrably satisfied by already-integrated work",
@@ -66,10 +61,5 @@
     "A child ticket has no independent validation strategy"
   ],
 
-  "verdicts": [
-    "RALPH_READY",
-    "RESHAPE_REQUIRED",
-    "ALREADY_SATISFIED",
-    "SUPERVISED_REQUIRED"
-  ]
+  "verdicts": ["RALPH_READY", "RESHAPE_REQUIRED", "ALREADY_SATISFIED", "SUPERVISED_REQUIRED"]
 }
