@@ -12,6 +12,7 @@
     "test": "pnpm --filter @soundhub/api test && pnpm --filter @soundhub/web test && pnpm test:repository && pnpm test:forbidden-deps",
     "test:repository": "pnpm --filter @soundhub/api test:full",
     "test:forbidden-deps": "node --test scripts/check-forbidden-deps.test.mjs",
+    "test:ralph-smoke": "node --test scripts/ralph-smoke-marker.test.mjs",
     "test:e2e": "pnpm --filter @soundhub/web test:e2e",
     "lint": "eslint .",
     "lint:fix": "eslint . --fix",
