@@ -30,7 +30,7 @@
     "db:test:cycle": "apps/api/node_modules/.bin/tsx scripts/db-test-cycle.mjs",
     "check:forbidden-deps": "node scripts/check-forbidden-deps.mjs",
     "acceptance-gate": "node scripts/acceptance-gate.mjs",
-    "test:ralph-milestone-smoke": "node --test scripts/ralph-milestone-smoke-a.test.mjs"
+    "test:ralph-milestone-smoke": "node --test scripts/ralph-milestone-smoke-a.test.mjs scripts/ralph-milestone-smoke-b.test.mjs"
   },
   "devDependencies": {
     "@eslint/js": "^9.37.0",
