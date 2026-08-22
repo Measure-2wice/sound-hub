@@ -129,10 +129,25 @@ class ReviewRunner:
 
         response = self._call_nebius(prompt)
 
-        return self._parse_response(
+        result = self._parse_response(
             response,
             stage=stage,
         )
+
+        # Console observability: project the trusted
+        # stage + verdict enums only.  No model
+        # content ever reaches the operator's
+        # terminal.  Findings, summary, and any
+        # subprocess text remain in the dedicated
+        # checkpoint evidence fields.
+        print(
+            "RALPH REVIEW: "
+            f"{result.stage.value} -> "
+            f"{result.verdict.value}",
+            flush=True,
+        )
+
+        return result
 
     def _read_complete_diff(self) -> str:
         result = self.sandbox.exec(

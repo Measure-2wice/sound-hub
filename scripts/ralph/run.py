@@ -631,6 +631,17 @@ def _consume_attempt(
     if current + 1 > limit:
         # ``last_error`` is Ralph-owned control-plane data;
         # only static ``TerminalReason`` messages are allowed.
+        # The counter and limit are also Ralph-owned numeric
+        # state; they are safe to project to the operator
+        # console so the human can see which budget gate
+        # blocked the run.
+        print(
+            "RALPH BUDGET: "
+            f"{_budget_field_label(field)} "
+            f"{current + 1}/{limit} -> "
+            "BLOCKED_FOR_HUMAN",
+            flush=True,
+        )
         blocked = replace(
             updated,
             state=TicketState.BLOCKED_FOR_HUMAN,
@@ -640,6 +651,24 @@ def _consume_attempt(
         raise _BudgetExhausted(blocked)
 
     return updated
+
+
+# Map checkpoint attempt-counter field names to the
+# static human-readable labels used in budget-exhaustion
+# console lines.  Field names are Ralph-owned internals;
+# the labels are static and have no relation to model
+# output, subprocess output, or configuration strings.
+_BUDGET_FIELD_LABELS: dict = {
+    "implementation_attempts": "implementation",
+    "fix_attempts": "fix",
+    "qa_attempts": "QA",
+    "review_attempts": "review",
+    "review_cycles_consumed": "review cycles",
+}
+
+
+def _budget_field_label(field: str) -> str:
+    return _BUDGET_FIELD_LABELS.get(field, field)
 
 
 class _BudgetExhausted(Exception):
@@ -973,6 +1002,21 @@ class Conductor:
                 self.checkpoint.review_cycles_consumed
                 > self._budgets.max_review_cycles
             ):
+                # Counter and limit are Ralph-owned
+                # numeric state and are safe to
+                # project to the operator console so
+                # the human can see the exact gate
+                # that blocked the run.  No model
+                # content, subprocess text, or
+                # configuration strings are exposed.
+                print(
+                    "RALPH BUDGET: "
+                    f"review cycles "
+                    f"{self.checkpoint.review_cycles_consumed}"
+                    f"/{self._budgets.max_review_cycles} -> "
+                    "BLOCKED_FOR_HUMAN",
+                    flush=True,
+                )
                 self._record_terminal(
                     state=TicketState.BLOCKED_FOR_HUMAN,
                     reason=(
@@ -1038,6 +1082,11 @@ class Conductor:
                 # ``last_error`` string is resolved
                 # through the closed ``TerminalReason``
                 # trust boundary.
+                print(
+                    "RALPH: PRE_QA requested fixes "
+                    "-> FIXING",
+                    flush=True,
+                )
                 self.checkpoint = replace(
                     self.checkpoint,
                     state=TicketState.FIXING,
@@ -1084,6 +1133,11 @@ class Conductor:
             # ``last_error`` string is resolved
             # through the closed ``TerminalReason``
             # trust boundary.
+            print(
+                "RALPH: PRE_PERSISTENCE requested fixes "
+                "-> FIXING",
+                flush=True,
+            )
             self.checkpoint = replace(
                 self.checkpoint,
                 state=TicketState.FIXING,
@@ -1246,6 +1300,11 @@ class Conductor:
             == QaStatus.CODE_FAILURE
         ):
             evidence = qa_result.evidence()
+
+            print(
+                "RALPH: QA code failure -> FIXING",
+                flush=True,
+            )
 
             self.checkpoint = replace(
                 self.checkpoint,

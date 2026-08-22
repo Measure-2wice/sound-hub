@@ -1,3 +1,4 @@
+import re
 from dataclasses import dataclass
 from enum import Enum
 from typing import Mapping, Optional
@@ -14,6 +15,94 @@ class QaStatus(str, Enum):
     PASSED = "PASSED"
     CODE_FAILURE = "CODE_FAILURE"
     INFRA_FAILURE = "INFRA_FAILURE"
+
+
+# Console-output trust boundary
+# ---------------------------------------------------------------------------
+#
+# QA command ``name`` values come from the milestone
+# configuration and are intended to be short identifiers
+# ("format-check", "ralph-smoke").  They are NOT arbitrary
+# subprocess output.  Even so, we constrain the console
+# projection to a small safe character set and length so:
+#
+#   - a misconfigured name cannot inject ANSI escapes or
+#     control characters into the operator's terminal,
+#   - a future review surface (e.g. an internal Slack
+#     bridge) never inherits a longer, attacker-controlled
+#     string by accident.
+#
+# No subprocess stdout, stderr, command text, or
+# environment variable is ever projected to the console
+# by QaRunner.
+_QA_NAME_SAFE_RE = re.compile(r"[^A-Za-z0-9_.\-]")
+
+
+def _sanitize_qa_name(name: str) -> str:
+    """Project a configured QA command name to a
+    console-safe identifier.
+
+    - Replaces every disallowed character with ``_``.
+    - Truncates to a 32-character cap.
+    - Returns ``"<unnamed>"`` for an empty result.
+    """
+    if not name:
+        return "<unnamed>"
+
+    cleaned = _QA_NAME_SAFE_RE.sub("_", name)
+    cleaned = cleaned[:32]
+
+    if not cleaned:
+        return "<unnamed>"
+
+    return cleaned
+
+
+# Operator-facing QA status label.
+#
+# The internal ``QaStatus`` enum keeps the word
+# ``PASSED`` for symmetry with the failure names
+# (``CODE_FAILURE``, ``INFRA_FAILURE``).  The operator
+# console, however, must use the short token ``PASS``
+# to match the contract in the Ralph observability
+# spec.
+#
+# This is a presentation-only mapping.  It MUST NOT
+# change ``QaStatus`` semantics, the QA evidence
+# format, the ``last_error`` text, the checkpoint
+# schema, or any state-machine transitions.
+_QA_STATUS_LABELS: dict = {
+    QaStatus.PASSED: "PASS",
+    QaStatus.CODE_FAILURE: "CODE_FAILURE",
+    QaStatus.INFRA_FAILURE: "INFRA_FAILURE",
+}
+
+
+def _qa_status_label(status: "QaStatus") -> str:
+    """Return the operator-facing console label for a
+    ``QaStatus``.  Falls back to the enum value if a
+    future status is added before its label is wired
+    in, so the console never silently drops a status.
+    """
+    return _QA_STATUS_LABELS.get(status, status.value)
+
+
+def _announce_qa_start(name: str) -> None:
+    print(
+        f"RALPH QA: starting {_sanitize_qa_name(name)}",
+        flush=True,
+    )
+
+
+def _announce_qa_result(
+    name: str,
+    status: "QaStatus",
+) -> None:
+    print(
+        f"RALPH QA: {_sanitize_qa_name(name)} "
+        f"-> {_qa_status_label(status)}",
+        flush=True,
+    )
 
 
 @dataclass(frozen=True)
@@ -91,10 +180,14 @@ class QaRunner:
         results = []
 
         for command in commands:
+            _announce_qa_start(command.name)
+
             result = self._run_command(
                 command,
                 env=env,
             )
+
+            _announce_qa_result(command.name, result.status)
 
             results.append(result)
 
