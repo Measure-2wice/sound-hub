@@ -20,7 +20,39 @@ Boundary contract:
     invalid number) are surfaced via ``malformed_reasons`` — the
     recovery layer uses that to AMBIGUOUS-collapse rather than
     silently drop bad candidates.
+
+Verified HTTP 404 vs. malformed boundary:
+
+  ``_request`` uses a private ``_VerifiedNotFound`` sentinel to
+  represent a verified HTTP 404 received with
+  ``allow_not_found=True``.  This sentinel is intentionally
+  distinct from ``None`` (malformed / unparseable body) and from
+  any well-formed JSON value (FOUND).  Callers MUST map the
+  sentinel to an ABSENT classification and ``None`` (or any
+  malformed indicator) to a MALFORMED classification.  The
+  recovery layer depends on this distinction to choose
+  NOTHING_DURABLE vs AMBIGUOUS.
 """
+
+
+class _VerifiedNotFound:
+    """Private sentinel returned by ``_request`` for a verified
+    HTTP 404 received with ``allow_not_found=True``.
+
+    This sentinel is the only signal that distinguishes a real
+    GitHub 404 from a malformed/null response body.  It is
+    deliberately not equal to any other object the probe could
+    return.  Callers MUST handle it explicitly.
+    """
+
+    __slots__ = ()
+
+    def __repr__(self) -> str:
+        return "_VerifiedNotFound()"
+
+
+_VERIFIED_NOT_FOUND = _VerifiedNotFound()
+
 
 import json
 from typing import Optional
@@ -67,9 +99,19 @@ class GitHubReadOnlyProbe:
             allow_not_found=True,
         )
 
-        # Transport / sandbox errors raise RuntimeError via
-        # ``_request``.  ``None`` here means the response body was
-        # not parseable JSON, which Ralph classifies as malformed.
+        # A verified HTTP 404 with ``allow_not_found=True`` is
+        # the canonical "branch does not exist" signal from
+        # GitHub and MUST be reported as ABSENT, not as
+        # malformed.  Transport errors raise via ``_request``;
+        # ``None`` here means the response body was not
+        # parseable JSON, which Ralph classifies as malformed.
+        if isinstance(response, _VerifiedNotFound):
+            return BranchLookup(
+                absent_reason=(
+                    BranchAbsentReason.NOT_FOUND
+                ),
+            )
+
         if response is None:
             return BranchLookup(
                 malformed_reason=(
@@ -369,7 +411,7 @@ except urllib.error.HTTPError as error:
         error.code == 404
         and "allow_not_found" in request_data
     ):
-        sys.stdout.write("null")
+        sys.stdout.write("__RALPH_VERIFIED_NOT_FOUND__")
         sys.exit(0)
 
     sys.stderr.write(
@@ -396,6 +438,15 @@ except urllib.error.HTTPError as error:
             )
 
         raw = result.stdout.strip()
+
+        # A verified HTTP 404 (allow_not_found=True) is reported
+        # by the subprocess with the literal sentinel string
+        # ``__RALPH_VERIFIED_NOT_FOUND__``.  This MUST NOT be
+        # conflated with empty stdout, the JSON ``null`` literal,
+        # or unparseable JSON — those are all malformed bodies
+        # and Ralph must fail closed on them.
+        if raw == "__RALPH_VERIFIED_NOT_FOUND__":
+            return _VERIFIED_NOT_FOUND
 
         if not raw or raw == "null":
             return None

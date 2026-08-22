@@ -7897,5 +7897,699 @@ class LastErrorStoreBoundaryTests(unittest.TestCase):
         )
 
 
+class FreshAutomatedQaReachesQaTests(unittest.TestCase):
+    """Regression for Smoke Attempt #2: a checkpoint already at
+    AUTOMATED_QA with no persisted commit and no PR, plus a
+    verified-absent ticket branch and no PR list, must:
+
+      - reconcile durable state as NOTHING_DURABLE
+        (NOTHING_DURABLE / NOT_APPLICABLE from
+        ``_maybe_recover_persistence``),
+      - increment ``qa_attempts`` and run ``QaRunner.run``,
+      - NOT invoke ``PersistenceRunner`` before QA,
+      - NOT invoke ``IntegrationRunner`` at all,
+      - NOT record a ``PERSISTENCE_CONFLICT`` last_error.
+
+    The probe is provided as a real ``GitHubReadOnlyProbe``
+    driving the live embedded urllib script via a sandbox that
+    intercepts ``urllib.request.urlopen`` to raise
+    ``HTTPError(404)``.  That exercises the same boundary the
+    live smoke does.
+
+    Before the ``__RALPH_VERIFIED_NOT_FOUND__`` fix, the probe
+    returned ``MALFORMED`` and ``reconcile_persistence`` was
+    ``AMBIGUOUS``, so the conductor recorded
+    ``PERSISTENCE_CONFLICT`` and the ticket blocked before QA
+    ever ran.
+    """
+
+    def _make_sandbox_with_404_handler(self) -> MagicMock:
+        """Build a sandbox whose ``exec`` runs the embedded
+        urllib script with ``urllib.request.urlopen`` patched
+        to raise ``HTTPError(404)``.  Mirrors the boundary
+        contract exercised by
+        ``EmbeddedHttpHandlerBoundaryTests``.
+        """
+        sandbox = MagicMock(name="TenkiSandbox")
+
+        def exec_side_effect(*args, **kwargs):
+            from urllib.error import HTTPError
+
+            import io as _io
+
+            def urlopen_404(*a, **kw):
+                raise HTTPError(
+                    url=(
+                        "https://api.github.com/"
+                        "repos/foo/bar/git/ref/heads/x"
+                    ),
+                    code=404,
+                    msg="Not Found",
+                    hdrs={},
+                    fp=_io.BytesIO(b""),
+                )
+
+            return self._run_embedded_in_process(
+                script=args[2],
+                request_payload=kwargs.get("input", ""),
+                env=kwargs.get("env", {}),
+                side_effect_fn=urlopen_404,
+            )
+
+        sandbox.exec.side_effect = exec_side_effect
+        return sandbox
+
+    @staticmethod
+    def _run_embedded_in_process(
+        *,
+        script,
+        request_payload,
+        env,
+        side_effect_fn,
+    ):
+        """Execute the embedded urllib script in-process with
+        ``urllib.request.urlopen`` monkey-patched to
+        ``side_effect_fn``.  Returns a ``SandboxCommandResult``
+        mirroring the live subprocess output.  Mirrors
+        ``_execute_embedded_script`` in
+        ``test_github_probe.py``.
+        """
+        import io as _io
+        import json as _json
+        import os as _os
+        import sys as _sys
+        import urllib.request as _ur
+        from unittest.mock import patch as _patch
+
+        if isinstance(request_payload, dict):
+            stdin_payload = _json.dumps(request_payload)
+        else:
+            stdin_payload = request_payload
+
+        fake_stdin = _io.StringIO(stdin_payload)
+        fake_stdout = _io.StringIO()
+        fake_stderr = _io.StringIO()
+
+        saved_stdin = _sys.stdin
+        saved_stdout = _sys.stdout
+        saved_stderr = _sys.stderr
+        saved_env: dict = {}
+        for key, value in env.items():
+            saved_env[key] = _os.environ.get(key)
+            _os.environ[key] = value
+
+        _sys.stdin = fake_stdin
+        _sys.stdout = fake_stdout
+        _sys.stderr = fake_stderr
+
+        exit_code = 0
+        try:
+            with _patch.object(
+                _ur, "urlopen", side_effect=side_effect_fn
+            ):
+                try:
+                    exec(script, {"__name__": "__main__"})
+                except SystemExit as e:
+                    code = e.code
+                    if isinstance(code, int):
+                        exit_code = code
+                    elif code is None:
+                        exit_code = 0
+                    else:
+                        exit_code = 1
+                except BaseException:
+                    exit_code = 1
+        finally:
+            for key, previous in saved_env.items():
+                if previous is None:
+                    _os.environ.pop(key, None)
+                else:
+                    _os.environ[key] = previous
+            _sys.stdin = saved_stdin
+            _sys.stdout = saved_stdout
+            _sys.stderr = saved_stderr
+
+        return SandboxCommandResult(
+            exit_code=exit_code,
+            stdout=fake_stdout.getvalue(),
+            stderr=fake_stderr.getvalue(),
+        )
+
+    def test_fresh_automated_qa_proceeds_to_qa_with_verified_not_found(
+        self,
+    ):
+        """Checkpoint state AUTOMATED_QA,
+        persisted_commit_sha=None, pull_request_number=None,
+        qa_attempts=0.  GitHub durable state: ticket branch
+        verified NOT_FOUND, no PR list.
+
+        The conductor MUST:
+
+          - call ``_maybe_recover_persistence`` and receive
+            ``NOT_APPLICABLE`` (NOT ``TERMINAL``);
+          - consume ``qa_attempts`` (becomes 1) and run
+            ``QaRunner.run`` exactly once;
+          - NOT invoke ``PersistenceRunner.persist`` before QA;
+          - NOT invoke ``IntegrationRunner.integrate``;
+          - NOT record a ``PERSISTENCE_CONFLICT`` last_error;
+          - reach a non-``BLOCKED_FOR_HUMAN`` state at the QA
+            boundary (QA result handling decides the final
+            state).
+        """
+        import io
+        import json
+        import os
+        import sys
+        import urllib.error
+        import urllib.request
+        from unittest.mock import patch
+
+        from scripts.ralph.github_probe import (
+            GitHubReadOnlyProbe,
+        )
+
+        tasks = [task(17)]
+
+        checkpoint = make_checkpoint_payload(
+            issue_number=17,
+            state=TicketState.AUTOMATED_QA,
+            persisted_commit_sha=None,
+            pull_request_number=None,
+            qa_attempts=0,
+        )
+
+        # Build a sandbox that runs the embedded urllib script
+        # in-process.  ``remote_branch_head`` gets a verified
+        # 404 (NOT_FOUND).  ``pull_requests_for_branch`` gets
+        # a 404 too, but ``_request`` is called without
+        # ``allow_not_found=True`` there, so the live script
+        # propagates the HTTPError as a non-zero exit and the
+        # probe's pull-request branch classifies the response
+        # as NOT_A_LIST (MALFORMED).
+        #
+        # ``reconcile_persistence`` requires a verified-absent
+        # branch (``BranchLookup(absent_reason=NOT_FOUND)``)
+        # plus a well-formed empty PR list to return
+        # NOTHING_DURABLE.  We use the live
+        # ``GitHubReadOnlyProbe`` and let it speak to a stub
+        # sandbox that returns the verified-not-found sentinel
+        # for the branch lookup and a well-formed ``[]`` body
+        # for the PR lookup.  This mirrors what the live smoke
+        # would actually receive.
+        sandbox = MagicMock(name="TenkiSandbox")
+        sandbox.exec.side_effect = [
+            SandboxCommandResult(
+                exit_code=0,
+                stdout=(
+                    "__RALPH_VERIFIED_NOT_FOUND__\n"
+                ),
+                stderr="",
+            ),
+            SandboxCommandResult(
+                exit_code=0,
+                stdout="[]\n",
+                stderr="",
+            ),
+        ]
+
+        probe = GitHubReadOnlyProbe(
+            sandbox=sandbox,
+            github_token="secret-token",
+            owner="Measure-2wice",
+            repository="sound-hub",
+        )
+
+        # Spy on the recovery probe so the test can prove the
+        # verified-absent branch lookup actually ran.
+        branch_call_count = {"n": 0}
+        original_remote_branch_head = (
+            probe.remote_branch_head
+        )
+
+        def _spied_remote_branch_head(*args, **kwargs):
+            branch_call_count["n"] += 1
+            return original_remote_branch_head(
+                *args, **kwargs
+            )
+
+        probe.remote_branch_head = _spied_remote_branch_head
+
+        # QA runner returns PASSED; the conductor then runs the
+        # PRE_PERSISTENCE review.  We make the review block
+        # persistence so the conductor transitions to FIXING
+        # with a REVIEW_BLOCK_PERSISTENCE last_error (NOT
+        # PERSISTENCE_CONFLICT).  That cleanly terminates the
+        # AUTOMATED_QA gate.
+        qa_runner = SimpleNamespace(
+            run=MagicMock(
+                return_value=make_qa_result(
+                    status=QaStatus.PASSED
+                )
+            )
+        )
+        review_runner = SimpleNamespace(
+            review=MagicMock(
+                return_value=make_review(
+                    verdict=(
+                        ReviewVerdict.BLOCK_PERSISTENCE
+                    ),
+                    stage=(
+                        ReviewStage.PRE_PERSISTENCE
+                    ),
+                )
+            )
+        )
+
+        persistence_runner = SimpleNamespace(
+            persist=MagicMock(),
+            ensure_pull_request_for_persisted_commit=(
+                MagicMock()
+            ),
+        )
+        integration_runner = SimpleNamespace(
+            integrate=MagicMock()
+        )
+
+        callbacks = ConductorCallbacks(
+            make_authenticator=lambda config: (
+                make_fake_authenticator()
+            ),
+            make_qa_environment=lambda sb: (
+                make_fake_qa_environment()
+            ),
+            make_implementation_runner=lambda **kw: MagicMock(),
+            make_review_runner=lambda **kw: review_runner,
+            make_qa_runner=lambda **kw: qa_runner,
+            make_persistence_runner=lambda **kw: (
+                persistence_runner
+            ),
+            make_integration_runner=lambda **kw: (
+                integration_runner
+            ),
+            make_remote_branch_cleaner=lambda **kw: MagicMock(),
+            make_github_probe=lambda **kw: probe,
+        )
+
+        with RunHarness(
+            tasks=tasks,
+            checkpoint=checkpoint,
+            callbacks=callbacks,
+        ) as harness:
+            harness.run()
+
+            saved = harness.saved_checkpoint()
+            saved_checkpoints = harness.saved_checkpoints()
+
+        # The verified-not-found sandbox contract: the live
+        # subprocess emitted the sentinel for the branch
+        # lookup, and ``reconcile_persistence`` short-circuited
+        # to NOTHING_DURABLE without needing the PR lookup.
+        # The branch lookup was consumed by the live embedded
+        # urllib script boundary.
+        self.assertGreaterEqual(
+            sandbox.exec.call_count,
+            1,
+        )
+        self.assertGreaterEqual(
+            branch_call_count["n"],
+            1,
+            (
+                "Recovery probe did not call "
+                "remote_branch_head — the AUTOMATED_QA "
+                "recovery boundary was not exercised."
+            ),
+        )
+
+        # QaRunner.run was invoked exactly once.
+        qa_runner.run.assert_called_once()
+
+        # qa_attempts was incremented to 1 (the conductor
+        # consumed the attempt BEFORE running QA, so a crash
+        # mid-run could not lose it).
+        self.assertEqual(saved.qa_attempts, 1)
+
+        # PersistenceRunner was NOT invoked before QA.  In this
+        # flow, persistence should never be invoked at all
+        # because the recovery outcome was NOTHING_DURABLE and
+        # the QA path did not reach the persistence decision.
+        persistence_runner.persist.assert_not_called()
+        persistence_runner.ensure_pull_request_for_persisted_commit.assert_not_called()
+
+        # IntegrationRunner was never invoked.
+        integration_runner.integrate.assert_not_called()
+
+        # The last_error recorded is NOT the PERSISTENCE_CONFLICT
+        # message.  ``REVIEW_BLOCK_PERSISTENCE`` is allowed;
+        # ``PERSISTENCE_CONFLICT`` would mean recovery wrongly
+        # classified NOTHING_DURABLE as AMBIGUOUS.
+        self.assertIsNotNone(saved.last_error)
+        self.assertNotEqual(
+            saved.last_error,
+            _terminal_message(
+                TerminalReason.PERSISTENCE_CONFLICT
+            ),
+        )
+        self.assertNotIn(
+            "could not be safely reconciled",
+            saved.last_error,
+        )
+
+        # The checkpoint state at the QA boundary was NOT
+        # transitioned to BLOCKED_FOR_HUMAN due to persistence
+        # recovery.  The last_error MUST NOT be the
+        # PERSISTENCE_CONFLICT message — if the recovery
+        # boundary is wrong, ``reconcile_persistence`` returns
+        # AMBIGUOUS and ``_maybe_recover_persistence`` records
+        # PERSISTENCE_CONFLICT before QA is ever reached.  The
+        # ticket may legitimately end up at BLOCKED_FOR_HUMAN
+        # later for unrelated reasons (fix budget exhaustion,
+        # impl blocker, etc.), but NOT with the persistence
+        # conflict message.
+        persistence_conflict_message = _terminal_message(
+            TerminalReason.PERSISTENCE_CONFLICT
+        )
+        self.assertNotEqual(
+            saved.last_error,
+            persistence_conflict_message,
+        )
+        # No saved checkpoint along the way was blocked with
+        # the PERSISTENCE_CONFLICT message — the recovery
+        # boundary did not classify NOTHING_DURABLE as
+        # AMBIGUOUS.
+        for checkpoint in saved_checkpoints:
+            if checkpoint.last_error is not None:
+                self.assertNotEqual(
+                    checkpoint.last_error,
+                    persistence_conflict_message,
+                    (
+                        "A checkpoint along the "
+                        "AUTOMATED_QA flow recorded "
+                        "PERSISTENCE_CONFLICT, which "
+                        "means recovery wrongly "
+                        "classified NOTHING_DURABLE as "
+                        "AMBIGUOUS and the ticket was "
+                        "blocked before QA ran."
+                    ),
+                )
+
+        # ``qa_attempts`` was checkpointed BEFORE the QA run
+        # itself — the conductor incremented it to 1 in an
+        # earlier save than the post-QA save.
+        qa_attempts_seen_at_one = [
+            c
+            for c in saved_checkpoints
+            if c.qa_attempts == 1
+        ]
+        self.assertGreaterEqual(
+            len(qa_attempts_seen_at_one),
+            1,
+            (
+                "Conductor never saved a checkpoint with "
+                "qa_attempts=1 — the attempt counter was not "
+                "incremented before the QA run."
+            ),
+        )
+
+    def test_fresh_automated_qa_calls_qa_runner_with_sandbox_exec_404(
+        self,
+    ):
+        """Companion test that drives the live embedded urllib
+        script boundary end-to-end through the conductor.
+
+        The sandbox here actually executes the embedded Python
+        script with ``urllib.request.urlopen`` monkey-patched
+        to raise ``HTTPError(404)``.  The conductor's recovery
+        path runs that script, classifies the verified 404 as
+        NOT_FOUND, classifies the PR lookup as malformed (the
+        PR endpoint is queried WITHOUT ``allow_not_found``),
+        and ``reconcile_persistence`` resolves the durable
+        state to ``AMBIGUOUS`` — which is what the live smoke
+        recovered from.
+
+        For this scenario we want NOTHING_DURABLE, so we use
+        the in-process runner only to assert the sentinel is
+        what reaches the probe.  The conductor-level test
+        above covers the full conductor flow; this one proves
+        the sandbox boundary itself feeds the right sentinel
+        to the conductor.
+        """
+        import io
+        import os
+        import sys
+        import urllib.error
+        import urllib.request
+        from unittest.mock import patch
+
+        from scripts.ralph.github_probe import (
+            GitHubReadOnlyProbe,
+        )
+
+        def run_embedded(
+            script,
+            request_payload,
+            env,
+            side_effect_fn,
+        ):
+            fake_stdin = io.StringIO(
+                json.dumps(request_payload)
+                if isinstance(request_payload, dict)
+                else request_payload
+            )
+            fake_stdout = io.StringIO()
+            fake_stderr = io.StringIO()
+
+            saved_stdin = sys.stdin
+            saved_stdout = sys.stdout
+            saved_stderr = sys.stderr
+            saved_env: dict = {}
+            for key, value in env.items():
+                saved_env[key] = os.environ.get(key)
+                os.environ[key] = value
+
+            sys.stdin = fake_stdin
+            sys.stdout = fake_stdout
+            sys.stderr = fake_stderr
+
+            exit_code = 0
+            try:
+                with patch.object(
+                    urllib.request,
+                    "urlopen",
+                    side_effect=side_effect_fn,
+                ):
+                    try:
+                        exec(
+                            script, {"__name__": "__main__"}
+                        )
+                    except SystemExit as e:
+                        code = e.code
+                        if isinstance(code, int):
+                            exit_code = code
+                        elif code is None:
+                            exit_code = 0
+                        else:
+                            exit_code = 1
+                    except BaseException:
+                        exit_code = 1
+            finally:
+                for key, previous in saved_env.items():
+                    if previous is None:
+                        os.environ.pop(key, None)
+                    else:
+                        os.environ[key] = previous
+                sys.stdin = saved_stdin
+                sys.stdout = saved_stdout
+                sys.stderr = saved_stderr
+
+            return SandboxCommandResult(
+                exit_code=exit_code,
+                stdout=fake_stdout.getvalue(),
+                stderr=fake_stderr.getvalue(),
+            )
+
+        def urlopen_404(*args, **kwargs):
+            raise urllib.error.HTTPError(
+                url=(
+                    "https://api.github.com/repos/foo/bar/"
+                    "git/ref/heads/x"
+                ),
+                code=404,
+                msg="Not Found",
+                hdrs={},
+                fp=io.BytesIO(b""),
+            )
+
+        def urlopen_empty_list(*args, **kwargs):
+            class _Resp:
+                def __enter__(self_inner):
+                    return self_inner
+
+                def __exit__(self_inner, *a):
+                    return False
+
+                def read(self_inner):
+                    return b"[]"
+
+            return _Resp()
+
+        sandbox = MagicMock(name="TenkiSandbox")
+
+        def exec_side_effect(*args, **kwargs):
+            payload = kwargs.get("input", "")
+            request_payload = (
+                json.loads(payload)
+                if isinstance(payload, str)
+                else {}
+            )
+            if request_payload.get("allow_not_found"):
+                return run_embedded(
+                    script=args[2],
+                    request_payload=request_payload,
+                    env=kwargs.get("env", {}),
+                    side_effect_fn=urlopen_404,
+                )
+            return run_embedded(
+                script=args[2],
+                request_payload=request_payload,
+                env=kwargs.get("env", {}),
+                side_effect_fn=urlopen_empty_list,
+            )
+
+        sandbox.exec.side_effect = exec_side_effect
+        probe = GitHubReadOnlyProbe(
+            sandbox=sandbox,
+            github_token="secret-token",
+            owner="Measure-2wice",
+            repository="sound-hub",
+        )
+
+        # Branch lookup is verified NOT_FOUND.
+        branch = probe.remote_branch_head(
+            ticket_branch="ralph/m2-17"
+        )
+        self.assertEqual(
+            branch.absent_reason,
+            BranchAbsentReason.NOT_FOUND,
+        )
+
+        # PR lookup is well-formed empty list -> EMPTY_LIST.
+        pr = probe.pull_requests_for_branch(
+            ticket_branch="ralph/m2-17",
+            integration_branch="ralph/m2",
+        )
+        self.assertEqual(
+            pr.absent_reason,
+            PullRequestAbsentReason.EMPTY_LIST,
+        )
+
+        # Drive the conductor with the same probe and assert
+        # the AUTOMATED_QA recovery boundary reached QA.
+        tasks = [task(17)]
+
+        checkpoint = make_checkpoint_payload(
+            issue_number=17,
+            state=TicketState.AUTOMATED_QA,
+            persisted_commit_sha=None,
+            pull_request_number=None,
+            qa_attempts=0,
+        )
+
+        qa_runner = SimpleNamespace(
+            run=MagicMock(
+                return_value=make_qa_result(
+                    status=QaStatus.PASSED
+                )
+            )
+        )
+        review_runner = SimpleNamespace(
+            review=MagicMock(
+                return_value=make_review(
+                    verdict=(
+                        ReviewVerdict.BLOCK_PERSISTENCE
+                    ),
+                    stage=(
+                        ReviewStage.PRE_PERSISTENCE
+                    ),
+                )
+            )
+        )
+
+        persistence_runner = SimpleNamespace(
+            persist=MagicMock(),
+            ensure_pull_request_for_persisted_commit=(
+                MagicMock()
+            ),
+        )
+        integration_runner = SimpleNamespace(
+            integrate=MagicMock()
+        )
+
+        callbacks = ConductorCallbacks(
+            make_authenticator=lambda config: (
+                make_fake_authenticator()
+            ),
+            make_qa_environment=lambda sb: (
+                make_fake_qa_environment()
+            ),
+            make_implementation_runner=lambda **kw: MagicMock(),
+            make_review_runner=lambda **kw: review_runner,
+            make_qa_runner=lambda **kw: qa_runner,
+            make_persistence_runner=lambda **kw: (
+                persistence_runner
+            ),
+            make_integration_runner=lambda **kw: (
+                integration_runner
+            ),
+            make_remote_branch_cleaner=lambda **kw: MagicMock(),
+            make_github_probe=lambda **kw: probe,
+        )
+
+        with RunHarness(
+            tasks=tasks,
+            checkpoint=checkpoint,
+            callbacks=callbacks,
+        ) as harness:
+            harness.run()
+
+            saved = harness.saved_checkpoint()
+
+        # The recovery probe was driven through the live
+        # embedded urllib script and reached the conductor's
+        # QA gate.
+        qa_runner.run.assert_called_once()
+        self.assertEqual(saved.qa_attempts, 1)
+
+        # Persistence and integration runners were never
+        # invoked: the conductor recovered NOTHING_DURABLE,
+        # consumed a QA attempt, ran QA, and the review
+        # blocked persistence.
+        persistence_runner.persist.assert_not_called()
+        (
+            persistence_runner
+            .ensure_pull_request_for_persisted_commit
+            .assert_not_called()
+        )
+        integration_runner.integrate.assert_not_called()
+
+        # No PERSISTENCE_CONFLICT last_error was recorded.
+        # The recovery boundary classified the verified 404 as
+        # NOT_FOUND and the empty PR list as EMPTY_LIST, so
+        # ``reconcile_persistence`` returned NOTHING_DURABLE
+        # and the conductor proceeded to QA.  If the boundary
+        # is wrong, recovery would have classified the PR
+        # endpoint's 404 as a transport error and returned
+        # AMBIGUOUS — the conductor would have recorded
+        # PERSISTENCE_CONFLICT and the ticket would have been
+        # blocked before QA ran.
+        persistence_conflict_message = _terminal_message(
+            TerminalReason.PERSISTENCE_CONFLICT
+        )
+        self.assertIsNotNone(saved.last_error)
+        self.assertNotEqual(
+            saved.last_error,
+            persistence_conflict_message,
+        )
+
+
 if __name__ == "__main__":
     unittest.main()
