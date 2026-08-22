@@ -76,6 +76,21 @@ Prefer `RALPH_READY` for one coherent delta. Otherwise prefer meaningful reshapi
 
 Never split solely by file, weaken requirements, or invent work to keep an issue alive.
 
+## Routing Labels
+
+When explicitly asked to prepare the evaluated ticket for Ralph,
+apply the routing label corresponding to the verdict:
+
+| Verdict                | Label              |
+| ---------------------- | ------------------ |
+| `RALPH_READY`          | `ready-for-ralph`  |
+| `RESHAPE_REQUIRED`     | `needs-reshaping`  |
+| `SUPERVISED_REQUIRED`  | `supervised-agent` |
+| `ALREADY_SATISFIED`    | (no routing label) |
+
+When merely asked to evaluate or refine a ticket, remain read-only.
+Do not apply, add, or remove any GitHub labels by default.
+
 ## Output
 
 Report:
