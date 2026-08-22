@@ -362,7 +362,160 @@ claude --version
             else "initial implementation"
         )
 
-        completion_instructions = f"""
+        qa_repair = bool(
+            fix_context is not None
+            and fix_context.qa_failure_evidence
+        )
+
+        completion_instructions = self._completion_instructions(
+            completion_path=completion_path,
+            qa_repair=qa_repair,
+        )
+
+        rules_block = """
+Rules:
+
+- Implement only the current ticket boundary.
+- Preserve already-correct work on this branch.
+- Do not redesign unrelated architecture.
+- Do not expand scope beyond the current issue or accepted architecture.
+- Do not push, merge, rebase, reset, switch branches, or close GitHub issues.
+- Do not create pull requests.
+- Do not modify GitHub configuration or credentials.
+- Run focused validation for the implementation.
+- Leave all implementation changes in the working tree.
+- Do not create a git commit. The Ralph controller owns persistence.
+- If durable repository evidence shows the ticket is already satisfied,
+  make no speculative changes.
+- If implementation is blocked by an unresolved decision, stop rather than
+  inventing one.
+""".strip()
+
+        qa_repair_block = ""
+        if qa_repair:
+            qa_repair_block = self._qa_repair_contract()
+
+        before_finishing = """
+Before finishing:
+1. inspect git diff,
+2. inspect git status,
+3. run the focused validation appropriate to the ticket,
+4. write the machine-readable completion JSON file described above.
+""".strip()
+
+        prompt_lines = [
+            f"You are the Ralph implementation agent for SoundHub issue #{issue_number}.",
+            "",
+            f"This is a {iteration_label}.",
+            "",
+            "The repository and correct ticket branch are already prepared for you.",
+            "",
+            f"Read {packet_path} first. It contains the CURRENT authoritative GitHub issue",
+            "and, if present, the specific defects to repair in this iteration.",
+            "",
+            "Then inspect only the durable repository context necessary to implement that",
+            "ticket, including AGENTS.md, CLAUDE.md, specifications, ADRs, tests, and",
+            "existing implementation where relevant.",
+            "",
+            rules_block,
+        ]
+
+        if qa_repair_block:
+            prompt_lines.extend(
+                ["", qa_repair_block]
+            )
+
+        prompt_lines.extend(
+            [
+                "",
+                before_finishing,
+                "",
+                completion_instructions,
+            ]
+        )
+
+        return "\n".join(prompt_lines)
+
+    @staticmethod
+    def _qa_repair_contract() -> str:
+        """QA-failure repair contract for fix iterations.
+
+        Returned ONLY when ``fix_context.qa_failure_evidence``
+        is present.  The contract pins the agent to:
+
+          1. Reading the failed QA evidence carefully and
+             identifying the failing command.
+          2. Repairing the implementation / root cause.
+          3. Rerunning the exact previously-failing QA
+             command after the repair.
+          4. NOT writing ``status: COMPLETE`` while that
+             command still fails.
+          5. Returning ``status: BLOCKED`` if the failing
+             command cannot be made to pass within the
+             authoritative ticket scope.
+
+        The contract uses MUST / MUST NOT language and
+        intentionally avoids naming any specific Ralph QA
+        command so it generalises to any configured gate.
+        """
+        return """
+QA-failure repair contract (applies to this iteration):
+
+- This is a repair of a previously failed automated QA gate.
+  You MUST read the QA failure evidence carefully and
+  identify the failed QA command, its exit code, and the
+  failure output.
+
+- You MUST repair the implementation or root cause that
+  caused the previously failing QA command to fail.
+
+- After the repair, you MUST rerun the EXACT previously
+  failing QA command (the command named in the evidence
+  block of the packet) and observe its exit code and
+  output yourself before writing the completion file.
+
+- You MUST NOT write ``status: COMPLETE`` while the
+  previously failing QA command still fails.  COMPLETE
+  is only valid after you have rerun that exact command
+  and it has exited successfully.
+
+- If the previously failing QA command cannot be made to
+  pass within the authoritative ticket scope (for example
+  because the failure is in unrelated baseline code, the
+  repair would require scope expansion, or the failure is
+  environmental), you MUST return ``status: BLOCKED``
+  with a non-empty ``blocker`` explaining why.  Do NOT
+  claim COMPLETE in that case.
+
+- You MUST stay inside the authoritative ticket boundary.
+  Do NOT redesign unrelated code, expand scope, or repair
+  pre-existing baseline failures that are outside this
+  ticket.  If the evidence describes a failure outside
+  the ticket scope, return ``status: BLOCKED``.
+
+- Ralph's independent QaRunner will rerun the same QA
+  commands after you finish and remains the source of
+  truth.  Your ``validation`` field MUST describe the
+  exact QA command you reran and state that it passed.
+""".strip()
+
+    @staticmethod
+    def _completion_instructions(
+        *,
+        completion_path: str,
+        qa_repair: bool,
+    ) -> str:
+        """Build the machine-readable completion instructions.
+
+        The four-key completion schema and the strict
+        validation rules are identical for every iteration
+        so the strict parser in ``parse_completion`` keeps
+        its contract.  When the iteration is a QA-repair
+        iteration, the ``validation`` guidance is tightened
+        so the agent documents that the exact previously
+        failing QA command was rerun and passed.
+        """
+        base = f"""
 Before finishing you MUST write a single machine-readable JSON file at:
 
     {completion_path}
@@ -398,55 +551,33 @@ Rules:
   the wrong type for any field.
 """.strip()
 
-        rules_block = """
-Rules:
+        if not qa_repair:
+            return base
 
-- Implement only the current ticket boundary.
-- Preserve already-correct work on this branch.
-- Do not redesign unrelated architecture.
-- Do not expand scope beyond the current issue or accepted architecture.
-- Do not push, merge, rebase, reset, switch branches, or close GitHub issues.
-- Do not create pull requests.
-- Do not modify GitHub configuration or credentials.
-- Run focused validation for the implementation.
-- Leave all implementation changes in the working tree.
-- Do not create a git commit. The Ralph controller owns persistence.
-- If durable repository evidence shows the ticket is already satisfied,
-  make no speculative changes.
-- If implementation is blocked by an unresolved decision, stop rather than
-  inventing one.
+        # QA-repair completion discipline: COMPLETE is
+        # only valid after the exact previously failing
+        # QA command has been rerun and passed.  The
+        # four-key schema is unchanged so the strict
+        # parser keeps its contract.
+        return base + "\n\n" + """
+QA-repair completion discipline (this iteration only):
+
+- ``status: COMPLETE`` means ALL of the following:
+    1. the defect identified in the QA failure evidence
+       is repaired;
+    2. the EXACT previously failing QA command named in
+       the evidence block of the packet has been rerun
+       by you; and
+    3. that rerun exited successfully (zero exit code).
+- The ``validation`` field MUST identify the exact QA
+  command you reran and state that it passed.  Do not
+  claim ``validation: "ran tests"`` or any equivalent
+  non-specific statement.  ``validation`` MUST reference
+  the same command named in the evidence block.
+- If any of the three conditions above is not satisfied,
+  you MUST NOT write ``status: COMPLETE``.  Return
+  ``status: BLOCKED`` with a non-empty ``blocker``.
 """.strip()
-
-        before_finishing = """
-Before finishing:
-1. inspect git diff,
-2. inspect git status,
-3. run the focused validation appropriate to the ticket,
-4. write the machine-readable completion JSON file described above.
-""".strip()
-
-        prompt_lines = [
-            f"You are the Ralph implementation agent for SoundHub issue #{issue_number}.",
-            "",
-            f"This is a {iteration_label}.",
-            "",
-            "The repository and correct ticket branch are already prepared for you.",
-            "",
-            f"Read {packet_path} first. It contains the CURRENT authoritative GitHub issue",
-            "and, if present, the specific defects to repair in this iteration.",
-            "",
-            "Then inspect only the durable repository context necessary to implement that",
-            "ticket, including AGENTS.md, CLAUDE.md, specifications, ADRs, tests, and",
-            "existing implementation where relevant.",
-            "",
-            rules_block,
-            "",
-            before_finishing,
-            "",
-            completion_instructions,
-        ]
-
-        return "\n".join(prompt_lines)
 
     def _changed_files(self) -> tuple[str, ...]:
         result = self.sandbox.exec(

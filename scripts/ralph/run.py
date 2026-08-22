@@ -813,6 +813,20 @@ class Conductor:
     ) -> None:
         is_fix = fix_context is not None
 
+        # Static, evidence-free observability.  No
+        # command name, no evidence body, no model
+        # content.  Lets the operator tell a
+        # QA-repair iteration apart from a
+        # reviewer-driven fix iteration at a glance.
+        if (
+            is_fix
+            and fix_context.qa_failure_evidence
+        ):
+            print(
+                "RALPH FIX: repairing failed QA gate",
+                flush=True,
+            )
+
         limit = (
             self._budgets.max_review_fix_iterations
             if is_fix
