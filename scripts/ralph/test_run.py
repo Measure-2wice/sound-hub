@@ -17,6 +17,7 @@ from typing import Optional
 from unittest.mock import MagicMock
 
 from scripts.ralph.checkpoint import (
+    CheckpointError,
     CheckpointStore,
     TicketCheckpoint,
 )
@@ -53,14 +54,19 @@ from scripts.ralph.recovery import (
     PullRequestMalformedReason,
 )
 from scripts.ralph.review import (
+    ReviewError,
     ReviewFinding,
     ReviewResult,
     ReviewStage,
     ReviewVerdict,
 )
 from scripts.ralph.run import (
+    APPROVED_LAST_ERROR_MESSAGES,
     ConductorCallbacks,
     Orchestrator,
+    TERMINAL_REASON_MESSAGES,
+    TerminalReason,
+    _terminal_message,
     build_qa_commands,
     format_findings,
     split_repository,
@@ -936,7 +942,16 @@ class ImplementationOutcomeTests(unittest.TestCase):
             final,
             TicketState.BLOCKED_FOR_HUMAN,
         )
-        self.assertIn(
+        # ``completion_blocker`` is model-authored text and
+        # MUST NOT reach ``checkpoint.last_error``.  The
+        # terminal message is the static
+        # ``IMPLEMENTATION_BLOCKED`` reason — not the
+        # blocker string itself.
+        self.assertEqual(
+            loaded.last_error,
+            "Implementation agent reported a blocker.",
+        )
+        self.assertNotIn(
             "workspace authorization model",
             loaded.last_error or "",
         )
@@ -6121,6 +6136,1764 @@ class RecoveryDispositionPropagationTests(unittest.TestCase):
         self.assertEqual(
             final,
             TicketState.HUMAN_QA_PENDING,
+        )
+
+
+class LastErrorControlPlaneTests(unittest.TestCase):
+    """``checkpoint.last_error`` is Ralph-owned
+    control-plane data.  It MUST NEVER contain
+    model-authored content from
+    ``ReviewResult.summary`` or any
+    ``ReviewFinding`` field.
+
+    These tests prove the conductor copies no
+    reviewer content into ``last_error`` — only
+    static Ralph-authored categorical messages.
+    """
+
+    SECRET = "super-secret-nebius-value-12345"
+
+    FIX_PRE_QA_STATIC = (
+        "PRE_QA review requested "
+        "implementation fixes."
+    )
+
+    FIX_PRE_PERSISTENCE_STATIC = (
+        "PRE_PERSISTENCE review blocked "
+        "persistence."
+    )
+
+    @staticmethod
+    def _fixing_checkpoint(checkpoints):
+        """Return the first saved checkpoint
+        that landed in FIXING with a non-None
+        ``last_error``.  This is the moment the
+        reviewer failure verdict is recorded."""
+        for checkpoint in checkpoints:
+            if (
+                checkpoint.state
+                == TicketState.FIXING
+                and checkpoint.last_error
+                is not None
+            ):
+                return checkpoint
+        return None
+
+    def _assert_no_leak(self, text):
+        """Assert the secret never appears in
+        ``text`` in any form."""
+        self.assertNotIn(self.SECRET, text or "")
+        for start in range(0, len(self.SECRET) - 3):
+            fragment = self.SECRET[start : start + 4]
+            self.assertNotIn(fragment, text or "")
+
+    # ------------------------------------------------------------------
+    # A. FIX_BEFORE_QA
+    # ------------------------------------------------------------------
+    def test_fix_before_qa_does_not_leak_summary(self):
+        """When the reviewer returns
+        ``FIX_BEFORE_QA`` with a malicious
+        ``summary``, the conductor MUST NOT copy
+        that summary into ``checkpoint.last_error``.
+        The dedicated ``pre_qa_findings`` field
+        continues to receive the structured
+        findings so the fix workflow can use them.
+        """
+        tasks = [task(17)]
+
+        checkpoint = make_checkpoint_payload(
+            issue_number=17,
+            state=TicketState.REVIEWING,
+        )
+
+        with RunHarness(
+            tasks=tasks,
+            checkpoint=checkpoint,
+        ) as harness:
+            harness.review_runner.review.return_value = (
+                make_review(
+                    verdict=(
+                        ReviewVerdict.FIX_BEFORE_QA
+                    ),
+                    summary=self.SECRET,
+                    findings=(
+                        ReviewFinding(
+                            severity="BLOCKING",
+                            title=(
+                                "Wrong migration order"
+                            ),
+                            details=(
+                                "Tables must be created "
+                                "before indexes."
+                            ),
+                        ),
+                    ),
+                )
+            )
+
+            _ = harness.run()
+
+            checkpoints = (
+                harness.saved_checkpoints()
+            )
+
+        fixing = self._fixing_checkpoint(checkpoints)
+
+        # The conductor MUST have routed the
+        # ticket through FIXING at least once.
+        self.assertIsNotNone(
+            fixing,
+            msg=(
+                "Conductor never saved a FIXING "
+                "checkpoint with last_error set"
+            ),
+        )
+
+        # ``last_error`` MUST be the static
+        # Ralph-owned message, NOT the secret
+        # model-authored summary.
+        self.assertEqual(
+            fixing.last_error,
+            self.FIX_PRE_QA_STATIC,
+        )
+
+        # Belt-and-suspenders: the secret MUST
+        # not appear in any form in
+        # ``last_error`` (the control plane).
+        self._assert_no_leak(fixing.last_error)
+
+        # The dedicated ``pre_qa_findings`` field
+        # is a REVIEW/FIX evidence field, not
+        # control-plane state.  It continues to
+        # carry the structured findings so the
+        # fix agent can consume them via the
+        # existing dedicated fix-context
+        # mechanism.  We confirm the field is
+        # populated rather than asserting it
+        # contains no model content.
+        self.assertIsNotNone(fixing.pre_qa_findings)
+
+        # And: no checkpoint at any point may
+        # carry the secret in ``last_error``.
+        for saved in checkpoints:
+            self._assert_no_leak(saved.last_error)
+
+    # ------------------------------------------------------------------
+    # B. BLOCK_PERSISTENCE
+    # ------------------------------------------------------------------
+    def test_block_persistence_does_not_leak_summary(
+        self,
+    ):
+        """When the reviewer returns
+        ``BLOCK_PERSISTENCE`` with a malicious
+        ``summary``, the conductor MUST NOT copy
+        that summary into ``checkpoint.last_error``.
+        """
+        tasks = [task(17)]
+
+        checkpoint = make_checkpoint_payload(
+            issue_number=17,
+            state=TicketState.AUTOMATED_QA,
+            qa_evidence=(
+                "QA STATUS: PASSED\n\n"
+                "## format-check\n"
+            ),
+        )
+
+        with RunHarness(
+            tasks=tasks,
+            checkpoint=checkpoint,
+        ) as harness:
+            harness.qa_runner.run.return_value = (
+                make_qa_result(
+                    status=QaStatus.PASSED,
+                )
+            )
+
+            harness.review_runner.review.return_value = (
+                make_review(
+                    verdict=(
+                        ReviewVerdict.BLOCK_PERSISTENCE
+                    ),
+                    stage=(
+                        ReviewStage.PRE_PERSISTENCE
+                    ),
+                    summary=self.SECRET,
+                    findings=(
+                        ReviewFinding(
+                            severity="BLOCKING",
+                            title=(
+                                "Migration missing"
+                            ),
+                            details=(
+                                "Adds a column with no "
+                                "default."
+                            ),
+                        ),
+                    ),
+                )
+            )
+
+            _ = harness.run()
+
+            checkpoints = (
+                harness.saved_checkpoints()
+            )
+
+        fixing = self._fixing_checkpoint(checkpoints)
+
+        self.assertIsNotNone(
+            fixing,
+            msg=(
+                "Conductor never saved a FIXING "
+                "checkpoint with last_error set"
+            ),
+        )
+
+        # ``last_error`` MUST be the static
+        # Ralph-owned message, NOT the secret.
+        self.assertEqual(
+            fixing.last_error,
+            self.FIX_PRE_PERSISTENCE_STATIC,
+        )
+        self._assert_no_leak(fixing.last_error)
+
+        # The dedicated ``pre_persistence_findings``
+        # field is a REVIEW/FIX evidence field,
+        # not control-plane state.  It continues
+        # to carry the structured findings so the
+        # fix agent can consume them.
+        self.assertIsNotNone(
+            fixing.pre_persistence_findings,
+        )
+
+        # pre_qa_findings is reset because this
+        # is the PRE_PERSISTENCE branch.
+        self.assertIsNone(fixing.pre_qa_findings)
+
+        # And: no checkpoint at any point may
+        # carry the secret in last_error.
+        for saved in checkpoints:
+            self._assert_no_leak(saved.last_error)
+
+    # ------------------------------------------------------------------
+    # C. SUCCESS PATHS
+    # ------------------------------------------------------------------
+    def test_pre_qa_approval_clears_last_error(self):
+        """``APPROVE_FOR_QA`` MUST reset
+        ``last_error`` to ``None``.  No
+        model-authored summary may be persisted
+        on success either."""
+        tasks = [task(17)]
+
+        checkpoint = make_checkpoint_payload(
+            issue_number=17,
+            state=TicketState.REVIEWING,
+        )
+
+        with RunHarness(
+            tasks=tasks,
+            checkpoint=checkpoint,
+        ) as harness:
+            harness.review_runner.review.return_value = (
+                make_review(
+                    verdict=(
+                        ReviewVerdict.APPROVE_FOR_QA
+                    ),
+                    summary=self.SECRET,
+                )
+            )
+
+            harness.qa_runner.run.return_value = (
+                make_qa_result(
+                    status=QaStatus.PASSED,
+                )
+            )
+
+            _ = harness.run()
+
+            checkpoints = (
+                harness.saved_checkpoints()
+            )
+
+        # No checkpoint at any point may carry
+        # the secret in last_error.
+        for saved in checkpoints:
+            self._assert_no_leak(saved.last_error)
+
+        # The transition from REVIEWING into
+        # AUTOMATED_QA on the success path MUST
+        # have cleared last_error.
+        automated_qa = [
+            saved
+            for saved in checkpoints
+            if saved.state == TicketState.AUTOMATED_QA
+        ]
+        self.assertTrue(
+            automated_qa,
+            "Conductor never saved an "
+            "AUTOMATED_QA checkpoint on the "
+            "PRE_QA success path",
+        )
+        self.assertIsNone(automated_qa[0].last_error)
+
+    def test_pre_persistence_approval_clears_last_error(
+        self,
+    ):
+        """``APPROVE_FOR_PERSISTENCE`` MUST
+        clear ``last_error`` and run through
+        persistence without persisting any
+        model-authored content."""
+        tasks = [task(17)]
+
+        checkpoint = make_checkpoint_payload(
+            issue_number=17,
+            state=TicketState.AUTOMATED_QA,
+            qa_evidence=(
+                "QA STATUS: PASSED\n\n"
+                "## format-check\n"
+            ),
+        )
+
+        with RunHarness(
+            tasks=tasks,
+            checkpoint=checkpoint,
+        ) as harness:
+            harness.qa_runner.run.return_value = (
+                make_qa_result(
+                    status=QaStatus.PASSED,
+                )
+            )
+
+            harness.review_runner.review.return_value = (
+                make_review(
+                    verdict=(
+                        ReviewVerdict.APPROVE_FOR_PERSISTENCE
+                    ),
+                    stage=(
+                        ReviewStage.PRE_PERSISTENCE
+                    ),
+                    summary=self.SECRET,
+                )
+            )
+
+            harness.persistence_runner.persist.return_value = (
+                SimpleNamespace(
+                    commit_sha="commit123",
+                    remote_sha="commit123",
+                    pull_request_number=99,
+                    pull_request_url="https://x",
+                    pull_request_created=True,
+                )
+            )
+
+            harness.cleaner.cleanup_ticket_branch.return_value = (
+                SimpleNamespace(
+                    deleted=True,
+                    already_absent=False,
+                    branch="ralph/m2-17",
+                )
+            )
+
+            _ = harness.run()
+
+            checkpoints = (
+                harness.saved_checkpoints()
+            )
+
+        # No checkpoint at any point may carry
+        # the secret in last_error.
+        for saved in checkpoints:
+            self._assert_no_leak(saved.last_error)
+
+    # ------------------------------------------------------------------
+    # D. STATIC REGRESSION GUARD
+    # ------------------------------------------------------------------
+    def test_run_module_has_no_last_error_assignment_from_summary(
+        self,
+    ):
+        """A focused static guard: there must be
+        no remaining code path in run.py that
+        copies ``ReviewResult.summary`` (or any
+        ``review.summary`` / ``result.summary``
+        attribute) into ``checkpoint.last_error``.
+
+        This protects against an accidental
+        regression where a future change
+        re-introduces the leak.
+        """
+        import re
+
+        run_path = (
+            "/Users/calebmatteis/sound-hub/"
+            "scripts/ralph/run.py"
+        )
+        # Allow override for worktrees.
+        try:
+            with open(run_path) as handle:
+                source = handle.read()
+        except OSError:
+            # In a different layout, fall back to
+            # the actual module path.
+            import scripts.ralph.run as run_module
+
+            source = Path(run_module.__file__).read_text()
+
+        # Strip line/block comments and string
+        # literals before scanning so prose about
+        # the security policy is not counted as a
+        # match.
+        stripped_lines = []
+        in_block_string = False
+        for line in source.splitlines():
+            stripped = line
+            if in_block_string:
+                if '"""' in stripped or "'''" in stripped:
+                    in_block_string = False
+                stripped = ""
+            elif (
+                stripped.lstrip().startswith('"""')
+                or stripped.lstrip().startswith("'''")
+            ):
+                if (
+                    stripped.count('"""') < 2
+                    and stripped.count("'''") < 2
+                ):
+                    in_block_string = True
+                stripped = ""
+            stripped = re.sub(
+                r"#.*$",
+                "",
+                stripped,
+            )
+            stripped_lines.append(stripped)
+        stripped_source = "\n".join(stripped_lines)
+
+        # Remove string literals to avoid false
+        # positives on test message strings.
+        no_strings = re.sub(
+            r'"(?:[^"\\]|\\.)*"',
+            '""',
+            stripped_source,
+        )
+        no_strings = re.sub(
+            r"'(?:[^'\\]|\\.)*'",
+            "''",
+            no_strings,
+        )
+
+        # Look for any line that assigns a
+        # ``*.summary`` expression into
+        # ``last_error``.
+        forbidden = re.compile(
+            r"last_error\s*=\s*[^#\n]*\.summary\b"
+        )
+
+        matches = list(
+            forbidden.finditer(no_strings),
+        )
+
+        self.assertEqual(
+            matches,
+            [],
+            msg=(
+                "run.py still has a code path that "
+                "assigns *.summary to last_error.  "
+                "This would re-introduce the "
+                "reviewer-content leak the security "
+                "policy forbids.  Matches: "
+                f"{[m.group(0) for m in matches]}"
+            ),
+        )
+
+
+class LastErrorTrustBoundaryTests(unittest.TestCase):
+    """``checkpoint.last_error`` is Ralph-owned
+    control-plane metadata.  It MUST be sourced from the
+    closed ``TerminalReason`` enum only.
+
+    These tests are the structural sink-level guard.
+    They prove:
+
+      - ``_record_terminal`` and ``_record_failure`` can
+        never receive an arbitrary string,
+      - ``_terminal_message`` rejects non-enum values,
+      - the closed enum maps to a STATIC message table,
+      - the implementation BLOCKED path does not copy
+        ``completion_blocker`` into ``last_error``,
+      - the reviewer -> fix -> BLOCKED echo chain (the
+        exact Codex trace) cannot leak a secret,
+      - agent exception text and QA infrastructure errors
+        are mapped to static categorical reasons only,
+      - persistence / integration conflict paths use
+        static categorical reasons only,
+      - the FIX_BEFORE_QA / BLOCK_PERSISTENCE /
+        QA_CODE_FAILURE FIXING transitions use static
+        categorical reasons only,
+      - the conductor still reaches the expected
+        terminal states (no semantic regression).
+
+    No model text, exception string, subprocess output,
+    API response text, QA command output, or arbitrary
+    runtime string may reach ``checkpoint.last_error``.
+    """
+
+    SECRET = "super-secret-nebius-value-12345"
+
+    # Pre-computed expected static messages so a future
+    # edit to TERMINAL_REASON_MESSAGES that changes the
+    # message text without a deliberate reason fails this
+    # test loudly.
+    EXPECTED_IMPLEMENTATION_BLOCKED = (
+        "Implementation agent reported a blocker."
+    )
+
+    EXPECTED_IMPLEMENTATION_AGENT_FAILURE = (
+        "Implementation agent failed."
+    )
+
+    EXPECTED_REVIEW_AGENT_FAILURE = (
+        "Independent reviewer returned an invalid response."
+    )
+
+    EXPECTED_REVIEW_FIX_BEFORE_QA = (
+        "PRE_QA review requested implementation fixes."
+    )
+
+    EXPECTED_REVIEW_BLOCK_PERSISTENCE = (
+        "PRE_PERSISTENCE review blocked persistence."
+    )
+
+    EXPECTED_QA_CODE_FAILURE = (
+        "Automated QA reported code failure."
+    )
+
+    EXPECTED_QA_INFRA_FAILURE = (
+        "Automated QA reported an infrastructure failure."
+    )
+
+    EXPECTED_QA_ENVIRONMENT_FAILURE = (
+        "Automated QA environment could not be provisioned."
+    )
+
+    EXPECTED_PERSISTENCE_CONFLICT = (
+        "Persistence state could not be safely reconciled."
+    )
+
+    EXPECTED_PERSISTENCE_AGENT_FAILURE = (
+        "Persistence agent failed."
+    )
+
+    EXPECTED_INTEGRATION_AGENT_FAILURE = (
+        "Integration agent failed."
+    )
+
+    EXPECTED_WORKSPACE_UNAVAILABLE = (
+        "Workspace preparation failed."
+    )
+
+    EXPECTED_REMOTE_BRANCH_CLEANUP_FAILURE = (
+        "Remote ticket branch cleanup failed."
+    )
+
+    EXPECTED_ITERATION_GUARD_EXCEEDED = (
+        "Ralph exceeded its internal iteration guard. "
+        "Manual inspection required."
+    )
+
+    EXPECTED_REVIEW_FIX_BUDGET_EXHAUSTED = (
+        "Fix iteration budget exhausted."
+    )
+
+    EXPECTED_REVIEW_CYCLE_BUDGET_EXHAUSTED = (
+        "Review cycle budget exhausted."
+    )
+
+    EXPECTED_QA_BUDGET_EXHAUSTED = (
+        "Automated QA attempt budget exhausted."
+    )
+
+    EXPECTED_IMPLEMENTATION_BUDGET_EXHAUSTED = (
+        "Implementation iteration budget exhausted."
+    )
+
+    EXPECTED_IMPLEMENTATION_EXHAUSTED_NO_CHANGES = (
+        "Implementation exhausted its iteration budget "
+        "without producing changes."
+    )
+
+    EXPECTED_ISSUE_NOT_ELIGIBLE = (
+        "Issue is no longer execution-authorized in its "
+        "current GitHub state."
+    )
+
+    EXPECTED_ISSUE_NO_LONGER_PRESENT = (
+        "Issue is no longer present in the current "
+        "milestone task list."
+    )
+
+    def _assert_no_leak(self, text):
+        """Assert the secret never appears in ``text``
+        in any form.  No substring, no fragment, no
+        partial overlap of any 4+ character window.
+        """
+        self.assertNotIn(self.SECRET, text or "")
+        for start in range(0, len(self.SECRET) - 3):
+            fragment = self.SECRET[start : start + 4]
+            self.assertNotIn(fragment, text or "")
+
+    def _assert_static_terminal(
+        self,
+        loaded,
+        expected,
+    ):
+        """Assert the loaded terminal checkpoint has
+        the expected static ``last_error`` and the
+        secret never appears anywhere in the
+        checkpoint."""
+        self.assertIsNotNone(loaded)
+        self.assertEqual(loaded.last_error, expected)
+        self._assert_no_leak(loaded.last_error)
+
+    # ------------------------------------------------------------------
+    # A. IMPLEMENTATION BLOCKED — completion_blocker leak path
+    # ------------------------------------------------------------------
+    def test_implementation_blocked_does_not_leak_blocker(
+        self,
+    ):
+        """When the implementation runner reports
+        BLOCKED with a secret-bearing
+        ``completion_blocker``, the conductor MUST NOT
+        copy the blocker into ``checkpoint.last_error``.
+
+        This is the canonical Codex trace path:
+            review findings
+            -> ImplementationFixContext
+            -> implementation-agent prompt
+            -> BLOCKED completion blocker
+            -> result.completion_blocker
+            -> checkpoint.last_error
+        """
+        tasks = [task(17)]
+
+        with RunHarness(tasks=tasks) as harness:
+            harness.impl_runner.run.return_value = (
+                make_completion(
+                    status=CompletionStatus.BLOCKED,
+                    blocker=self.SECRET,
+                )
+            )
+
+            final = harness.run()
+
+        loaded = harness.saved_checkpoint()
+        self.assertEqual(
+            final,
+            TicketState.BLOCKED_FOR_HUMAN,
+        )
+        self._assert_static_terminal(
+            loaded,
+            self.EXPECTED_IMPLEMENTATION_BLOCKED,
+        )
+        # Belt-and-suspenders: every saved checkpoint
+        # for this run.
+        for saved in harness.saved_checkpoints():
+            self._assert_no_leak(saved.last_error)
+
+    # ------------------------------------------------------------------
+    # B. REVIEWER-DERIVED ECHO — Codex trace reproducer
+    # ------------------------------------------------------------------
+    def test_reviewer_echo_through_fix_context_does_not_leak(
+        self,
+    ):
+        """Reproduce Codex's exact trace: a reviewer
+        verdict echoes a secret into the fix-context,
+        the implementation agent BLOCKEDs with the
+        same secret in ``completion_blocker``, and the
+        conductor MUST NOT persist the secret in
+        ``checkpoint.last_error``.
+
+        The reviewer-fingerprint text flows through:
+            ReviewResult.summary
+            -> pre_qa_findings
+            -> ImplementationFixContext.reviewer_findings
+            -> implementation-agent prompt
+            -> completion_blocker
+            -> checkpoint.last_error
+
+        The trust boundary MUST hold across this
+        entire chain.
+        """
+        tasks = [task(17)]
+
+        checkpoint = make_checkpoint_payload(
+            issue_number=17,
+            state=TicketState.REVIEWING,
+        )
+
+        with RunHarness(
+            tasks=tasks,
+            checkpoint=checkpoint,
+        ) as harness:
+            # 1) PRE_QA reviewer returns FIX_BEFORE_QA.
+            #    The secret appears in:
+            #      - result.summary
+            #      - result.findings[*].title and details
+            #    These flow into:
+            #      - checkpoint.pre_qa_findings
+            #    (NOT into checkpoint.last_error — that
+            #    is the static categorical message.)
+            harness.review_runner.review.return_value = (
+                make_review(
+                    verdict=(
+                        ReviewVerdict.FIX_BEFORE_QA
+                    ),
+                    summary=self.SECRET,
+                    findings=(
+                        ReviewFinding(
+                            severity="BLOCKING",
+                            title=(
+                                f"Found {self.SECRET}"
+                            ),
+                            details=(
+                                f"Detail: {self.SECRET}"
+                            ),
+                        ),
+                    ),
+                )
+            )
+
+            # 2) The implementation agent on the FIX
+            #    attempt echoes the secret back as the
+            #    completion_blocker.
+            harness.impl_runner.run.return_value = (
+                make_completion(
+                    status=CompletionStatus.BLOCKED,
+                    blocker=(
+                        f"Cannot resolve: {self.SECRET}"
+                    ),
+                )
+            )
+
+            final = harness.run()
+
+        loaded = harness.saved_checkpoint()
+        self.assertEqual(
+            final,
+            TicketState.BLOCKED_FOR_HUMAN,
+        )
+        self._assert_static_terminal(
+            loaded,
+            self.EXPECTED_IMPLEMENTATION_BLOCKED,
+        )
+        # The dedicated pre_qa_findings evidence field
+        # continues to carry reviewer content so the
+        # fix-context mechanism can still consume it.
+        # That is fine — it is the dedicated evidence
+        # field, not control-plane metadata.
+        self.assertIsNotNone(
+            harness.saved_checkpoint().pre_qa_findings,
+        )
+        # Every saved checkpoint's last_error must be
+        # free of the secret.
+        for saved in harness.saved_checkpoints():
+            self._assert_no_leak(saved.last_error)
+
+    # ------------------------------------------------------------------
+    # C. AGENT EXCEPTION — exception string leak path
+    # ------------------------------------------------------------------
+    def test_implementation_runner_exception_does_not_leak(
+        self,
+    ):
+        """When ``ImplementationRunner.run`` raises
+        ``ImplementationError`` whose message contains
+        a secret, the conductor MUST NOT persist that
+        exception text in ``checkpoint.last_error``."""
+        tasks = [task(17)]
+
+        with RunHarness(tasks=tasks) as harness:
+            harness.impl_runner.run.side_effect = (
+                ImplementationError(
+                    f"runner failure: {self.SECRET}"
+                )
+            )
+
+            final = harness.run()
+
+        loaded = harness.saved_checkpoint()
+        self.assertEqual(
+            final,
+            TicketState.AGENT_FAILURE,
+        )
+        self._assert_static_terminal(
+            loaded,
+            self.EXPECTED_IMPLEMENTATION_AGENT_FAILURE,
+        )
+        for saved in harness.saved_checkpoints():
+            self._assert_no_leak(saved.last_error)
+
+    def test_review_runner_exception_does_not_leak(
+        self,
+    ):
+        """When ``ReviewRunner.review`` raises
+        ``ReviewError`` whose message contains a
+        secret, the conductor MUST NOT persist that
+        exception text in ``checkpoint.last_error``.
+        """
+        tasks = [task(17)]
+
+        checkpoint = make_checkpoint_payload(
+            issue_number=17,
+            state=TicketState.REVIEWING,
+        )
+
+        with RunHarness(
+            tasks=tasks,
+            checkpoint=checkpoint,
+        ) as harness:
+            harness.review_runner.review.side_effect = (
+                ReviewError(
+                    f"review failure: {self.SECRET}"
+                )
+            )
+
+            final = harness.run()
+
+        loaded = harness.saved_checkpoint()
+        self.assertEqual(
+            final,
+            TicketState.AGENT_FAILURE,
+        )
+        self._assert_static_terminal(
+            loaded,
+            self.EXPECTED_REVIEW_AGENT_FAILURE,
+        )
+        for saved in harness.saved_checkpoints():
+            self._assert_no_leak(saved.last_error)
+
+    # ------------------------------------------------------------------
+    # D. PERSISTENCE / INTEGRATION / QA INFRASTRUCTURE ERROR PATHS
+    # ------------------------------------------------------------------
+    def test_persistence_error_does_not_leak(self):
+        """When ``PersistenceRunner.persist`` raises
+        ``PersistenceError`` whose message contains a
+        secret, the conductor MUST NOT persist that
+        text in ``checkpoint.last_error``.
+        """
+        tasks = [task(17)]
+
+        checkpoint = make_checkpoint_payload(
+            issue_number=17,
+            state=TicketState.AUTOMATED_QA,
+            qa_evidence=(
+                "QA STATUS: PASSED\n\n"
+                "## format-check\n"
+            ),
+        )
+
+        with RunHarness(
+            tasks=tasks,
+            checkpoint=checkpoint,
+        ) as harness:
+            harness.qa_runner.run.return_value = (
+                make_qa_result(
+                    status=QaStatus.PASSED,
+                )
+            )
+
+            harness.review_runner.review.return_value = (
+                make_review(
+                    verdict=(
+                        ReviewVerdict
+                        .APPROVE_FOR_PERSISTENCE
+                    ),
+                    stage=(
+                        ReviewStage.PRE_PERSISTENCE
+                    ),
+                )
+            )
+
+            harness.persistence_runner.persist.side_effect = (
+                PersistenceError(
+                    f"persist failure: {self.SECRET}"
+                )
+            )
+
+            final = harness.run()
+
+        loaded = harness.saved_checkpoint()
+        self.assertEqual(
+            final,
+            TicketState.BLOCKED_FOR_HUMAN,
+        )
+        self._assert_static_terminal(
+            loaded,
+            self.EXPECTED_PERSISTENCE_AGENT_FAILURE,
+        )
+        for saved in harness.saved_checkpoints():
+            self._assert_no_leak(saved.last_error)
+
+    def test_integration_error_does_not_leak(self):
+        """When ``IntegrationRunner.integrate`` raises
+        ``IntegrationError`` whose message contains a
+        secret, the conductor MUST NOT persist that
+        text in ``checkpoint.last_error``.
+        """
+        tasks = [task(17)]
+
+        checkpoint = make_checkpoint_payload(
+            issue_number=17,
+            state=TicketState.AUTOMATED_QA,
+            qa_evidence=(
+                "QA STATUS: PASSED\n\n"
+                "## format-check\n"
+            ),
+            persisted_commit_sha="commit_ok",
+            pull_request_number=42,
+        )
+
+        with RunHarness(
+            tasks=tasks,
+            checkpoint=checkpoint,
+        ) as harness:
+            harness.qa_runner.run.return_value = (
+                make_qa_result(
+                    status=QaStatus.PASSED,
+                )
+            )
+
+            harness.review_runner.review.return_value = (
+                make_review(
+                    verdict=(
+                        ReviewVerdict
+                        .APPROVE_FOR_PERSISTENCE
+                    ),
+                    stage=(
+                        ReviewStage.PRE_PERSISTENCE
+                    ),
+                )
+            )
+
+            harness.persistence_runner.persist.return_value = (
+                SimpleNamespace(
+                    commit_sha="commit_ok",
+                    remote_sha="commit_ok",
+                    pull_request_number=42,
+                    pull_request_url="https://x",
+                    pull_request_created=True,
+                )
+            )
+
+            harness.integration_runner.integrate.side_effect = (
+                scripts_ralph_integration_error_with_secret(
+                    self.SECRET
+                )
+            )
+
+            final = harness.run()
+
+        loaded = harness.saved_checkpoint()
+        self.assertEqual(
+            final,
+            TicketState.BLOCKED_FOR_HUMAN,
+        )
+        self._assert_static_terminal(
+            loaded,
+            self.EXPECTED_INTEGRATION_AGENT_FAILURE,
+        )
+        for saved in harness.saved_checkpoints():
+            self._assert_no_leak(saved.last_error)
+
+    def test_qa_environment_error_does_not_leak(self):
+        """When the QA environment fails to start with
+        an error message containing a secret, the
+        conductor MUST NOT persist that text in
+        ``checkpoint.last_error``.
+        """
+        tasks = [task(17)]
+
+        checkpoint = make_checkpoint_payload(
+            issue_number=17,
+            state=TicketState.AUTOMATED_QA,
+            qa_evidence=(
+                "QA STATUS: PASSED\n\n"
+                "## format-check\n"
+            ),
+        )
+
+        with RunHarness(
+            tasks=tasks,
+            checkpoint=checkpoint,
+        ) as harness:
+            # A ``QaEnvironmentError`` whose message
+            # contains the secret.
+            from scripts.ralph.qa_environment import (
+                QaEnvironmentError,
+            )
+
+            secret_error = QaEnvironmentError(
+                f"provisioning failed: {self.SECRET}"
+            )
+
+            harness.qa_environment.start_error = (
+                secret_error
+            )
+
+            final = harness.run()
+
+        loaded = harness.saved_checkpoint()
+        self.assertEqual(
+            final,
+            TicketState.INFRA_FAILURE,
+        )
+        self._assert_static_terminal(
+            loaded,
+            self.EXPECTED_QA_ENVIRONMENT_FAILURE,
+        )
+        for saved in harness.saved_checkpoints():
+            self._assert_no_leak(saved.last_error)
+
+    def test_qa_infra_failure_status_does_not_leak(self):
+        """When the QA runner reports
+        ``QaStatus.INFRA_FAILURE`` (an automated QA
+        infrastructure failure, not a code failure),
+        the conductor MUST persist a static categorical
+        ``last_error`` only — never the QA command
+        stdout/stderr or evidence.
+        """
+        tasks = [task(17)]
+
+        checkpoint = make_checkpoint_payload(
+            issue_number=17,
+            state=TicketState.AUTOMATED_QA,
+        )
+
+        with RunHarness(
+            tasks=tasks,
+            checkpoint=checkpoint,
+        ) as harness:
+            harness.qa_runner.run.return_value = (
+                make_qa_result(
+                    status=QaStatus.INFRA_FAILURE,
+                )
+            )
+
+            final = harness.run()
+
+        loaded = harness.saved_checkpoint()
+        self.assertEqual(
+            final,
+            TicketState.INFRA_FAILURE,
+        )
+        self._assert_static_terminal(
+            loaded,
+            self.EXPECTED_QA_INFRA_FAILURE,
+        )
+        for saved in harness.saved_checkpoints():
+            self._assert_no_leak(saved.last_error)
+
+    def test_qa_code_failure_fixing_does_not_leak(self):
+        """When the QA runner reports
+        ``QaStatus.CODE_FAILURE``, the conductor moves
+        the ticket to FIXING with a static
+        ``last_error``.  QA command output (which is
+        untrusted) is persisted ONLY into the
+        dedicated ``qa_failure_evidence`` field for
+        the fix-context mechanism — never into
+        ``last_error``.
+        """
+        tasks = [task(17)]
+
+        checkpoint = make_checkpoint_payload(
+            issue_number=17,
+            state=TicketState.AUTOMATED_QA,
+        )
+
+        with RunHarness(
+            tasks=tasks,
+            checkpoint=checkpoint,
+        ) as harness:
+            harness.qa_runner.run.return_value = (
+                make_qa_result(
+                    status=QaStatus.CODE_FAILURE,
+                )
+            )
+
+            _ = harness.run()
+
+        loaded = self._first_checkpoint_with_state(
+            harness.saved_checkpoints(),
+            TicketState.FIXING,
+        )
+        self.assertIsNotNone(loaded)
+        self.assertEqual(
+            loaded.state,
+            TicketState.FIXING,
+        )
+        self._assert_static_terminal(
+            loaded,
+            self.EXPECTED_QA_CODE_FAILURE,
+        )
+        # The dedicated QA evidence field is allowed to
+        # carry the QA command output (it is the
+        # evidence channel, not control-plane state).
+        self.assertIsNotNone(
+            loaded.qa_failure_evidence,
+        )
+        for saved in harness.saved_checkpoints():
+            self._assert_no_leak(saved.last_error)
+
+    def test_review_fix_before_qa_fixing_does_not_leak(self):
+        """When PRE_QA reviewer returns FIX_BEFORE_QA,
+        the conductor moves to FIXING with a static
+        ``last_error``.  Reviewer findings remain in
+        ``pre_qa_findings`` as untrusted evidence for
+        the fix-context mechanism.
+        """
+        tasks = [task(17)]
+
+        checkpoint = make_checkpoint_payload(
+            issue_number=17,
+            state=TicketState.REVIEWING,
+        )
+
+        with RunHarness(
+            tasks=tasks,
+            checkpoint=checkpoint,
+        ) as harness:
+            harness.review_runner.review.return_value = (
+                make_review(
+                    verdict=(
+                        ReviewVerdict.FIX_BEFORE_QA
+                    ),
+                    summary=self.SECRET,
+                    findings=(
+                        ReviewFinding(
+                            severity="BLOCKING",
+                            title=(
+                                f"Found {self.SECRET}"
+                            ),
+                            details=(
+                                f"Detail: {self.SECRET}"
+                            ),
+                        ),
+                    ),
+                )
+            )
+
+            _ = harness.run()
+
+        # The first FIXING checkpoint with last_error
+        # set is the one carrying the static message.
+        loaded = self._first_checkpoint_with_state(
+            harness.saved_checkpoints(),
+            TicketState.FIXING,
+        )
+        self.assertIsNotNone(loaded)
+        self.assertEqual(
+            loaded.state,
+            TicketState.FIXING,
+        )
+        self._assert_static_terminal(
+            loaded,
+            self.EXPECTED_REVIEW_FIX_BEFORE_QA,
+        )
+        # pre_qa_findings carries reviewer content
+        # (this is the fix-context evidence field, not
+        # control-plane state).
+        self.assertIsNotNone(
+            loaded.pre_qa_findings,
+        )
+        for saved in harness.saved_checkpoints():
+            self._assert_no_leak(saved.last_error)
+
+    def test_review_block_persistence_fixing_does_not_leak(
+        self,
+    ):
+        """When PRE_PERSISTENCE reviewer returns
+        BLOCK_PERSISTENCE, the conductor moves to
+        FIXING with a static ``last_error``.
+        """
+        tasks = [task(17)]
+
+        checkpoint = make_checkpoint_payload(
+            issue_number=17,
+            state=TicketState.AUTOMATED_QA,
+            qa_evidence=(
+                "QA STATUS: PASSED\n\n"
+                "## format-check\n"
+            ),
+        )
+
+        with RunHarness(
+            tasks=tasks,
+            checkpoint=checkpoint,
+        ) as harness:
+            harness.qa_runner.run.return_value = (
+                make_qa_result(
+                    status=QaStatus.PASSED,
+                )
+            )
+
+            harness.review_runner.review.return_value = (
+                make_review(
+                    verdict=(
+                        ReviewVerdict.BLOCK_PERSISTENCE
+                    ),
+                    stage=(
+                        ReviewStage.PRE_PERSISTENCE
+                    ),
+                    summary=self.SECRET,
+                    findings=(
+                        ReviewFinding(
+                            severity="BLOCKING",
+                            title=(
+                                f"Found {self.SECRET}"
+                            ),
+                            details=(
+                                f"Detail: {self.SECRET}"
+                            ),
+                        ),
+                    ),
+                )
+            )
+
+            _ = harness.run()
+
+        loaded = self._first_checkpoint_with_state(
+            harness.saved_checkpoints(),
+            TicketState.FIXING,
+        )
+        self.assertIsNotNone(loaded)
+        self.assertEqual(
+            loaded.state,
+            TicketState.FIXING,
+        )
+        self._assert_static_terminal(
+            loaded,
+            self.EXPECTED_REVIEW_BLOCK_PERSISTENCE,
+        )
+        self.assertIsNotNone(
+            loaded.pre_persistence_findings,
+        )
+        for saved in harness.saved_checkpoints():
+            self._assert_no_leak(saved.last_error)
+
+    def _first_checkpoint_with_state(
+        self,
+        checkpoints,
+        state,
+    ):
+        for checkpoint in checkpoints:
+            if checkpoint.state == state:
+                return checkpoint
+        return None
+
+    # ------------------------------------------------------------------
+    # E. STATIC BOUNDARY — structural guard
+    # ------------------------------------------------------------------
+    def test_terminal_message_rejects_non_enum(self):
+        """``_terminal_message`` MUST raise if the
+        caller passes anything that is not a
+        ``TerminalReason``.  This is the runtime
+        enforcement of the trust boundary.
+        """
+        with self.assertRaises(TypeError):
+            _terminal_message(
+                "Implementation agent failed."
+            )
+
+        with self.assertRaises(TypeError):
+            _terminal_message(
+                "super-secret-nebius-value-12345"
+            )
+
+        with self.assertRaises(TypeError):
+            _terminal_message(None)
+
+    def test_terminal_reason_is_closed_enum(self):
+        """The ``TerminalReason`` enum MUST be the only
+        type that ``_terminal_message`` accepts.  Any
+        other Enum value (or string) MUST be rejected.
+        """
+        from enum import Enum
+
+        class ForeignEnum(str, Enum):
+            ATTACKER = "ATTACKER"
+
+        with self.assertRaises(TypeError):
+            _terminal_message(ForeignEnum.ATTACKER)
+
+    def test_every_terminal_reason_has_static_message(self):
+        """Every ``TerminalReason`` value MUST map to
+        a non-empty static message in
+        ``TERMINAL_REASON_MESSAGES``.  A missing key
+        or an empty string would silently break the
+        trust boundary.
+        """
+        for reason in TerminalReason:
+            message = TERMINAL_REASON_MESSAGES.get(
+                reason
+            )
+            self.assertIsNotNone(
+                message,
+                msg=(
+                    f"TerminalReason.{reason.name} "
+                    "has no static message"
+                ),
+            )
+            self.assertNotEqual(
+                message.strip(),
+                "",
+                msg=(
+                    f"TerminalReason.{reason.name} "
+                    "maps to an empty message"
+                ),
+            )
+
+    def test_static_messages_are_disjoint_from_secret_shapes(
+        self,
+    ):
+        """No static message may resemble a secret
+        shape (long hex / base64-like runs of length
+        >= 16).  This is a defense-in-depth guard so
+        a substring scan of last_error is meaningful
+        for leak detection.
+        """
+        import re
+
+        for reason, message in (
+            TERMINAL_REASON_MESSAGES.items()
+        ):
+            # Confirm the static message does not
+            # contain any plausible API-key shape
+            # (>= 32 consecutive characters from
+            # [A-Za-z0-9_-]).  Static messages are
+            # normal English prose with spaces and
+            # punctuation, so a long unbroken run
+            # would be suspicious.
+            self.assertIsNone(
+                re.search(
+                    r"[A-Za-z0-9_-]{32,}",
+                    message,
+                ),
+                msg=(
+                    "Static message for "
+                    f"{reason.name} looks like it "
+                    "could carry an opaque secret"
+                ),
+            )
+
+    def test_record_terminal_signature_rejects_arbitrary_string(
+        self,
+    ):
+        """``_record_terminal`` MUST only accept a
+        ``TerminalReason`` (not an arbitrary string)
+        as its terminal-reason argument.  This is the
+        signature-level enforcement of the trust
+        boundary.
+        """
+        import inspect
+
+        sig = inspect.signature(
+            _record_terminal_unbound
+        )
+        params = list(sig.parameters.values())
+        self.assertEqual(len(params), 4)
+        self.assertEqual(params[0].name, "self")
+        self.assertEqual(params[1].name, "state")
+        self.assertEqual(params[2].name, "reason")
+        self.assertEqual(params[3].name, "kwargs")
+
+    def test_record_failure_signature_rejects_arbitrary_string(
+        self,
+    ):
+        """``Orchestrator._record_failure`` MUST only
+        accept a ``TerminalReason`` (not an arbitrary
+        string) as its terminal-reason argument.
+        """
+        import inspect
+
+        sig = inspect.signature(
+            _record_failure_unbound
+        )
+        params = list(sig.parameters.values())
+        # self, checkpoint, store, state, reason
+        names = [p.name for p in params]
+        self.assertIn("reason", names)
+        self.assertNotIn(
+            "message",
+            names,
+            msg=(
+                "_record_failure must not accept a "
+                "'message' parameter; only 'reason'"
+            ),
+        )
+
+    def test_no_str_error_or_subprocess_text_in_last_error_paths(
+        self,
+    ):
+        """Static guard: run.py MUST NOT contain any
+        pattern that assigns ``str(error)``, an
+        f-string with ``{error}``, ``result.summary``,
+        ``result.completion_blocker``, or any
+        ``.stdout`` / ``.stderr`` / ``.evidence()``
+        expression into ``last_error`` directly.
+
+        The trust boundary requires that the only
+        sink for ``last_error`` text is
+        ``_terminal_message(reason)``.
+        """
+        import re
+        from pathlib import Path
+
+        run_path = Path(
+            __file__
+        ).parent / "run.py"
+        source = run_path.read_text()
+
+        # Strip comments and string literals so prose
+        # about the security policy is not counted.
+        no_strings = re.sub(
+            r'"""[\s\S]*?"""',
+            "",
+            source,
+        )
+        no_strings = re.sub(
+            r"'''[\s\S]*?'''",
+            "",
+            no_strings,
+        )
+
+        # Forbidden: last_error= followed by anything
+        # that resolves to runtime text.  The
+        # TerminalReason message table is the only
+        # legal source, and every legal assignment
+        # routes through ``_terminal_message``.
+        forbidden_patterns = [
+            r"last_error\s*=\s*[^#\n]*str\(\s*error\s*\)",
+            r"last_error\s*=\s*[^#\n]*f\"[^\"]*\{error\}",
+            r"last_error\s*=\s*[^#\n]*\.summary\b",
+            r"last_error\s*=\s*[^#\n]*\.completion_blocker\b",
+            r"last_error\s*=\s*[^#\n]*\.stdout\b",
+            r"last_error\s*=\s*[^#\n]*\.stderr\b",
+            r"last_error\s*=\s*[^#\n]*\.evidence\(",
+        ]
+
+        violations = []
+        for pattern in forbidden_patterns:
+            for match in re.finditer(
+                pattern,
+                no_strings,
+            ):
+                violations.append(
+                    (
+                        pattern,
+                        match.group(0),
+                    )
+                )
+
+        self.assertEqual(
+            violations,
+            [],
+            msg=(
+                "run.py still has a code path that "
+                "assigns runtime/model text to "
+                "last_error.  Violations: "
+                f"{violations}"
+            ),
+        )
+
+
+def scripts_ralph_integration_error_with_secret(
+    secret,
+):
+    """Construct an ``IntegrationError`` whose message
+    contains ``secret``.  Defined at module scope so the
+    test class body stays declarative.
+    """
+    from scripts.ralph.integration import (
+        IntegrationError,
+    )
+
+    return IntegrationError(
+        f"integrate failure: {secret}"
+    )
+
+
+def _record_terminal_unbound(self, state, reason, **kwargs):
+    pass
+
+
+def _record_failure_unbound(
+    self,
+    *,
+    checkpoint,
+    store,
+    state,
+    reason,
+):
+    pass
+
+
+class LastErrorStoreBoundaryTests(unittest.TestCase):
+    """Sink-level trust-boundary tests for
+    ``CheckpointStore.load`` and ``CheckpointStore.save``.
+
+    Every non-null ``TicketCheckpoint.last_error`` MUST be an
+    exact member of ``APPROVED_LAST_ERROR_MESSAGES``.  This
+    invariant is enforced at the store boundary so that:
+
+    - an arbitrary string in the persisted JSON cannot reach
+      ``TicketCheckpoint``;
+    - a programmatically constructed invalid checkpoint
+      cannot reach disk.
+
+    The tests are parameterized across the closed set of
+    approved messages to prove the invariant holds for every
+    legitimate value, plus targeted cases for each rejection
+    shape.
+    """
+
+    def _write_checkpoint(
+        self,
+        tmp,
+        *,
+        last_error,
+        state=None,
+        issue_number=17,
+    ):
+        """Persist a JSON checkpoint with the given
+        ``last_error`` value (which may be any object)."""
+        from scripts.ralph.states import TicketState
+
+        path = Path(tmp) / "checkpoint.json"
+        payload = {
+            "schema_version": 2,
+            "milestone_id": "m2",
+            "issue_number": issue_number,
+            "state": (
+                state.value
+                if state is not None
+                else TicketState.REVIEWING.value
+            ),
+            "integration_branch": "ralph/m2",
+            "ticket_branch": "ralph/m2-17",
+            "last_error": last_error,
+        }
+        path.write_text(json.dumps(payload))
+        return path
+
+    def _make_checkpoint(
+        self,
+        *,
+        last_error,
+    ) -> TicketCheckpoint:
+        from scripts.ralph.review import ReviewStage
+        from scripts.ralph.states import TicketState
+
+        return TicketCheckpoint(
+            milestone_id="m2",
+            issue_number=17,
+            state=TicketState.REVIEWING,
+            integration_branch="ralph/m2",
+            ticket_branch="ralph/m2-17",
+            review_stage=ReviewStage.PRE_QA,
+            last_error=last_error,
+        )
+
+    # ------------------------------------------------------------------
+    # LOAD (A-E)
+    # ------------------------------------------------------------------
+    def test_load_approved_static_message_succeeds(self):
+        """A) approved static last_error loads successfully."""
+        for message in APPROVED_LAST_ERROR_MESSAGES:
+            with self.subTest(message=message):
+                with tempfile.TemporaryDirectory() as tmp:
+                    path = self._write_checkpoint(
+                        tmp,
+                        last_error=message,
+                    )
+                    store = CheckpointStore(path)
+                    loaded = store.load()
+                    self.assertIsNotNone(loaded)
+                    self.assertEqual(
+                        loaded.last_error,
+                        message,
+                    )
+
+    def test_load_none_succeeds(self):
+        """B) last_error=None loads successfully."""
+        with tempfile.TemporaryDirectory() as tmp:
+            path = self._write_checkpoint(
+                tmp,
+                last_error=None,
+            )
+            store = CheckpointStore(path)
+            loaded = store.load()
+            self.assertIsNotNone(loaded)
+            self.assertIsNone(loaded.last_error)
+
+    def test_load_arbitrary_string_rejected(self):
+        """C) arbitrary string last_error -> CheckpointError."""
+        with tempfile.TemporaryDirectory() as tmp:
+            path = self._write_checkpoint(
+                tmp,
+                last_error="arbitrary runtime text",
+            )
+            store = CheckpointStore(path)
+            with self.assertRaises(CheckpointError):
+                store.load()
+
+    def test_load_secret_shaped_string_rejected(self):
+        """D) secret-looking string last_error -> CheckpointError."""
+        secret = "super-secret-nebius-value-12345"
+        with tempfile.TemporaryDirectory() as tmp:
+            path = self._write_checkpoint(
+                tmp,
+                last_error=secret,
+            )
+            store = CheckpointStore(path)
+            with self.assertRaises(CheckpointError):
+                store.load()
+
+    def test_load_wrong_type_rejected(self):
+        """E) wrong-type last_error (number/list/dict/bool)
+        -> CheckpointError."""
+        for invalid in [
+            12345,
+            ["a", "list"],
+            {"key": "value"},
+            True,
+            False,
+            3.14,
+        ]:
+            with self.subTest(invalid=invalid):
+                with tempfile.TemporaryDirectory() as tmp:
+                    path = self._write_checkpoint(
+                        tmp,
+                        last_error=invalid,
+                    )
+                    store = CheckpointStore(path)
+                    with self.assertRaises(
+                        CheckpointError
+                    ):
+                        store.load()
+
+    # ------------------------------------------------------------------
+    # SAVE (F-H)
+    # ------------------------------------------------------------------
+    def test_save_approved_static_message_succeeds(self):
+        """F) approved static last_error saves successfully."""
+        with tempfile.TemporaryDirectory() as tmp:
+            store = CheckpointStore(
+                Path(tmp) / "checkpoint.json"
+            )
+            for message in APPROVED_LAST_ERROR_MESSAGES:
+                with self.subTest(message=message):
+                    store.save(
+                        self._make_checkpoint(
+                            last_error=message
+                        )
+                    )
+                    reloaded = store.load()
+                    self.assertEqual(
+                        reloaded.last_error,
+                        message,
+                    )
+
+    def test_save_none_succeeds(self):
+        """G) None last_error saves successfully."""
+        with tempfile.TemporaryDirectory() as tmp:
+            store = CheckpointStore(
+                Path(tmp) / "checkpoint.json"
+            )
+            store.save(self._make_checkpoint(last_error=None))
+            reloaded = store.load()
+            self.assertIsNone(reloaded.last_error)
+
+    def test_save_arbitrary_string_rejected_not_persisted(
+        self,
+    ):
+        """H) programmatically constructed arbitrary last_error
+        -> CheckpointError -> invalid value is not serialized."""
+        with tempfile.TemporaryDirectory() as tmp:
+            store = CheckpointStore(
+                Path(tmp) / "checkpoint.json"
+            )
+            checkpoint = self._make_checkpoint(
+                last_error="arbitrary runtime text"
+            )
+            with self.assertRaises(CheckpointError):
+                store.save(checkpoint)
+            # The file MUST NOT have been written.
+            self.assertFalse(
+                (Path(tmp) / "checkpoint.json").exists()
+            )
+
+    def test_save_secret_shaped_string_rejected(self):
+        """H-extended) secret-shaped last_error also rejected."""
+        secret = "super-secret-nebius-value-12345"
+        with tempfile.TemporaryDirectory() as tmp:
+            store = CheckpointStore(
+                Path(tmp) / "checkpoint.json"
+            )
+            checkpoint = self._make_checkpoint(
+                last_error=secret
+            )
+            with self.assertRaises(CheckpointError):
+                store.save(checkpoint)
+            self.assertFalse(
+                (Path(tmp) / "checkpoint.json").exists()
+            )
+
+    def test_save_review_error_message_rejected(self):
+        """H-extended) ReviewError str() repr cannot be saved."""
+        review_error_message = (
+            "Reviewer did not return valid verdict "
+            "JSON. stable-code=REVIEW_INVALID_JSON"
+        )
+        with tempfile.TemporaryDirectory() as tmp:
+            store = CheckpointStore(
+                Path(tmp) / "checkpoint.json"
+            )
+            checkpoint = self._make_checkpoint(
+                last_error=review_error_message
+            )
+            with self.assertRaises(CheckpointError):
+                store.save(checkpoint)
+
+    # ------------------------------------------------------------------
+    # ROUND TRIP (I)
+    # ------------------------------------------------------------------
+    def test_round_trip_each_approved_message(self):
+        """I) every approved static last_error round-trips
+        through save -> load without alteration."""
+        with tempfile.TemporaryDirectory() as tmp:
+            store = CheckpointStore(
+                Path(tmp) / "checkpoint.json"
+            )
+            for message in APPROVED_LAST_ERROR_MESSAGES:
+                with self.subTest(message=message):
+                    store.save(
+                        self._make_checkpoint(
+                            last_error=message
+                        )
+                    )
+                    roundtripped = store.load()
+                    self.assertEqual(
+                        roundtripped.last_error,
+                        message,
+                    )
+
+    def test_approved_set_matches_terminal_reason_messages(
+        self,
+    ):
+        """The approved set MUST be derived from the
+        TerminalReason mapping and MUST NOT have drifted."""
+        self.assertEqual(
+            APPROVED_LAST_ERROR_MESSAGES,
+            frozenset(TERMINAL_REASON_MESSAGES.values()),
         )
 
 

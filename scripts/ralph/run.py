@@ -36,6 +36,7 @@ import argparse
 import json
 import os
 from dataclasses import dataclass, replace
+from enum import Enum
 from pathlib import Path
 from typing import Optional
 
@@ -128,6 +129,204 @@ class ConductorCallbacks:
     make_remote_branch_cleaner: object = None
     make_github_probe: object = None
     mint_github_token: object = None
+
+
+# ---------------------------------------------------------------------------
+# Control-plane trust boundary
+# ---------------------------------------------------------------------------
+#
+# ``checkpoint.last_error`` is Ralph-owned control-plane metadata.
+# It MUST NEVER be derived from runtime model output, exception
+# strings, subprocess stdout/stderr, API response text, QA command
+# output, or any other untrusted source.
+#
+# The only path into ``checkpoint.last_error`` is
+# ``_record_terminal(..., reason=TerminalReason)``, which maps
+# the closed categorical reason to a STATIC Ralph-authored
+# message.  No caller may provide the final string.
+#
+# This is the security boundary.  Do not weaken it.
+# ---------------------------------------------------------------------------
+
+
+class TerminalReason(str, Enum):
+    """Closed categorical reasons for terminating ticket
+    orchestration.  Each reason maps to a single static
+    Ralph-authored message in ``TERMINAL_REASON_MESSAGES``.
+
+    Reasons correspond to terminal paths the conductor already
+    takes.  No new state is invented; the enum only names what
+    the conductor was already doing so the message it persists
+    cannot be chosen by an attacker.
+    """
+
+    ITERATION_GUARD_EXCEEDED = (
+        "ITERATION_GUARD_EXCEEDED"
+    )
+    IMPLEMENTATION_AGENT_FAILURE = (
+        "IMPLEMENTATION_AGENT_FAILURE"
+    )
+    IMPLEMENTATION_BLOCKED = (
+        "IMPLEMENTATION_BLOCKED"
+    )
+    IMPLEMENTATION_EXHAUSTED_NO_CHANGES = (
+        "IMPLEMENTATION_EXHAUSTED_NO_CHANGES"
+    )
+    IMPLEMENTATION_BUDGET_EXHAUSTED = (
+        "IMPLEMENTATION_BUDGET_EXHAUSTED"
+    )
+    REVIEW_FIX_BUDGET_EXHAUSTED = (
+        "REVIEW_FIX_BUDGET_EXHAUSTED"
+    )
+    REVIEW_CYCLE_BUDGET_EXHAUSTED = (
+        "REVIEW_CYCLE_BUDGET_EXHAUSTED"
+    )
+    REVIEW_AGENT_FAILURE = (
+        "REVIEW_AGENT_FAILURE"
+    )
+    REVIEW_FIX_BEFORE_QA = (
+        "REVIEW_FIX_BEFORE_QA"
+    )
+    REVIEW_BLOCK_PERSISTENCE = (
+        "REVIEW_BLOCK_PERSISTENCE"
+    )
+    QA_CODE_FAILURE = (
+        "QA_CODE_FAILURE"
+    )
+    QA_BUDGET_EXHAUSTED = (
+        "QA_BUDGET_EXHAUSTED"
+    )
+    QA_ENVIRONMENT_FAILURE = (
+        "QA_ENVIRONMENT_FAILURE"
+    )
+    QA_INFRA_FAILURE = (
+        "QA_INFRA_FAILURE"
+    )
+    PERSISTENCE_CONFLICT = (
+        "PERSISTENCE_CONFLICT"
+    )
+    PERSISTENCE_AGENT_FAILURE = (
+        "PERSISTENCE_AGENT_FAILURE"
+    )
+    INTEGRATION_CONFLICT = (
+        "INTEGRATION_CONFLICT"
+    )
+    INTEGRATION_AGENT_FAILURE = (
+        "INTEGRATION_AGENT_FAILURE"
+    )
+    WORKSPACE_UNAVAILABLE = (
+        "WORKSPACE_UNAVAILABLE"
+    )
+    REMOTE_BRANCH_CLEANUP_FAILURE = (
+        "REMOTE_BRANCH_CLEANUP_FAILURE"
+    )
+    ISSUE_NOT_ELIGIBLE = (
+        "ISSUE_NOT_ELIGIBLE"
+    )
+    ISSUE_NO_LONGER_PRESENT = (
+        "ISSUE_NO_LONGER_PRESENT"
+    )
+
+
+# Static Ralph-authored terminal messages.
+#
+# These strings are the ONLY strings that may ever appear in
+# ``checkpoint.last_error``.  No runtime text is permitted.
+#
+# Vocabulary is deliberately disjoint from plausible secret
+# shapes (API keys, tokens, JSON fragments, base64) so a
+# substring scan can prove the absence of a leak without false
+# positives.
+TERMINAL_REASON_MESSAGES: dict = {
+    TerminalReason.ITERATION_GUARD_EXCEEDED:
+        "Ralph exceeded its internal iteration guard. "
+        "Manual inspection required.",
+    TerminalReason.IMPLEMENTATION_AGENT_FAILURE:
+        "Implementation agent failed.",
+    TerminalReason.IMPLEMENTATION_BLOCKED:
+        "Implementation agent reported a blocker.",
+    TerminalReason.IMPLEMENTATION_EXHAUSTED_NO_CHANGES:
+        "Implementation exhausted its iteration "
+        "budget without producing changes.",
+    TerminalReason.IMPLEMENTATION_BUDGET_EXHAUSTED:
+        "Implementation iteration budget exhausted.",
+    TerminalReason.REVIEW_FIX_BUDGET_EXHAUSTED:
+        "Fix iteration budget exhausted.",
+    TerminalReason.REVIEW_CYCLE_BUDGET_EXHAUSTED:
+        "Review cycle budget exhausted.",
+    TerminalReason.REVIEW_AGENT_FAILURE:
+        "Independent reviewer returned an invalid "
+        "response.",
+    TerminalReason.REVIEW_FIX_BEFORE_QA:
+        "PRE_QA review requested "
+        "implementation fixes.",
+    TerminalReason.REVIEW_BLOCK_PERSISTENCE:
+        "PRE_PERSISTENCE review blocked "
+        "persistence.",
+    TerminalReason.QA_CODE_FAILURE:
+        "Automated QA reported code failure.",
+    TerminalReason.QA_BUDGET_EXHAUSTED:
+        "Automated QA attempt budget exhausted.",
+    TerminalReason.QA_ENVIRONMENT_FAILURE:
+        "Automated QA environment could not be "
+        "provisioned.",
+    TerminalReason.QA_INFRA_FAILURE:
+        "Automated QA reported an infrastructure "
+        "failure.",
+    TerminalReason.PERSISTENCE_CONFLICT:
+        "Persistence state could not be safely "
+        "reconciled.",
+    TerminalReason.PERSISTENCE_AGENT_FAILURE:
+        "Persistence agent failed.",
+    TerminalReason.INTEGRATION_CONFLICT:
+        "Integration state could not be safely "
+        "reconciled.",
+    TerminalReason.INTEGRATION_AGENT_FAILURE:
+        "Integration agent failed.",
+    TerminalReason.WORKSPACE_UNAVAILABLE:
+        "Workspace preparation failed.",
+    TerminalReason.REMOTE_BRANCH_CLEANUP_FAILURE:
+        "Remote ticket branch cleanup failed.",
+    TerminalReason.ISSUE_NOT_ELIGIBLE:
+        "Issue is no longer execution-authorized "
+        "in its current GitHub state.",
+    TerminalReason.ISSUE_NO_LONGER_PRESENT:
+        "Issue is no longer present in the "
+        "current milestone task list.",
+}
+
+
+def _terminal_message(reason: TerminalReason) -> str:
+    """Resolve a ``TerminalReason`` to its static Ralph-owned
+    message.  This is the single source of truth for the content
+    of ``checkpoint.last_error``.
+    """
+    if not isinstance(reason, TerminalReason):
+        # Defensive: a non-enum value must never produce a
+        # ``last_error`` string.  Raising here converts the
+        # caller bug into an immediate, loud failure rather
+        # than a silent leak.
+        raise TypeError(
+            "_record_terminal requires a TerminalReason, "
+            f"got {type(reason).__name__}"
+        )
+    return TERMINAL_REASON_MESSAGES[reason]
+
+
+# Closed set of approved ``checkpoint.last_error`` values.
+#
+# Every non-null ``TicketCheckpoint.last_error`` MUST equal an
+# exact member of this immutable set.  The set is derived
+# directly from ``TERMINAL_REASON_MESSAGES`` so the two sources
+# cannot drift.
+#
+# ``CheckpointStore`` enforces this invariant on both load and
+# save.  Any value not in this set is rejected with
+# ``CheckpointError`` rather than being silently persisted,
+# deserialized, or coerced into a "trusted" value.
+APPROVED_LAST_ERROR_MESSAGES: frozenset = frozenset(
+    TERMINAL_REASON_MESSAGES.values()
+)
 
 
 @dataclass(frozen=True)
@@ -239,9 +438,8 @@ class Orchestrator:
                 checkpoint=checkpoint,
                 store=store,
                 state=TicketState.BLOCKED_FOR_HUMAN,
-                message=(
-                    "Issue is no longer execution-authorized "
-                    "in its current GitHub state."
+                reason=(
+                    TerminalReason.ISSUE_NOT_ELIGIBLE
                 ),
             )
             return checkpoint.state
@@ -328,9 +526,9 @@ class Orchestrator:
                 checkpoint = replace(
                     existing,
                     state=TicketState.BLOCKED_FOR_HUMAN,
-                    last_error=(
-                        "Issue is no longer present in the "
-                        "current milestone task list."
+                    last_error=_terminal_message(
+                        TerminalReason
+                        .ISSUE_NO_LONGER_PRESENT
                     ),
                 )
                 store.save(checkpoint)
@@ -385,8 +583,14 @@ class Orchestrator:
         checkpoint: TicketCheckpoint,
         store: CheckpointStore,
         state: TicketState,
-        message: str,
+        reason: TerminalReason,
     ) -> TicketCheckpoint:
+        # ``last_error`` is Ralph-owned control-plane data.
+        # Only ``_terminal_message(reason)`` produces the
+        # persisted string.  No caller may supply an arbitrary
+        # message.  This is the security boundary.
+        message = _terminal_message(reason)
+
         updated = replace(
             checkpoint,
             state=state,
@@ -404,7 +608,7 @@ def _consume_attempt(
     store: CheckpointStore,
     field: str,
     limit: int,
-    budget_message: str,
+    budget_reason: TerminalReason,
 ) -> TicketCheckpoint:
     """Increment an attempt counter, save the checkpoint, then
     enforce the limit.
@@ -425,10 +629,12 @@ def _consume_attempt(
     store.save(updated)
 
     if current + 1 > limit:
+        # ``last_error`` is Ralph-owned control-plane data;
+        # only static ``TerminalReason`` messages are allowed.
         blocked = replace(
             updated,
             state=TicketState.BLOCKED_FOR_HUMAN,
-            last_error=budget_message,
+            last_error=_terminal_message(budget_reason),
         )
         store.save(blocked)
         raise _BudgetExhausted(blocked)
@@ -498,9 +704,9 @@ class Conductor:
             if guard > max_guard:
                 self._record_terminal(
                     state=TicketState.BLOCKED_FOR_HUMAN,
-                    message=(
-                        "Ralph exceeded its internal iteration "
-                        "guard. Manual inspection required."
+                    reason=(
+                        TerminalReason
+                        .ITERATION_GUARD_EXCEEDED
                     ),
                 )
                 return self.checkpoint.state
@@ -542,8 +748,14 @@ class Conductor:
         self,
         *,
         state: TicketState,
-        message: str,
+        reason: TerminalReason,
     ) -> None:
+        # ``last_error`` is Ralph-owned control-plane data.
+        # Only ``_terminal_message(reason)`` produces the
+        # persisted string.  No caller may supply an arbitrary
+        # message.  This is the security boundary.
+        message = _terminal_message(reason)
+
         self.checkpoint = replace(
             self.checkpoint,
             state=state,
@@ -590,12 +802,12 @@ class Conductor:
                 store=self.store,
                 field=field,
                 limit=limit,
-                budget_message=(
-                    "Fix iteration budget exhausted."
+                budget_reason=(
+                    TerminalReason.REVIEW_FIX_BUDGET_EXHAUSTED
                     if is_fix
                     else (
-                        "Implementation iteration budget "
-                        "exhausted."
+                        TerminalReason
+                        .IMPLEMENTATION_BUDGET_EXHAUSTED
                     )
                 ),
             )
@@ -642,19 +854,31 @@ class Conductor:
                 ],
                 fix_context=fix_context,
             )
-        except ImplementationError as error:
+        except ImplementationError:
+            # ``ImplementationError`` text is untrusted and
+            # MUST NOT reach ``checkpoint.last_error``.  Map
+            # the failure to a static categorical reason.
             self._record_terminal(
                 state=TicketState.AGENT_FAILURE,
-                message=str(error),
+                reason=(
+                    TerminalReason
+                    .IMPLEMENTATION_AGENT_FAILURE
+                ),
             )
             return
 
         if result.is_blocked:
+            # ``result.completion_blocker`` is model-authored
+            # text and MUST NOT reach ``checkpoint.last_error``.
+            # Map the BLOCKED verdict to a static categorical
+            # reason.  The blocker string continues to live
+            # on the ImplementationResult / completion file
+            # as untrusted evidence if needed elsewhere.
             self._record_terminal(
                 state=TicketState.BLOCKED_FOR_HUMAN,
-                message=(
-                    result.completion_blocker
-                    or "Implementation agent reported BLOCKED."
+                reason=(
+                    TerminalReason
+                    .IMPLEMENTATION_BLOCKED
                 ),
             )
             return
@@ -662,9 +886,9 @@ class Conductor:
         if not result.changed_files and result.exhausted:
             self._record_terminal(
                 state=TicketState.BLOCKED_FOR_HUMAN,
-                message=(
-                    "Implementation exhausted its iteration "
-                    "budget without producing changes."
+                reason=(
+                    TerminalReason
+                    .IMPLEMENTATION_EXHAUSTED_NO_CHANGES
                 ),
             )
             return
@@ -751,8 +975,9 @@ class Conductor:
             ):
                 self._record_terminal(
                     state=TicketState.BLOCKED_FOR_HUMAN,
-                    message=(
-                        "Review cycle budget exhausted."
+                    reason=(
+                        TerminalReason
+                        .REVIEW_CYCLE_BUDGET_EXHAUSTED
                     ),
                 )
                 return
@@ -779,10 +1004,17 @@ class Conductor:
                 ),
                 qa_evidence=self.checkpoint.qa_evidence,
             )
-        except ReviewError as error:
+        except ReviewError:
+            # ``ReviewError`` text is untrusted (it embeds
+            # subprocess exit codes only, never model content,
+            # but we still treat it as untrusted).  Map the
+            # failure to a static categorical reason.
             self._record_terminal(
                 state=TicketState.AGENT_FAILURE,
-                message=str(error),
+                reason=(
+                    TerminalReason
+                    .REVIEW_AGENT_FAILURE
+                ),
             )
             return
 
@@ -794,6 +1026,18 @@ class Conductor:
                 result.verdict
                 == ReviewVerdict.FIX_BEFORE_QA
             ):
+                # checkpoint.last_error is Ralph
+                # control-plane state.  The model-
+                # authored ReviewResult.summary is
+                # untrusted content and MUST NOT be
+                # persisted there.  Structured
+                # reviewer findings remain in the
+                # dedicated ``pre_qa_findings``
+                # field so the fix-context mechanism
+                # can still consume them.  The
+                # ``last_error`` string is resolved
+                # through the closed ``TerminalReason``
+                # trust boundary.
                 self.checkpoint = replace(
                     self.checkpoint,
                     state=TicketState.FIXING,
@@ -803,7 +1047,10 @@ class Conductor:
                     ),
                     pre_persistence_findings=None,
                     qa_failure_evidence=None,
-                    last_error=result.summary,
+                    last_error=_terminal_message(
+                        TerminalReason
+                        .REVIEW_FIX_BEFORE_QA
+                    ),
                 )
                 self.store.save(self.checkpoint)
                 return
@@ -825,6 +1072,18 @@ class Conductor:
             result.verdict
             == ReviewVerdict.BLOCK_PERSISTENCE
         ):
+            # checkpoint.last_error is Ralph
+            # control-plane state.  The model-
+            # authored ReviewResult.summary is
+            # untrusted content and MUST NOT be
+            # persisted there.  Structured
+            # reviewer findings remain in the
+            # dedicated ``pre_persistence_findings``
+            # field so the fix-context mechanism
+            # can still consume them.  The
+            # ``last_error`` string is resolved
+            # through the closed ``TerminalReason``
+            # trust boundary.
             self.checkpoint = replace(
                 self.checkpoint,
                 state=TicketState.FIXING,
@@ -834,7 +1093,10 @@ class Conductor:
                 ),
                 pre_qa_findings=None,
                 qa_failure_evidence=None,
-                last_error=result.summary,
+                last_error=_terminal_message(
+                    TerminalReason
+                    .REVIEW_BLOCK_PERSISTENCE
+                ),
             )
             self.store.save(self.checkpoint)
             return
@@ -926,8 +1188,8 @@ class Conductor:
                 store=self.store,
                 field="qa_attempts",
                 limit=self._budgets.max_qa_attempts,
-                budget_message=(
-                    "Automated QA attempt budget exhausted."
+                budget_reason=(
+                    TerminalReason.QA_BUDGET_EXHAUSTED
                 ),
             )
         except _BudgetExhausted as error:
@@ -941,12 +1203,14 @@ class Conductor:
 
         try:
             environment = self.qa_environment.start()
-        except QaEnvironmentError as error:
+        except QaEnvironmentError:
+            # ``QaEnvironmentError`` text is untrusted and
+            # MUST NOT reach ``checkpoint.last_error``.  Map
+            # the failure to a static categorical reason.
             self._record_terminal(
                 state=TicketState.INFRA_FAILURE,
-                message=(
-                    "PostgreSQL provisioning failed: "
-                    f"{error}"
+                reason=(
+                    TerminalReason.QA_ENVIRONMENT_FAILURE
                 ),
             )
             return
@@ -971,9 +1235,8 @@ class Conductor:
         ):
             self._record_terminal(
                 state=TicketState.INFRA_FAILURE,
-                message=(
-                    "Automated QA reported an infrastructure "
-                    "failure."
+                reason=(
+                    TerminalReason.QA_INFRA_FAILURE
                 ),
             )
             return
@@ -990,8 +1253,8 @@ class Conductor:
                 qa_failure_evidence=evidence,
                 pre_qa_findings=None,
                 pre_persistence_findings=None,
-                last_error=(
-                    "Automated QA reported code failure."
+                last_error=_terminal_message(
+                    TerminalReason.QA_CODE_FAILURE
                 ),
             )
             self.store.save(self.checkpoint)
@@ -1123,9 +1386,8 @@ class Conductor:
         if outcome.outcome == RecoveryOutcome.AMBIGUOUS:
             self._record_terminal(
                 state=TicketState.BLOCKED_FOR_HUMAN,
-                message=(
-                    "Durable persistence state is ambiguous. "
-                    "Manual inspection required."
+                reason=(
+                    TerminalReason.PERSISTENCE_CONFLICT
                 ),
             )
             return PersistenceRecoveryDisposition.TERMINAL
@@ -1229,12 +1491,15 @@ class Conductor:
                     f"#{self.checkpoint.issue_number}."
                 ),
             )
-        except PersistenceError as error:
+        except PersistenceError:
+            # ``PersistenceError`` text is untrusted and MUST
+            # NOT reach ``checkpoint.last_error``.  Map the
+            # failure to a static categorical reason.
             self._record_terminal(
                 state=TicketState.BLOCKED_FOR_HUMAN,
-                message=(
-                    "COMMIT_ONLY continuation failed: "
-                    f"{error}"
+                reason=(
+                    TerminalReason
+                    .PERSISTENCE_AGENT_FAILURE
                 ),
             )
             return None
@@ -1332,10 +1597,16 @@ class Conductor:
                     f"#{self.checkpoint.issue_number}."
                 ),
             )
-        except PersistenceError as error:
+        except PersistenceError:
+            # ``PersistenceError`` text is untrusted and MUST
+            # NOT reach ``checkpoint.last_error``.  Map the
+            # failure to a static categorical reason.
             self._record_terminal(
                 state=TicketState.BLOCKED_FOR_HUMAN,
-                message=str(error),
+                reason=(
+                    TerminalReason
+                    .PERSISTENCE_AGENT_FAILURE
+                ),
             )
             return
 
@@ -1371,9 +1642,9 @@ class Conductor:
             ):
                 self._record_terminal(
                     state=TicketState.BLOCKED_FOR_HUMAN,
-                    message=(
-                        "Integration requested without a "
-                        "persisted commit or PR."
+                    reason=(
+                        TerminalReason
+                        .PERSISTENCE_CONFLICT
                     ),
                 )
                 return
@@ -1402,10 +1673,16 @@ class Conductor:
                     self.checkpoint.persisted_commit_sha
                 ),
             )
-        except IntegrationError as error:
+        except IntegrationError:
+            # ``IntegrationError`` text is untrusted and MUST
+            # NOT reach ``checkpoint.last_error``.  Map the
+            # failure to a static categorical reason.
             self._record_terminal(
                 state=TicketState.BLOCKED_FOR_HUMAN,
-                message=str(error),
+                reason=(
+                    TerminalReason
+                    .INTEGRATION_AGENT_FAILURE
+                ),
             )
             return
 
@@ -1428,10 +1705,17 @@ class Conductor:
         ):
             try:
                 self._cleanup_remote_branch()
-            except RemoteBranchCleanupError as error:
+            except RemoteBranchCleanupError:
+                # ``RemoteBranchCleanupError`` text is
+                # untrusted and MUST NOT reach
+                # ``checkpoint.last_error``.  Map the failure
+                # to a static categorical reason.
                 self._record_terminal(
                     state=TicketState.BLOCKED_FOR_HUMAN,
-                    message=str(error),
+                    reason=(
+                        TerminalReason
+                        .REMOTE_BRANCH_CLEANUP_FAILURE
+                    ),
                 )
                 return self.checkpoint.state
 
@@ -1532,17 +1816,22 @@ class Conductor:
                 expected_base_sha=expected_base_sha,
                 github_token=token.token,
             )
-        except WorkspacePreparationError as error:
+        except WorkspacePreparationError:
+            # ``WorkspacePreparationError`` text is untrusted
+            # and MUST NOT reach ``checkpoint.last_error``.
+            # Map the failure to a static categorical reason.
             self._workspace_unavailable = True
 
             self._record_terminal(
                 state=TicketState.BLOCKED_FOR_HUMAN,
-                message=(
-                    "Workspace preparation failed: "
-                    f"{error}"
+                reason=(
+                    TerminalReason
+                    .WORKSPACE_UNAVAILABLE
                 ),
             )
-            raise WorkspaceUnavailable(str(error)) from error
+            raise WorkspaceUnavailable(
+                "Workspace preparation failed."
+            )
 
         # The original ticket_sha is the durable pre-implementation
         # baseline. On a fresh sandbox we receive the current HEAD

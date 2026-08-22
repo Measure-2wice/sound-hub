@@ -15,6 +15,45 @@ class CheckpointError(RuntimeError):
     pass
 
 
+def _approved_last_error_messages() -> frozenset:
+    """Return the closed set of approved ``last_error``
+    values.
+
+    The set is owned by ``scripts.ralph.run`` and derived from
+    the ``TerminalReason`` -> static-message mapping.  Lazy
+    import avoids a module-load cycle between ``run.py`` and
+    ``checkpoint.py``.
+    """
+    from scripts.ralph.run import APPROVED_LAST_ERROR_MESSAGES
+
+    return APPROVED_LAST_ERROR_MESSAGES
+
+
+def _validate_last_error(value) -> None:
+    """Enforce the trust boundary on ``last_error``.
+
+    ``value`` must be either ``None`` or an exact member of the
+    closed approved static-message set.  Any other value
+    (arbitrary string, secret-shaped string, number, list,
+    dict, bool, unknown future string) is rejected with
+    ``CheckpointError``.
+
+    This function never coerces an untrusted value into a
+    trusted one.  It fails closed.
+    """
+    if value is None:
+        return
+    if not isinstance(value, str):
+        raise CheckpointError(
+            "checkpoint.last_error has unexpected type."
+        )
+    if value not in _approved_last_error_messages():
+        raise CheckpointError(
+            "checkpoint.last_error is not an approved "
+            "static Ralph message."
+        )
+
+
 @dataclass(frozen=True)
 class TicketCheckpoint:
     milestone_id: str
@@ -80,6 +119,13 @@ class CheckpointStore:
             raise CheckpointError(
                 "Unsupported Ralph checkpoint schema."
             )
+
+        # Validate ``last_error`` BEFORE constructing the
+        # dataclass so an untrusted value can never reach
+        # ``TicketCheckpoint``.  This is the load-side
+        # half of the trust boundary.
+        last_error = payload.get("last_error")
+        _validate_last_error(last_error)
 
         try:
             return TicketCheckpoint(
@@ -159,9 +205,7 @@ class CheckpointStore:
                 pre_persistence_findings=payload.get(
                     "pre_persistence_findings"
                 ),
-                last_error=payload.get(
-                    "last_error"
-                ),
+                last_error=last_error,
             )
         except (
             KeyError,
@@ -180,6 +224,13 @@ class CheckpointStore:
             parents=True,
             exist_ok=True,
         )
+
+        # Validate ``last_error`` BEFORE serialization so an
+        # invalid value can never reach disk.  This is the
+        # save-side half of the trust boundary and protects
+        # against programmatically constructed checkpoints
+        # that bypass the conductor's typed APIs.
+        _validate_last_error(checkpoint.last_error)
 
         payload = {
             "schema_version":

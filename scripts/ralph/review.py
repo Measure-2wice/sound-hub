@@ -15,6 +15,39 @@ NEBIUS_CHAT_URL = (
     "chat/completions"
 )
 
+# Reviewer content is untrusted output.  It must NEVER
+# appear in ReviewError text because that text is
+# persisted into checkpoint.last_error.  Persisted
+# ReviewError messages are static categorical error
+# codes only — no content substring, no content hash,
+# no content length, no content prefix/suffix, no
+# content fingerprint of any kind.
+
+# Stable internal error categories.  These are static
+# identifiers — they are NOT derived from model
+# output, subprocess output, prompts, or diffs.
+REVIEW_INVALID_JSON = "RALPH_REVIEW_INVALID_JSON"
+REVIEW_UNKNOWN_VERDICT = (
+    "RALPH_REVIEW_UNKNOWN_VERDICT"
+)
+REVIEW_VERDICT_INVALID_FOR_STAGE = (
+    "RALPH_REVIEW_VERDICT_INVALID_FOR_STAGE"
+)
+REVIEW_FINDINGS_NOT_LIST = (
+    "RALPH_REVIEW_FINDINGS_NOT_LIST"
+)
+REVIEW_MALFORMED_FINDING = (
+    "RALPH_REVIEW_MALFORMED_FINDING"
+)
+REVIEW_MISSING_CONTENT = (
+    "RALPH_REVIEW_MISSING_CONTENT"
+)
+REVIEW_INVALID_WRAPPER_JSON = (
+    "RALPH_REVIEW_INVALID_WRAPPER_JSON"
+)
+REVIEW_NEBIUS_FAILED = "RALPH_NEBIUS_FAILED"
+REVIEW_NEBIUS_TIMEOUT = "RALPH_NEBIUS_TIMEOUT"
+
 
 class ReviewError(RuntimeError):
     pass
@@ -141,10 +174,14 @@ class ReviewRunner:
         )
 
         if result.exit_code != 0:
+            # Persisted ReviewError text flows into
+            # checkpoint.last_error.  The git diff
+            # subprocess stdout/stderr are untrusted
+            # and MUST NOT be persisted.  Use only the
+            # numeric process boundary exit code.
             raise ReviewError(
                 "Unable to capture implementation diff.\n"
-                f"stdout:\n{result.stdout}\n"
-                f"stderr:\n{result.stderr}"
+                f"exit_code={result.exit_code}"
             )
 
         return result.stdout
@@ -295,6 +332,9 @@ verdict strings, not the entire allowed-verdict phrase.
             ],
             "temperature": 0,
             "max_tokens": self.max_tokens,
+            "response_format": {
+                "type": "json_object",
+            },
         }
 
         script = f"""
@@ -345,18 +385,33 @@ print(
         )
 
         if result.exit_code != 0:
+            # Persisted ReviewError text flows into
+            # checkpoint.last_error.  The subprocess
+            # stdout/stderr are untrusted and MUST NOT
+            # be persisted.  Only the numeric process
+            # boundary exit code is safe to expose.
+            #
+            # The static message uses vocabulary that
+            # is deliberately disjoint from any
+            # plausible secret string so a substring
+            # scan can prove no leak without false
+            # positives.
             raise ReviewError(
-                "Nebius reviewer failed.\n"
-                f"exit_code: {result.exit_code}\n"
-                f"stdout:\n{result.stdout}\n"
-                f"stderr:\n{result.stderr}"
+                "Reviewer subprocess invocation failed.\n"
+                f"exit_code={result.exit_code} "
+                f"code={REVIEW_NEBIUS_FAILED}"
             )
 
         try:
             return json.loads(result.stdout)
         except json.JSONDecodeError as error:
+            # Persisted ReviewError text flows into
+            # checkpoint.last_error.  The wrapper
+            # JSON is untrusted and MUST NOT be
+            # persisted.
             raise ReviewError(
-                "Nebius reviewer returned invalid wrapper JSON."
+                "Reviewer subprocess returned invalid "
+                f"wrapper JSON. code={REVIEW_INVALID_WRAPPER_JSON}"
             ) from error
 
     def _parse_response(
@@ -368,19 +423,31 @@ print(
         content = response.get("content")
 
         if not isinstance(content, str):
+            # Persisted ReviewError text flows into
+            # checkpoint.last_error.  Use a static
+            # categorical message; never embed the
+            # response value.
             raise ReviewError(
-                "Reviewer response is missing content."
+                "Reviewer response is missing content. "
+                f"code={REVIEW_MISSING_CONTENT}"
             )
 
-        content = self._strip_code_fence(
+        stripped = self._strip_code_fence(
             content.strip()
         )
 
         try:
-            payload = json.loads(content)
+            payload = json.loads(stripped)
         except json.JSONDecodeError as error:
+            # Reviewer content is untrusted output.
+            # It MUST NEVER appear in ReviewError
+            # because ReviewError text is persisted
+            # to checkpoint.last_error.  Use only a
+            # static categorical message and the
+            # stable error code.
             raise ReviewError(
-                "Reviewer did not return valid verdict JSON."
+                "Reviewer did not return valid "
+                f"verdict JSON. code={REVIEW_INVALID_JSON}"
             ) from error
 
         try:
@@ -392,7 +459,8 @@ print(
             ValueError,
         ) as error:
             raise ReviewError(
-                "Reviewer returned an unknown verdict."
+                "Reviewer returned an unknown "
+                f"verdict. code={REVIEW_UNKNOWN_VERDICT}"
             ) from error
 
         self._assert_verdict_allowed(
@@ -407,7 +475,8 @@ print(
 
         if not isinstance(raw_findings, list):
             raise ReviewError(
-                "Reviewer findings must be a list."
+                "Reviewer findings must be a list. "
+                f"code={REVIEW_FINDINGS_NOT_LIST}"
             )
 
         findings = []
@@ -432,7 +501,8 @@ print(
                 TypeError,
             ) as error:
                 raise ReviewError(
-                    "Reviewer returned malformed finding."
+                    "Reviewer returned malformed "
+                    f"finding. code={REVIEW_MALFORMED_FINDING}"
                 ) from error
 
         usage = response.get(
@@ -508,6 +578,7 @@ print(
 
         if verdict not in allowed[stage]:
             raise ReviewError(
-                "Reviewer returned a verdict that is invalid "
-                f"for stage {stage.value}: {verdict.value}"
+                "Reviewer returned a verdict that is "
+                "invalid for the current stage. "
+                f"code={REVIEW_VERDICT_INVALID_FOR_STAGE}"
             )
