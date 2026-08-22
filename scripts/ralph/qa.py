@@ -1,4 +1,5 @@
 import re
+import shlex
 from dataclasses import dataclass
 from enum import Enum
 from typing import Mapping, Optional
@@ -208,11 +209,42 @@ class QaRunner:
         *,
         env: Optional[Mapping[str, str]],
     ) -> QaCommandResult:
+        # The configured QA command is itself a
+        # trusted shell string authored in the
+        # milestone config.  We do NOT try to
+        # parse, re-escape, or otherwise
+        # reinterpret its inner shell tokens.
+        #
+        # The Tenki SDK `cwd` parameter is also
+        # passed below as defense in depth, but it
+        # is NOT relied upon: the live sandbox
+        # ignored `cwd` in smoke #43 and ran
+        # `pnpm format:check` from ``/home/tenki``
+        # instead of the prepared repository,
+        # producing
+        # ``ERR_PNPM_NO_IMPORTER_MANIFEST_FOUND``.
+        #
+        # Therefore the repository directory is
+        # established INSIDE the shell itself,
+        # before the QA command runs, with
+        # ``shlex.quote`` so a workspace path
+        # containing spaces or shell-significant
+        # characters cannot inject shell tokens.
+        # If the cd fails, ``&&`` short-circuits
+        # the rest of the line and the QA command
+        # never runs from an unintended directory.
+        repository_path = self.workspace.repository_path
+        quoted_repository = shlex.quote(repository_path)
+        shell_command = (
+            f"cd {quoted_repository} && "
+            f"{command.command}"
+        )
+
         result = self.sandbox.exec(
             "bash",
             "-lc",
-            command.command,
-            cwd=self.workspace.repository_path,
+            shell_command,
+            cwd=repository_path,
             env=dict(env or {}),
             timeout=command.timeout_seconds,
         )
