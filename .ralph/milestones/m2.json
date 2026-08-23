@@ -8,7 +8,7 @@
   "execution": {
     "mode": "sequential",
     "maxReviewCycles": 3,
-    "closeIssuesBeforeFinalMerge": false,
+    "closeIssuesBeforeFinalMerge": true,
     "requireAutomatedApprovalBeforeIntegration": true,
     "requireHumanQaBeforeFinalMerge": true
   },

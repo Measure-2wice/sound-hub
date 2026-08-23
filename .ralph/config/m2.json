@@ -1,0 +1,64 @@
+{
+  "id": "m2",
+  "name": "Authenticated Workspaces and Seller Onboarding",
+  "githubMilestone": "M2: Authenticated Workspaces and Seller Onboarding",
+  "repository": "Measure-2wice/sound-hub",
+  "parentIssue": 12,
+
+  "githubApp": {
+    "idEnv": "RALPH_GITHUB_APP_ID",
+    "privateKeyPathEnv": "RALPH_GITHUB_APP_PRIVATE_KEY_PATH"
+  },
+
+  "integration": {
+    "branch": "ralph/m2",
+    "ticketBranchPrefix": "ralph/m2-",
+    "strategy": "merge-no-ff",
+    "pushAfterIntegration": true,
+    "closeIssueAfterIntegration": true,
+    "deleteTicketWorktreeAfterIntegration": true,
+    "deleteLocalTicketBranchAfterIntegration": true,
+    "deleteRemoteTicketBranchAfterIntegration": true,
+    "mergeToMain": false
+  },
+
+  "execution": {
+    "mode": "sequential",
+    "freshContextPerIteration": true,
+    "maxImplementationIterations": 2,
+    "maxReviewCycles": 3,
+    "maxReviewFixIterations": 2,
+    "maxQaAttempts": 2,
+    "requireCodexApproval": true,
+    "requireAutomatedQaBeforeIntegration": true,
+    "requireHumanQaBeforeFinalMerge": true
+  },
+
+  "selection": {
+    "requiredLabel": "ready-for-ralph",
+    "skipLabels": ["supervised-agent", "needs-reshaping"]
+  },
+
+  "qa": {
+    "commands": [
+      {
+        "name": "format-check",
+        "command": "pnpm format:check",
+        "timeoutSeconds": 300
+      },
+      {
+        "name": "check",
+        "command": "pnpm check",
+        "timeoutSeconds": 1800
+      }
+    ]
+  },
+
+  "safety": {
+    "allowPushTicketBranches": true,
+    "allowPushIntegrationBranch": true,
+    "allowCloseIntegratedIssues": true,
+    "allowMergeToMain": false,
+    "allowForcePush": false
+  }
+}
