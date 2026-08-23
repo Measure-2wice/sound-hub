@@ -2,8 +2,14 @@ import json
 import unittest
 from unittest.mock import MagicMock
 
+import tenki
+
 from scripts.ralph.implementation import (
+    DEFAULT_IMPLEMENTATION_TIMEOUT_SECONDS,
+    ImplementationError,
+    ImplementationFixContext,
     ImplementationRunner,
+    ImplementationTimeoutError,
     CompletionPhase,
     CompletionStatus,
     completion_result_path,
@@ -170,6 +176,426 @@ class ImplementationRunnerTests(unittest.TestCase):
                 "packages/db/file.ts",
                 "packages/db/new.sql",
             ),
+        )
+
+
+class ImplementationTimeoutTests(unittest.TestCase):
+    """Regression tests for the bounded wall-clock timeout
+    added after the M2 #17 hang.
+
+    Contract under test:
+
+    - The implementation ``Sandbox.exec`` invocation ALWAYS
+      receives a finite, positive integer ``timeout``.  The
+      value is bounded and configurable via
+      ``implementation_timeout_seconds``.
+
+    - The same finite timeout is applied to BOTH the initial
+      implementation phase and the fix phase.
+
+    - On timeout (Tenki ``CommandTimeoutError`` or built-in
+      ``TimeoutError``) ``ImplementationRunner.run`` raises
+      ``ImplementationTimeoutError`` and does NOT hang.
+
+    - The exception does NOT carry subprocess stdout, stderr,
+      or model output (those are untrusted for
+      ``checkpoint.last_error``).
+
+    - Successful runs (normal completion) are unaffected by
+      the timeout contract.
+    """
+
+    def setUp(self):
+        self.sandbox = MagicMock()
+
+        self.workspace = TicketWorkspace(
+            repository_path="/tmp/sound-hub",
+            integration_branch="ralph/m2",
+            ticket_branch="ralph/m2-16",
+            base_sha="base123",
+            ticket_sha="ticket123",
+            resumed=True,
+        )
+
+        # Default timeout matches the production default; tests
+        # that need to inspect specific values construct
+        # ``ImplementationRunner`` explicitly.
+        self.runner = ImplementationRunner(
+            sandbox=self.sandbox,
+            workspace=self.workspace,
+            model="MiniMax-M2.7",
+            max_turns=60,
+        )
+
+    def _setup_happy_path_exec(self):
+        """Configure the sandbox so a happy-path implementation
+        invocation completes with a syntactically valid Claude
+        JSON payload and an empty completion file.
+
+        Returns the sequence of exec calls the runner issues
+        (claude, git status, completion cat, ...) so the tests
+        can inspect what arguments were passed.
+        """
+
+        def fake_exec(*args, **kwargs):
+            argv = args
+            if argv and argv[0] == "git":
+                return SandboxCommandResult(
+                    exit_code=0,
+                    stdout="",
+                    stderr="",
+                )
+            if argv and argv[0] == "python3":
+                return SandboxCommandResult(
+                    exit_code=0,
+                    stdout="",
+                    stderr="",
+                )
+            if argv and argv[0] == "bash":
+                return SandboxCommandResult(
+                    exit_code=0,
+                    stdout=(
+                        "__RALPH_COMPLETION_MISSING__"
+                    ),
+                    stderr="",
+                )
+            # ``claude`` invocation.
+            return SandboxCommandResult(
+                exit_code=0,
+                stdout=json.dumps(
+                    {
+                        "type": "result",
+                        "subtype": "success",
+                        "is_error": False,
+                        "session_id": "session-1",
+                        "num_turns": 1,
+                        "stop_reason": None,
+                        "terminal_reason": "completed",
+                        "result": "ok",
+                    }
+                ),
+                stderr="",
+            )
+
+        self.sandbox.exec.side_effect = fake_exec
+
+    def test_default_implementation_timeout_seconds_is_3600(self):
+        # The buildathon runner default is 3600s.  Locking the
+        # constant here ensures a future edit cannot silently
+        # change the production default.
+        self.assertEqual(
+            DEFAULT_IMPLEMENTATION_TIMEOUT_SECONDS, 3600
+        )
+
+    def test_runner_stores_configured_timeout(self):
+        runner = ImplementationRunner(
+            sandbox=self.sandbox,
+            workspace=self.workspace,
+            implementation_timeout_seconds=1234,
+        )
+        self.assertEqual(
+            runner.implementation_timeout_seconds, 1234
+        )
+
+    def test_runner_defaults_to_3600_seconds(self):
+        runner = ImplementationRunner(
+            sandbox=self.sandbox,
+            workspace=self.workspace,
+        )
+        self.assertEqual(
+            runner.implementation_timeout_seconds, 3600
+        )
+
+    def test_runner_rejects_non_positive_timeout(self):
+        with self.assertRaises(ValueError):
+            ImplementationRunner(
+                sandbox=self.sandbox,
+                workspace=self.workspace,
+                implementation_timeout_seconds=0,
+            )
+
+        with self.assertRaises(ValueError):
+            ImplementationRunner(
+                sandbox=self.sandbox,
+                workspace=self.workspace,
+                implementation_timeout_seconds=-1,
+            )
+
+    def test_runner_rejects_non_integer_timeout(self):
+        with self.assertRaises(ValueError):
+            ImplementationRunner(
+                sandbox=self.sandbox,
+                workspace=self.workspace,
+                implementation_timeout_seconds=12.5,
+            )
+
+        with self.assertRaises(ValueError):
+            ImplementationRunner(
+                sandbox=self.sandbox,
+                workspace=self.workspace,
+                implementation_timeout_seconds=None,
+            )
+
+    def test_implementation_phase_passes_finite_timeout(self):
+        self._setup_happy_path_exec()
+
+        self.runner.run(
+            issue_number=17,
+            issue_title="Issue 17",
+            issue_body="body",
+            minimax_api_key="key",
+            fix_context=None,
+        )
+
+        # The runner issues multiple ``exec`` calls; the
+        # ``claude`` invocation is the one that must carry the
+        # bounded timeout.  Identify it by argv[0].
+        claude_calls = [
+            call
+            for call in self.sandbox.exec.call_args_list
+            if call.args
+            and call.args[0] == "claude"
+        ]
+        self.assertEqual(len(claude_calls), 1)
+
+        claude_call = claude_calls[0]
+        timeout = claude_call.kwargs.get("timeout")
+
+        self.assertIsNotNone(timeout)
+        self.assertIsInstance(timeout, int)
+        self.assertEqual(timeout, 3600)
+
+    def test_fix_phase_passes_finite_timeout(self):
+        self._setup_happy_path_exec()
+
+        runner = ImplementationRunner(
+            sandbox=self.sandbox,
+            workspace=self.workspace,
+            attempt=2,
+            phase=CompletionPhase.FIX,
+            implementation_timeout_seconds=900,
+        )
+
+        runner.run(
+            issue_number=17,
+            issue_title="Issue 17",
+            issue_body="body",
+            minimax_api_key="key",
+            fix_context=ImplementationFixContext(
+                reviewer_findings="fix me",
+            ),
+        )
+
+        claude_calls = [
+            call
+            for call in self.sandbox.exec.call_args_list
+            if call.args
+            and call.args[0] == "claude"
+        ]
+        self.assertEqual(len(claude_calls), 1)
+
+        claude_call = claude_calls[0]
+        timeout = claude_call.kwargs.get("timeout")
+
+        self.assertIsNotNone(timeout)
+        self.assertEqual(timeout, 900)
+
+    def test_tenki_command_timeout_raises_implementation_timeout(
+        self,
+    ):
+        # The Tenki SDK raises ``CommandTimeoutError`` on a
+        # server-side ``DEADLINE_EXCEEDED``.  ``Implementation
+        # Runner`` must translate that to
+        # ``ImplementationTimeoutError`` so the conductor can
+        # map to a static terminal reason.  The first
+        # ``exec`` call (claude) is the one that must time out;
+        # the runner MUST NOT silently retry.  The install
+        # check call (``bash -lc`` in ``_ensure_claude_code``)
+        # is allowed to succeed here because the test is
+        # pinning the timeout to the implementation command
+        # specifically.
+        def fake_exec(*args, **kwargs):
+            argv = args
+            if argv and argv[0] == "bash":
+                return SandboxCommandResult(
+                    exit_code=0,
+                    stdout="claude 1.0.0",
+                    stderr="",
+                )
+            if argv and argv[0] == "python3":
+                return SandboxCommandResult(
+                    exit_code=0,
+                    stdout="",
+                    stderr="",
+                )
+            if argv and argv[0] == "git":
+                return SandboxCommandResult(
+                    exit_code=0,
+                    stdout="",
+                    stderr="",
+                )
+            raise tenki.CommandTimeoutError(
+                "DEADLINE_EXCEEDED: command deadline"
+            )
+
+        self.sandbox.exec.side_effect = fake_exec
+
+        with self.assertRaises(
+            ImplementationTimeoutError
+        ) as ctx:
+            self.runner.run(
+                issue_number=17,
+                issue_title="Issue 17",
+                issue_body="body",
+                minimax_api_key="key",
+            )
+
+        # The exception must be a subclass of
+        # ``ImplementationError`` so existing callers can catch
+        # the broader class if they want to.
+        self.assertIsInstance(
+            ctx.exception, ImplementationError
+        )
+
+        # The exception MUST NOT carry subprocess / model
+        # output: only the static Ralph-owned deadline string
+        # is permitted so the ``checkpoint.last_error``
+        # trust boundary stays intact.
+        message = str(ctx.exception)
+        self.assertNotIn("DEADLINE_EXCEEDED", message)
+        self.assertNotIn("command deadline", message)
+        self.assertIn("wall-clock deadline", message)
+
+    def test_builtin_timeout_raises_implementation_timeout(self):
+        # The Tenki SDK's ``Process.wait`` raises the built-in
+        # ``TimeoutError`` when the local wait cushion
+        # (``timeout + 5``) elapses.  ``ImplementationRunner``
+        # must translate that too.
+        def fake_exec(*args, **kwargs):
+            argv = args
+            if argv and argv[0] == "bash":
+                return SandboxCommandResult(
+                    exit_code=0,
+                    stdout="claude 1.0.0",
+                    stderr="",
+                )
+            if argv and argv[0] == "python3":
+                return SandboxCommandResult(
+                    exit_code=0,
+                    stdout="",
+                    stderr="",
+                )
+            if argv and argv[0] == "git":
+                return SandboxCommandResult(
+                    exit_code=0,
+                    stdout="",
+                    stderr="",
+                )
+            raise TimeoutError(
+                "timed out waiting for command"
+            )
+
+        self.sandbox.exec.side_effect = fake_exec
+
+        with self.assertRaises(
+            ImplementationTimeoutError
+        ):
+            self.runner.run(
+                issue_number=17,
+                issue_title="Issue 17",
+                issue_body="body",
+                minimax_api_key="key",
+            )
+
+    def test_timeout_does_not_leak_subprocess_output(self):
+        # Even when the SDK exception embeds rich output
+        # (which it normally does NOT for a timeout, but
+        # defensively guard), ``ImplementationTimeoutError``
+        # carries only the static deadline string.
+        def fake_exec(*args, **kwargs):
+            argv = args
+            if argv and argv[0] == "bash":
+                return SandboxCommandResult(
+                    exit_code=0,
+                    stdout="claude 1.0.0",
+                    stderr="",
+                )
+            if argv and argv[0] == "python3":
+                return SandboxCommandResult(
+                    exit_code=0,
+                    stdout="",
+                    stderr="",
+                )
+            if argv and argv[0] == "git":
+                return SandboxCommandResult(
+                    exit_code=0,
+                    stdout="",
+                    stderr="",
+                )
+            raise tenki.CommandTimeoutError(
+                "DEADLINE_EXCEEDED: SECRET_KEY=abc123 "
+                "stdout-leaked-token"
+            )
+
+        self.sandbox.exec.side_effect = fake_exec
+
+        with self.assertRaises(
+            ImplementationTimeoutError
+        ) as ctx:
+            self.runner.run(
+                issue_number=17,
+                issue_title="Issue 17",
+                issue_body="body",
+                minimax_api_key="key",
+            )
+
+        message = str(ctx.exception)
+        self.assertNotIn("SECRET_KEY", message)
+        self.assertNotIn("abc123", message)
+        self.assertNotIn("stdout-leaked-token", message)
+        self.assertNotIn("DEADLINE_EXCEEDED", message)
+
+    def test_normal_successful_run_unaffected(self):
+        self._setup_happy_path_exec()
+
+        result = self.runner.run(
+            issue_number=17,
+            issue_title="Issue 17",
+            issue_body="body",
+            minimax_api_key="key",
+            fix_context=None,
+        )
+
+        # Happy-path semantics are unchanged: terminal_reason
+        # is "completed", no error.
+        self.assertFalse(result.is_error)
+        self.assertEqual(
+            result.terminal_reason, "completed"
+        )
+
+    def test_normal_fix_run_unaffected(self):
+        self._setup_happy_path_exec()
+
+        runner = ImplementationRunner(
+            sandbox=self.sandbox,
+            workspace=self.workspace,
+            attempt=2,
+            phase=CompletionPhase.FIX,
+        )
+
+        result = runner.run(
+            issue_number=17,
+            issue_title="Issue 17",
+            issue_body="body",
+            minimax_api_key="key",
+            fix_context=ImplementationFixContext(
+                reviewer_findings="fix me",
+            ),
+        )
+
+        self.assertFalse(result.is_error)
+        self.assertEqual(
+            result.terminal_reason, "completed"
         )
 
 

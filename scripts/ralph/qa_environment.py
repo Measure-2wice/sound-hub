@@ -3,6 +3,7 @@ from typing import Optional
 
 from scripts.ralph.sandbox import (
     SandboxCommandResult,
+    SandboxSessionTerminatedError,
     TenkiSandbox,
 )
 
@@ -99,7 +100,28 @@ class PostgresQaEnvironment:
                     "-m", "fast",
                     "stop",
                 ])
-            except QaEnvironmentError:
+            except (
+                QaEnvironmentError,
+                # The Tenki sandbox that wraps this
+                # disposable PostgreSQL cluster may have
+                # been torn down by the platform before
+                # the QA teardown sequence runs (see the
+                # teardown-safety defect found during
+                # the M2 #17 recovery review).
+                # ``TenkiSandbox.exec`` translates the
+                # installed ``tenki.SessionTerminatedError``
+                # into the Ralph-owned static
+                # ``SandboxSessionTerminatedError``.  Treat
+                # an already-dead sandbox as
+                # cleanup-complete; do NOT re-raise the
+                # boundary exception because doing so
+                # would replace the previously-recorded
+                # Ralph terminal state (typically
+                # ``INFRA_FAILURE`` / ``SANDBOX_SESSION_TERMINATED``)
+                # with an uncaught traceback on the
+                # operator control plane.
+                SandboxSessionTerminatedError,
+            ):
                 pass
 
         self._started = False

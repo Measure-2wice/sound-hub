@@ -4,6 +4,8 @@ from dataclasses import dataclass
 from enum import Enum
 from typing import Optional
 
+import tenki
+
 from scripts.ralph.sandbox import (
     SandboxCommandResult,
     TenkiSandbox,
@@ -11,8 +13,44 @@ from scripts.ralph.sandbox import (
 from scripts.ralph.workspace import TicketWorkspace
 
 
+# Default wall-clock budget for one implementation/fix command
+# invocation. Long enough for a full agentic implementation pass
+# (including tool calls, network calls, and focused validation),
+# short enough that a stuck agent cannot hang Ralph indefinitely.
+#
+# The Tenki SDK translates ``timeout`` to a server-side deadline
+# plus a ``+5`` second local-wait cushion on
+# ``Process.wait``.  When the wall-clock deadline is reached
+# the subprocess is killed (SIGKILL) and the SDK raises one of:
+#
+#   - ``tenki.CommandTimeoutError`` — server-side
+#     ``DEADLINE_EXCEEDED`` translated by ``map_rpc_error``;
+#   - built-in ``TimeoutError("timed out waiting for command")``
+#     — raised by ``Process.wait`` when the local wait times out
+#     (the subprocess has already been killed in that path).
+#
+# ImplementationRunner catches both at the boundary and translates
+# them to ``ImplementationTimeoutError`` so ``run.py`` can map the
+# event to a static Ralph terminal reason without persisting
+# subprocess / model output into ``checkpoint.last_error``.
+DEFAULT_IMPLEMENTATION_TIMEOUT_SECONDS: int = 3600
+
+
 class ImplementationError(RuntimeError):
     """A Ralph implementation iteration could not be executed."""
+
+
+class ImplementationTimeoutError(ImplementationError):
+    """The implementation/fix command exceeded its wall-clock
+    budget.
+
+    Raised by ``ImplementationRunner.run`` when the underlying
+    sandbox exec exceeds ``implementation_timeout_seconds``.  No
+    subprocess stdout/stderr/model output is carried in this
+    exception; only the static fact that the deadline was hit
+    propagates to the conductor so the trust boundary on
+    ``checkpoint.last_error`` remains intact.
+    """
 
 
 class CompletionStatus(str, Enum):
@@ -117,6 +155,9 @@ class ImplementationRunner:
         phase: CompletionPhase = (
             CompletionPhase.IMPLEMENTATION
         ),
+        implementation_timeout_seconds: int = (
+            DEFAULT_IMPLEMENTATION_TIMEOUT_SECONDS
+        ),
     ):
         self.sandbox = sandbox
         self.workspace = workspace
@@ -124,6 +165,25 @@ class ImplementationRunner:
         self.max_turns = max_turns
         self.attempt = attempt
         self.phase = phase
+        # Wall-clock budget for one implementation/fix command
+        # invocation.  Applies to BOTH initial implementation and
+        # fix iterations.  ``None`` is intentionally NOT accepted:
+        # an unbounded implementation command is the failure mode
+        # this parameter was added to prevent.
+        if (
+            not isinstance(
+                implementation_timeout_seconds, int
+            )
+            or implementation_timeout_seconds <= 0
+        ):
+            raise ValueError(
+                "implementation_timeout_seconds must be a "
+                "positive integer; got "
+                f"{implementation_timeout_seconds!r}."
+            )
+        self.implementation_timeout_seconds = (
+            implementation_timeout_seconds
+        )
 
     def run(
         self,
@@ -156,31 +216,52 @@ class ImplementationRunner:
             fix_context=fix_context,
         )
 
-        command_result = self.sandbox.exec(
-            "claude",
-            "-p",
-            prompt,
-            "--output-format",
-            "json",
-            "--max-turns",
-            str(self.max_turns),
-            "--model",
-            self.model,
-            "--dangerously-skip-permissions",
-            cwd=self.workspace.repository_path,
-            env={
-                "ANTHROPIC_BASE_URL": (
-                    "https://api.minimax.io/anthropic"
-                ),
-                "ANTHROPIC_AUTH_TOKEN": minimax_api_key,
-                "ANTHROPIC_MODEL": self.model,
-                "ANTHROPIC_DEFAULT_SONNET_MODEL": self.model,
-                "ANTHROPIC_DEFAULT_OPUS_MODEL": self.model,
-                "ANTHROPIC_DEFAULT_HAIKU_MODEL": self.model,
-                "API_TIMEOUT_MS": "3000000",
-                "CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC": "1",
-            },
-        )
+        try:
+            command_result = self.sandbox.exec(
+                "claude",
+                "-p",
+                prompt,
+                "--output-format",
+                "json",
+                "--max-turns",
+                str(self.max_turns),
+                "--model",
+                self.model,
+                "--dangerously-skip-permissions",
+                cwd=self.workspace.repository_path,
+                env={
+                    "ANTHROPIC_BASE_URL": (
+                        "https://api.minimax.io/anthropic"
+                    ),
+                    "ANTHROPIC_AUTH_TOKEN": minimax_api_key,
+                    "ANTHROPIC_MODEL": self.model,
+                    "ANTHROPIC_DEFAULT_SONNET_MODEL": self.model,
+                    "ANTHROPIC_DEFAULT_OPUS_MODEL": self.model,
+                    "ANTHROPIC_DEFAULT_HAIKU_MODEL": self.model,
+                    "API_TIMEOUT_MS": "3000000",
+                    "CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC": "1",
+                },
+                timeout=self.implementation_timeout_seconds,
+            )
+        except (
+            tenki.CommandTimeoutError,
+            TimeoutError,
+        ) as error:
+            # The wall-clock budget was reached.  Per the
+            # contract documented on
+            # ``ImplementationTimeoutError``: do NOT persist
+            # subprocess / model output.  The exception message
+            # here is a static Ralph-owned string only; the
+            # ``error`` argument is intentionally not formatted
+            # into the message because it may carry Tenki RPC
+            # detail text that is untrusted for the
+            # ``checkpoint.last_error`` trust boundary.
+            del error
+            raise ImplementationTimeoutError(
+                "Implementation command exceeded its "
+                f"{self.implementation_timeout_seconds}s "
+                "wall-clock deadline."
+            )
 
         changed_files = self._changed_files()
 

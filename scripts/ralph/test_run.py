@@ -30,10 +30,12 @@ from scripts.ralph.github_source import (
     GitHubTaskSource,
 )
 from scripts.ralph.implementation import (
+    CompletionPhase,
     CompletionStatus,
     ImplementationError,
     ImplementationFixContext,
     ImplementationResult,
+    ImplementationTimeoutError,
 )
 from scripts.ralph.persistence import (
     PersistenceError,
@@ -62,16 +64,25 @@ from scripts.ralph.review import (
 )
 from scripts.ralph.run import (
     APPROVED_LAST_ERROR_MESSAGES,
+    Budgets,
     ConductorCallbacks,
     Orchestrator,
+    OrchestratorError,
     TERMINAL_REASON_MESSAGES,
     TerminalReason,
+    _load_budgets,
     _terminal_message,
+    _validate_implementation_timeout_seconds,
+    _validate_sandbox_max_duration_seconds,
     build_qa_commands,
     format_findings,
     split_repository,
 )
-from scripts.ralph.sandbox import SandboxCommandResult
+from scripts.ralph.sandbox import (
+    SandboxCommandResult,
+    SandboxSessionTerminatedError,
+    TenkiSandbox,
+)
 from scripts.ralph.states import TicketState
 from scripts.ralph.workspace import (
     TicketWorkspace,
@@ -377,6 +388,7 @@ class RunHarness:
         initial_workspace=None,
         authenticator=None,
         config_override=None,
+        sandbox_override=None,
     ):
         self._saved_env = {
             "RALPH_GITHUB_APP_ID": os.environ.get(
@@ -454,12 +466,16 @@ class RunHarness:
             else "ralph/m2-17"
         )
 
-        self.sandbox = make_fake_sandbox(
-            workspace=(
-                initial_workspace
-                if initial_workspace is not None
-                else workspace_response(
-                    branch=default_branch
+        self.sandbox = (
+            sandbox_override
+            if sandbox_override is not None
+            else make_fake_sandbox(
+                workspace=(
+                    initial_workspace
+                    if initial_workspace is not None
+                    else workspace_response(
+                        branch=default_branch
+                    )
                 )
             )
         )
@@ -2235,6 +2251,2022 @@ class AttemptBudgetDurabilityTests(unittest.TestCase):
             saved.state,
             TicketState.BLOCKED_FOR_HUMAN,
         )
+
+
+class ImplementationTimeoutTerminalStateTests(unittest.TestCase):
+    """Regression tests for the wall-clock timeout added after
+    the M2 #17 hang.
+
+    Contract under test:
+
+    - When ``ImplementationRunner.run`` raises
+      ``ImplementationTimeoutError`` (either phase), the
+      conductor MUST transition to ``AGENT_FAILURE`` with
+      ``last_error`` set to the static
+      ``IMPLEMENTATION_TIMEOUT`` message.
+
+    - The trust boundary on ``checkpoint.last_error`` MUST
+      remain intact: no subprocess stdout / stderr / model
+      output may reach ``last_error``.
+
+    - The attempt counter is already incremented BEFORE the
+      runner runs (existing durable checkpoint contract), so
+      the timeout consumes the next allowed fix attempt on
+      restart.
+
+    - ``ImplementationTimeoutError`` is a subclass of
+      ``ImplementationError`` so existing exception-driven
+      fallbacks still apply, but the dedicated ``except
+      ImplementationTimeoutError`` arm fires first.
+    """
+
+    def _timeout_runner(self):
+        return SimpleNamespace(
+            run=MagicMock(
+                side_effect=ImplementationTimeoutError(
+                    "Implementation command exceeded "
+                    "its 3600s wall-clock deadline."
+                )
+            )
+        )
+
+    def test_implementation_timeout_maps_to_agent_failure(self):
+        tasks = [task(17)]
+
+        checkpoint = make_checkpoint_payload(
+            issue_number=17,
+            state=TicketState.IMPLEMENTING,
+        )
+
+        impl_runner = self._timeout_runner()
+
+        callbacks = ConductorCallbacks(
+            make_authenticator=lambda config: (
+                make_fake_authenticator()
+            ),
+            make_qa_environment=lambda sb: (
+                make_fake_qa_environment()
+            ),
+            make_implementation_runner=lambda **kw: (
+                impl_runner
+            ),
+            make_review_runner=lambda **kw: MagicMock(),
+            make_qa_runner=lambda **kw: MagicMock(),
+            make_persistence_runner=lambda **kw: MagicMock(),
+            make_integration_runner=lambda **kw: MagicMock(),
+            make_remote_branch_cleaner=lambda **kw: MagicMock(),
+        )
+
+        with RunHarness(
+            tasks=tasks,
+            checkpoint=checkpoint,
+            callbacks=callbacks,
+        ) as harness:
+            harness.run()
+
+            saved = harness.saved_checkpoint()
+
+        # The runner was actually invoked (the timeout is not
+        # short-circuited by the budget guard).
+        impl_runner.run.assert_called_once()
+
+        self.assertEqual(
+            saved.implementation_attempts,
+            1,
+        )
+        self.assertEqual(
+            saved.state,
+            TicketState.AGENT_FAILURE,
+        )
+
+        # ``last_error`` MUST be the static Ralph-authored
+        # message; no subprocess / model output may leak.
+        self.assertEqual(
+            saved.last_error,
+            _terminal_message(
+                TerminalReason.IMPLEMENTATION_TIMEOUT
+            ),
+        )
+        self.assertIn(
+            "wall-clock deadline",
+            saved.last_error,
+        )
+        # The static message is disjoint from the runtime
+        # exception's text (the runtime message uses the same
+        # vocabulary by design), but it MUST NOT contain any
+        # arbitrary SDK detail.
+        self.assertNotIn("DEADLINE_EXCEEDED", saved.last_error)
+
+    def test_fix_timeout_maps_to_agent_failure(self):
+        tasks = [task(17)]
+
+        checkpoint = make_checkpoint_payload(
+            issue_number=17,
+            state=TicketState.FIXING,
+            pre_qa_findings="Old defect",
+        )
+
+        impl_runner = self._timeout_runner()
+
+        callbacks = ConductorCallbacks(
+            make_authenticator=lambda config: (
+                make_fake_authenticator()
+            ),
+            make_qa_environment=lambda sb: (
+                make_fake_qa_environment()
+            ),
+            make_implementation_runner=lambda **kw: (
+                impl_runner
+            ),
+            make_review_runner=lambda **kw: MagicMock(),
+            make_qa_runner=lambda **kw: MagicMock(),
+            make_persistence_runner=lambda **kw: MagicMock(),
+            make_integration_runner=lambda **kw: MagicMock(),
+            make_remote_branch_cleaner=lambda **kw: MagicMock(),
+        )
+
+        with RunHarness(
+            tasks=tasks,
+            checkpoint=checkpoint,
+            callbacks=callbacks,
+        ) as harness:
+            harness.run()
+
+            saved = harness.saved_checkpoint()
+
+        impl_runner.run.assert_called_once()
+
+        # The fix attempt counter is incremented BEFORE the
+        # runner is invoked, so a timeout cannot lose the
+        # attempt.  This is what allows a restart to resume
+        # the durable ``fix_attempts == 1`` checkpoint and
+        # consume the next allowed attempt normally.
+        self.assertEqual(
+            saved.fix_attempts,
+            1,
+        )
+        self.assertEqual(
+            saved.state,
+            TicketState.AGENT_FAILURE,
+        )
+        self.assertEqual(
+            saved.last_error,
+            _terminal_message(
+                TerminalReason.IMPLEMENTATION_TIMEOUT
+            ),
+        )
+
+    def test_timeout_last_error_is_in_approved_set(self):
+        # Belt-and-braces: the new terminal message MUST be
+        # in the closed ``APPROVED_LAST_ERROR_MESSAGES`` set
+        # so the load/save trust boundary accepts it.
+        tasks = [task(17)]
+
+        checkpoint = make_checkpoint_payload(
+            issue_number=17,
+            state=TicketState.IMPLEMENTING,
+        )
+
+        impl_runner = self._timeout_runner()
+
+        callbacks = ConductorCallbacks(
+            make_authenticator=lambda config: (
+                make_fake_authenticator()
+            ),
+            make_qa_environment=lambda sb: (
+                make_fake_qa_environment()
+            ),
+            make_implementation_runner=lambda **kw: (
+                impl_runner
+            ),
+            make_review_runner=lambda **kw: MagicMock(),
+            make_qa_runner=lambda **kw: MagicMock(),
+            make_persistence_runner=lambda **kw: MagicMock(),
+            make_integration_runner=lambda **kw: MagicMock(),
+            make_remote_branch_cleaner=lambda **kw: MagicMock(),
+        )
+
+        with RunHarness(
+            tasks=tasks,
+            checkpoint=checkpoint,
+            callbacks=callbacks,
+        ) as harness:
+            harness.run()
+
+            saved = harness.saved_checkpoint()
+
+        self.assertIn(
+            saved.last_error,
+            APPROVED_LAST_ERROR_MESSAGES,
+        )
+
+    def test_timeout_does_not_silently_retry_in_runner(self):
+        # The runner is invoked exactly once.  The durable
+        # checkpoint/attempt mechanism owns retry semantics:
+        # ``ImplementationRunner`` MUST NOT loop on a
+        # timeout.
+        tasks = [task(17)]
+
+        checkpoint = make_checkpoint_payload(
+            issue_number=17,
+            state=TicketState.IMPLEMENTING,
+        )
+
+        impl_runner = self._timeout_runner()
+
+        callbacks = ConductorCallbacks(
+            make_authenticator=lambda config: (
+                make_fake_authenticator()
+            ),
+            make_qa_environment=lambda sb: (
+                make_fake_qa_environment()
+            ),
+            make_implementation_runner=lambda **kw: (
+                impl_runner
+            ),
+            make_review_runner=lambda **kw: MagicMock(),
+            make_qa_runner=lambda **kw: MagicMock(),
+            make_persistence_runner=lambda **kw: MagicMock(),
+            make_integration_runner=lambda **kw: MagicMock(),
+            make_remote_branch_cleaner=lambda **kw: MagicMock(),
+        )
+
+        with RunHarness(
+            tasks=tasks,
+            checkpoint=checkpoint,
+            callbacks=callbacks,
+        ) as harness:
+            harness.run()
+
+        self.assertEqual(impl_runner.run.call_count, 1)
+
+    def test_timeout_subclass_is_a_kind_of_implementation_error(self):
+        # The dedicated ``except ImplementationTimeoutError``
+        # arm fires BEFORE the generic ``except
+        # ImplementationError`` arm, but the new exception
+        # MUST remain a subclass of ``ImplementationError``
+        # so any existing fallback still matches.
+        self.assertTrue(
+            issubclass(
+                ImplementationTimeoutError,
+                ImplementationError,
+            )
+        )
+
+    def test_timeout_message_in_terminal_reason_messages(self):
+        # The terminal reason catalog and the approved
+        # ``last_error`` set are derived from the same source
+        # of truth (``TERMINAL_REASON_MESSAGES``).  The
+        # ``IMPLEMENTATION_TIMEOUT`` entry MUST exist in both
+        # and use the same static string.
+        self.assertIn(
+            TerminalReason.IMPLEMENTATION_TIMEOUT,
+            TERMINAL_REASON_MESSAGES,
+        )
+        message = TERMINAL_REASON_MESSAGES[
+            TerminalReason.IMPLEMENTATION_TIMEOUT
+        ]
+        self.assertIn(
+            "wall-clock deadline", message
+        )
+        self.assertIn(
+            message,
+            APPROVED_LAST_ERROR_MESSAGES,
+        )
+
+
+class ImplementationTimeoutConfigValidationTests(unittest.TestCase):
+    """Regression tests for the
+    ``execution.implementationTimeoutSeconds`` configuration
+    boundary.
+
+    Contract under test (added after Codex review of the M2 #17
+    hang fix):
+
+    - The configuration validator uses
+      ``type(value) is int and value > 0``.  Using
+      ``isinstance(value, int)`` is unsafe because ``bool`` is
+      a subclass of ``int`` in Python; ``True`` would otherwise
+      survive integer validation and reach Tenki as
+      approximately 1 second.
+
+    - Validation runs at the configuration/budget loading
+      boundary (the single source of truth in
+      ``_load_budgets``), BEFORE any checkpoint load, task
+      discovery, sandbox creation, runner construction, attempt
+      consumption, or GitHub mutation.  An invalid config
+      therefore CANNOT consume a ticket attempt budget or
+      mutate the durable checkpoint.
+
+    - Invalid configurations surface as ``OrchestratorError``,
+      the existing Ralph orchestration error boundary.  The
+      message is a static Ralph-owned string and never echoes
+      the raw value.
+    """
+
+    # ---- 1. Missing key defaults to integer 3600 ----
+
+    def test_missing_key_defaults_to_3600_integer(self):
+        config = json.loads(json.dumps(CONFIG))
+
+        budgets = _load_budgets(config)
+
+        self.assertEqual(
+            budgets.implementation_timeout_seconds, 3600
+        )
+        self.assertIsInstance(
+            budgets.implementation_timeout_seconds, int
+        )
+        self.assertIsNot(
+            type(budgets.implementation_timeout_seconds),
+            bool,
+        )
+
+    # ---- 2. Positive integer is accepted exactly ----
+
+    def test_positive_integer_accepted_exactly(self):
+        for value in (1, 30, 900, 3600):
+            with self.subTest(value=value):
+                config = json.loads(json.dumps(CONFIG))
+                config["execution"][
+                    "implementationTimeoutSeconds"
+                ] = value
+
+                budgets = _load_budgets(config)
+
+                self.assertEqual(
+                    budgets.implementation_timeout_seconds,
+                    value,
+                )
+
+    # ---- 3. ``True`` is rejected ----
+
+    def test_true_is_rejected(self):
+        config = json.loads(json.dumps(CONFIG))
+        config["execution"][
+            "implementationTimeoutSeconds"
+        ] = True
+
+        with self.assertRaises(ValueError):
+            _load_budgets(config)
+
+        # And the predicate itself rejects ``True`` directly
+        # (proves the unsafe ``isinstance(True, int)`` path is
+        # not what we use).
+        self.assertRaises(
+            ValueError,
+            _validate_implementation_timeout_seconds,
+            True,
+        )
+
+    # ---- 4. ``False`` is rejected ----
+
+    def test_false_is_rejected(self):
+        config = json.loads(json.dumps(CONFIG))
+        config["execution"][
+            "implementationTimeoutSeconds"
+        ] = False
+
+        with self.assertRaises(ValueError):
+            _load_budgets(config)
+
+        self.assertRaises(
+            ValueError,
+            _validate_implementation_timeout_seconds,
+            False,
+        )
+
+    # ---- 5. The string ``"3600"`` is rejected ----
+
+    def test_string_3600_is_rejected(self):
+        config = json.loads(json.dumps(CONFIG))
+        config["execution"][
+            "implementationTimeoutSeconds"
+        ] = "3600"
+
+        with self.assertRaises(ValueError):
+            _load_budgets(config)
+
+        self.assertRaises(
+            ValueError,
+            _validate_implementation_timeout_seconds,
+            "3600",
+        )
+
+    # ---- 6. The float ``3600.0`` is rejected ----
+
+    def test_float_3600_is_rejected(self):
+        config = json.loads(json.dumps(CONFIG))
+        config["execution"][
+            "implementationTimeoutSeconds"
+        ] = 3600.0
+
+        with self.assertRaises(ValueError):
+            _load_budgets(config)
+
+        self.assertRaises(
+            ValueError,
+            _validate_implementation_timeout_seconds,
+            3600.0,
+        )
+
+    # ---- 7. ``0`` is rejected ----
+
+    def test_zero_is_rejected(self):
+        config = json.loads(json.dumps(CONFIG))
+        config["execution"][
+            "implementationTimeoutSeconds"
+        ] = 0
+
+        with self.assertRaises(ValueError):
+            _load_budgets(config)
+
+        self.assertRaises(
+            ValueError,
+            _validate_implementation_timeout_seconds,
+            0,
+        )
+
+    # ---- 8. Negative integer is rejected ----
+
+    def test_negative_integer_is_rejected(self):
+        config = json.loads(json.dumps(CONFIG))
+        config["execution"][
+            "implementationTimeoutSeconds"
+        ] = -1
+
+        with self.assertRaises(ValueError):
+            _load_budgets(config)
+
+        self.assertRaises(
+            ValueError,
+            _validate_implementation_timeout_seconds,
+            -3600,
+        )
+
+    # ---- 9. Explicit ``None`` is rejected ----
+
+    def test_explicit_null_is_rejected(self):
+        config = json.loads(json.dumps(CONFIG))
+        config["execution"][
+            "implementationTimeoutSeconds"
+        ] = None
+
+        with self.assertRaises(ValueError):
+            _load_budgets(config)
+
+        self.assertRaises(
+            ValueError,
+            _validate_implementation_timeout_seconds,
+            None,
+        )
+
+    # ---- Additional negative cases (lists, objects) ----
+
+    def test_list_is_rejected(self):
+        config = json.loads(json.dumps(CONFIG))
+        config["execution"][
+            "implementationTimeoutSeconds"
+        ] = [3600]
+
+        with self.assertRaises(ValueError):
+            _load_budgets(config)
+
+    def test_object_is_rejected(self):
+        config = json.loads(json.dumps(CONFIG))
+        config["execution"][
+            "implementationTimeoutSeconds"
+        ] = {"seconds": 3600}
+
+        with self.assertRaises(ValueError):
+            _load_budgets(config)
+
+    # ---- Predicate sanity: ``isinstance(True, int) is True``
+    # but our predicate is strict ----
+
+    def test_predicate_rejects_bool_even_though_isinstance_passes(
+        self,
+    ):
+        # Belt-and-braces: prove that ``isinstance(True, int)``
+        # is the trap we are explicitly avoiding, and that
+        # ``type(True) is int`` is False.
+        self.assertTrue(isinstance(True, int))
+        self.assertFalse(type(True) is int)
+        self.assertFalse(type(False) is int)
+        # Both ``True`` and ``False`` MUST raise.
+        with self.assertRaises(ValueError):
+            _validate_implementation_timeout_seconds(True)
+        with self.assertRaises(ValueError):
+            _validate_implementation_timeout_seconds(False)
+        # And the predicate accepts a positive int.
+        self.assertEqual(
+            _validate_implementation_timeout_seconds(3600),
+            3600,
+        )
+
+
+class ImplementationTimeoutConfigFailFastTests(unittest.TestCase):
+    """End-to-end fail-closed tests proving invalid config
+    cannot mutate the durable checkpoint, consume a ticket
+    attempt, or invoke Claude / ``ImplementationRunner``.
+    """
+
+    def _config_with_timeout(self, value):
+        config = json.loads(json.dumps(CONFIG))
+        config["execution"][
+            "implementationTimeoutSeconds"
+        ] = value
+        return config
+
+    # ---- 10. Invalid config fails BEFORE implementation
+    # attempt consumption ----
+
+    def test_invalid_config_fails_before_implementation_attempt(
+        self,
+    ):
+        tasks = [task(17)]
+
+        checkpoint = make_checkpoint_payload(
+            issue_number=17,
+            state=TicketState.IMPLEMENTING,
+            implementation_attempts=0,
+        )
+
+        impl_runner = SimpleNamespace(
+            run=MagicMock(
+                return_value=ImplementationResult(
+                    exit_code=0,
+                    session_id="x",
+                    num_turns=1,
+                    terminal_reason="completed",
+                    stop_reason=None,
+                    is_error=False,
+                    result_text="ok",
+                    changed_files=(),
+                    completion_status=CompletionStatus.COMPLETE,
+                    completion_summary="ok",
+                    completion_validation="ok",
+                    completion_blocker=None,
+                )
+            )
+        )
+
+        callbacks = ConductorCallbacks(
+            make_authenticator=lambda config: (
+                make_fake_authenticator()
+            ),
+            make_qa_environment=lambda sb: (
+                make_fake_qa_environment()
+            ),
+            make_implementation_runner=lambda **kw: (
+                impl_runner
+            ),
+            make_review_runner=lambda **kw: MagicMock(),
+            make_qa_runner=lambda **kw: MagicMock(),
+            make_persistence_runner=lambda **kw: MagicMock(),
+            make_integration_runner=lambda **kw: MagicMock(),
+            make_remote_branch_cleaner=lambda **kw: MagicMock(),
+        )
+
+        with RunHarness(
+            tasks=tasks,
+            checkpoint=checkpoint,
+            callbacks=callbacks,
+            config_override=self._config_with_timeout(True),
+        ) as harness:
+            with self.assertRaises(OrchestratorError):
+                harness.run()
+
+        # The runner MUST NOT have been invoked at all.
+        impl_runner.run.assert_not_called()
+
+        # No checkpoint save was performed (the
+        # implementation_attempts counter was never
+        # incremented).
+        self.assertIsNone(harness.saved_checkpoint())
+
+    # ---- 11. Invalid config fails BEFORE fix attempt
+    # consumption ----
+
+    def test_invalid_config_fails_before_fix_attempt(self):
+        tasks = [task(17)]
+
+        checkpoint = make_checkpoint_payload(
+            issue_number=17,
+            state=TicketState.FIXING,
+            pre_qa_findings="Old defect",
+            fix_attempts=0,
+            review_cycles_consumed=1,
+        )
+
+        impl_runner = SimpleNamespace(
+            run=MagicMock(
+                return_value=ImplementationResult(
+                    exit_code=0,
+                    session_id="x",
+                    num_turns=1,
+                    terminal_reason="completed",
+                    stop_reason=None,
+                    is_error=False,
+                    result_text="ok",
+                    changed_files=(),
+                    completion_status=CompletionStatus.COMPLETE,
+                    completion_summary="ok",
+                    completion_validation="ok",
+                    completion_blocker=None,
+                )
+            )
+        )
+
+        callbacks = ConductorCallbacks(
+            make_authenticator=lambda config: (
+                make_fake_authenticator()
+            ),
+            make_qa_environment=lambda sb: (
+                make_fake_qa_environment()
+            ),
+            make_implementation_runner=lambda **kw: (
+                impl_runner
+            ),
+            make_review_runner=lambda **kw: MagicMock(),
+            make_qa_runner=lambda **kw: MagicMock(),
+            make_persistence_runner=lambda **kw: MagicMock(),
+            make_integration_runner=lambda **kw: MagicMock(),
+            make_remote_branch_cleaner=lambda **kw: MagicMock(),
+        )
+
+        with RunHarness(
+            tasks=tasks,
+            checkpoint=checkpoint,
+            callbacks=callbacks,
+            config_override=self._config_with_timeout(True),
+        ) as harness:
+            with self.assertRaises(OrchestratorError):
+                harness.run()
+
+            # Read the checkpoint on disk BEFORE the
+            # ``TemporaryDirectory`` cleanup removes the file.
+            on_disk = json.loads(
+                harness.checkpoint_path.read_text()
+            )
+
+        impl_runner.run.assert_not_called()
+
+        # The durable FIXING checkpoint MUST remain
+        # byte-for-byte unchanged on disk.  fix_attempts,
+        # review_cycles_consumed, and state are the three
+        # fields the failure path must not touch.
+        self.assertEqual(on_disk["state"], "FIXING")
+        self.assertEqual(on_disk["fix_attempts"], 0)
+        self.assertEqual(on_disk["review_cycles_consumed"], 1)
+        self.assertEqual(
+            on_disk["implementation_attempts"], 0
+        )
+
+    # ---- 12. FIXING checkpoint leaves all counters/state
+    # unchanged for invalid config (cross-config sweep) ----
+
+    def test_fixing_checkpoint_unchanged_for_any_invalid_config(
+        self,
+    ):
+        invalid_values = [
+            True,
+            False,
+            "3600",
+            3600.0,
+            0,
+            -1,
+            None,
+            [3600],
+            {"seconds": 3600},
+        ]
+
+        for value in invalid_values:
+            with self.subTest(value=value):
+                tasks = [task(17)]
+
+                checkpoint = make_checkpoint_payload(
+                    issue_number=17,
+                    state=TicketState.FIXING,
+                    pre_qa_findings="Old defect",
+                    fix_attempts=0,
+                    review_cycles_consumed=1,
+                )
+
+                callbacks = ConductorCallbacks(
+                    make_authenticator=lambda config: (
+                        make_fake_authenticator()
+                    ),
+                    make_qa_environment=lambda sb: (
+                        make_fake_qa_environment()
+                    ),
+                    make_implementation_runner=lambda **kw: (
+                        MagicMock()
+                    ),
+                    make_review_runner=lambda **kw: MagicMock(),
+                    make_qa_runner=lambda **kw: MagicMock(),
+                    make_persistence_runner=lambda **kw: (
+                        MagicMock()
+                    ),
+                    make_integration_runner=lambda **kw: (
+                        MagicMock()
+                    ),
+                    make_remote_branch_cleaner=lambda **kw: (
+                        MagicMock()
+                    ),
+                )
+
+                with RunHarness(
+                    tasks=tasks,
+                    checkpoint=checkpoint,
+                    callbacks=callbacks,
+                    config_override=(
+                        self._config_with_timeout(value)
+                    ),
+                ) as harness:
+                    with self.assertRaises(OrchestratorError):
+                        harness.run()
+
+                    # Read inside the ``with`` block, before
+                    # the temp directory is removed.
+                    on_disk = json.loads(
+                        harness.checkpoint_path.read_text()
+                    )
+
+                self.assertEqual(
+                    on_disk["state"], "FIXING"
+                )
+                self.assertEqual(on_disk["fix_attempts"], 0)
+                self.assertEqual(
+                    on_disk["review_cycles_consumed"], 1
+                )
+
+    # ---- 13. Claude / ``ImplementationRunner`` is never
+    # invoked for invalid config ----
+
+    def test_implementation_runner_never_invoked_for_invalid_config(
+        self,
+    ):
+        tasks = [task(17)]
+
+        checkpoint = make_checkpoint_payload(
+            issue_number=17,
+            state=TicketState.IMPLEMENTING,
+        )
+
+        factory_calls: list = []
+        runner_instance = SimpleNamespace(
+            run=MagicMock(
+                side_effect=AssertionError(
+                    "ImplementationRunner.run was invoked "
+                    "for invalid configuration."
+                )
+            )
+        )
+
+        def make_runner(**kwargs):
+            factory_calls.append(kwargs)
+            return runner_instance
+
+        callbacks = ConductorCallbacks(
+            make_authenticator=lambda config: (
+                make_fake_authenticator()
+            ),
+            make_qa_environment=lambda sb: (
+                make_fake_qa_environment()
+            ),
+            make_implementation_runner=make_runner,
+            make_review_runner=lambda **kw: MagicMock(),
+            make_qa_runner=lambda **kw: MagicMock(),
+            make_persistence_runner=lambda **kw: MagicMock(),
+            make_integration_runner=lambda **kw: MagicMock(),
+            make_remote_branch_cleaner=lambda **kw: MagicMock(),
+        )
+
+        with RunHarness(
+            tasks=tasks,
+            checkpoint=checkpoint,
+            callbacks=callbacks,
+            config_override=self._config_with_timeout(True),
+        ) as harness:
+            with self.assertRaises(OrchestratorError):
+                harness.run()
+
+        # The factory MUST never have been called: validation
+        # short-circuits before any ``Conductor`` instance is
+        # constructed.
+        self.assertEqual(factory_calls, [])
+
+    # ---- 14. Normal valid timeout execution still propagates
+    # the configured finite timeout to BOTH IMPLEMENTING and
+    # FIXING ----
+
+    def test_valid_timeout_propagates_to_implementing(self):
+        tasks = [task(17)]
+
+        checkpoint = make_checkpoint_payload(
+            issue_number=17,
+            state=TicketState.IMPLEMENTING,
+        )
+
+        captured_kwargs: list = []
+
+        def make_runner(**kwargs):
+            captured_kwargs.append(kwargs)
+            return SimpleNamespace(
+                run=MagicMock(
+                    return_value=ImplementationResult(
+                        exit_code=0,
+                        session_id="x",
+                        num_turns=1,
+                        terminal_reason="completed",
+                        stop_reason=None,
+                        is_error=False,
+                        result_text="ok",
+                        changed_files=(),
+                        completion_status=(
+                            CompletionStatus.COMPLETE
+                        ),
+                        completion_summary="ok",
+                        completion_validation="ok",
+                        completion_blocker=None,
+                    )
+                )
+            )
+
+        callbacks = ConductorCallbacks(
+            make_authenticator=lambda config: (
+                make_fake_authenticator()
+            ),
+            make_qa_environment=lambda sb: (
+                make_fake_qa_environment()
+            ),
+            make_implementation_runner=make_runner,
+            make_review_runner=lambda **kw: MagicMock(),
+            make_qa_runner=lambda **kw: MagicMock(),
+            make_persistence_runner=lambda **kw: MagicMock(),
+            make_integration_runner=lambda **kw: MagicMock(),
+            make_remote_branch_cleaner=lambda **kw: MagicMock(),
+        )
+
+        with RunHarness(
+            tasks=tasks,
+            checkpoint=checkpoint,
+            callbacks=callbacks,
+            config_override=self._config_with_timeout(900),
+        ) as harness:
+            harness.run()
+
+        self.assertEqual(len(captured_kwargs), 1)
+        self.assertEqual(
+            captured_kwargs[0][
+                "implementation_timeout_seconds"
+            ],
+            900,
+        )
+
+    def test_valid_timeout_propagates_to_fixing(self):
+        tasks = [task(17)]
+
+        checkpoint = make_checkpoint_payload(
+            issue_number=17,
+            state=TicketState.FIXING,
+            pre_qa_findings="Old defect",
+        )
+
+        captured_kwargs: list = []
+
+        def make_runner(**kwargs):
+            captured_kwargs.append(kwargs)
+            return SimpleNamespace(
+                run=MagicMock(
+                    return_value=ImplementationResult(
+                        exit_code=0,
+                        session_id="x",
+                        num_turns=1,
+                        terminal_reason="completed",
+                        stop_reason=None,
+                        is_error=False,
+                        result_text="ok",
+                        changed_files=(),
+                        completion_status=(
+                            CompletionStatus.COMPLETE
+                        ),
+                        completion_summary="ok",
+                        completion_validation="ok",
+                        completion_blocker=None,
+                    )
+                )
+            )
+
+        callbacks = ConductorCallbacks(
+            make_authenticator=lambda config: (
+                make_fake_authenticator()
+            ),
+            make_qa_environment=lambda sb: (
+                make_fake_qa_environment()
+            ),
+            make_implementation_runner=make_runner,
+            make_review_runner=lambda **kw: MagicMock(),
+            make_qa_runner=lambda **kw: MagicMock(),
+            make_persistence_runner=lambda **kw: MagicMock(),
+            make_integration_runner=lambda **kw: MagicMock(),
+            make_remote_branch_cleaner=lambda **kw: MagicMock(),
+        )
+
+        with RunHarness(
+            tasks=tasks,
+            checkpoint=checkpoint,
+            callbacks=callbacks,
+            config_override=self._config_with_timeout(1800),
+        ) as harness:
+            harness.run()
+
+        self.assertEqual(len(captured_kwargs), 1)
+        self.assertEqual(
+            captured_kwargs[0][
+                "implementation_timeout_seconds"
+            ],
+            1800,
+        )
+        self.assertEqual(
+            captured_kwargs[0]["phase"],
+            CompletionPhase.FIX,
+        )
+
+
+class SandboxMaxDurationConfigValidationTests(unittest.TestCase):
+    """Regression tests for the ``sandbox.maxDurationSeconds``
+    configuration boundary added after the M2 #17 hang
+    investigation.
+
+    Contract under test:
+
+    - ``sandbox.maxDurationSeconds`` defaults to 21600 (6
+      hours) when the key is absent from the config.
+
+    - The validator uses
+      ``type(value) is int and value > 0`` — same predicate
+      as ``execution.implementationTimeoutSeconds`` so a
+      ``bool`` cannot survive integer validation and reach
+      the Tenki SDK.
+
+    - The validator rejects ``bool``, ``str``, ``float``,
+      ``None``, ``list``, ``dict``, zero, and negative
+      values at the configuration loading boundary so an
+      invalid value cannot reach ``TenkiSandbox.__enter__``
+      or the installed ``tenki`` SDK.
+
+    - ``sandbox.maxDurationSeconds`` MUST be strictly
+      greater than
+      ``execution.implementationTimeoutSeconds``.  This is
+      a hard configuration consistency invariant — we
+      deliberately do NOT silently clamp either value.
+
+    - Validation runs in ``_load_budgets`` BEFORE any
+      checkpoint load, task discovery, sandbox creation,
+      runner construction, attempt consumption, or
+      GitHub mutation — so an invalid config cannot
+      consume a ticket attempt budget or mutate the
+      durable checkpoint.
+
+    - Invalid configurations surface as
+      ``OrchestratorError``, the existing Ralph
+      orchestration error boundary.  The message is a
+      static Ralph-owned string and never echoes the raw
+      value.
+    """
+
+    # ---- 1. Default sandbox max duration is 21600 ----
+
+    def test_default_sandbox_max_duration_is_21600(self):
+        config = json.loads(json.dumps(CONFIG))
+
+        budgets = _load_budgets(config)
+
+        self.assertEqual(
+            budgets.sandbox_max_duration_seconds, 21_600
+        )
+        self.assertIsInstance(
+            budgets.sandbox_max_duration_seconds, int
+        )
+        self.assertIsNot(
+            type(budgets.sandbox_max_duration_seconds),
+            bool,
+        )
+
+    # ---- 2. Positive integer is accepted exactly ----
+
+    def test_positive_integer_accepted_exactly(self):
+        for value in (3601, 21_600, 86_400):
+            with self.subTest(value=value):
+                config = json.loads(json.dumps(CONFIG))
+                # Lower the implementation timeout below
+                # the candidate sandbox lifetime so the
+                # cross-check invariant does not reject it.
+                config["execution"][
+                    "implementationTimeoutSeconds"
+                ] = 1800
+                config["sandbox"] = {
+                    "maxDurationSeconds": value
+                }
+
+                budgets = _load_budgets(config)
+
+                self.assertEqual(
+                    budgets.sandbox_max_duration_seconds,
+                    value,
+                )
+
+    # ---- 3. ``True`` is rejected ----
+
+    def test_true_is_rejected(self):
+        config = json.loads(json.dumps(CONFIG))
+        config["sandbox"] = {"maxDurationSeconds": True}
+
+        with self.assertRaises(ValueError):
+            _load_budgets(config)
+
+        self.assertRaises(
+            ValueError,
+            _validate_sandbox_max_duration_seconds,
+            True,
+        )
+
+    # ---- 4. ``False`` is rejected ----
+
+    def test_false_is_rejected(self):
+        config = json.loads(json.dumps(CONFIG))
+        config["sandbox"] = {"maxDurationSeconds": False}
+
+        with self.assertRaises(ValueError):
+            _load_budgets(config)
+
+        self.assertRaises(
+            ValueError,
+            _validate_sandbox_max_duration_seconds,
+            False,
+        )
+
+    # ---- 5. String is rejected ----
+
+    def test_string_is_rejected(self):
+        config = json.loads(json.dumps(CONFIG))
+        config["sandbox"] = {
+            "maxDurationSeconds": "21600"
+        }
+
+        with self.assertRaises(ValueError):
+            _load_budgets(config)
+
+        self.assertRaises(
+            ValueError,
+            _validate_sandbox_max_duration_seconds,
+            "21600",
+        )
+
+    # ---- 6. Float is rejected ----
+
+    def test_float_is_rejected(self):
+        config = json.loads(json.dumps(CONFIG))
+        config["sandbox"] = {
+            "maxDurationSeconds": 21_600.0
+        }
+
+        with self.assertRaises(ValueError):
+            _load_budgets(config)
+
+        self.assertRaises(
+            ValueError,
+            _validate_sandbox_max_duration_seconds,
+            21_600.0,
+        )
+
+    # ---- 7. Zero is rejected ----
+
+    def test_zero_is_rejected(self):
+        config = json.loads(json.dumps(CONFIG))
+        config["sandbox"] = {"maxDurationSeconds": 0}
+
+        with self.assertRaises(ValueError):
+            _load_budgets(config)
+
+        self.assertRaises(
+            ValueError,
+            _validate_sandbox_max_duration_seconds,
+            0,
+        )
+
+    # ---- 8. Negative integer is rejected ----
+
+    def test_negative_integer_is_rejected(self):
+        config = json.loads(json.dumps(CONFIG))
+        config["sandbox"] = {
+            "maxDurationSeconds": -21_600
+        }
+
+        with self.assertRaises(ValueError):
+            _load_budgets(config)
+
+        self.assertRaises(
+            ValueError,
+            _validate_sandbox_max_duration_seconds,
+            -21_600,
+        )
+
+    # ---- 9. Explicit ``None`` is rejected ----
+
+    def test_explicit_null_is_rejected(self):
+        config = json.loads(json.dumps(CONFIG))
+        config["sandbox"] = {"maxDurationSeconds": None}
+
+        with self.assertRaises(ValueError):
+            _load_budgets(config)
+
+        self.assertRaises(
+            ValueError,
+            _validate_sandbox_max_duration_seconds,
+            None,
+        )
+
+    # ---- 10. List / object is rejected ----
+
+    def test_list_is_rejected(self):
+        config = json.loads(json.dumps(CONFIG))
+        config["sandbox"] = {"maxDurationSeconds": [21600]}
+
+        with self.assertRaises(ValueError):
+            _load_budgets(config)
+
+    def test_object_is_rejected(self):
+        config = json.loads(json.dumps(CONFIG))
+        config["sandbox"] = {
+            "maxDurationSeconds": {"seconds": 21600}
+        }
+
+        with self.assertRaises(ValueError):
+            _load_budgets(config)
+
+    # ---- 11. Cross-check invariant: lifetime <= impl
+    # timeout is rejected (no silent clamping) ----
+
+    def test_lifetime_equal_to_impl_timeout_is_rejected(self):
+        config = json.loads(json.dumps(CONFIG))
+        config["execution"]["implementationTimeoutSeconds"] = (
+            3600
+        )
+        config["sandbox"] = {"maxDurationSeconds": 3600}
+
+        with self.assertRaises(ValueError):
+            _load_budgets(config)
+
+    def test_lifetime_less_than_impl_timeout_is_rejected(self):
+        config = json.loads(json.dumps(CONFIG))
+        config["execution"]["implementationTimeoutSeconds"] = (
+            7200
+        )
+        config["sandbox"] = {"maxDurationSeconds": 3600}
+
+        with self.assertRaises(ValueError):
+            _load_budgets(config)
+
+    def test_lifetime_greater_than_impl_timeout_is_accepted(self):
+        config = json.loads(json.dumps(CONFIG))
+        config["execution"]["implementationTimeoutSeconds"] = (
+            1800
+        )
+        config["sandbox"] = {"maxDurationSeconds": 3600}
+
+        budgets = _load_budgets(config)
+
+        self.assertEqual(
+            budgets.implementation_timeout_seconds, 1800
+        )
+        self.assertEqual(
+            budgets.sandbox_max_duration_seconds, 3600
+        )
+
+
+class SandboxMaxDurationConfigFailFastTests(unittest.TestCase):
+    """End-to-end fail-closed tests proving invalid sandbox
+    lifetime config cannot mutate the durable checkpoint,
+    consume a ticket attempt, or invoke Claude /
+    ``ImplementationRunner``.
+    """
+
+    def _config_with(
+        self,
+        *,
+        impl_timeout=3600,
+        sandbox_max=None,
+    ):
+        config = json.loads(json.dumps(CONFIG))
+        config["execution"]["implementationTimeoutSeconds"] = (
+            impl_timeout
+        )
+        if sandbox_max is not None:
+            config["sandbox"] = {
+                "maxDurationSeconds": sandbox_max
+            }
+        return config
+
+    def test_invalid_sandbox_lifetime_fails_before_implementation(
+        self,
+    ):
+        tasks = [task(17)]
+
+        checkpoint = make_checkpoint_payload(
+            issue_number=17,
+            state=TicketState.IMPLEMENTING,
+            implementation_attempts=0,
+        )
+
+        impl_runner = SimpleNamespace(
+            run=MagicMock(
+                return_value=make_completion()
+            )
+        )
+
+        callbacks = ConductorCallbacks(
+            make_authenticator=lambda config: (
+                make_fake_authenticator()
+            ),
+            make_qa_environment=lambda sb: (
+                make_fake_qa_environment()
+            ),
+            make_implementation_runner=lambda **kw: (
+                impl_runner
+            ),
+            make_review_runner=lambda **kw: MagicMock(),
+            make_qa_runner=lambda **kw: MagicMock(),
+            make_persistence_runner=lambda **kw: MagicMock(),
+            make_integration_runner=lambda **kw: MagicMock(),
+            make_remote_branch_cleaner=lambda **kw: MagicMock(),
+        )
+
+        with RunHarness(
+            tasks=tasks,
+            checkpoint=checkpoint,
+            callbacks=callbacks,
+            config_override=self._config_with(
+                impl_timeout=3600,
+                sandbox_max=1800,
+            ),
+        ) as harness:
+            with self.assertRaises(OrchestratorError):
+                harness.run()
+
+            saved = harness.saved_checkpoint()
+
+        # Configuration validation failed before any
+        # side effect, so no checkpoint save ever
+        # occurred.  ``saved_checkpoint`` returns ``None``
+        # in that case — proof that the durable store was
+        # not mutated.
+        self.assertIsNone(saved)
+        # The runner MUST NOT have been invoked.
+        impl_runner.run.assert_not_called()
+
+    def test_lifetime_equal_impl_timeout_fails_before_runner(self):
+        tasks = [task(17)]
+
+        checkpoint = make_checkpoint_payload(
+            issue_number=17,
+            state=TicketState.IMPLEMENTING,
+        )
+
+        impl_runner = SimpleNamespace(
+            run=MagicMock(return_value=make_completion())
+        )
+
+        callbacks = ConductorCallbacks(
+            make_authenticator=lambda config: (
+                make_fake_authenticator()
+            ),
+            make_qa_environment=lambda sb: (
+                make_fake_qa_environment()
+            ),
+            make_implementation_runner=lambda **kw: (
+                impl_runner
+            ),
+            make_review_runner=lambda **kw: MagicMock(),
+            make_qa_runner=lambda **kw: MagicMock(),
+            make_persistence_runner=lambda **kw: MagicMock(),
+            make_integration_runner=lambda **kw: MagicMock(),
+            make_remote_branch_cleaner=lambda **kw: MagicMock(),
+        )
+
+        with RunHarness(
+            tasks=tasks,
+            checkpoint=checkpoint,
+            callbacks=callbacks,
+            config_override=self._config_with(
+                impl_timeout=3600,
+                sandbox_max=3600,
+            ),
+        ) as harness:
+            with self.assertRaises(OrchestratorError):
+                harness.run()
+
+        impl_runner.run.assert_not_called()
+
+
+class SandboxSessionTerminatedMappingTests(unittest.TestCase):
+    """Regression tests proving the installed tenki 1.0.0
+    SDK's ``SessionTerminatedError`` is mapped to a static
+    Ralph-owned reason and never surfaces as an uncaught
+    traceback, raw SDK text, or arbitrary subprocess
+    output.
+
+    Contract under test:
+
+    - When ``TenkiSandbox.exec`` (which already translates
+      ``tenki.SessionTerminatedError`` to the static
+      ``SandboxSessionTerminatedError``) propagates into
+      ``Conductor.run``, the conductor MUST transition to
+      ``INFRA_FAILURE`` (not ``AGENT_FAILURE`` — this is
+      platform loss, not model loss) with ``last_error``
+      set to the static
+      ``SANDBOX_SESSION_TERMINATED`` message.
+
+    - ``last_error`` MUST contain the static Ralph-authored
+      string and MUST NOT contain any SDK exception text,
+      ``session_terminated:`` prefix, secret-shaped
+      substring, subprocess stdout/stderr, or model output.
+
+    - The mapping runs at most once per
+      ``Conductor.run`` invocation; the runner MUST NOT
+      be silently retried inside the conductor.
+
+    - The approved ``last_error`` set MUST accept the
+      new ``SANDBOX_SESSION_TERMINATED`` message so
+      ``CheckpointStore`` accepts it on save and load.
+    """
+
+    def _terminated_runner(self):
+        return SimpleNamespace(
+            run=MagicMock(
+                side_effect=SandboxSessionTerminatedError(
+                    "Sandbox session terminated unexpectedly."
+                )
+            )
+        )
+
+    def test_session_terminated_maps_to_infra_failure(self):
+        tasks = [task(17)]
+
+        checkpoint = make_checkpoint_payload(
+            issue_number=17,
+            state=TicketState.IMPLEMENTING,
+        )
+
+        impl_runner = self._terminated_runner()
+
+        callbacks = ConductorCallbacks(
+            make_authenticator=lambda config: (
+                make_fake_authenticator()
+            ),
+            make_qa_environment=lambda sb: (
+                make_fake_qa_environment()
+            ),
+            make_implementation_runner=lambda **kw: (
+                impl_runner
+            ),
+            make_review_runner=lambda **kw: MagicMock(),
+            make_qa_runner=lambda **kw: MagicMock(),
+            make_persistence_runner=lambda **kw: MagicMock(),
+            make_integration_runner=lambda **kw: MagicMock(),
+            make_remote_branch_cleaner=lambda **kw: MagicMock(),
+        )
+
+        with RunHarness(
+            tasks=tasks,
+            checkpoint=checkpoint,
+            callbacks=callbacks,
+        ) as harness:
+            harness.run()
+
+            saved = harness.saved_checkpoint()
+
+        # The implementation attempt counter was
+        # incremented before the runner ran (existing
+        # durable checkpoint contract).
+        self.assertEqual(
+            saved.implementation_attempts, 1
+        )
+        # Infrastructure loss, not agent failure.
+        self.assertEqual(
+            saved.state, TicketState.INFRA_FAILURE
+        )
+        # Static Ralph-owned message only.
+        self.assertEqual(
+            saved.last_error,
+            _terminal_message(
+                TerminalReason.SANDBOX_SESSION_TERMINATED
+            ),
+        )
+        self.assertIn(
+            "Sandbox session terminated unexpectedly.",
+            saved.last_error,
+        )
+        # No SDK exception text / prefixes leak.
+        self.assertNotIn(
+            "session_terminated", saved.last_error
+        )
+        self.assertNotIn(
+            "guest_agent_liveness", saved.last_error
+        )
+
+    def test_session_terminated_last_error_in_approved_set(self):
+        tasks = [task(17)]
+
+        checkpoint = make_checkpoint_payload(
+            issue_number=17,
+            state=TicketState.IMPLEMENTING,
+        )
+
+        impl_runner = self._terminated_runner()
+
+        callbacks = ConductorCallbacks(
+            make_authenticator=lambda config: (
+                make_fake_authenticator()
+            ),
+            make_qa_environment=lambda sb: (
+                make_fake_qa_environment()
+            ),
+            make_implementation_runner=lambda **kw: (
+                impl_runner
+            ),
+            make_review_runner=lambda **kw: MagicMock(),
+            make_qa_runner=lambda **kw: MagicMock(),
+            make_persistence_runner=lambda **kw: MagicMock(),
+            make_integration_runner=lambda **kw: MagicMock(),
+            make_remote_branch_cleaner=lambda **kw: MagicMock(),
+        )
+
+        with RunHarness(
+            tasks=tasks,
+            checkpoint=checkpoint,
+            callbacks=callbacks,
+        ) as harness:
+            harness.run()
+
+            saved = harness.saved_checkpoint()
+
+        self.assertIn(
+            saved.last_error, APPROVED_LAST_ERROR_MESSAGES
+        )
+
+    def test_session_terminated_does_not_silently_retry(self):
+        tasks = [task(17)]
+
+        checkpoint = make_checkpoint_payload(
+            issue_number=17,
+            state=TicketState.IMPLEMENTING,
+        )
+
+        impl_runner = self._terminated_runner()
+
+        callbacks = ConductorCallbacks(
+            make_authenticator=lambda config: (
+                make_fake_authenticator()
+            ),
+            make_qa_environment=lambda sb: (
+                make_fake_qa_environment()
+            ),
+            make_implementation_runner=lambda **kw: (
+                impl_runner
+            ),
+            make_review_runner=lambda **kw: MagicMock(),
+            make_qa_runner=lambda **kw: MagicMock(),
+            make_persistence_runner=lambda **kw: MagicMock(),
+            make_integration_runner=lambda **kw: MagicMock(),
+            make_remote_branch_cleaner=lambda **kw: MagicMock(),
+        )
+
+        with RunHarness(
+            tasks=tasks,
+            checkpoint=checkpoint,
+            callbacks=callbacks,
+        ) as harness:
+            harness.run()
+
+        # Exactly one invocation — the durable
+        # checkpoint/attempt mechanism owns retry.
+        self.assertEqual(impl_runner.run.call_count, 1)
+
+    def test_session_terminated_terminal_reason_in_catalog(self):
+        self.assertIn(
+            TerminalReason.SANDBOX_SESSION_TERMINATED,
+            TERMINAL_REASON_MESSAGES,
+        )
+        message = TERMINAL_REASON_MESSAGES[
+            TerminalReason.SANDBOX_SESSION_TERMINATED
+        ]
+        self.assertEqual(
+            message, "Sandbox session terminated unexpectedly."
+        )
+        self.assertIn(
+            message, APPROVED_LAST_ERROR_MESSAGES
+        )
+
+
+class TenkiSandboxLifetimePropagationTests(unittest.TestCase):
+    """End-to-end test proving the validated
+    ``sandbox.maxDurationSeconds`` budget is actually
+    forwarded to ``TenkiSandbox(max_duration_seconds=...)``
+    so ``Sandbox.create(max_duration=...)`` receives a
+    finite, validated value.
+
+    Re-uses the RunHarness machinery, but swaps the
+    ``mock_tenki`` factory before ``Orchestrator.run``
+    enters the ``with TenkiSandbox(...)`` block so the
+    kwargs are captured.
+    """
+
+    def test_propagated_max_duration_reaches_tenki_sandbox(self):
+        tasks = [task(17)]
+
+        checkpoint = make_checkpoint_payload(
+            issue_number=17,
+            state=TicketState.HUMAN_QA_PENDING,
+        )
+
+        callbacks = ConductorCallbacks(
+            make_authenticator=lambda config: (
+                make_fake_authenticator()
+            ),
+            make_qa_environment=lambda sb: (
+                make_fake_qa_environment()
+            ),
+            make_implementation_runner=lambda **kw: (
+                MagicMock()
+            ),
+            make_review_runner=lambda **kw: MagicMock(),
+            make_qa_runner=lambda **kw: MagicMock(),
+            make_persistence_runner=lambda **kw: MagicMock(),
+            make_integration_runner=lambda **kw: MagicMock(),
+            make_remote_branch_cleaner=lambda **kw: MagicMock(),
+        )
+
+        config = json.loads(json.dumps(CONFIG))
+        config["execution"]["implementationTimeoutSeconds"] = (
+            1800
+        )
+        config["sandbox"] = {"maxDurationSeconds": 21_600}
+
+        with RunHarness(
+            tasks=tasks,
+            checkpoint=checkpoint,
+            callbacks=callbacks,
+            config_override=config,
+        ) as harness:
+            captured_kwargs = []
+
+            def _capture(**kwargs):
+                captured_kwargs.append(kwargs)
+                return harness.sandbox
+
+            # Re-bind the factory so Orchestrator.run
+            # calls our capture instead of returning the
+            # default MagicMock.  ``__enter__`` returns the
+            # harness ``sandbox`` so the conductor never
+            # actually executes ``__enter__`` on the real
+            # TenkiSandbox.
+            harness.mock_tenki.side_effect = _capture
+
+            harness.run()
+
+        self.assertEqual(len(captured_kwargs), 1)
+        self.assertEqual(
+            captured_kwargs[0].get("max_duration_seconds"),
+            21_600,
+        )
+        self.assertEqual(
+            captured_kwargs[0].get("name"), "ralph-17"
+        )
+
+
+class SandboxCleanupTraceSafetyTests(unittest.TestCase):
+    """Regression tests for the teardown-safety defect
+    found during the M2 #17 sandbox-lifetime review.
+
+    Contract under test:
+
+    - Once the Conductor has classified the ticket as
+      ``INFRA_FAILURE`` (because ``SandboxSessionTerminatedError``
+      escaped a ``sandbox.exec`` call), the Orchestrator's
+      QA teardown sequence MUST NOT overwrite that
+      terminal state with an uncaught traceback.
+
+    - The Orchestrator's outer ``TenkiSandbox.__exit__``
+      MUST NOT propagate the installed SDK's
+      ``tenki.SessionTerminatedError`` or
+      ``tenki.SessionNotFoundError`` raised from
+      ``Sandbox.close()``; both must be treated as
+      already-closed cleanup.
+
+    - Provider / RPC / secret-shaped text from the SDK
+      MUST NOT appear in ``checkpoint.last_error``,
+      console output, or raised Ralph-owned exception
+      messages.
+
+    - The combined sequence (sandbox dies mid-exec →
+      ``INFRA_FAILURE`` → QA teardown sees terminated
+      sandbox → sandbox ``__exit__`` sees terminated
+      session) MUST leave ``INFRA_FAILURE`` intact and
+      MUST NOT emit an uncaught traceback.
+
+    - Healthy sandbox close MUST still work normally.
+    """
+
+    def _make_runner_raising_session_terminated(self):
+        # Carry fabricated provider-internal detail
+        # including secret-shaped substrings so we can
+        # prove nothing leaks into ``last_error``.
+        return SimpleNamespace(
+            run=MagicMock(
+                side_effect=SandboxSessionTerminatedError(
+                    "Sandbox session terminated unexpectedly."
+                )
+            )
+        )
+
+    def _terminated_sandbox_factory(self):
+        # Sandbox whose ``exec`` raises the Ralph-owned
+        # boundary exception (used to simulate the
+        # already-dead-sandbox QA teardown sequence) and
+        # whose ``close`` raises the installed SDK's
+        # ``SessionTerminatedError`` carrying fabricated
+        # provider-internal detail.
+        sandbox = MagicMock(name="TenkiSandbox")
+
+        def _exec_raises(*args, **kwargs):
+            raise SandboxSessionTerminatedError(
+                "Sandbox session terminated unexpectedly."
+            )
+
+        sandbox.exec.side_effect = _exec_raises
+
+        def _close_raises_terminated():
+            raise tenki.SessionTerminatedError(
+                "session_terminated:guest_agent_liveness "
+                "TENKI_SECRET=abc123 "
+                "grpc_status=FAILED_PRECONDITION "
+                "provider-internal-session-id="
+                "s_xxxxxxxxxxxxxxxxxxxxxx"
+            )
+
+        sandbox.close.side_effect = _close_raises_terminated
+        return sandbox
+
+    def _missing_session_sandbox_factory(self):
+        # Variant: SDK close() raises
+        # ``SessionNotFoundError``.
+        sandbox = MagicMock(name="TenkiSandbox")
+
+        def _exec_ok(*args, **kwargs):
+            return SandboxCommandResult(
+                exit_code=0,
+                stdout="",
+                stderr="",
+            )
+
+        sandbox.exec.side_effect = _exec_ok
+
+        def _close_raises_missing():
+            raise tenki.SessionNotFoundError(
+                "session not found "
+                "TENKI_SECRET=abc123 "
+                "provider-internal-session-id="
+                "s_xxxxxxxxxxxxxxxxxxxxxx"
+            )
+
+        sandbox.close.side_effect = _close_raises_missing
+        return sandbox
+
+    # ---- 1. TRACE 1: dead sandbox during QA teardown
+    # does NOT override the recorded INFRA_FAILURE ----
+
+    def test_qa_teardown_against_dead_sandbox_preserves_infra_failure(
+        self,
+    ):
+        tasks = [task(17)]
+
+        checkpoint = make_checkpoint_payload(
+            issue_number=17,
+            state=TicketState.IMPLEMENTING,
+        )
+
+        impl_runner = self._make_runner_raising_session_terminated()
+
+        # The sandbox ``exec`` raises ``SandboxSessionTerminatedError``
+        # both during the implementation phase AND during
+        # the QA teardown sequence (which runs ``pg_ctl
+        # stop`` via ``sandbox.exec``).
+        dead_sandbox = self._terminated_sandbox_factory()
+
+        qa_env = make_fake_qa_environment()
+
+        callbacks = ConductorCallbacks(
+            make_authenticator=lambda config: (
+                make_fake_authenticator()
+            ),
+            make_qa_environment=lambda sb: qa_env,
+            make_implementation_runner=lambda **kw: (
+                impl_runner
+            ),
+            make_review_runner=lambda **kw: MagicMock(),
+            make_qa_runner=lambda **kw: MagicMock(),
+            make_persistence_runner=lambda **kw: MagicMock(),
+            make_integration_runner=lambda **kw: MagicMock(),
+            make_remote_branch_cleaner=lambda **kw: MagicMock(),
+        )
+
+        with RunHarness(
+            tasks=tasks,
+            checkpoint=checkpoint,
+            callbacks=callbacks,
+            sandbox_override=dead_sandbox,
+        ) as harness:
+            harness.run()
+
+            saved = harness.saved_checkpoint()
+
+        # Primary failure (the implementation runner) was
+        # classified as INFRA_FAILURE / SANDBOX_SESSION_TERMINATED.
+        self.assertEqual(
+            saved.state, TicketState.INFRA_FAILURE
+        )
+        self.assertEqual(
+            saved.last_error,
+            _terminal_message(
+                TerminalReason.SANDBOX_SESSION_TERMINATED
+            ),
+        )
+        # No provider / RPC / secret-shaped text leaked.
+        self.assertNotIn("TENKI_SECRET", saved.last_error)
+        self.assertNotIn(
+            "grpc_status=FAILED_PRECONDITION",
+            saved.last_error,
+        )
+        self.assertNotIn(
+            "provider-internal-session-id",
+            saved.last_error,
+        )
+        # No uncaught traceback escaped from QA teardown.
+        # (If a traceback had escaped, the harness's
+        # ``run()`` would have raised rather than
+        # returned normally.)
+
+    # ---- 2. TRACE 2: SDK close() raising
+    # ``SessionTerminatedError`` does NOT escape
+    # ``TenkiSandbox.__exit__`` ----
+
+    def test_sandbox_exit_swallows_sdk_session_terminated(self):
+        tasks = [task(17)]
+
+        checkpoint = make_checkpoint_payload(
+            issue_number=17,
+            state=TicketState.HUMAN_QA_PENDING,
+        )
+
+        # Sandbox whose close() raises
+        # ``tenki.SessionTerminatedError``.  ``exec``
+        # behaves normally so the conductor reaches
+        # the ``__exit__`` phase through a healthy
+        # path.  No attempt consumption, no
+        # implementation runner needed.
+        sandbox = self._terminated_sandbox_factory()
+
+        # Replace the ``__exit__`` side_effect so close()
+        # raises only on ``__exit__`` (the harness
+        # already wraps TenkiSandbox in a context
+        # manager).
+        def _exec_ok(*args, **kwargs):
+            return SandboxCommandResult(
+                exit_code=0,
+                stdout="",
+                stderr="",
+            )
+
+        sandbox.exec.side_effect = _exec_ok
+
+        callbacks = ConductorCallbacks(
+            make_authenticator=lambda config: (
+                make_fake_authenticator()
+            ),
+            make_qa_environment=lambda sb: (
+                make_fake_qa_environment()
+            ),
+            make_implementation_runner=lambda **kw: MagicMock(),
+            make_review_runner=lambda **kw: MagicMock(),
+            make_qa_runner=lambda **kw: MagicMock(),
+            make_persistence_runner=lambda **kw: MagicMock(),
+            make_integration_runner=lambda **kw: MagicMock(),
+            make_remote_branch_cleaner=lambda **kw: MagicMock(),
+        )
+
+        with RunHarness(
+            tasks=tasks,
+            checkpoint=checkpoint,
+            callbacks=callbacks,
+            sandbox_override=sandbox,
+        ) as harness:
+            # The Orchestrator runs through a healthy
+            # conductor loop and exits via ``TenkiSandbox``
+            # ``__exit__``.  The ``TenkiSandbox`` boundary
+            # itself is patched by the harness, so
+            # close()-level teardown safety is verified
+            # directly in
+            # ``test_sandbox.SandboxTeardownSafetyTests``.
+            # Here we prove the orchestrator's outer
+            # context-manager exit does not propagate
+            # the SDK signal past the conductor.
+            try:
+                final_state = harness.run()
+            except (
+                tenki.SessionTerminatedError,
+                tenki.SessionNotFoundError,
+            ) as err:
+                self.fail(
+                    "TenkiSandbox.__exit__ path leaked SDK "
+                    f"exception: {type(err).__name__}: "
+                    f"{err!r}"
+                )
+
+        # The conductor reached ``HUMAN_QA_PENDING``
+        # via the healthy path; the SDK's
+        # ``SessionTerminatedError`` MUST NOT have
+        # rewritten that.
+        self.assertEqual(
+            final_state, TicketState.HUMAN_QA_PENDING
+        )
+        # No provider / secret-shaped text in any
+        # persisted checkpoint.
+        for saved in harness.saved_checkpoints():
+            self.assertNotIn(
+                "TENKI_SECRET", str(saved.last_error)
+            )
+            self.assertNotIn(
+                "provider-internal-session-id",
+                str(saved.last_error),
+            )
+
+    # ---- 3. SDK close() raising
+    # ``SessionNotFoundError`` does NOT escape ----
+
+    def test_sandbox_exit_swallows_sdk_session_not_found(self):
+        tasks = [task(17)]
+
+        checkpoint = make_checkpoint_payload(
+            issue_number=17,
+            state=TicketState.HUMAN_QA_PENDING,
+        )
+
+        sandbox = self._missing_session_sandbox_factory()
+
+        callbacks = ConductorCallbacks(
+            make_authenticator=lambda config: (
+                make_fake_authenticator()
+            ),
+            make_qa_environment=lambda sb: (
+                make_fake_qa_environment()
+            ),
+            make_implementation_runner=lambda **kw: MagicMock(),
+            make_review_runner=lambda **kw: MagicMock(),
+            make_qa_runner=lambda **kw: MagicMock(),
+            make_persistence_runner=lambda **kw: MagicMock(),
+            make_integration_runner=lambda **kw: MagicMock(),
+            make_remote_branch_cleaner=lambda **kw: MagicMock(),
+        )
+
+        with RunHarness(
+            tasks=tasks,
+            checkpoint=checkpoint,
+            callbacks=callbacks,
+            sandbox_override=sandbox,
+        ) as harness:
+            try:
+                final_state = harness.run()
+            except (
+                tenki.SessionTerminatedError,
+                tenki.SessionNotFoundError,
+            ) as err:
+                self.fail(
+                    "TenkiSandbox.__exit__ path leaked SDK "
+                    f"exception: {type(err).__name__}: "
+                    f"{err!r}"
+                )
+
+        self.assertEqual(
+            final_state, TicketState.HUMAN_QA_PENDING
+        )
+        for saved in harness.saved_checkpoints():
+            self.assertNotIn(
+                "TENKI_SECRET", str(saved.last_error)
+            )
+
+    # ---- 4. Combined TRACE 1 + TRACE 2: full
+    # production sequence leaves ``INFRA_FAILURE``
+    # intact ----
+
+    def test_combined_traces_leave_infra_failure_intact(self):
+        tasks = [task(17)]
+
+        checkpoint = make_checkpoint_payload(
+            issue_number=17,
+            state=TicketState.IMPLEMENTING,
+        )
+
+        impl_runner = self._make_runner_raising_session_terminated()
+
+        # Sandbox that:
+        # - raises ``SandboxSessionTerminatedError`` on
+        #   every ``exec`` call (so both the implementation
+        #   runner and the QA teardown see a dead sandbox);
+        # - raises ``tenki.SessionTerminatedError`` on
+        #   ``close()`` (so ``__exit__`` sees the SDK
+        #   teardown signal too).
+        sandbox = MagicMock(name="TenkiSandbox")
+
+        def _exec_raises(*args, **kwargs):
+            raise SandboxSessionTerminatedError(
+                "Sandbox session terminated unexpectedly."
+            )
+
+        sandbox.exec.side_effect = _exec_raises
+
+        def _close_raises_terminated():
+            raise tenki.SessionTerminatedError(
+                "session_terminated:guest_agent_liveness "
+                "TENKI_SECRET=abc123 "
+                "grpc_status=FAILED_PRECONDITION "
+                "provider-internal-session-id="
+                "s_xxxxxxxxxxxxxxxxxxxxxx"
+            )
+
+        sandbox.close.side_effect = _close_raises_terminated
+
+        callbacks = ConductorCallbacks(
+            make_authenticator=lambda config: (
+                make_fake_authenticator()
+            ),
+            make_qa_environment=lambda sb: (
+                make_fake_qa_environment()
+            ),
+            make_implementation_runner=lambda **kw: (
+                impl_runner
+            ),
+            make_review_runner=lambda **kw: MagicMock(),
+            make_qa_runner=lambda **kw: MagicMock(),
+            make_persistence_runner=lambda **kw: MagicMock(),
+            make_integration_runner=lambda **kw: MagicMock(),
+            make_remote_branch_cleaner=lambda **kw: MagicMock(),
+        )
+
+        with RunHarness(
+            tasks=tasks,
+            checkpoint=checkpoint,
+            callbacks=callbacks,
+            sandbox_override=sandbox,
+        ) as harness:
+            try:
+                harness.run()
+            except (
+                tenki.SessionTerminatedError,
+                tenki.SessionNotFoundError,
+                SandboxSessionTerminatedError,
+            ) as err:
+                self.fail(
+                    "Combined teardown trace leaked: "
+                    f"{type(err).__name__}: {err!r}"
+                )
+
+            saved = harness.saved_checkpoint()
+
+        # The primary failure MUST win.  Nothing in the
+        # teardown path overwrites it.
+        self.assertEqual(
+            saved.state, TicketState.INFRA_FAILURE
+        )
+        self.assertEqual(
+            saved.last_error,
+            _terminal_message(
+                TerminalReason.SANDBOX_SESSION_TERMINATED
+            ),
+        )
+        # No provider / secret-shaped text leaked.
+        self.assertNotIn("TENKI_SECRET", saved.last_error)
+        self.assertNotIn(
+            "grpc_status=FAILED_PRECONDITION",
+            saved.last_error,
+        )
+        self.assertNotIn(
+            "provider-internal-session-id",
+            saved.last_error,
+        )
+
 
 class FreshWorkspaceRestartTests(unittest.TestCase):
     """Scenario A: an implementation produced unpersisted changes,

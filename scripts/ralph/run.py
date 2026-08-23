@@ -67,6 +67,7 @@ from scripts.ralph.implementation import (
     ImplementationError,
     ImplementationFixContext,
     ImplementationRunner,
+    ImplementationTimeoutError,
     completion_result_path,
 )
 from scripts.ralph.integration import (
@@ -101,7 +102,10 @@ from scripts.ralph.review import (
     ReviewStage,
     ReviewVerdict,
 )
-from scripts.ralph.sandbox import TenkiSandbox
+from scripts.ralph.sandbox import (
+    SandboxSessionTerminatedError,
+    TenkiSandbox,
+)
 from scripts.ralph.states import TicketState
 from scripts.ralph.transitions import assert_transition
 from scripts.ralph.workspace import (
@@ -169,6 +173,9 @@ class TerminalReason(str, Enum):
     IMPLEMENTATION_BLOCKED = (
         "IMPLEMENTATION_BLOCKED"
     )
+    IMPLEMENTATION_TIMEOUT = (
+        "IMPLEMENTATION_TIMEOUT"
+    )
     IMPLEMENTATION_EXHAUSTED_NO_CHANGES = (
         "IMPLEMENTATION_EXHAUSTED_NO_CHANGES"
     )
@@ -226,6 +233,16 @@ class TerminalReason(str, Enum):
     ISSUE_NO_LONGER_PRESENT = (
         "ISSUE_NO_LONGER_PRESENT"
     )
+    # The Tenki sandbox that wraps the entire ticket
+    # ``Conductor.run()`` was torn down by the platform
+    # before orchestration completed.  Detected via the
+    # installed SDK's ``tenki.SessionTerminatedError``;
+    # the checkpoint stores the static
+    # ``SANDBOX_SESSION_TERMINATED`` message, never the
+    # SDK's runtime exception text.
+    SANDBOX_SESSION_TERMINATED = (
+        "SANDBOX_SESSION_TERMINATED"
+    )
 
 
 # Static Ralph-authored terminal messages.
@@ -245,6 +262,9 @@ TERMINAL_REASON_MESSAGES: dict = {
         "Implementation agent failed.",
     TerminalReason.IMPLEMENTATION_BLOCKED:
         "Implementation agent reported a blocker.",
+    TerminalReason.IMPLEMENTATION_TIMEOUT:
+        "Implementation command exceeded its "
+        "wall-clock deadline.",
     TerminalReason.IMPLEMENTATION_EXHAUSTED_NO_CHANGES:
         "Implementation exhausted its iteration "
         "budget without producing changes.",
@@ -293,6 +313,8 @@ TERMINAL_REASON_MESSAGES: dict = {
     TerminalReason.ISSUE_NO_LONGER_PRESENT:
         "Issue is no longer present in the "
         "current milestone task list.",
+    TerminalReason.SANDBOX_SESSION_TERMINATED:
+        "Sandbox session terminated unexpectedly.",
 }
 
 
@@ -335,10 +357,145 @@ class Budgets:
     max_review_cycles: int
     max_review_fix_iterations: int
     max_qa_attempts: int
+    implementation_timeout_seconds: int
+    # Hard ceiling for the Tenki sandbox lifetime that
+    # wraps an entire ticket ``Conductor.run()`` —
+    # implementation, review, fixing, QA, persistence,
+    # integration.  This is the value forwarded to the
+    # installed tenki 1.0.0 SDK as
+    # ``Sandbox.create(max_duration=...)`` and MUST be
+    # strictly greater than
+    # ``implementation_timeout_seconds`` so that no
+    # individual Claude command can outlive the sandbox.
+    sandbox_max_duration_seconds: int
+
+
+def _validate_implementation_timeout_seconds(
+    value: object,
+) -> int:
+    """Strictly validate ``execution.implementationTimeoutSeconds``.
+
+    Semantic predicate:
+
+        type(value) is int and value > 0
+
+    The predicate deliberately does NOT use
+    ``isinstance(value, int)`` because in Python ``bool`` is a
+    subclass of ``int``:
+
+        >>> isinstance(True, int)
+        True
+
+    A ``True`` value would otherwise survive integer validation
+    and reach Tenki, which would interpret it as approximately
+    one second.  Using ``type(value) is int`` rejects every
+    bool without an explicit ``is bool`` arm.
+
+    The error message is a static Ralph-owned string and never
+    embeds the raw value, so the trust boundary on
+    ``checkpoint.last_error`` and the error-surface
+    configuration-leak boundary both remain intact.
+
+    Callers translate the underlying ``ValueError`` into the
+    existing Ralph ``OrchestratorError`` boundary before the
+    exception leaves the orchestration layer.
+    """
+    if type(value) is not int or value <= 0:
+        raise ValueError(
+            "execution.implementationTimeoutSeconds must be "
+            "a positive integer (got type "
+            f"{type(value).__name__})."
+        )
+    return value
+
+
+# Default hard ceiling for the Tenki sandbox lifetime
+# (in seconds).  Six hours: long enough that a single
+# ticket can absorb several implementation, fix, and
+# review cycles plus QA, persistence, and integration;
+# short enough that an orphaned sandbox is not silently
+# billed indefinitely.  The value is a CEILING — Ralph
+# still closes the sandbox at the end of
+# ``Orchestrator.run`` when it finishes earlier.
+DEFAULT_SANDBOX_MAX_DURATION_SECONDS: int = 21_600
+
+
+def _validate_sandbox_max_duration_seconds(
+    value: object,
+) -> int:
+    """Strictly validate ``sandbox.maxDurationSeconds``.
+
+    Same predicate as
+    ``_validate_implementation_timeout_seconds``:
+
+        type(value) is int and value > 0
+
+    Rejects ``bool`` (which is an ``int`` subclass), ``str``,
+    ``float``, ``None``, ``list``, ``dict``, zero, and negative
+    values at the configuration loading boundary so an invalid
+    value cannot reach the installed ``tenki`` SDK and cannot
+    reach ``TenkiSandbox.__enter__`` (where it would otherwise
+    leak into a control-plane boundary).
+
+    The error message is a static Ralph-owned string and never
+    embeds the raw value.  Callers translate the underlying
+    ``ValueError`` into the existing Ralph ``OrchestratorError``
+    boundary.
+    """
+    if type(value) is not int or value <= 0:
+        raise ValueError(
+            "sandbox.maxDurationSeconds must be a positive "
+            f"integer (got type {type(value).__name__})."
+        )
+    return value
 
 
 def _load_budgets(config: dict) -> Budgets:
     execution = config.get("execution", {})
+    sandbox_cfg = config.get("sandbox", {})
+
+    raw_timeout = execution.get(
+        "implementationTimeoutSeconds", 3600
+    )
+
+    # ``execution.get(..., 3600)`` only returns the default
+    # when the key is ABSENT.  An explicit ``None`` still
+    # falls through to validation, which rejects it.
+    implementation_timeout_seconds = (
+        _validate_implementation_timeout_seconds(raw_timeout)
+    )
+
+    raw_sandbox_max_duration = sandbox_cfg.get(
+        "maxDurationSeconds",
+        DEFAULT_SANDBOX_MAX_DURATION_SECONDS,
+    )
+
+    sandbox_max_duration_seconds = (
+        _validate_sandbox_max_duration_seconds(
+            raw_sandbox_max_duration
+        )
+    )
+
+    # Cross-check invariant: the sandbox ceiling MUST
+    # strictly exceed any individual Claude command
+    # timeout, otherwise an implementation/fix command
+    # could outlive the sandbox and trigger
+    # ``tenki.SessionTerminatedError`` mid-execution.
+    # This is a hard configuration consistency check —
+    # we deliberately do NOT silently clamp either value
+    # because a clamp would mask a misconfiguration that
+    # the operator should see and resolve.
+    if (
+        sandbox_max_duration_seconds
+        <= implementation_timeout_seconds
+    ):
+        raise ValueError(
+            "sandbox.maxDurationSeconds must be strictly "
+            "greater than "
+            "execution.implementationTimeoutSeconds so that "
+            "no individual Claude command can outlive the "
+            "sandbox."
+        )
 
     return Budgets(
         max_implementation_iterations=execution.get(
@@ -352,6 +509,28 @@ def _load_budgets(config: dict) -> Budgets:
         ),
         max_qa_attempts=execution.get(
             "maxQaAttempts", 1
+        ),
+        # Wall-clock budget for one implementation/fix
+        # invocation.  Long enough for an agentic
+        # implementation pass, short enough that a stuck
+        # agent cannot hang Ralph indefinitely.  See
+        # ``ImplementationRunner`` for the SDK timeout
+        # surface (``tenki.CommandTimeoutError`` /
+        # built-in ``TimeoutError``).
+        implementation_timeout_seconds=(
+            implementation_timeout_seconds
+        ),
+        # Hard ceiling for the Tenki sandbox that wraps
+        # the entire ticket ``Conductor.run()`` —
+        # implementation, review, fixing, QA,
+        # persistence, integration.  Threaded through to
+        # ``TenkiSandbox.__enter__`` as
+        # ``max_duration=...`` so the installed tenki
+        # 1.0.0 SDK does NOT fall back to the
+        # workspace/server default lifetime.  See
+        # ``TenkiSandbox`` for the SDK surface.
+        sandbox_max_duration_seconds=(
+            sandbox_max_duration_seconds
         ),
     )
 
@@ -399,9 +578,38 @@ class Orchestrator:
         self.expected_issue_number = (
             expected_issue_number
         )
+        # ``_budgets`` is populated by ``run()`` AFTER strict
+        # configuration validation.  ``run()`` MUST be the only
+        # entry point that loads budgets; callers that bypass
+        # ``run()`` (e.g. milestone-level wrappers) MUST go
+        # through it before reaching the conductor.  This is the
+        # single source of truth for runtime budgets.
+        self._budgets: Optional[Budgets] = None
 
     def run(self) -> TicketState:
         config = load_config(self.config_path)
+
+        # Fail-closed configuration validation.  MUST run BEFORE
+        # any side effect — checkpoint load, task discovery,
+        # sandbox creation, runner construction, attempt
+        # consumption, or GitHub mutation — so an invalid
+        # configuration cannot consume a ticket attempt budget
+        # or mutate the durable checkpoint.  The ``Budgets``
+        # dataclass is the single configuration/budget loading
+        # boundary; everything downstream is forbidden from
+        # re-reading ``execution.implementationTimeoutSeconds``.
+        try:
+            self._budgets = _load_budgets(config)
+        except ValueError as error:
+            raise OrchestratorError(
+                "Ralph configuration rejected: "
+                "execution.implementationTimeoutSeconds "
+                "and sandbox.maxDurationSeconds must both "
+                "be positive integers, and "
+                "sandbox.maxDurationSeconds must be strictly "
+                "greater than "
+                "execution.implementationTimeoutSeconds."
+            ) from error
 
         store = CheckpointStore(self.checkpoint_path)
 
@@ -472,6 +680,9 @@ class Orchestrator:
 
         with TenkiSandbox(
             name=f"ralph-{checkpoint.issue_number}",
+            max_duration_seconds=(
+                self._budgets.sandbox_max_duration_seconds
+            ),
         ) as sandbox:
             qa_environment = (
                 self.callbacks.make_qa_environment(sandbox)
@@ -490,6 +701,7 @@ class Orchestrator:
                     authenticator=authenticator,
                     qa_environment=qa_environment,
                     callbacks=self.callbacks,
+                    budgets=self._budgets,
                 )
 
                 return conductor.run()
@@ -814,6 +1026,7 @@ class Conductor:
         authenticator: GitHubAppAuthenticator,
         qa_environment: PostgresQaEnvironment,
         callbacks: ConductorCallbacks,
+        budgets: Budgets,
     ):
         self.sandbox = sandbox
         self.checkpoint = checkpoint
@@ -836,12 +1049,52 @@ class Conductor:
             ],
         )
 
-        self._budgets = _load_budgets(config)
+        # ``Budgets`` arrives already validated by
+        # ``_load_budgets`` at the Orchestrator boundary.  The
+        # conductor never re-reads configuration.
+        self._budgets = budgets
 
     def run(self) -> TicketState:
         guard = 0
         max_guard = 100
 
+        try:
+            return self._run_loop(guard=guard, max_guard=max_guard)
+        except SandboxSessionTerminatedError:
+            # The installed tenki 1.0.0 SDK reported that
+            # the platform tore down the Tenki sandbox that
+            # wraps the entire ticket ``Conductor.run()``
+            # lifecycle.  ``TenkiSandbox.exec`` already
+            # suppressed the original SDK exception text and
+            # translated it to a static Ralph-owned
+            # ``SandboxSessionTerminatedError``; we map it
+            # here to the closed categorical
+            # ``TerminalReason.SANDBOX_SESSION_TERMINATED``
+            # whose static message is the only string
+            # permitted to reach ``checkpoint.last_error``.
+            #
+            # We deliberately use ``INFRA_FAILURE`` (not
+            # ``AGENT_FAILURE``) because this is a
+            # platform-level loss, not a model or agent
+            # failure.  We do NOT silently retry inside
+            # ``ImplementationRunner``; the durable
+            # checkpoint/attempt mechanism and outer
+            # milestone runner own recovery.
+            self._record_terminal(
+                state=TicketState.INFRA_FAILURE,
+                reason=(
+                    TerminalReason
+                    .SANDBOX_SESSION_TERMINATED
+                ),
+            )
+            return self.checkpoint.state
+
+    def _run_loop(
+        self,
+        *,
+        guard: int,
+        max_guard: int,
+    ) -> TicketState:
         while True:
             guard += 1
 
@@ -1012,6 +1265,26 @@ class Conductor:
                 ],
                 fix_context=fix_context,
             )
+        except ImplementationTimeoutError:
+            # ``ImplementationTimeoutError`` text is a static
+            # Ralph-owned string; the underlying SDK exception
+            # was suppressed inside ``ImplementationRunner``.
+            # Map to a static categorical reason whose message
+            # is the only thing permitted to reach
+            # ``checkpoint.last_error``.  The transition is
+            # fail-closed (AGENT_FAILURE) so a stuck command
+            # cannot hang Ralph.  Retry semantics remain the
+            # durable checkpoint/attempt mechanism's
+            # responsibility: do NOT silently retry inside
+            # ``ImplementationRunner``.
+            self._record_terminal(
+                state=TicketState.AGENT_FAILURE,
+                reason=(
+                    TerminalReason
+                    .IMPLEMENTATION_TIMEOUT
+                ),
+            )
+            return
         except ImplementationError:
             # ``ImplementationError`` text is untrusted and
             # MUST NOT reach ``checkpoint.last_error``.  Map
@@ -2151,6 +2424,10 @@ class Conductor:
                     workspace=workspace,
                     attempt=attempt,
                     phase=phase,
+                    implementation_timeout_seconds=(
+                        self._budgets
+                        .implementation_timeout_seconds
+                    ),
                 )
             )
 
@@ -2159,6 +2436,9 @@ class Conductor:
             workspace=workspace,
             attempt=attempt,
             phase=phase,
+            implementation_timeout_seconds=(
+                self._budgets.implementation_timeout_seconds
+            ),
         )
 
     def _make_review_runner(
