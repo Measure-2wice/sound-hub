@@ -308,9 +308,11 @@ non-ready verdict.
 
 ## Safe Mutation Boundary
 
-Permitted automatic mutations:
+Permitted automatic GitHub mutations are limited to adding or removing these three routing labels only:
 
-- add or remove the four routing labels only
+- `ready-for-ralph`
+- `needs-reshaping`
+- `supervised-agent`
 
 Forbidden automatic mutations:
 
