@@ -53,15 +53,33 @@ function mapStatus(code: ApiErrorCodeV1): number {
   switch (code) {
     case "INVALID_JSON":
     case "INVALID_SEARCH_CRITERIA":
+    case "INVALID_AUTH_REQUEST":
       return 400;
     case "UNSUPPORTED_MEDIA_TYPE":
       return 415;
     case "SEARCH_RATE_LIMITED":
+    case "AUTH_RATE_LIMITED":
       return 429;
     case "SEARCH_FAILED":
+    case "AUTH_FAILED":
       return 500;
     case "SEARCH_UNAVAILABLE":
+    case "AUTH_PROVIDER_UNAVAILABLE":
       return 503;
+    // GS 4 / GS 5 authorization rejections. The standard safe envelope
+    // does not include 401/403 by default, so we map the new
+    // authorization codes to status codes that respect the spirit of
+    // those HTTP semantics while preserving the shared envelope
+    // contract (every error response carries the same shape).
+    case "SESSION_INVALID":
+    case "SESSION_EXPIRED":
+      return 401;
+    case "WORKSPACE_NOT_FOUND":
+      return 404;
+    case "WORKSPACE_INELIGIBLE":
+    case "NOT_A_MEMBER":
+    case "MISSING_CAPABILITY":
+      return 403;
   }
 }
 

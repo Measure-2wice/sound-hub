@@ -408,6 +408,20 @@ export const apiErrorCodeV1Schema = z.enum([
   "SEARCH_RATE_LIMITED",
   "SEARCH_FAILED",
   "SEARCH_UNAVAILABLE",
+  // Buildathon Golden Slice 1 error codes. Each code maps to a stable
+  // HTTP status via buildSafeError's switch table and to a buyer-safe
+  // message. The codes never expose provider subjects, raw tokens,
+  // session ids, or membership internals.
+  "INVALID_AUTH_REQUEST",
+  "AUTH_RATE_LIMITED",
+  "AUTH_FAILED",
+  "AUTH_PROVIDER_UNAVAILABLE",
+  "SESSION_INVALID",
+  "SESSION_EXPIRED",
+  "WORKSPACE_NOT_FOUND",
+  "WORKSPACE_INELIGIBLE",
+  "NOT_A_MEMBER",
+  "MISSING_CAPABILITY",
 ]);
 export type ApiErrorCodeV1 = z.infer<typeof apiErrorCodeV1Schema>;
 
@@ -499,3 +513,187 @@ export const pricingKindValuesV1 = ["StartingAt", "Fixed", "ContactForQuote"] as
 export type PricingKindV1 = (typeof pricingKindValuesV1)[number];
 export const purchaseModeValuesV1 = ["BundleOnly"] as const;
 export type PurchaseModeV1 = (typeof purchaseModeValuesV1)[number];
+
+// ===========================================================================
+// Buildathon Golden Slice 1 (BG1) shared runtime contracts.
+//
+// These schemas cover the identity, session, and acting-Workspace
+// surfaces. They follow the same patterns as the v1 search contract:
+// shared Zod is the executable contract; TypeScript types are inferred
+// from it; the same schema is consumed by the Express route validator
+// and the browser response parser. No Prisma model or raw provider
+// subject ever crosses a public DTO.
+//
+// Per ticket #59, the GS 1 / GS 2 / GS 3 / GS 4 / GS 5 / GS 6
+// requirements are:
+//
+//   GS 1 — preserve the buildathon-only governance boundary.
+//   GS 2 — deployed managed magic-link auth with the bounded fallback.
+//   GS 3 — both adapters map credentials to persisted UserAccounts and
+//          produce server-validated sessions through the same boundary.
+//   GS 4 — every Golden Slice command names an acting Workspace and
+//          rejects a human without a current qualifying membership.
+//   GS 5 — a matching legacy Workspace.ownerUserId grants no authority
+//          without current membership.
+//   GS 6 — buyer/seller Workspaces, capabilities, and memberships are
+//          persisted (no DealApprover authorization here; BG5 owns it).
+//
+// ===========================================================================
+
+// ---------- Magic link request ----------
+
+// SoundHub always uses neutral responses: the request envelope returns
+// the same shape whether the email is registered or not, so the public
+// surface cannot be used to enumerate accounts. The deterministic
+// adapter adds a non-production `devVerificationUrl` for the
+// integration test and emergency fallback paths; managed providers omit
+// it because the real email delivery happens on the provider side.
+export const bg1MagicLinkRequestV1Schema = z
+  .object({
+    email: z
+      .string()
+      .trim()
+      .toLowerCase()
+      .email("email must be a valid email address")
+      .max(254, "email must be at most 254 characters"),
+    // Optional human-friendly hint carried into the session metadata
+    // for diagnostics. Never returned to other members.
+    displayName: z.string().min(1).max(120).optional(),
+  })
+  .strict();
+export type Bg1MagicLinkRequestV1 = z.infer<typeof bg1MagicLinkRequestV1Schema>;
+
+export const bg1MagicLinkResponseV1Schema = z
+  .object({
+    // Neutral acknowledgement. `ok` is always true on a well-formed
+    // request; rate-limited or otherwise rejected requests produce the
+    // standard safe error envelope instead.
+    ok: z.literal(true),
+    // Deterministic-adapter only: a one-time verification URL that the
+    // browser can follow in the absence of email delivery. Production
+    // Supabase magic-link emails render this field absent. The contract
+    // documents the field name verbatim so a contract-drift detector
+    // can catch a managed adapter that begins leaking the verification
+    // URL to production.
+    devVerificationUrl: z.string().min(1).max(2048).optional(),
+  })
+  .strict();
+export type Bg1MagicLinkResponseV1 = z.infer<typeof bg1MagicLinkResponseV1Schema>;
+
+// ---------- Verify token ----------
+
+export const bg1VerifyTokenRequestV1Schema = z
+  .object({
+    requestId: z.string().min(1).max(256),
+  })
+  .strict();
+export type Bg1VerifyTokenRequestV1 = z.infer<typeof bg1VerifyTokenRequestV1Schema>;
+
+// The verify-token response is what the server returns when a magic-link
+// verification succeeds. The HttpOnly session cookie is set on the
+// response side (not part of the body) so the client cannot read the
+// session id; this body contains only allow-listed identity and
+// membership facts the client needs to render the post-sign-in state.
+export const bg1PublicWorkspaceV1Schema = z
+  .object({
+    workspaceId: z.string().min(1).max(128),
+    slug: z.string().min(1).max(120),
+    name: z.string().min(1).max(200),
+    workspaceType: z.enum(["Personal", "Organization"]),
+    workspaceStatus: z.enum(["Active", "Suspended"]),
+    capabilities: z
+      .array(z.enum(["Buyer", "Seller"]))
+      .min(1)
+      .max(8),
+  })
+  .strict();
+export type Bg1PublicWorkspaceV1 = z.infer<typeof bg1PublicWorkspaceV1Schema>;
+
+export const bg1PublicUserV1Schema = z
+  .object({
+    userAccountId: z.string().min(1).max(128),
+    // The primary SoundHub-owned email, when present. May be absent if
+    // the identity provider does not surface an email and the user has
+    // not set one explicitly. Per ADR 0004 the email is private; it
+    // never enters the public seller contract and the workspace UI is
+    // the only place it appears (for the signed-in user themselves).
+    email: z.string().email().nullable(),
+    displayName: z.string().min(1).max(120).nullable(),
+    identityProvider: z.string().min(1).max(64),
+    identitySubject: z.string().min(1).max(256),
+    workspaces: z.array(bg1PublicWorkspaceV1Schema).max(64),
+  })
+  .strict();
+export type Bg1PublicUserV1 = z.infer<typeof bg1PublicUserV1Schema>;
+
+export const bg1VerifyTokenResponseV1Schema = z
+  .object({
+    ok: z.literal(true),
+    user: bg1PublicUserV1Schema,
+  })
+  .strict();
+export type Bg1VerifyTokenResponseV1 = z.infer<typeof bg1VerifyTokenResponseV1Schema>;
+
+// ---------- Current session info ----------
+
+export const bg1SessionInfoV1Schema = z
+  .object({
+    // Null when the request carries no valid session cookie. Otherwise
+    // the user the cookie authenticates, plus the workspaces they
+    // currently belong to. The acting workspace is NOT in this
+    // payload: per GS 4 every consequential command must carry the
+    // acting workspace explicitly, so the UI chooses a workspace and
+    // passes it on the command itself rather than persisting it on the
+    // session.
+    user: bg1PublicUserV1Schema.nullable(),
+  })
+  .strict();
+export type Bg1SessionInfoV1 = z.infer<typeof bg1SessionInfoV1Schema>;
+
+// ---------- Sign out ----------
+
+export const bg1SignOutResponseV1Schema = z
+  .object({
+    ok: z.literal(true),
+  })
+  .strict();
+export type Bg1SignOutResponseV1 = z.infer<typeof bg1SignOutResponseV1Schema>;
+
+// ---------- Sample consequential command (acts as a Workspace) ----------
+//
+// The Buildathon Golden Slice ticket (#59) requires that
+// consequential command contracts identify an acting Workspace and use
+// a reusable current-membership authorization service. This is the
+// minimal sample contract used to demonstrate that property at the
+// HTTP boundary and in the focused authorization tests. Real
+// ProjectRequest, Deal, TermsVersion, and approval commands will be
+// authored against the same pattern in later tickets; this sample is
+// sufficient to satisfy GS 4 / GS 5 / GS 6 today.
+export const bg1ActingWorkspaceRequestV1Schema = z
+  .object({
+    actingWorkspaceId: z.string().min(1).max(128),
+  })
+  .strict();
+export type Bg1ActingWorkspaceRequestV1 = z.infer<typeof bg1ActingWorkspaceRequestV1Schema>;
+
+export const bg1ActingWorkspaceResponseV1Schema = z
+  .object({
+    ok: z.literal(true),
+    actingWorkspace: bg1PublicWorkspaceV1Schema,
+    membership: z
+      .object({
+        role: z.enum(["Owner", "Admin", "Member"]),
+        joinedAt: z.string().datetime(),
+      })
+      .strict(),
+  })
+  .strict();
+export type Bg1ActingWorkspaceResponseV1 = z.infer<typeof bg1ActingWorkspaceResponseV1Schema>;
+
+// ---------- Stable provider keys exposed for runtime validation ----------
+//
+// The provider keys are a closed enum so a future provider can only be
+// added by editing this contract and the adapter factory together.
+// SoundHub owns these keys; provider SDKs never read them.
+export const bg1IdentityProviderV1Values = ["managed-magic-link", "deterministic"] as const;
+export type Bg1IdentityProviderV1 = (typeof bg1IdentityProviderV1Values)[number];

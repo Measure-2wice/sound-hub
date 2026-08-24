@@ -6,22 +6,37 @@ import { createPrismaClient, type PrismaClient } from "@soundhub/db";
 import { healthRoutes } from "./routes/health.js";
 import { createSearchRouter } from "./routes/search.js";
 import { createMetadataRouter } from "./routes/metadata.js";
+import { createAuthRouter } from "./routes/auth.js";
 import { TalentSearchService } from "./services/talent-search.service.js";
+import { AuthenticationService } from "./services/authentication.service.js";
+import { WorkspaceAuthorizationService } from "./services/workspace-authorization.service.js";
 import { PrismaTalentSearchRepository } from "./repositories/prisma-talent-search.repository.js";
 import { PrismaMetadataRepository } from "./repositories/prisma-metadata.repository.js";
+import { PrismaAuthRepository } from "./auth-repository/prisma-auth-repository.js";
 import type { MetadataRepository } from "./repositories/metadata.repository.js";
+import type { AuthRepository } from "./auth-repository/auth-repository.js";
+import type { IdentityAdapter } from "./identity/identity-adapter.js";
+import { buildIdentityAdapters } from "./identity/identity-adapter-factory.js";
 import { buildSafeError, generateRequestId, writeSafeError } from "./lib/errors.js";
 
 export interface AppOptions {
   readonly service?: TalentSearchService;
   readonly metadataRepository?: MetadataRepository;
   readonly prismaClient?: PrismaClient;
+  readonly authenticationService?: AuthenticationService;
+  readonly workspaceAuthorizationService?: WorkspaceAuthorizationService;
+  readonly authRepository?: AuthRepository;
+  readonly identityAdapter?: IdentityAdapter;
 }
 
 export interface BuiltApp {
   readonly app: Application;
   readonly prisma: PrismaClient;
   readonly service: TalentSearchService;
+  readonly authenticationService: AuthenticationService;
+  readonly workspaceAuthorizationService: WorkspaceAuthorizationService;
+  readonly authRepository: AuthRepository;
+  readonly identityAdapter: IdentityAdapter;
 }
 
 export function buildApp(options: AppOptions = {}): BuiltApp {
@@ -29,6 +44,20 @@ export function buildApp(options: AppOptions = {}): BuiltApp {
   const service =
     options.service ?? new TalentSearchService(new PrismaTalentSearchRepository(prisma));
   const metadataRepository = options.metadataRepository ?? new PrismaMetadataRepository(prisma);
+
+  const authRepository = options.authRepository ?? new PrismaAuthRepository(prisma);
+  const identityAdapters = buildIdentityAdapters({
+    supabase: {
+      url: process.env.SUPABASE_URL,
+      anonKey: process.env.SUPABASE_ANON_KEY,
+      serviceRoleKey: process.env.SUPABASE_SERVICE_ROLE_KEY,
+    },
+  });
+  const identityAdapter = options.identityAdapter ?? identityAdapters.active;
+  const authenticationService =
+    options.authenticationService ?? new AuthenticationService({ identityAdapter, authRepository });
+  const workspaceAuthorizationService =
+    options.workspaceAuthorizationService ?? new WorkspaceAuthorizationService({ authRepository });
 
   const app: Application = express();
   app.disable("x-powered-by");
@@ -54,6 +83,14 @@ export function buildApp(options: AppOptions = {}): BuiltApp {
   app.use("/api/health", healthRoutes);
   app.use("/api/search", createSearchRouter({ service }));
   app.use("/api/metadata", createMetadataRouter({ repository: metadataRepository }));
+  app.use(
+    "/api/auth",
+    createAuthRouter({
+      authenticationService,
+      workspaceAuthorizationService,
+      authRepository,
+    }),
+  );
 
   // 404 fallback
   app.use((req: Request, res: Response) => {
@@ -81,5 +118,13 @@ export function buildApp(options: AppOptions = {}): BuiltApp {
     writeSafeError(res, safe);
   });
 
-  return { app, prisma, service };
+  return {
+    app,
+    prisma,
+    service,
+    authenticationService,
+    workspaceAuthorizationService,
+    authRepository,
+    identityAdapter,
+  };
 }

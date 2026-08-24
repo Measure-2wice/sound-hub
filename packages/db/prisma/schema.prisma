@@ -72,14 +72,69 @@ enum PurchaseMode {
 
 model UserAccount {
   id        String   @id @default(cuid())
-  email     String   @unique
+  // The primary email associated with the account. Owned by SoundHub for
+  // display and notification purposes; provider-owned identities live in
+  // the IdentityProvider mapping table so a provider change does not
+  // rewrite this column. Nullable because the Buildathon Golden Slice
+  // introduces identity-only accounts (a user may sign in via a managed
+  // provider without SoundHub ever having been told an email).
+  email     String?  @unique
   createdAt DateTime @default(now())
   updatedAt DateTime @updatedAt
 
   memberships         WorkspaceMembership[]
   ownedWorkspaces     Workspace[]            @relation("WorkspaceOwner")
+  identityProviders   IdentityProvider[]
+  authSessions        AuthSession[]
 
   @@map("user_accounts")
+}
+
+// IdentityProvider maps a managed provider's subject identifier to a
+// durable SoundHub UserAccount. The (provider, subject) tuple is unique
+// so the same provider subject cannot accidentally create duplicate
+// accounts on repeat sign-in. Provider subjects, claims, roles, and
+// metadata never identify or authorize a Workspace; they only resolve
+// to a UserAccount. See ADR 0004 (External authentication proves login
+// only) for the architectural split.
+model IdentityProvider {
+  id            String   @id @default(cuid())
+  // Stable provider key, e.g. "managed-magic-link" or "deterministic".
+  provider      String
+  // The provider's unique identifier for this human. Opaque to
+  // SoundHub; never exposed in public DTOs.
+  subject       String
+  // The email the provider knows the user by, when applicable. Optional
+  // because some provider configurations do not surface email.
+  providerEmail String?
+  userAccountId String
+  createdAt     DateTime @default(now())
+
+  userAccount UserAccount @relation(fields: [userAccountId], references: [id], onDelete: Cascade)
+
+  @@unique([provider, subject])
+  @@index([userAccountId])
+  @@map("identity_providers")
+}
+
+// AuthSession is a server-issued, opaque session handle. The browser
+// receives the id as an HttpOnly cookie; the server resolves it back
+// to the authenticated UserAccount on every protected request. The
+// client cannot assert an arbitrary UserAccount because the session
+// id is the only authoritative identity signal. Revocation is recorded
+// rather than deleted so audit evidence survives the lifetime of the
+// session.
+model AuthSession {
+  id            String    @id @default(cuid())
+  userAccountId String
+  createdAt     DateTime  @default(now())
+  expiresAt     DateTime
+  revokedAt     DateTime?
+
+  userAccount UserAccount @relation(fields: [userAccountId], references: [id], onDelete: Cascade)
+
+  @@index([userAccountId])
+  @@map("auth_sessions")
 }
 
 model Workspace {
