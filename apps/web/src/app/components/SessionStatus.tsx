@@ -47,7 +47,7 @@ export function SessionStatus() {
   if (!user) {
     return (
       <Link
-        href={"/login" as unknown as React.ComponentProps<typeof Link>["href"]}
+        href={"/login"}
         className="text-sm font-medium text-blue-600 hover:text-blue-700"
         data-testid="nav-sign-in"
       >

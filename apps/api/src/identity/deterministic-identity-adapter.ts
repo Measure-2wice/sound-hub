@@ -27,6 +27,7 @@
 
 import { randomUUID, createHash } from "node:crypto";
 import type { Bg1IdentityProviderV1 } from "@soundhub/types";
+import { deriveDeterministicSubject } from "@soundhub/types";
 import {
   type IdentityAdapter,
   type SignInRequestResult,
@@ -120,7 +121,7 @@ export class DeterministicIdentityAdapter implements IdentityAdapter {
   async requestSignIn(input: { readonly email: string }): Promise<SignInRequestResult> {
     const normalizedEmail = input.email.trim().toLowerCase();
     const requestId = randomUUID();
-    const subject = deterministicSubject(normalizedEmail);
+    const subject = deriveDeterministicSubject(normalizedEmail, sha256Hex);
     this.pending.set(requestId, {
       email: normalizedEmail,
       subject,
@@ -160,14 +161,12 @@ export class DeterministicIdentityAdapter implements IdentityAdapter {
 }
 
 /**
- * Derive a stable provider subject from the email address. The mapping
- * is deterministic so the same human always produces the same subject
- * across sign-in attempts — without that invariant, the second sign-in
- * would create a second UserAccount, which the ticket explicitly
- * forbids. The hash is opaque (never surfaced to the client) and
- * scoped per provider so a future migration to a different adapter
- * cannot reuse a hash by accident.
+ * SHA-256 hex digest shared between the deterministic adapter and the
+ * seed. Both use Node's `crypto.createHash` so the digest matches
+ * exactly; the contract in `@soundhub/types` only specifies the
+ * string format, not the algorithm, so a future migration can swap
+ * the hash without breaking the lookup.
  */
-function deterministicSubject(email: string): string {
-  return createHash("sha256").update(`deterministic|${email}`).digest("hex");
+function sha256Hex(input: string): string {
+  return createHash("sha256").update(input).digest("hex");
 }

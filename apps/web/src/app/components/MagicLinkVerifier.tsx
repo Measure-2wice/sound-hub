@@ -25,17 +25,16 @@ export function MagicLinkVerifier({ paramName, children }: MagicLinkVerifierProp
   useEffect(() => {
     const requestId = searchParams.get(paramName);
     if (!requestId) {
-      router.replace("/login" as unknown as Parameters<typeof router.replace>[0]);
+      router.replace("/login");
       return;
     }
     let cancelled = false;
     void (async () => {
       try {
         await verifyToken({ requestId });
-        if (!cancelled)
-          router.replace("/dashboard" as unknown as Parameters<typeof router.replace>[0]);
+        if (!cancelled) router.replace("/dashboard");
       } catch {
-        if (!cancelled) router.replace("/login" as unknown as Parameters<typeof router.replace>[0]);
+        if (!cancelled) router.replace("/login");
       }
     })();
     return () => {

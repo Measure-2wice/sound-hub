@@ -65,15 +65,61 @@ export class PrismaAuthRepository implements AuthRepository {
     if (existing) return existing;
 
     return this.prisma.$transaction(async (tx) => {
-      const user = await tx.userAccount.create({
-        data: {
-          // The primary email column is nullable since BG1; we only
-          // populate it when the provider surfaces one. The
-          // @unique constraint still enforces single SoundHub email
-          // when present.
-          email: input.providerEmail,
-        },
-      });
+      // Safe application-owned linking seam (ticket #59 P1-002):
+      // when a newly verified provider identity arrives for an email
+      // that already exists in SoundHub and that UserAccount has no
+      // IdentityProvider mappings yet, we attach the new mapping to
+      // that UserAccount. This preserves the ticket's invariant that
+      // "an external provider identity maps to a persisted SoundHub
+      // UserAccount" without using provider claims to authorize
+      // Workspaces — the resulting UserAccount still gains
+      // authority only through WorkspaceMembership.
+      //
+      // A UserAccount that already has an IdentityProvider mapping
+      // represents a different human sharing the email; we leave
+      // that UserAccount alone and create a fresh UserAccount with
+      // a NULL email column. Reusing the email would violate the
+      // `UserAccount.email @unique` constraint and the new human
+      // is a distinct marketplace identity.
+      let userId: string | null = null;
+      let existingEmailOwner: { readonly id: string } | null = null;
+      if (input.providerEmail) {
+        const matchingUser = await tx.userAccount.findUnique({
+          where: { email: input.providerEmail },
+        });
+        if (matchingUser) {
+          const existingProviderCount = await tx.identityProvider.count({
+            where: { userAccountId: matchingUser.id },
+          });
+          if (existingProviderCount === 0) {
+            // SoundHub pre-created the UserAccount (no providers
+            // yet) and the human is signing in for the first time.
+            // Attach the new credential to that account.
+            userId = matchingUser.id;
+          } else {
+            // The existing UserAccount is already claimed by a
+            // real human via another provider; treat the new
+            // credential as a different human and create a fresh
+            // SoundHub identity for them.
+            existingEmailOwner = { id: matchingUser.id };
+          }
+        }
+      }
+
+      let user: { readonly id: string };
+      if (userId !== null) {
+        user = await tx.userAccount.findUniqueOrThrow({ where: { id: userId } });
+      } else {
+        // Only populate the email column when no other UserAccount
+        // already claims it. A pre-existing UserAccount that owns
+        // the email keeps the email; the new human is recorded as
+        // a distinct identity without a SoundHub email.
+        const emailForNewUser =
+          input.providerEmail && existingEmailOwner === null ? input.providerEmail : null;
+        user = await tx.userAccount.create({
+          data: { email: emailForNewUser },
+        });
+      }
       await tx.identityProvider.create({
         data: {
           provider: input.provider,

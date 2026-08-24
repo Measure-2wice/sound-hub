@@ -24,10 +24,8 @@ import type {
   WorkspaceMembershipRoleV1,
   WorkspaceStatusV1,
 } from "@soundhub/types";
-import type {
-  AuthRepository,
-  WorkspaceMembershipView,
-} from "../auth-repository/auth-repository.js";
+import type { AuthRepository } from "../auth-repository/auth-repository.js";
+import { toPublicWorkspace } from "../dto/public-mappers.js";
 
 export class AuthorizationError extends Error {
   constructor(
@@ -116,15 +114,4 @@ export class WorkspaceAuthorizationService {
     }
     return membership;
   }
-}
-
-function toPublicWorkspace(view: WorkspaceMembershipView): Bg1PublicWorkspaceV1 {
-  return {
-    workspaceId: view.workspaceId,
-    slug: view.slug,
-    name: view.name,
-    workspaceType: view.workspaceType,
-    workspaceStatus: view.workspaceStatus,
-    capabilities: [...view.capabilities],
-  };
 }

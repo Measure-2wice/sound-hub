@@ -63,7 +63,7 @@ export default function DashboardPage() {
             <p className="text-gray-700">
               You are not signed in.{" "}
               <Link
-                href={"/login" as unknown as React.ComponentProps<typeof Link>["href"]}
+                href={"/login"}
                 className="text-blue-600 hover:text-blue-700 font-medium"
                 data-testid="dashboard-sign-in-link"
               >

@@ -46,9 +46,7 @@ import {
   bg1ActingWorkspaceRequestV1Schema,
   bg1ActingWorkspaceResponseV1Schema,
   type ApiErrorCodeV1,
-  type Bg1PublicUserV1,
 } from "@soundhub/types";
-import type { PublicUserView } from "../auth-repository/auth-repository.js";
 import { ZodError } from "zod";
 import type { AuthenticationService } from "../services/authentication.service.js";
 import {
@@ -63,7 +61,9 @@ import {
   type SafeErrorResponse,
 } from "../lib/errors.js";
 import { SESSION_COOKIE, setSessionCookie, clearSessionCookie } from "../lib/session-cookie.js";
-import type { AuthRepository } from "../auth-repository/auth-repository.js";
+import type { AuthRepository, PublicUserView } from "../auth-repository/auth-repository.js";
+import { toPublicUser } from "../dto/public-mappers.js";
+import type { Bg1PublicUserV1 } from "@soundhub/types";
 
 export interface AuthRouteDeps {
   readonly authenticationService: AuthenticationService;
@@ -387,19 +387,7 @@ function writeAuthError(res: Response, err: unknown, requestId: string, route: s
 }
 
 function toPublicUserView(view: PublicUserView): Bg1PublicUserV1 {
-  return {
-    userAccountId: view.userAccountId,
-    email: view.email,
-    displayName: view.displayName,
-    identityProvider: view.identityProvider,
-    identitySubject: view.identitySubject,
-    workspaces: view.workspaces.map((w) => ({
-      workspaceId: w.workspaceId,
-      slug: w.slug,
-      name: w.name,
-      workspaceType: w.workspaceType,
-      workspaceStatus: w.workspaceStatus,
-      capabilities: [...w.capabilities],
-    })),
-  };
+  // Defer to the shared mapper so the route cannot drift from the
+  // authentication service or the workspace authorization service.
+  return toPublicUser(view);
 }

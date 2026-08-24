@@ -1054,8 +1054,23 @@ async function applySellerGraph(
 // The demo buyer Workspace has Buyer capability and the demo buyer
 // UserAccount is the Owner via a WorkspaceMembership row. The seed
 // restores this graph on every run so stale mutations cannot persist.
+//
+// The subject is derived from the email through the canonical
+// `deriveDeterministicSubject` helper in `@soundhub/types` so the
+// seeded (provider, subject) tuple is exactly the one the
+// deterministic adapter computes at sign-in. Without this, the
+// adapter would look up an unknown subject and create a second
+// UserAccount (violating ticket #59 GS 2 and the deterministic
+// mapping invariant).
+import { createHash } from "node:crypto";
+import { deriveDeterministicSubject } from "@soundhub/types";
+
 const DEMO_BUYER_EMAIL = "demo.buyer@soundhub.example";
-const DEMO_BUYER_SUBJECT = "demo-buyer";
+const DEMO_SELLER_EMAIL = "marc.andre@creolebeats.example";
+
+const sha256Hex = (input: string): string => createHash("sha256").update(input).digest("hex");
+const DEMO_BUYER_SUBJECT = deriveDeterministicSubject(DEMO_BUYER_EMAIL, sha256Hex);
+const DEMO_SELLER_SUBJECT = deriveDeterministicSubject(DEMO_SELLER_EMAIL, sha256Hex);
 const DEMO_BUYER_WORKSPACE_SLUG = "bg1-demo-buyer";
 const DEMO_BUYER_WORKSPACE_NAME = "BG1 Demo Buyer";
 const DEMO_BUYER_USER_ID = "user-bg1-demo-buyer";
@@ -1067,8 +1082,6 @@ const DEMO_BUYER_WORKSPACE_ID = "ws-bg1-demo-buyer";
 // add a deterministic identity provider mapping so the journey can
 // complete magic-link sign-in deterministically. The seller UserAccount
 // already exists from the canonical SELLERS loop above.
-const DEMO_SELLER_EMAIL = "marc.andre@creolebeats.example";
-const DEMO_SELLER_SUBJECT = "demo-seller";
 
 async function applyDemoBuyerGraph(tx: Prisma.TransactionClient): Promise<void> {
   const buyer = await tx.userAccount.upsert({

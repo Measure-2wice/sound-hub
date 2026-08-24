@@ -17,14 +17,14 @@
 // of the Golden Slice authority path.
 
 import { randomUUID } from "node:crypto";
-import type { Bg1IdentityProviderV1, Bg1PublicUserV1, Bg1PublicWorkspaceV1 } from "@soundhub/types";
+import type { Bg1IdentityProviderV1, Bg1PublicUserV1 } from "@soundhub/types";
 import type { IdentityAdapter, SignInRequestResult } from "../identity/identity-adapter.js";
 import type {
   AuthRepository,
   PublicUserView,
   SessionRecord,
-  WorkspaceMembershipView,
 } from "../auth-repository/auth-repository.js";
+import { toPublicUser } from "../dto/public-mappers.js";
 
 // Default session lifetime for the Buildathon Golden Slice. The ticket
 // explicitly excludes production session-lifetime policy from this
@@ -232,28 +232,6 @@ export class AuthenticationService {
  * single source of truth for the mapping so route handlers and
  * future server-side consumers cannot drift.
  */
-export function toPublicUser(user: PublicUserView): Bg1PublicUserV1 {
-  return {
-    userAccountId: user.userAccountId,
-    email: user.email,
-    displayName: user.displayName,
-    identityProvider: user.identityProvider,
-    identitySubject: user.identitySubject,
-    workspaces: user.workspaces.map(toPublicWorkspace),
-  };
-}
-
-export function toPublicWorkspace(view: WorkspaceMembershipView): Bg1PublicWorkspaceV1 {
-  return {
-    workspaceId: view.workspaceId,
-    slug: view.slug,
-    name: view.name,
-    workspaceType: view.workspaceType,
-    workspaceStatus: view.workspaceStatus,
-    capabilities: [...view.capabilities],
-  };
-}
-
 function withOptionalDevUrl(result: SignInRequestResult): {
   ok: true;
   devVerificationUrl?: string;
@@ -263,6 +241,12 @@ function withOptionalDevUrl(result: SignInRequestResult): {
   }
   return { ok: true, devVerificationUrl: result.devVerificationUrl };
 }
+
+// Re-export the shared mapper for callers that imported it from this
+// module before the move to `dto/public-mappers.ts`. The internal
+// implementation lives in one module so the route, the authentication
+// service, and the authorization service cannot drift.
+export { toPublicUser };
 
 // Re-export a helper for tests that need to mint a session id
 // without exercising the full sign-in flow. The id is opaque; the

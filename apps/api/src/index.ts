@@ -52,6 +52,15 @@ export function buildApp(options: AppOptions = {}): BuiltApp {
       anonKey: process.env.SUPABASE_ANON_KEY,
       serviceRoleKey: process.env.SUPABASE_SERVICE_ROLE_KEY,
     },
+    log: (message) => {
+      console.log(`[bg1] ${message}`);
+    },
+    // The async smoke result is not awaited here so the
+    // composition root stays synchronous. The factory falls back
+    // to deterministic when the smoke result is missing; the
+    // deployable process can run `await identityAdapters.managed.smoke()`
+    // before calling `buildApp` to get a real probe.
+    managedSmoke: undefined,
   });
   const identityAdapter = options.identityAdapter ?? identityAdapters.active;
   const authenticationService =

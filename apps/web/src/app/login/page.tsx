@@ -60,7 +60,7 @@ export default function LoginPage() {
     }
     try {
       await verifyToken({ requestId });
-      router.push("/dashboard" as unknown as Parameters<typeof router.push>[0]);
+      router.push("/dashboard");
     } catch (err) {
       setStatus("error");
       const message = err instanceof Error ? err.message : "Could not verify the magic link.";

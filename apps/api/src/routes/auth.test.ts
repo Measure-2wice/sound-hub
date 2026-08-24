@@ -183,6 +183,37 @@ describe("BG1 auth routes (in-memory, deterministic adapter)", () => {
     assert.equal(me.body.user, null);
   });
 
+  test("verify-token and /me responses never include the provider subject (privacy boundary)", async () => {
+    // The provider subject is credential material. It MUST NOT cross a
+    // public DTO in any response shape. The session cookie remains the
+    // server-side identity signal; the public payload only carries the
+    // durable UserAccount id and the user's workspaces.
+    const cookie = await signIn(app, "buyer-route@example.com");
+    const me = await request(app).get("/api/auth/me").set("Cookie", cookie);
+    assert.equal(me.status, 200);
+    assert.equal("identitySubject" in me.body.user, false);
+    const serialized = JSON.stringify(me.body);
+    assert.equal(serialized.includes("buyer-route-subject"), false);
+
+    // Re-sign-in via a fresh magic-link to inspect the verify-token
+    // response shape directly.
+    const magic = await request(app)
+      .post("/api/auth/magic-link")
+      .send({ email: "buyer-route@example.com" })
+      .set("Content-Type", "application/json");
+    const requestId = new URL(magic.body.devVerificationUrl, "http://localhost").searchParams.get(
+      "request_id",
+    );
+    const verify = await request(app)
+      .post("/api/auth/verify-token")
+      .send({ requestId })
+      .set("Content-Type", "application/json");
+    assert.equal(verify.status, 200);
+    assert.equal("identitySubject" in verify.body.user, false);
+    const verifySerialized = JSON.stringify(verify.body);
+    assert.equal(verifySerialized.includes("buyer-route-subject"), false);
+  });
+
   test("POST /api/auth/acting-workspace authorizes a current member (GS 4)", async () => {
     const cookie = await signIn(app, "buyer-route@example.com");
     const response = await request(app)

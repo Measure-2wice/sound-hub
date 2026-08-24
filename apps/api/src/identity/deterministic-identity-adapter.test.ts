@@ -9,7 +9,9 @@
 /* eslint-disable @typescript-eslint/no-floating-promises */
 
 import assert from "node:assert/strict";
+import { createHash } from "node:crypto";
 import { describe, test } from "node:test";
+import { deriveDeterministicSubject } from "@soundhub/types";
 import { DeterministicIdentityAdapter } from "./deterministic-identity-adapter.js";
 
 describe("DeterministicIdentityAdapter", () => {
@@ -118,5 +120,33 @@ describe("DeterministicIdentityAdapter", () => {
     });
     const result = await adapter.requestSignIn({ email: "buyer@example.com" });
     assert.ok(result.devVerificationUrl?.startsWith("/api/auth/dev-verify?request_id="));
+  });
+
+  test("the seed-derived subject and the adapter-derived subject agree for the BG1 demo emails", async () => {
+    // P1-001 regression: the deterministic adapter and the seed must
+    // produce the SAME (provider, subject) tuple for the demo emails.
+    // The shared `deriveDeterministicSubject` helper in
+    // `@soundhub/types` is the single source of truth; the seed and
+    // the adapter both pass the same Node `crypto.createHash`.
+    const sha256 = (input: string) => createHash("sha256").update(input).digest("hex");
+    const demoBuyer = "demo.buyer@soundhub.example";
+    const demoSeller = "marc.andre@creolebeats.example";
+    const adapter = new DeterministicIdentityAdapter();
+    const buyerRequest = await adapter.requestSignIn({ email: demoBuyer });
+    const buyerVerified = await adapter.verifySignIn({ requestId: buyerRequest.requestId });
+    const sellerRequest = await adapter.requestSignIn({ email: demoSeller });
+    const sellerVerified = await adapter.verifySignIn({ requestId: sellerRequest.requestId });
+    assert.ok(buyerVerified);
+    assert.ok(sellerVerified);
+    assert.equal(
+      buyerVerified.subject,
+      deriveDeterministicSubject(demoBuyer, sha256),
+      "demo buyer subject must match the seed-derived subject",
+    );
+    assert.equal(
+      sellerVerified.subject,
+      deriveDeterministicSubject(demoSeller, sha256),
+      "demo seller subject must match the seed-derived subject",
+    );
   });
 });

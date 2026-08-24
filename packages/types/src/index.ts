@@ -619,8 +619,12 @@ export const bg1PublicUserV1Schema = z
     // the only place it appears (for the signed-in user themselves).
     email: z.string().email().nullable(),
     displayName: z.string().min(1).max(120).nullable(),
+    // The provider key is exposed to the signed-in user so they can
+    // understand how SoundHub authenticated them, but the provider
+    // subject NEVER crosses a public DTO (privacy boundary). Provider
+    // claims, roles, and metadata never identify or authorize a
+    // Workspace — only the server-validated UserAccount does.
     identityProvider: z.string().min(1).max(64),
-    identitySubject: z.string().min(1).max(256),
     workspaces: z.array(bg1PublicWorkspaceV1Schema).max(64),
   })
   .strict();
@@ -697,3 +701,23 @@ export type Bg1ActingWorkspaceResponseV1 = z.infer<typeof bg1ActingWorkspaceResp
 // SoundHub owns these keys; provider SDKs never read them.
 export const bg1IdentityProviderV1Values = ["managed-magic-link", "deterministic"] as const;
 export type Bg1IdentityProviderV1 = (typeof bg1IdentityProviderV1Values)[number];
+
+// ---------- Shared deterministic subject derivation ----------
+//
+// The deterministic identity adapter and the seed must agree on the
+// provider subject derived from an email. Otherwise the seeded
+// IdentityProvider row for a demo account never matches the row the
+// adapter looks up at sign-in, and a second UserAccount is created
+// for the same email.
+//
+// The derivation is intentionally opaque (a SHA-256 hash). It is
+// scoped per-provider so a future migration to a different adapter
+// cannot accidentally resolve to the same subject for an unrelated
+// email. The hash function is injected so this contract lives in
+// `@soundhub/types` (no Node-only imports) while every consumer
+// passes Node `crypto.createHash` or an equivalent WebCrypto digest.
+export type Sha256HexFn = (input: string) => string;
+
+export function deriveDeterministicSubject(email: string, sha256Hex: Sha256HexFn): string {
+  return sha256Hex(`deterministic|${email.trim().toLowerCase()}`);
+}

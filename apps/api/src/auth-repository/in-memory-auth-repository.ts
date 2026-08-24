@@ -65,6 +65,9 @@ export class InMemoryAuthRepository implements AuthRepository {
         email: seed.email ?? null,
         displayName: seed.displayName ?? null,
         identityProvider: seed.identityProvider,
+        // The internal view retains the provider subject for lookup;
+        // the public mapper in `toPublicUser` is responsible for
+        // stripping it before crossing any public DTO.
         identitySubject: seed.identitySubject,
         workspaces: seed.memberships.map((m) => this.toMembershipView(m)),
       });
