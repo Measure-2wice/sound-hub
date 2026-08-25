@@ -19,6 +19,13 @@
 // so the bounded smoke traverses the link produced by the
 // deployed email-template configuration.
 //
+// Per ticket #59 P0-001 (this iteration) the smoke never logs
+// bearer session identifiers or account identifiers; the
+// session probe revokes the smoke-created session before
+// returning and returns only non-secret pass/fail evidence plus
+// the verified provider email (for the smoke's
+// mailbox-correlation assertion).
+//
 // Per ticket #59 P2-001 the captured token is the PRIVATE
 // `verificationToken` extracted from the magic-link callback URL.
 
@@ -105,14 +112,10 @@ function supabaseVerifyEnvelope(overrides: {
 }
 
 const SMOKE_MAILBOX = "bg1-smoke@soundhub.example";
+const STALE_TOKEN_MAILBOX = "stale-attacker@soundhub.example";
 
 describe("runStartupSmoke", () => {
-  test("returns ok:true only when every step (health, otp, session probe) succeeds (P1-001)", async () => {
-    // Per ticket #59 P1-001 the smoke delegates the verify to
-    // the session probe; the smoke itself does NOT call
-    // `verifySignIn` directly. The probe below counts provider
-    // verification calls and asserts the smoke makes exactly
-    // zero independent verify attempts.
+  test("returns ok:true only when every step (health, otp, session probe, mailbox correlation) succeeds (P0-001, P1-001)", async () => {
     let verifyCount = 0;
     const { fetchImpl, calls } = makeFetch({
       responses: [
@@ -126,12 +129,28 @@ describe("runStartupSmoke", () => {
       verifyToken: "captured-verification-token",
       sessionProbe: async () => {
         verifyCount += 1;
-        return { ok: true, userAccountId: "ua-1", sessionId: "sess-1" };
+        return {
+          ok: true,
+          verifiedEmail: SMOKE_MAILBOX,
+        };
       },
     });
     assert.equal(result.ok, true);
-    assert.ok(result.detail?.includes("sess-1"));
     assert.ok(result.detail?.includes(SMOKE_MAILBOX));
+    // Per ticket #59 P0-001 the smoke detail carries NO bearer
+    // session id or account identifier — the live credential
+    // cannot leak through the smoke detail, the factory log, or
+    // any error envelope.
+    assert.equal(
+      result.detail?.includes("sess-"),
+      false,
+      "smoke detail MUST NOT embed the live bearer session id",
+    );
+    assert.equal(
+      result.detail?.includes("ua-"),
+      false,
+      "smoke detail MUST NOT embed account identifiers",
+    );
     assert.equal(verifyCount, 1, "session probe must be the SOLE provider exchange");
     // The OTP request MUST target the operator-configured smoke
     // mailbox (per ticket #59 P1-001 deployed magic-link
@@ -141,6 +160,41 @@ describe("runStartupSmoke", () => {
     assert.ok(otpCall, "OTP request must be made");
     const otpBody = JSON.parse((otpCall.init?.body as string) ?? "{}") as Record<string, unknown>;
     assert.equal(otpBody.email, SMOKE_MAILBOX);
+  });
+
+  test("returns ok:false (session-coverage-incomplete) when the verified email does not match the smoke mailbox (P1-001 stale token)", async () => {
+    // A stale token issued for some other account MUST fail
+    // closed. The smoke proves the captured credential was
+    // actually issued for the smoke mailbox; without this check,
+    // any still-valid Supabase token would pass the smoke.
+    const { fetchImpl } = makeFetch({
+      responses: [
+        { url: "https://example.supabase.co/auth/v1/health", status: 200, body: {} },
+        { url: "https://example.supabase.co/auth/v1/otp", status: 200, body: {} },
+      ],
+    });
+    const result = await runStartupSmoke({
+      managed: configure({ fetchImpl }),
+      smokeMailbox: SMOKE_MAILBOX,
+      verifyToken: "stale-token-from-different-account",
+      sessionProbe: async () => ({
+        ok: true,
+        // Stale token: the verified email is for a DIFFERENT
+        // account, not the configured smoke mailbox.
+        verifiedEmail: STALE_TOKEN_MAILBOX,
+      }),
+    });
+    assert.equal(result.ok, false);
+    assert.equal(result.reason, "session-coverage-incomplete");
+    assert.ok(result.detail?.includes("does not match smoke mailbox"));
+    assert.ok(result.detail?.includes(SMOKE_MAILBOX));
+    // The detail MUST NOT embed account identifiers from the
+    // verified (stale) identity even when reporting the mismatch.
+    assert.equal(
+      result.detail?.includes(STALE_TOKEN_MAILBOX),
+      false,
+      "smoke detail MUST NOT embed the stale-attacker mailbox",
+    );
   });
 
   test("returns ok:false (unconfigured) when env vars are missing", async () => {
@@ -210,12 +264,6 @@ describe("runStartupSmoke", () => {
   });
 
   test("returns ok:false (session-coverage-incomplete) when no smoke mailbox is configured (P1-001)", async () => {
-    // Per ticket #59 P1-001 the smoke must tie the OTP probe
-    // to the SAME mailbox the captured link arrives on. Without
-    // an operator-configured smoke mailbox the smoke cannot
-    // prove the deployed email-template configuration delivers
-    // a link the operator can capture; the factory must select
-    // the deterministic fallback.
     const { fetchImpl } = makeFetch({
       responses: [
         { url: "https://example.supabase.co/auth/v1/health", status: 200, body: {} },
@@ -224,7 +272,6 @@ describe("runStartupSmoke", () => {
     });
     const result = await runStartupSmoke({
       managed: configure({ fetchImpl }),
-      // smokeMailbox omitted intentionally.
     });
     assert.equal(result.ok, false);
     assert.equal(result.reason, "session-coverage-incomplete");
@@ -232,10 +279,6 @@ describe("runStartupSmoke", () => {
   });
 
   test("returns ok:false (session-coverage-incomplete) when no operator token is supplied (P1-001)", async () => {
-    // The OTP request to the configured smoke mailbox succeeded
-    // (delivery proved) but no captured token was injected — the
-    // operator still needs to receive the delivered email and
-    // paste the token.
     const { fetchImpl } = makeFetch({
       responses: [
         { url: "https://example.supabase.co/auth/v1/health", status: 200, body: {} },
@@ -286,16 +329,7 @@ describe("runStartupSmoke", () => {
   });
 });
 
-describe("runStartupSmoke token consumption (P1-001 single-exchange)", () => {
-  // Per ticket #59 P1-001 the smoke must consume the captured
-  // token EXACTLY ONCE through the serving authentication
-  // seam. The tests below exercise the smoke end-to-end against
-  // the real `ManagedIdentityAdapter` (the one the factory
-  // selects) plus a `buildSessionProbe`-shaped probe that uses
-  // the production adapter. The captured token is therefore
-  // exchanged once via the production boundary; a second
-  // independent verify call would replay-reject.
-
+describe("runStartupSmoke token consumption (P0-001 single-exchange + revocation)", () => {
   test("the smoke itself never calls ManagedIdentityAdapter.verifySignIn independently", async () => {
     // The smoke routes the captured token through the session
     // probe ONLY. We construct a managed adapter that records
@@ -369,20 +403,20 @@ describe("runStartupSmoke token consumption (P1-001 single-exchange)", () => {
         probeCalls += 1;
         // Drive the production boundary directly through the
         // adapter the smoke was handed. This is the SOLE
-        // provider verification the smoke performs.
+        // provider verification the smoke performs. The probe
+        // simulates the failure-safe revoke step (the real
+        // `buildSessionProbe` does this via the auth service).
         const verified = await adapter.verifySignIn({ verificationToken });
         if (!verified) {
           return { ok: false, detail: "adapter rejected the captured token" };
         }
         return {
           ok: true,
-          userAccountId: verified.subject,
-          sessionId: `session-${probeCalls}`,
+          verifiedEmail: verified.providerEmail,
         };
       },
     });
     assert.equal(result.ok, true);
-    assert.ok(result.detail?.includes("session-1"));
     assert.ok(result.detail?.includes(SMOKE_MAILBOX));
     // The smoke itself never calls `adapter.verifySignIn`. The
     // adapter's verify count is owned entirely by the session
@@ -390,15 +424,18 @@ describe("runStartupSmoke token consumption (P1-001 single-exchange)", () => {
     assert.equal(adapterVerifyCalls, 1, "smoke must delegate verify to the probe exactly once");
     assert.equal(probeCalls, 1, "smoke must invoke the session probe exactly once");
     assert.equal(verifyEndpointCalls, 1, "Supabase verify endpoint called exactly once");
+    // Per ticket #59 P0-001 the smoke detail carries NO bearer
+    // session id or account identifier — the live credential
+    // cannot leak through the smoke detail, the factory log, or
+    // any error envelope.
+    assert.equal(
+      result.detail?.includes("supabase-uuid-smoke"),
+      false,
+      "smoke detail MUST NOT embed the provider subject",
+    );
   });
 
   test("a replayed captured token is rejected by the production seam (P1-001 single-use)", async () => {
-    // Drive the real `buildSessionProbe` path: the first
-    // exchange succeeds, the second (replayed) exchange is
-    // rejected as a replay. The smoke must therefore drive the
-    // session probe exactly once and never reuse the captured
-    // token; a misuse that re-runs the probe would observe the
-    // replay rejection here.
     const adapter = new ManagedIdentityAdapter({
       supabaseUrl: "https://example.supabase.co",
       supabaseAnonKey: "anon-key",
