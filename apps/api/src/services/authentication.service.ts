@@ -15,6 +15,11 @@
 // Per ADR 0004 the service never reads `Workspace.ownerUserId` — that
 // column exists for M1.1 backward compatibility only and is not part
 // of the Golden Slice authority path.
+//
+// Per ticket #59 P2-001 the service accepts a private
+// `verificationToken` (the one-time credential from the magic-link
+// callback) — NOT the public `correlationId` — so the provider-
+// neutral seam cannot accidentally substitute one for the other.
 
 import { randomUUID } from "node:crypto";
 import type { Bg1IdentityProviderV1, Bg1PublicUserV1 } from "@soundhub/types";
@@ -67,11 +72,12 @@ export interface RequestSignInResult {
   /**
    * Neutral envelope returned to the browser. Identical regardless of
    * whether the email is registered, so the public surface cannot be
-   * used to enumerate accounts. The `requestId` is the opaque
-   * SoundHub-side correlation id (managed: SoundHub UUID;
-   * deterministic: internal request id) and is required by the BG1
-   * shared contract. The `devVerificationUrl` is set only when the
-   * deterministic adapter runs in operator mode (`BG1_DETERMINISTIC_OPERATOR_MODE=1`)
+   * used to enumerate accounts. The `requestId` is the PUBLIC
+   * correlation id (managed: SoundHub UUID; deterministic:
+   * correlation id) and is required by the BG1 shared contract; it
+   * is NOT a verification credential (per ticket #59 P2-001). The
+   * `devVerificationUrl` is set only when the deterministic adapter
+   * runs in operator mode (`BG1_DETERMINISTIC_OPERATOR_MODE=1`)
    * so the deployed fallback never exposes a usable login credential
    * to an unauthenticated browser that merely supplies a demo email.
    */
@@ -115,20 +121,28 @@ export class AuthenticationService {
   }
 
   /**
-   * Verify a magic-link token, find-or-create the UserAccount, and
-   * issue a server-validated session. Returns the session record
-   * (the route maps it to an HttpOnly cookie) and the public user
-   * view for the post-sign-in render.
+   * Verify a magic-link verification credential, find-or-create the
+   * UserAccount, and issue a server-validated session. Returns the
+   * session record (the route maps it to an HttpOnly cookie) and
+   * the public user view for the post-sign-in render.
+   *
+   * Per ticket #59 P2-001 the input field is named
+   * `verificationToken`: the private, one-time credential the
+   * browser extracted from the magic-link callback URL (or the
+   * operator recovery workflow read from the server log). The
+   * PUBLIC `correlationId` from `requestSignIn` is NOT accepted
+   * here — presenting it is rejected as an unknown credential.
    *
    * The function is structured so the verify-token call and the
    * session creation are not transactional in PostgreSQL but the
-   * single-use verification token + the lookup-or-create mapping
-   * give the equivalent guarantee: the same request id cannot issue
-   * two sessions, and a stale token cannot claim an existing user.
+   * single-use verification credential + the lookup-or-create
+   * mapping give the equivalent guarantee: the same credential
+   * cannot issue two sessions, and a stale credential cannot
+   * claim an existing user.
    */
-  async verifySignIn(input: { readonly requestId: string }): Promise<VerifySignInResult> {
+  async verifySignIn(input: { readonly verificationToken: string }): Promise<VerifySignInResult> {
     const verified = await this.dispatch(() =>
-      this.identityAdapter.verifySignIn({ requestId: input.requestId }),
+      this.identityAdapter.verifySignIn({ verificationToken: input.verificationToken }),
     );
     if (!verified) {
       throw new AuthenticationError(
@@ -231,17 +245,17 @@ export class AuthenticationService {
 // ---------- Mapping helpers (DTO boundary) ----------
 
 /**
- * The magic-link envelope forwards the adapter's opaque
- * `requestId` plus the optional `devVerificationUrl`. The
- * `requestId` is the public correlation id the managed and
- * deterministic adapters return from `requestSignIn`; it is NOT a
- * verify credential. The deterministic adapter additionally
- * returns a private `verifierToken` on the adapter's return
- * value — that field is intentionally NOT forwarded here. It is
- * kept inside the adapter boundary so the public route layer can
- * never expose it (the BG1 magic-link response schema is
- * `.strict()` and does not declare a `verifierToken` field).
- * The `devVerificationUrl` is operator-only and absent in the
+ * The magic-link envelope forwards the adapter's PUBLIC
+ * `correlationId` (as `requestId` for backward compatibility with
+ * the BG1 magic-link response schema) plus the optional
+ * `devVerificationUrl`. The `requestId` is NOT a verify
+ * credential. The deterministic adapter additionally returns a
+ * private `verificationToken` on the adapter's return value —
+ * that field is intentionally NOT forwarded here. It is kept
+ * inside the adapter boundary so the public route layer can never
+ * expose it (the BG1 magic-link response schema is `.strict()`
+ * and does not declare a `verificationToken` field). The
+ * `devVerificationUrl` is operator-only and absent in the
  * deployed deterministic fallback so an unauthenticated browser
  * cannot pick a demo identity by email.
  */
@@ -251,11 +265,11 @@ function withRequestIdAndOptionalDevUrl(result: SignInRequestResult): {
   devVerificationUrl?: string;
 } {
   if (result.devVerificationUrl === undefined) {
-    return { ok: true, requestId: result.requestId };
+    return { ok: true, requestId: result.correlationId };
   }
   return {
     ok: true,
-    requestId: result.requestId,
+    requestId: result.correlationId,
     devVerificationUrl: result.devVerificationUrl,
   };
 }

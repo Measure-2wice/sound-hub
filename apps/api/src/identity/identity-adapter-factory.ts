@@ -30,12 +30,19 @@
 // so the smoke can never drift out of sync with the serving
 // adapter. The sync factory is preserved for tests that want to
 // inject a pre-computed smoke result.
+//
+// Per ticket #59 P1-002, the factory builds the managed adapter
+// ONCE and exposes it for the composition root to inject into
+// BOTH the smoke path and the serving routes. The
+// `emailRedirectTo` (read from `AUTH_CALLBACK_URL` by default) is
+// threaded through the same instance so the callback URL the
+// smoke validates is the same one serving uses.
 
 import type { Bg1IdentityProviderV1 } from "@soundhub/types";
 import { DeterministicIdentityAdapter } from "./deterministic-identity-adapter.js";
 import { ManagedIdentityAdapter, type SmokeResult } from "./managed-identity-adapter.js";
 import type { IdentityAdapter } from "./identity-adapter.js";
-import { runStartupSmoke } from "./startup-smoke.js";
+import { runStartupSmoke, type SessionProbe } from "./startup-smoke.js";
 
 export type { IdentityAdapter } from "./identity-adapter.js";
 
@@ -49,6 +56,15 @@ export interface IdentityAdapterFactoryOptions {
    */
   readonly override?: Bg1IdentityProviderV1;
   /**
+   * Optional pre-built managed adapter. Per ticket #59 P1-002 the
+   * composition root MUST build the managed adapter once and
+   * inject the SAME instance into both the smoke and the serving
+   * routes. When supplied, the factory reuses the instance
+   * (configuration is not re-read); otherwise the factory
+   * constructs one from the supplied Supabase configuration.
+   */
+  readonly managed?: ManagedIdentityAdapter;
+  /**
    * Configuration for the managed adapter. Read once at composition
    * time so the deployed smoke test can verify the env-var contract
    * deterministically.
@@ -59,6 +75,13 @@ export interface IdentityAdapterFactoryOptions {
     readonly serviceRoleKey?: string;
   };
   /**
+   * Optional callback URL the magic-link email redirects to.
+   * Default: `process.env.AUTH_CALLBACK_URL`. Threaded through the
+   * managed adapter so the same value the smoke validates is the
+   * value serving uses (per ticket #59 P1-002).
+   */
+  readonly emailRedirectTo?: string;
+  /**
    * Optional override for the managed smoke result. Tests pass an
    * explicit success/failure to exercise the factory decision
    * without a real network round-trip. The async factory ignores
@@ -66,13 +89,24 @@ export interface IdentityAdapterFactoryOptions {
    */
   readonly managedSmoke?: SmokeResult;
   /**
-   * Operator-injected captured magic-link token. Forwarded to the
-   * startup smoke so the async factory can drive the verify step
-   * end-to-end. Defaults to `process.env.BG1_SMOKE_TEST_TOKEN`
-   * when unset; the async factory exposes the override so the
-   * composition root can read the env var exactly once.
+   * Operator-injected captured magic-link verification token
+   * (per ticket #59 P2-001). Forwarded to the startup smoke so
+   * the async factory can drive the verify step end-to-end.
+   * Defaults to `process.env.BG1_SMOKE_TEST_TOKEN` when unset;
+   * the async factory exposes the override so the composition
+   * root can read the env var exactly once.
    */
   readonly smokeVerifyToken?: string;
+  /**
+   * Optional SoundHub server-side session probe. Per ticket #59
+   * P1-001 the smoke must exercise the application boundary
+   * (AuthenticationService → AuthRepository → UserAccount +
+   * Session) before reporting the managed path ready. The async
+   * factory exposes the override so the composition root can
+   * build the probe against the real services before passing it
+   * in.
+   */
+  readonly sessionProbe?: SessionProbe;
   /**
    * Optional logger sink. The factory emits a single line when it
    * decides between managed and deterministic so operators can act
@@ -113,11 +147,24 @@ function buildAdaptersInternal(options: IdentityAdapterFactoryOptions): {
   const deterministic = new DeterministicIdentityAdapter({
     allowDevVerificationUrl: operatorMode,
   });
-  const managed = new ManagedIdentityAdapter({
-    supabaseUrl: options.supabase?.url,
-    supabaseAnonKey: options.supabase?.anonKey,
-    supabaseServiceRoleKey: options.supabase?.serviceRoleKey,
-  });
+  // Per ticket #59 P1-002: when the composition root has already
+  // built a managed adapter (so the smoke and serving can share the
+  // SAME instance), reuse it. Otherwise build one from the
+  // supplied Supabase configuration. Either way the
+  // `emailRedirectTo` is threaded into the instance so the
+  // callback URL is identical across smoke and serving.
+  const emailRedirectTo = options.emailRedirectTo ?? process.env.AUTH_CALLBACK_URL;
+  let managed: ManagedIdentityAdapter;
+  if (options.managed) {
+    managed = options.managed;
+  } else {
+    managed = new ManagedIdentityAdapter({
+      supabaseUrl: options.supabase?.url,
+      supabaseAnonKey: options.supabase?.anonKey,
+      supabaseServiceRoleKey: options.supabase?.serviceRoleKey,
+      emailRedirectTo,
+    });
+  }
   return {
     deterministic,
     managed,
@@ -203,6 +250,11 @@ export function buildIdentityAdapters(
  * the serving application uses so the smoke can never drift out of
  * sync with the production selection. Tests should keep using the
  * synchronous `buildIdentityAdapters` with an injected smoke result.
+ *
+ * Per ticket #59 P1-002 the factory returns the full
+ * `BuiltIdentityAdapters` bundle (managed + deterministic + smoke)
+ * so the composition root can inject the SAME managed adapter into
+ * both the smoke and the serving routes without rebuilding it.
  */
 export async function buildIdentityAdaptersAsync(
   options: IdentityAdapterFactoryOptions = {},
@@ -215,6 +267,7 @@ export async function buildIdentityAdaptersAsync(
     smokeResult = await runStartupSmoke({
       managed,
       verifyToken: options.smokeVerifyToken ?? process.env.BG1_SMOKE_TEST_TOKEN,
+      sessionProbe: options.sessionProbe,
     });
   }
   const { active } = selectActive({

@@ -12,6 +12,25 @@
 // looking up or creating the UserAccount via the durable mapping
 // table; the adapter never knows about UserAccounts, Workspaces, or
 // memberships. Provider metadata never crosses a public DTO.
+//
+// Per ticket #59 P2-001 the contract distinguishes two opaque
+// identifiers that previously shared the name `requestId`:
+//
+//   - `correlationId`: the PUBLIC, non-verifying handle the adapter
+//     returns from `requestSignIn` and returns to the browser. It is
+//     safe to expose in logs and observability. It is NOT a
+//     verification credential and MUST NOT be accepted by
+//     `verifySignIn`.
+//
+//   - `verificationToken`: the PRIVATE, one-time credential. The
+//     browser extracts it from the magic-link callback URL and POSTs
+//     it to `/api/auth/verify-token`. The deterministic adapter
+//     stores its pending request under this value and returns it on
+//     the adapter's `SignInRequestResult` so test harnesses and the
+//     operator recovery workflow can drive `verifySignIn`. The
+//     managed adapter forwards whatever the browser sent directly
+//     to Supabase's verify endpoint. It MUST NEVER appear in a
+//     public DTO, an error envelope, or a log line.
 
 import type { Bg1IdentityProviderV1 } from "@soundhub/types";
 
@@ -39,19 +58,21 @@ export interface VerifiedIdentity {
 
 /**
  * Result of `requestSignIn`. The adapter returns a public
- * correlation id (`requestId`) and (for the deterministic adapter)
- * an internal verify credential (`verifierToken`) and (only when
- * operator mode is enabled) a one-shot URL the operator recovery
- * flow can drive.
+ * correlation id (`correlationId`) and (for the deterministic
+ * adapter) an internal verify credential (`verificationToken`) and
+ * (only when operator mode is enabled) a one-shot URL the operator
+ * recovery flow can drive.
  *
- * The public route strips every field except `requestId` and the
- * optional `devVerificationUrl` via the BG1 strict Zod schema so
- * the verifier credential never crosses the browser boundary. The
+ * The public route strips every field except `requestId` (the
+ * correlation id, renamed from `correlationId` for backward
+ * compatibility with the BG1 magic-link response schema) and the
+ * optional `devVerificationUrl` via the BG1 strict Zod schema so the
+ * verifier credential never crosses the browser boundary. The
  * browser therefore cannot claim any returned value as a verify
  * credential against `/api/auth/verify-token`. The deterministic
- * adapter stores its pending request under the verifier token, not
- * the public correlation id, so a browser that round-trips the
- * correlation id is rejected as an unknown request.
+ * adapter stores its pending request under the verification token,
+ * not the public correlation id, so a browser that round-trips the
+ * correlation id is rejected as an unknown credential.
  *
  * `devVerificationUrl` is set only when the deterministic adapter
  * runs in operator mode (`BG1_DETERMINISTIC_OPERATOR_MODE=1`); the
@@ -62,27 +83,29 @@ export interface VerifiedIdentity {
  */
 export interface SignInRequestResult {
   /**
-   * Public correlation id. The BG1 contract returns this value to
-   * the browser; it is NOT a verify credential. The deterministic
-   * adapter uses it for log correlation only; the managed adapter
-   * never reads it back.
+   * Public correlation id (per ticket #59 P2-001). The BG1 contract
+   * returns this value to the browser via the
+   * `bg1MagicLinkResponseV1Schema` `requestId` field; it is NOT a
+   * verify credential. The deterministic adapter uses it for log
+   * correlation only; the managed adapter never reads it back.
    */
-  readonly requestId: string;
+  readonly correlationId: string;
   /**
    * Operator-only verify credential. The deterministic adapter
    * looks up its pending request by this value (not by the public
-   * requestId), so the browser never has a valid value to present
-   * to `/api/auth/verify-token`. The credential is exposed via
-   * the adapter's return value so test harnesses can drive the
+   * correlationId), so the browser never has a valid value to
+   * present to `/api/auth/verify-token`. The credential is exposed
+   * via the adapter's return value so test harnesses can drive the
    * verify path directly; the deployed operator recovery path
-   * reads it from the operator log sink.
+   * reads it from the operator log sink. NEVER log, serialize, or
+   * forward this value into any public DTO.
    */
-  readonly verifierToken?: string;
+  readonly verificationToken?: string;
   /**
    * Operator-only one-shot URL. Only the deterministic adapter sets
    * it, and only when operator mode is enabled. Production
-   * deployments and the deployed deterministic fallback both
-   * render it absent.
+   * deployments and the deployed deterministic fallback both render
+   * it absent.
    */
   readonly devVerificationUrl?: string;
 }
@@ -118,17 +141,27 @@ export interface IdentityAdapter {
   readonly providerKey: Bg1IdentityProviderV1;
   /**
    * Initiate a magic-link sign-in for the given email. Returns an
-   * opaque request id the browser later presents to `verifySignIn`.
-   * Managed adapters send the magic link through their provider's
-   * email channel; the deterministic adapter stores the request
-   * locally and returns a `devVerificationUrl` the tests can use.
+   * opaque public correlation id (safe to log) and, for the
+   * deterministic adapter, a private `verificationToken` (the
+   * operator-only credential). Managed adapters send the magic link
+   * through their provider's email channel; the deterministic
+   * adapter stores the request locally and returns a
+   * `devVerificationUrl` the tests can use.
    */
   requestSignIn(input: { readonly email: string }): Promise<SignInRequestResult>;
   /**
-   * Verify a one-time magic-link token and return the canonical
-   * provider identity. Returns `null` when the request id is
-   * unknown, expired, or already consumed (single-use per BG1
-   * semantics).
+   * Exchange a one-time magic-link verification credential for a
+   * canonical provider identity. Returns `null` when the
+   * `verificationToken` is unknown, expired, or already consumed
+   * (single-use per BG1 semantics).
+   *
+   * The accepted value is the PRIVATE credential the browser
+   * extracted from the magic-link callback URL (or the operator
+   * recovery workflow read from the server log). The PUBLIC
+   * correlation id from `requestSignIn` is NOT accepted here —
+   * presenting it is rejected as an unknown credential so the
+   * provider-neutral seam cannot accidentally substitute one for
+   * the other (ticket #59 P2-001).
    */
-  verifySignIn(input: { readonly requestId: string }): Promise<VerifiedIdentity | null>;
+  verifySignIn(input: { readonly verificationToken: string }): Promise<VerifiedIdentity | null>;
 }

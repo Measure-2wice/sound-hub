@@ -7,12 +7,19 @@
 // the shared Zod schemas from `@soundhub/types` so the browser cannot
 // drift from the contract.
 //
-// Per ticket #59 P1-002, the deployed process never returns a
+// Per ticket #59 P2-001 the request payload for `/api/auth/verify-token`
+// carries the PRIVATE one-time `verificationToken` (the value the
+// browser extracted from the magic-link callback URL). The PUBLIC
+// correlation id returned by `/api/auth/magic-link` is NOT a
+// verification credential and CANNOT be submitted here.
+//
+// Per ticket #59 P1-002 the deployed process never returns a
 // `devVerificationUrl`; the operator-driven recovery workflow reads
-// it from server logs. The browser uses the opaque `requestId`
-// (managed: SoundHub UUID; deterministic: operator-side) to drive
-// verify-token when the magic-link callback URL is configured to
-// route through the deterministic fallback.
+// it from server logs. The browser uses the opaque
+// `verificationToken` (managed: Supabase-issued token from the email
+// link; deterministic: operator-side credential from the log sink)
+// to drive verify-token when the magic-link callback URL is
+// configured to route through the deterministic fallback.
 
 import type {
   Bg1MagicLinkRequestV1,

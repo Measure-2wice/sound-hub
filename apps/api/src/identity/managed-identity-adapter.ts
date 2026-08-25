@@ -19,12 +19,12 @@
 //      in the email callback with Supabase's verify endpoint.
 //      `requestSignIn` triggers Supabase OTP (real email delivery)
 //      and returns an opaque SoundHub-side handle. `verifySignIn`
-//      receives the Supabase-issued token (passed through the
-//      browser's `?request_id=...` URL parameter) and exchanges it
-//      with Supabase. The subject and email come ONLY from the
-//      verified response — the SoundHub request handle is opaque
-//      and never carries user identity. Replay is rejected via
-//      single-use tracking.
+//      receives the Supabase-issued token (extracted from the
+//      browser's `?token=...` URL parameter) and exchanges it with
+//      Supabase. The subject and email come ONLY from the verified
+//      response — the SoundHub request handle is opaque and never
+//      carries user identity. Replay is rejected via single-use
+//      tracking.
 //
 //   3. Runtime validation at the Supabase JSON boundary. Per
 //      AGENTS.md and the BG1 contract, untrusted provider payloads
@@ -47,6 +47,14 @@
 // envelope Supabase returns. Identity derivation only reads the
 // allow-listed `id` and `email` fields from the parsed envelope so
 // additional provider metadata never enters the SoundHub boundary.
+//
+// Per ticket #59 P1-001 (this iteration), the provider-response
+// parser is FORWARD-COMPATIBLE with documented Supabase fields
+// (e.g. `expires_at`, `expires_in` duplicates, future additions).
+// The SoundHub PUBLIC contract remains strict — only the provider
+// response parser tolerates documented/provider-added fields, and
+// the parsed shape is discarded after identity derivation so
+// additional provider metadata never crosses a SoundHub DTO.
 
 import { randomUUID } from "node:crypto";
 import { z } from "zod";
@@ -62,15 +70,20 @@ import {
 // ---------- Runtime schemas for Supabase responses ----------
 //
 // Per AGENTS.md, runtime validation is required at untrusted
-// provider JSON boundaries. The schemas below are intentionally
-// strict (extra fields rejected) so a drifted Supabase payload
-// cannot enter identity derivation. The verify success schema
-// mirrors the real Supabase access-token / session envelope
-// (access_token, token_type, expires_in, refresh_token, user with
-// the canonical user-shape fields) so a real magic-link callback
-// resolves through the strict parser. Identity derivation only
-// reads the allow-listed `id` and `email` from the parsed user
-// — provider metadata never enters the SoundHub boundary.
+// provider JSON boundaries. The schemas below are split between
+// provider-response parsers (FORWARD-COMPATIBLE — tolerate
+// documented Supabase fields like `expires_at`) and identity
+// derivation (STRICT — only the allow-listed `id` and `email`
+// fields are read).
+//
+// The provider-response parser uses `.passthrough()` so additional
+// documented fields Supabase publishes (e.g. `expires_at`,
+// `provider_token`, future additions) do not cause the parser to
+// reject otherwise-valid responses. The PUBLIC SoundHub contract
+// is unaffected: identity derivation only reads the allow-listed
+// fields, and the parsed provider envelope is discarded after
+// identity is established. A drifted payload that drops required
+// fields still fails closed.
 
 const supabaseUserV1Schema = z
   .object({
@@ -90,26 +103,42 @@ const supabaseUserV1Schema = z
   })
   .strict();
 
-const supabaseOtpSuccessV1Schema = z.union([
-  z.object({}).strict(),
-  z.object({ data: z.object({}).strict() }).strict(),
-  z.null(),
-]);
+// Supabase OTP success body is documented as either an empty `{}`
+// envelope or `{ data: {} }`. Per ticket #59 P1-001 the parser
+// tolerates additional documented Supabase response fields so a
+// future Supabase response shape is not silently rejected. We
+// require the body to be either an object or null (the documented
+// shapes) and tolerate any documented extras; a non-object
+// payload still fails closed.
+const supabaseOtpSuccessV1Schema = z.union([z.record(z.unknown()), z.null()]).nullable();
 
+// Supabase OTP error body is `{ error: { message, ... } }`. The
+// `message` field is required (the safe envelope surfaces it to
+// the caller); additional documented Supabase fields are
+// tolerated via `.passthrough()`.
 const supabaseOtpErrorV1Schema = z
   .object({
     error: z
       .object({
         message: z.string().min(1).max(1000),
       })
-      .strict(),
+      .passthrough(),
   })
-  .strict();
+  .passthrough();
 
-// Supabase verify response shape (current OpenAPI). The envelope
-// is the access-token/session shape with a strict `.strict()` user
-// schema on the inside. Extra top-level fields are rejected so a
-// drift in the envelope cannot silently enter identity derivation.
+// Supabase verify response shape (current OpenAPI). The envelope is
+// the access-token/session shape. The parser is FORWARD-COMPATIBLE
+// at the top level: additional documented Supabase fields (e.g.
+// `expires_at`, `provider_token`, `provider_refresh_token`) are
+// tolerated so a future Supabase response shape does not cause the
+// bounded smoke to reject a valid provider. The PUBLIC SoundHub
+// contract remains strict — identity derivation only reads the
+// allow-listed `id` and `email` from the parsed user object, and
+// every other parsed field is discarded.
+//
+// The `user` field is `.strict()` so unknown inner fields do not
+// silently enter the SoundHub boundary; identity derivation only
+// reads `id` and `email` from it.
 const supabaseVerifySuccessV1Schema = z
   .object({
     access_token: z.string().min(1).max(8192),
@@ -118,7 +147,7 @@ const supabaseVerifySuccessV1Schema = z
     refresh_token: z.string().min(1).max(8192),
     user: supabaseUserV1Schema.nullable(),
   })
-  .strict();
+  .passthrough();
 
 const supabaseVerifyErrorV1Schema = z
   .object({
@@ -126,9 +155,9 @@ const supabaseVerifyErrorV1Schema = z
       .object({
         message: z.string().min(1).max(1000),
       })
-      .strict(),
+      .passthrough(),
   })
-  .strict();
+  .passthrough();
 
 // ---------- Adapter options ----------
 
@@ -150,10 +179,11 @@ export interface ManagedIdentityAdapterOptions {
   /**
    * Optional callback URL the magic-link email redirects to. The
    * Supabase-issued token is appended to this URL by Supabase; the
-   * browser extracts it from the `?request_id=...` query string
-   * and POSTs it to `/api/auth/verify-token`. Per the Supabase
-   * REST contract the value is passed as the `redirect_to` query
-   * parameter on `POST /auth/v1/otp`, not as a body field.
+   * browser extracts it from the `?token=...` query string and
+   * POSTs it to `/api/auth/verify-token` as `verificationToken`.
+   * Per the Supabase REST contract the value is passed as the
+   * `redirect_to` query parameter on `POST /auth/v1/otp`, not as a
+   * body field.
    */
   readonly emailRedirectTo?: string;
   /**
@@ -173,7 +203,12 @@ export interface ManagedIdentityAdapterOptions {
 
 export interface SmokeResult {
   readonly ok: boolean;
-  readonly reason?: "unconfigured" | "non-2xx" | "network" | "timeout";
+  readonly reason?:
+    | "unconfigured"
+    | "non-2xx"
+    | "network"
+    | "timeout"
+    | "session-coverage-incomplete";
   readonly detail?: string;
 }
 
@@ -288,12 +323,20 @@ export class ManagedIdentityAdapter implements IdentityAdapter {
    * handle used only for logging — the handle contains no user
    * identity and is not safe to authorize a session.
    *
+   * Per ticket #59 P2-001 the public correlation id and the
+   * private one-time verification credential are returned under
+   * distinct field names so the provider-neutral seam cannot
+   * accidentally substitute one for the other. The managed path
+   * does NOT return a `verificationToken`: Supabase owns the
+   * one-time credential and surfaces it in the magic-link
+   * callback URL the browser extracts; the managed adapter never
+   * holds a verifier credential.
+   *
    * Per ticket #59 P0-002 the request honours the official
    * Supabase REST contract: the body carries only `email` and
    * `create_user`; the optional email-redirect URL is passed as
    * the `redirect_to` query parameter on the URL (NOT as a body
-   * field). Sending the redirect as a body field produced a
-   * 422 from Supabase in the prior iteration.
+   * field).
    */
   async requestSignIn(input: { readonly email: string }): Promise<SignInRequestResult> {
     this.assertConfigured();
@@ -327,10 +370,10 @@ export class ManagedIdentityAdapter implements IdentityAdapter {
       throw new IdentityProviderUnavailableError(err instanceof Error ? err.message : String(err));
     }
     const raw: unknown = await response.json().catch(() => null);
-    // Parse with the strict schema so a drifted payload fails
-    // closed before we trust the email delivery. The parsed
-    // payload itself is unused (Supabase's OTP success body is
-    // empty); we only need it to fail loudly on drift.
+    // Parse with the forward-compatible schema so a drifted
+    // payload fails closed before we trust the email delivery.
+    // The parsed payload itself is unused (Supabase's OTP success
+    // body is empty); we only need it to fail loudly on drift.
     if (!response.ok) {
       const errParsed = supabaseOtpErrorV1Schema.safeParse(raw);
       const detail = errParsed.success
@@ -344,42 +387,52 @@ export class ManagedIdentityAdapter implements IdentityAdapter {
     }
     supabaseOtpSuccessV1Schema.parse(raw);
     return {
-      requestId: `managed-pending-${randomUUID()}`,
+      // Public correlation id (per ticket #59 P2-001). The
+      // managed adapter never reads it back; the
+      // `verificationToken` the browser eventually sends to
+      // `/api/auth/verify-token` is the Supabase-issued token
+      // from the email link, not this handle.
+      correlationId: `managed-pending-${randomUUID()}`,
     };
   }
 
   /**
-   * Exchange a Supabase-issued magic-link token with Supabase's
-   * verify endpoint and derive the canonical identity from the
-   * verified response. The browser extracts the Supabase token
-   * from the email callback URL (typically `?request_id=<token>`)
-   * and POSTs it to `/api/auth/verify-token` as `requestId`. The
-   * token is treated as a Supabase credential — never as a
-   * SoundHub-side authorization handle.
+   * Exchange a Supabase-issued magic-link verification credential
+   * with Supabase's verify endpoint and derive the canonical
+   * identity from the verified response. The browser extracts the
+   * Supabase token from the email callback URL (typically
+   * `?token=<token>`) and POSTs it to `/api/auth/verify-token` as
+   * `verificationToken`. Per ticket #59 P2-001 the input field is
+   * named `verificationToken` so the provider-neutral seam
+   * cannot accidentally accept the public correlation id in its
+   * place.
    *
    * Per ticket #59 P0-002 the request body pins the current
    * Supabase REST contract (`token_hash` + `type: "email"` for
    * the current token-hash verification type). The success
    * response is parsed against the full access-token / session
    * envelope (access_token, token_type, expires_in, refresh_token,
-   * user); only the allow-listed `id` and `email` fields from the
-   * parsed user shape are forwarded into the SoundHub identity.
+   * user). The parser is FORWARD-COMPATIBLE with documented
+   * Supabase fields (e.g. `expires_at`, future additions) so a
+   * normal provider response is not rejected; the SoundHub
+   * PUBLIC contract remains strict — identity derivation only
+   * reads the allow-listed `id` and `email` from the parsed user.
    *
-   * Returns `null` for replayed, expired, or invalid tokens. The
-   * SoundHub request id format is intentionally irrelevant here;
-   * we forward whatever the browser sent to Supabase's verify
-   * endpoint, and Supabase's response is the only source of
-   * identity.
+   * Returns `null` for replayed, expired, or invalid tokens.
    */
-  async verifySignIn(input: { readonly requestId: string }): Promise<VerifiedIdentity | null> {
+  async verifySignIn(input: {
+    readonly verificationToken: string;
+  }): Promise<VerifiedIdentity | null> {
     this.assertConfigured();
-    const token = input.requestId.trim();
-    if (!token) return null;
+    const token = input.verificationToken;
+    if (typeof token !== "string") return null;
+    const trimmed = token.trim();
+    if (!trimmed) return null;
     // Replay protection: a Supabase token already exchanged cannot
     // mint a second SoundHub session. The token TTL is bounded so
     // the cache cannot grow without limit.
     this.gcExchangedTokens();
-    if (this.exchangedTokens.has(token)) return null;
+    if (this.exchangedTokens.has(trimmed)) return null;
 
     const url = `${this.options.supabaseUrl}/auth/v1/verify`;
     let response: Response;
@@ -391,7 +444,7 @@ export class ManagedIdentityAdapter implements IdentityAdapter {
           apikey: this.options.supabaseAnonKey ?? "",
           Authorization: `Bearer ${this.options.supabaseServiceRoleKey ?? ""}`,
         },
-        body: JSON.stringify({ token_hash: token, type: this.verifyType }),
+        body: JSON.stringify({ token_hash: trimmed, type: this.verifyType }),
       });
     } catch (err) {
       // Network failure or abort is provider unavailability —
@@ -433,7 +486,7 @@ export class ManagedIdentityAdapter implements IdentityAdapter {
     if (!parsed.user || !parsed.user.id) {
       throw new IdentityVerificationFailedError("Supabase verify did not return a user identifier");
     }
-    this.exchangedTokens.set(token, this.now());
+    this.exchangedTokens.set(trimmed, this.now());
     const user = {
       id: parsed.user.id,
       email: parsed.user.email ?? null,

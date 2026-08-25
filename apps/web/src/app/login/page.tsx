@@ -50,16 +50,16 @@ export default function LoginPage() {
 
   const handleDevVerification = async () => {
     if (!devVerificationUrl) return;
-    // Parse ?request_id=... from the verification URL.
+    // Parse ?token=... from the verification URL.
     const url = new URL(devVerificationUrl, window.location.origin);
-    const requestId = url.searchParams.get("request_id");
-    if (!requestId) {
+    const verificationToken = url.searchParams.get("token");
+    if (!verificationToken) {
       setStatus("error");
-      setErrorMessage("Verification URL is missing the request id.");
+      setErrorMessage("Verification URL is missing the verification token.");
       return;
     }
     try {
-      await verifyToken({ requestId });
+      await verifyToken({ verificationToken });
       router.push("/dashboard");
     } catch (err) {
       setStatus("error");

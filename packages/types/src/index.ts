@@ -569,12 +569,14 @@ export const bg1MagicLinkResponseV1Schema = z
     // request; rate-limited or otherwise rejected requests produce the
     // standard safe error envelope instead.
     ok: z.literal(true),
-    // Opaque SoundHub-side correlation id for the magic-link request.
-    // The managed adapter returns a SoundHub-side UUID; the
-    // deterministic adapter returns its internal request id. The
-    // managed callback flow never uses this value — the Supabase
-    // token arrives in the email link. The deterministic fallback
-    // uses it to drive the operator-controlled verify-token call.
+    // Public correlation id for the magic-link request (per ticket
+    // #59 P2-001). This value is observability only; it is NOT a
+    // verification credential. The managed adapter returns a
+    // SoundHub-side UUID and never reads it back; the deterministic
+    // adapter returns its own correlation id and keys its pending
+    // request under a separate private `verificationToken`. A browser
+    // that round-trips this value to `/api/auth/verify-token` is
+    // rejected as an unknown credential.
     requestId: z.string().min(1).max(256),
     // Deterministic-adapter operator-mode only: a one-time
     // verification URL that the operator-driven recovery UI can
@@ -591,10 +593,24 @@ export const bg1MagicLinkResponseV1Schema = z
 export type Bg1MagicLinkResponseV1 = z.infer<typeof bg1MagicLinkResponseV1Schema>;
 
 // ---------- Verify token ----------
-
+//
+// The verify-token request carries the **private one-time verification
+// credential** extracted from the magic-link callback URL — NOT a
+// public correlation id. The BG1 provider-neutral contract requires
+// distinct names for the two values so a future adapter cannot
+// accidentally substitute one for the other (ticket #59 P2-001):
+//
+//   - `requestId` is the **public correlation id** returned in the
+//     magic-link response and carried into logs and observability.
+//     It is never a credential and cannot be used to mint a session.
+//   - `verificationToken` is the **private one-time credential** the
+//     browser extracts from the email callback URL (or the dev
+//     recovery workflow reads from the server log). It is the only
+//     value `verifySignIn` accepts. It MUST NEVER appear in public
+//     DTOs, error envelopes, or log lines.
 export const bg1VerifyTokenRequestV1Schema = z
   .object({
-    requestId: z.string().min(1).max(256),
+    verificationToken: z.string().min(1).max(512),
   })
   .strict();
 export type Bg1VerifyTokenRequestV1 = z.infer<typeof bg1VerifyTokenRequestV1Schema>;

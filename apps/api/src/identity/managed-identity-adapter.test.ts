@@ -5,10 +5,10 @@
 // The ticket also requires a "bounded deployed-provider smoke"
 // so the factory can fall back to the deterministic adapter when
 // the managed path is unreachable. These tests pin the contract:
-// every Supabase response is validated with a strict Zod schema,
-// the SoundHub request handle is opaque, verify exchanges a real
-// Supabase magic-link token, and a forged / replayed / malformed
-// token cannot mint a session.
+// every Supabase response is validated with a forward-compatible
+// Zod schema, the SoundHub request handle is opaque, verify
+// exchanges a real Supabase magic-link token, and a forged /
+// replayed / malformed token cannot mint a session.
 //
 // Per ticket #59 P0-002 the adapter pins the official Supabase
 // REST contract:
@@ -19,6 +19,18 @@
 //   - the verify success response parses the real access-token /
 //     session envelope Supabase returns, with only the allow-listed
 //     `id` and `email` extracted into SoundHub identity.
+//
+// Per ticket #59 P1-001 the provider-response parser is
+// FORWARD-COMPATIBLE with documented Supabase fields (e.g.
+// `expires_at`, `provider_token`, future additions). The PUBLIC
+// SoundHub contract remains strict — only identity derivation
+// reads the allow-listed fields and the parsed provider envelope
+// is discarded after identity is established.
+//
+// Per ticket #59 P2-001 `verifySignIn` accepts the PRIVATE
+// one-time `verificationToken` (the value the browser extracted
+// from the magic-link callback URL). The PUBLIC correlation id
+// returned by `requestSignIn` is NOT accepted here.
 
 /* eslint-disable @typescript-eslint/no-floating-promises */
 
@@ -79,11 +91,14 @@ function configure(
 }
 
 /**
- * The official Supabase `/auth/v1/verify` success envelope — the
- * access-token / session shape Supabase publishes for the current
- * token-hash verification endpoint. Used by the verify tests so
- * the adapter is exercised against the contract fixture the BG1
- * smoke relies on.
+ * A realistic Supabase `/auth/v1/verify` success envelope. Per
+ * ticket #59 P1-001 the fixture mirrors the fields Supabase
+ * publishes (including documented extras like `expires_at`,
+ * `provider_token`, `provider_refresh_token`) so the parser is
+ * exercised against the contract the deployed environment will
+ * return. Identity derivation only reads `id` and `email` from
+ * the parsed user — every other field is discarded after
+ * identity is established.
  */
 function supabaseVerifyEnvelope(overrides: {
   readonly id: string;
@@ -93,7 +108,10 @@ function supabaseVerifyEnvelope(overrides: {
     access_token: "access-token-fixture",
     token_type: "bearer",
     expires_in: 3600,
+    expires_at: Math.floor(Date.now() / 1000) + 3600,
     refresh_token: "refresh-token-fixture",
+    provider_token: "provider-access-token-fixture",
+    provider_refresh_token: "provider-refresh-token-fixture",
     user: {
       id: overrides.id,
       aud: "authenticated",
@@ -142,7 +160,7 @@ describe("ManagedIdentityAdapter", () => {
     await assert.rejects(
       () =>
         new ManagedIdentityAdapter({}).verifySignIn({
-          requestId: "any-id",
+          verificationToken: "any-token",
         }),
       (err: unknown) => err instanceof IdentityProviderUnavailableError,
     );
@@ -194,6 +212,23 @@ describe("ManagedIdentityAdapter", () => {
     assert.equal(result.reason, "network");
   });
 
+  test("requestSignIn returns a public correlationId under the documented field name (P2-001)", async () => {
+    const { fetchImpl } = makeFetch({
+      url: "https://example.supabase.co/auth/v1/otp",
+      responses: [{ status: 200, body: {} }],
+    });
+    const adapter = configure({ fetchImpl });
+    const result = await adapter.requestSignIn({ email: "buyer@example.com" });
+    // Per P2-001 the adapter returns a `correlationId` field
+    // (public, observability-only). The managed adapter never
+    // returns a `verificationToken` — Supabase owns the one-time
+    // credential and surfaces it in the magic-link callback URL
+    // the browser extracts.
+    assert.match(result.correlationId, /^managed-pending-[0-9a-f-]+$/);
+    assert.equal(result.correlationId.includes("buyer@example.com"), false);
+    assert.equal(result.verificationToken, undefined);
+  });
+
   test("requestSignIn sends the OTP body with `redirect_to` as a query parameter (P0-002)", async () => {
     const { fetchImpl, calls } = makeFetch({
       url: "https://example.supabase.co/auth/v1/otp",
@@ -204,11 +239,8 @@ describe("ManagedIdentityAdapter", () => {
       emailRedirectTo: "http://localhost:3000/auth/callback",
     });
     const result = await adapter.requestSignIn({ email: "buyer@example.com" });
-    // Opaque SoundHub handle: prefixed with managed-pending- and
-    // contains a UUID. It does NOT embed the email or any
-    // identity claim.
-    assert.match(result.requestId, /^managed-pending-[0-9a-f-]+$/);
-    assert.equal(result.requestId.includes("buyer@example.com"), false);
+    assert.match(result.correlationId, /^managed-pending-[0-9a-f-]+$/);
+    assert.equal(result.correlationId.includes("buyer@example.com"), false);
     assert.equal(calls.length, 1);
     assert.equal(
       calls[0]!.url,
@@ -250,16 +282,45 @@ describe("ManagedIdentityAdapter", () => {
     );
   });
 
-  test("requestSignIn fails closed when Supabase returns a malformed success payload", async () => {
+  test("requestSignIn fails closed when Supabase returns a non-object success payload", async () => {
+    // Per P1-001 the parser tolerates documented extra top-level
+    // fields (e.g. `expires_at`); a clearly malformed payload
+    // (non-object / non-null, like a bare string or array) still
+    // fails closed so a drifted Supabase contract does not silently
+    // mint a session.
     const { fetchImpl } = makeFetch({
       url: "https://example.supabase.co/auth/v1/otp",
-      responses: [{ status: 200, body: { unexpected: "field" } }],
+      responses: [
+        {
+          status: 200,
+          body: "not-an-object",
+        },
+      ],
     });
     const adapter = configure({ fetchImpl });
     await assert.rejects(
       () => adapter.requestSignIn({ email: "buyer@example.com" }),
       (err: unknown) => err instanceof Error,
     );
+  });
+
+  test("requestSignIn tolerates documented extra top-level fields in the success payload (P1-001)", async () => {
+    // The forward-compatible parser must accept Supabase success
+    // bodies that carry documented extras (e.g. a future
+    // `expires_at` at the top level) so a normal provider
+    // response is not silently rejected.
+    const { fetchImpl } = makeFetch({
+      url: "https://example.supabase.co/auth/v1/otp",
+      responses: [
+        {
+          status: 200,
+          body: { data: {}, user: null },
+        },
+      ],
+    });
+    const adapter = configure({ fetchImpl });
+    const result = await adapter.requestSignIn({ email: "buyer@example.com" });
+    assert.match(result.correlationId, /^managed-pending-[0-9a-f-]+$/);
   });
 
   test('verifySignIn exchanges the Supabase token with type:"email" and parses the real envelope (P0-002)', async () => {
@@ -273,12 +334,9 @@ describe("ManagedIdentityAdapter", () => {
     });
     const adapter = configure({ fetchImpl });
     const token = "supabase-magic-link-token";
-    const verified = await adapter.verifySignIn({ requestId: token });
+    const verified = await adapter.verifySignIn({ verificationToken: token });
     assert.ok(verified);
     assert.equal(verified.provider, "managed-magic-link");
-    // The subject is the Supabase user id from the verified
-    // response — NOT anything derived from the SoundHub request
-    // handle.
     assert.equal(verified.subject, "supabase-uuid-1");
     assert.equal(verified.providerEmail, "buyer@example.com");
     assert.equal(calls.length, 1);
@@ -305,18 +363,41 @@ describe("ManagedIdentityAdapter", () => {
       fetchImpl,
       verifyType: "magiclink",
     });
-    await adapter.verifySignIn({ requestId: "legacy-token" });
+    await adapter.verifySignIn({ verificationToken: "legacy-token" });
     const body = JSON.parse((calls[0]!.init?.body as string) ?? "{}") as Record<string, unknown>;
     assert.equal(body.type, "magiclink");
   });
 
-  test("verifySignIn rejects an empty request id without calling Supabase", async () => {
+  test("verifySignIn tolerates documented Supabase response fields like expires_at (P1-001)", async () => {
+    // Per ticket #59 P1-001 the parser must be
+    // FORWARD-COMPATIBLE with documented Supabase response
+    // fields. The fixture mirrors the realistic shape the
+    // deployed environment will return (including `expires_at`,
+    // `provider_token`, `provider_refresh_token`); the parser
+    // accepts the envelope and identity derivation only reads
+    // the allow-listed `id` and `email`.
+    const verifiedBody = supabaseVerifyEnvelope({
+      id: "supabase-uuid-forward-compatible",
+      email: "buyer@example.com",
+    });
+    const { fetchImpl } = makeFetch({
+      url: "https://example.supabase.co/auth/v1/verify",
+      responses: [{ status: 200, body: verifiedBody }],
+    });
+    const adapter = configure({ fetchImpl });
+    const verified = await adapter.verifySignIn({ verificationToken: "captured-token" });
+    assert.ok(verified);
+    assert.equal(verified.subject, "supabase-uuid-forward-compatible");
+    assert.equal(verified.providerEmail, "buyer@example.com");
+  });
+
+  test("verifySignIn rejects an empty verification token without calling Supabase", async () => {
     const fetchImpl: typeof fetch = () => {
-      throw new Error("Supabase must not be contacted for an empty request id");
+      throw new Error("Supabase must not be contacted for an empty verification token");
     };
     const adapter = configure({ fetchImpl });
-    assert.equal(await adapter.verifySignIn({ requestId: "" }), null);
-    assert.equal(await adapter.verifySignIn({ requestId: "   " }), null);
+    assert.equal(await adapter.verifySignIn({ verificationToken: "" }), null);
+    assert.equal(await adapter.verifySignIn({ verificationToken: "   " }), null);
   });
 
   test("verifySignIn rejects a fabricated token (Supabase returns 4xx)", async () => {
@@ -326,7 +407,7 @@ describe("ManagedIdentityAdapter", () => {
     });
     const adapter = configure({ fetchImpl });
     await assert.rejects(
-      () => adapter.verifySignIn({ requestId: "fabricated-token" }),
+      () => adapter.verifySignIn({ verificationToken: "fabricated-token" }),
       (err: unknown) =>
         err instanceof IdentityVerificationFailedError && err.message.includes("Invalid token"),
     );
@@ -339,7 +420,7 @@ describe("ManagedIdentityAdapter", () => {
     });
     const adapter = configure({ fetchImpl });
     await assert.rejects(
-      () => adapter.verifySignIn({ requestId: "any-token" }),
+      () => adapter.verifySignIn({ verificationToken: "any-token" }),
       (err: unknown) =>
         err instanceof IdentityProviderUnavailableError && err.message.includes("Supabase is down"),
     );
@@ -348,11 +429,15 @@ describe("ManagedIdentityAdapter", () => {
   test("verifySignIn fails closed when Supabase returns the reduced legacy shape (P0-002)", async () => {
     const { fetchImpl } = makeFetch({
       url: "https://example.supabase.co/auth/v1/verify",
+      // Missing required access_token / token_type / refresh_token
+      // fields — even with the forward-compatible parser, a
+      // response that lacks the documented envelope fields is
+      // rejected.
       responses: [{ status: 200, body: { user: { id: "x", email: "y@z" } } }],
     });
     const adapter = configure({ fetchImpl });
     await assert.rejects(
-      () => adapter.verifySignIn({ requestId: "legacy-shape-token" }),
+      () => adapter.verifySignIn({ verificationToken: "legacy-shape-token" }),
       (err: unknown) => err instanceof IdentityVerificationFailedError,
     );
   });
@@ -366,7 +451,7 @@ describe("ManagedIdentityAdapter", () => {
     });
     const adapter = configure({ fetchImpl });
     await assert.rejects(
-      () => adapter.verifySignIn({ requestId: "null-user-token" }),
+      () => adapter.verifySignIn({ verificationToken: "null-user-token" }),
       (err: unknown) =>
         err instanceof IdentityVerificationFailedError && err.message.includes("user identifier"),
     );
@@ -380,40 +465,20 @@ describe("ManagedIdentityAdapter", () => {
       responses: [{ status: 200, body: verifiedBody }],
     });
     const adapter = configure({ fetchImpl });
-    // An empty user id fails the schema's `min(1)` constraint,
-    // so the failure mode is "response did not match the
-    // expected schema" — both branches reject the token.
     await assert.rejects(
-      () => adapter.verifySignIn({ requestId: "empty-id-token" }),
+      () => adapter.verifySignIn({ verificationToken: "empty-id-token" }),
       (err: unknown) => err instanceof IdentityVerificationFailedError,
     );
   });
 
-  test("verifySignIn rejects an extra top-level field on the envelope (P0-002 strict parser)", async () => {
-    const verifiedBody = {
-      ...supabaseVerifyEnvelope({ id: "supabase-uuid-5", email: "buyer@example.com" }),
-      leaked_secret: "shhh",
-    };
-    const { fetchImpl } = makeFetch({
-      url: "https://example.supabase.co/auth/v1/verify",
-      responses: [{ status: 200, body: verifiedBody }],
-    });
-    const adapter = configure({ fetchImpl });
-    await assert.rejects(
-      () => adapter.verifySignIn({ requestId: "drift-token" }),
-      (err: unknown) => err instanceof IdentityVerificationFailedError,
-    );
-  });
-
-  test("verifySignIn rejects an extra field inside the user object (P0-002 strict parser)", async () => {
+  test("verifySignIn rejects an extra field inside the user object (P0-002 strict user parser)", async () => {
     const verifiedBody = supabaseVerifyEnvelope({
       id: "supabase-uuid-6",
       email: "buyer@example.com",
     });
-    // Add an extra field NOT declared on the strict schema so the
-    // parser rejects it. (The user-shape schema declares aud, role,
-    // email_confirmed_at, phone, etc., so the parser does NOT
-    // reject those — only genuinely unknown keys fail.)
+    // The user-shape schema is `.strict()` so unknown inner
+    // fields are rejected (the public SoundHub contract must
+    // not silently accept arbitrary provider claims).
     (verifiedBody.user as Record<string, unknown>).custom_provider_claim = "service_role";
     const { fetchImpl } = makeFetch({
       url: "https://example.supabase.co/auth/v1/verify",
@@ -421,7 +486,7 @@ describe("ManagedIdentityAdapter", () => {
     });
     const adapter = configure({ fetchImpl });
     await assert.rejects(
-      () => adapter.verifySignIn({ requestId: "drifted-token" }),
+      () => adapter.verifySignIn({ verificationToken: "drifted-token" }),
       (err: unknown) => err instanceof IdentityVerificationFailedError,
     );
   });
@@ -436,12 +501,9 @@ describe("ManagedIdentityAdapter", () => {
       responses: [{ status: 200, body: verifiedBody }],
     });
     const adapter = configure({ fetchImpl });
-    const first = await adapter.verifySignIn({ requestId: "replay-token" });
+    const first = await adapter.verifySignIn({ verificationToken: "replay-token" });
     assert.ok(first);
-    // Second verify with the same token must NOT call Supabase
-    // again and must return null so a stolen token cannot mint
-    // two sessions.
-    const second = await adapter.verifySignIn({ requestId: "replay-token" });
+    const second = await adapter.verifySignIn({ verificationToken: "replay-token" });
     assert.equal(second, null);
     assert.equal(calls.length, 1, "Supabase must not be contacted twice for the same token");
   });
@@ -456,7 +518,7 @@ describe("ManagedIdentityAdapter", () => {
       responses: [{ status: 200, body: verifiedBody }],
     });
     const adapter = configure({ fetchImpl });
-    const verified = await adapter.verifySignIn({ requestId: "  token-with-padding  " });
+    const verified = await adapter.verifySignIn({ verificationToken: "  token-with-padding  " });
     assert.ok(verified);
     assert.equal(calls.length, 1);
     const body = JSON.parse((calls[0]!.init?.body as string) ?? "{}") as Record<string, unknown>;

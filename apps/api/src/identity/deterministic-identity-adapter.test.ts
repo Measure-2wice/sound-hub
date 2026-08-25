@@ -4,10 +4,13 @@
 // implement the same identity/session contract. These tests pin the
 // deterministic adapter's contract behaviour (single-use, expiry,
 // stable subject per email) without touching a database or a
-// managed provider. Per ticket #59 P0-001 the adapter must split
-// its public response into a non-verifying correlation id and a
+// managed provider. Per ticket #59 P0-001 the adapter splits its
+// public response into a non-verifying correlation id and a
 // private verifier credential so a browser cannot pick a demo
-// identity by email.
+// identity by email. Per ticket #59 P2-001 the two values are
+// named `correlationId` (public) and `verificationToken` (private)
+// so the provider-neutral seam cannot accidentally substitute one
+// for the other.
 
 /* eslint-disable @typescript-eslint/no-floating-promises */
 
@@ -19,51 +22,52 @@ import { DeterministicIdentityAdapter } from "./deterministic-identity-adapter.j
 
 /**
  * Drive `verifySignIn` for the deterministic adapter using the
- * private `verifierToken` the adapter returns alongside the public
- * correlation id. Test-only seam — the public route never sees
- * the verifierToken because the Zod-strict magic-link response
- * schema does not include it.
+ * private `verificationToken` the adapter returns alongside the
+ * public correlation id. Test-only seam — the public route never
+ * sees the verificationToken because the Zod-strict magic-link
+ * response schema does not include it.
  */
 function verifyWithVerifier(
   adapter: DeterministicIdentityAdapter,
-  request: { readonly verifierToken?: string },
+  request: { readonly verificationToken?: string },
 ): Promise<Awaited<ReturnType<DeterministicIdentityAdapter["verifySignIn"]>>> {
-  if (!request.verifierToken) {
-    throw new Error("verifierToken missing from adapter result");
+  if (!request.verificationToken) {
+    throw new Error("verificationToken missing from adapter result");
   }
-  return adapter.verifySignIn({ requestId: request.verifierToken });
+  return adapter.verifySignIn({ verificationToken: request.verificationToken });
 }
 
 describe("DeterministicIdentityAdapter", () => {
-  test("requestSignIn returns a public correlationId and a private verifierToken that is NEVER exposed through the public response (P0-001)", async () => {
+  test("requestSignIn returns a public correlationId and a private verificationToken that is NEVER exposed through the public response (P0-001, P2-001)", async () => {
     const adapter = new DeterministicIdentityAdapter();
     const result = await adapter.requestSignIn({ email: "buyer@example.com" });
-    assert.ok(result.requestId.length > 0);
-    assert.ok(result.verifierToken);
-    assert.notEqual(result.requestId, result.verifierToken);
-    // The verifierToken is the lookup key; the correlationId is not.
-    // The public BG1 schema (bg1MagicLinkResponseV1Schema) only
-    // permits { ok, requestId, devVerificationUrl? } — the
-    // verifierToken never crosses the route boundary.
+    assert.ok(result.correlationId.length > 0);
+    assert.ok(result.verificationToken);
+    assert.notEqual(result.correlationId, result.verificationToken);
+    // The verificationToken is the lookup key; the correlationId
+    // is not. The public BG1 schema
+    // (bg1MagicLinkResponseV1Schema) only permits { ok,
+    // requestId, devVerificationUrl? } — the verificationToken
+    // never crosses the route boundary.
   });
 
   test("requestSignIn OMITS the devVerificationUrl by default so the deployed fallback never exposes a usable login credential (P1-002)", async () => {
     const adapter = new DeterministicIdentityAdapter();
     const result = await adapter.requestSignIn({ email: "buyer@example.com" });
-    assert.ok(result.requestId.length > 0);
+    assert.ok(result.correlationId.length > 0);
     assert.equal(result.devVerificationUrl, undefined);
   });
 
   test("requestSignIn returns the public correlationId but NEVER a browser-facing devVerificationUrl, even in operator mode (P1-002)", async () => {
     const adapter = new DeterministicIdentityAdapter({ allowDevVerificationUrl: true });
     const result = await adapter.requestSignIn({ email: "buyer@example.com" });
-    assert.ok(result.requestId.length > 0);
+    assert.ok(result.correlationId.length > 0);
     // The URL is operator-only and is logged to the operator's
     // sink; it MUST NOT cross the public response boundary.
     assert.equal(result.devVerificationUrl, undefined);
   });
 
-  test("verifySignIn driven by the private verifierToken produces the deterministic identity (P0-001)", async () => {
+  test("verifySignIn driven by the private verificationToken produces the deterministic identity (P0-001)", async () => {
     const adapter = new DeterministicIdentityAdapter();
     const request = await adapter.requestSignIn({ email: "buyer@example.com" });
     const verified = await verifyWithVerifier(adapter, request);
@@ -72,22 +76,23 @@ describe("DeterministicIdentityAdapter", () => {
     assert.equal(verified.providerEmail, "buyer@example.com");
   });
 
-  test("the public correlationId is NOT a valid verify credential — a browser cannot complete sign-in by round-tripping it (P0-001)", async () => {
+  test("the public correlationId is NOT a valid verify credential — a browser cannot complete sign-in by round-tripping it (P0-001, P2-001)", async () => {
     const adapter = new DeterministicIdentityAdapter();
     const request = await adapter.requestSignIn({ email: "demo.buyer@soundhub.example" });
-    // The browser only ever sees `request.requestId` (the public
-    // correlation id). Sending it to verifySignIn must NOT
-    // resolve, even though the same request just succeeded for
-    // the verifierToken.
-    const browserAttempt = await adapter.verifySignIn({ requestId: request.requestId });
+    // The browser only ever sees `request.correlationId` (the
+    // public correlation id). Sending it to verifySignIn must
+    // NOT resolve, even though the same request just succeeded
+    // for the verificationToken.
+    const browserAttempt = await adapter.verifySignIn({ verificationToken: request.correlationId });
     assert.equal(browserAttempt, null, "public correlation id must not satisfy verifySignIn");
-    // The verifierToken still works for the operator recovery path.
+    // The verificationToken still works for the operator
+    // recovery path.
     const operatorAttempt = await verifyWithVerifier(adapter, request);
     assert.ok(operatorAttempt);
     assert.equal(operatorAttempt.providerEmail, "demo.buyer@soundhub.example");
   });
 
-  test("operator-mode requestSignIn logs the verifierToken URL to the operator sink without surfacing it in the response (P0-001, P1-002)", async () => {
+  test("operator-mode requestSignIn logs the verificationToken URL to the operator sink without surfacing it in the response (P0-001, P1-002)", async () => {
     const logs: string[] = [];
     const originalLog = console.log;
     console.log = (msg: string) => {
@@ -97,28 +102,25 @@ describe("DeterministicIdentityAdapter", () => {
       const adapter = new DeterministicIdentityAdapter({ allowDevVerificationUrl: true });
       const result = await adapter.requestSignIn({ email: "buyer@example.com" });
       assert.equal(result.devVerificationUrl, undefined);
-      // The operator log carries the verifierToken (the value the
-      // operator must drive verifySignIn with) and the public
-      // correlationId (for log correlation only).
-      assert.ok(result.verifierToken);
-      const verifierToken = result.verifierToken;
+      assert.ok(result.verificationToken);
+      const verificationToken = result.verificationToken;
       assert.ok(
         logs.some(
           (line) =>
             line.includes("operator-mode verification URL") &&
-            line.includes(verifierToken) &&
+            line.includes(verificationToken) &&
             line.includes("buyer@example.com"),
         ),
-        "operator-mode URL must be logged with the verifierToken",
+        "operator-mode URL must be logged with the verificationToken",
       );
     } finally {
       console.log = originalLog;
     }
   });
 
-  test("verifySignIn returns null for an unknown request id", async () => {
+  test("verifySignIn returns null for an unknown verification token", async () => {
     const adapter = new DeterministicIdentityAdapter();
-    const verified = await adapter.verifySignIn({ requestId: "not-a-real-request" });
+    const verified = await adapter.verifySignIn({ verificationToken: "not-a-real-token" });
     assert.equal(verified, null);
   });
 
@@ -163,13 +165,13 @@ describe("DeterministicIdentityAdapter", () => {
     assert.notEqual(aVerified.subject, bVerified.subject);
   });
 
-  test("two consecutive requests produce different correlationIds AND different verifierTokens (P0-001)", async () => {
+  test("two consecutive requests produce different correlationIds AND different verificationTokens (P0-001, P2-001)", async () => {
     const adapter = new DeterministicIdentityAdapter();
     const a = await adapter.requestSignIn({ email: "buyer@example.com" });
     const b = await adapter.requestSignIn({ email: "buyer@example.com" });
-    assert.notEqual(a.requestId, b.requestId);
-    assert.ok(a.verifierToken && b.verifierToken);
-    assert.notEqual(a.verifierToken, b.verifierToken);
+    assert.notEqual(a.correlationId, b.correlationId);
+    assert.ok(a.verificationToken && b.verificationToken);
+    assert.notEqual(a.verificationToken, b.verificationToken);
   });
 
   test("expired requests cannot be verified (TTL semantics)", () => {
@@ -180,10 +182,6 @@ describe("DeterministicIdentityAdapter", () => {
     const adapter = new DeterministicIdentityAdapter({ now, ttlMs: 1000 });
     return (async () => {
       const request = await adapter.requestSignIn({ email: "buyer@example.com" });
-      // Advance the clock past the TTL.
-      // The closure above makes now() always return 1_000_000; we
-      // explicitly advance it by reassigning. The simplest path is to
-      // use the `expireAll` shortcut.
       adapter.expireAll();
       const verified = await verifyWithVerifier(adapter, request);
       assert.equal(verified, null);
@@ -229,12 +227,12 @@ describe("DeterministicIdentityAdapter", () => {
       });
       const result = await adapter.requestSignIn({ email: "buyer@example.com" });
       assert.equal(result.devVerificationUrl, undefined);
-      assert.ok(result.verifierToken);
+      assert.ok(result.verificationToken);
       assert.ok(
         logs.some(
           (line) =>
-            line.includes("/api/auth/dev-verify?request_id=") &&
-            line.includes(result.verifierToken ?? ""),
+            line.includes("/api/auth/dev-verify?token=") &&
+            line.includes(result.verificationToken ?? ""),
         ),
       );
     } finally {

@@ -5,8 +5,11 @@
 // pin the service's contract behaviour against an in-memory auth
 // repository and the deterministic identity adapter. Per ticket
 // #59 P0-001 the deterministic adapter returns a private
-// `verifierToken` that the service's `verifySignIn` consumes —
-// tests use the same seam the operator recovery path uses.
+// `verificationToken` that the service's `verifySignIn` consumes
+// — tests use the same seam the operator recovery path uses.
+// Per ticket #59 P2-001 the input field is named
+// `verificationToken` (private) and the magic-link envelope field
+// is named `requestId` (public correlation).
 
 /* eslint-disable @typescript-eslint/no-floating-promises */
 /* eslint-disable @typescript-eslint/require-await */
@@ -40,11 +43,10 @@ describe("AuthenticationService", () => {
     const b = await service.requestSignIn({ email: "buyer@example.com" });
     assert.equal(a.envelope.ok, true);
     assert.equal(b.envelope.ok, true);
-    // The opaque requestId is the PUBLIC correlation id; the
-    // verifierToken stays inside the adapter and is NOT forwarded
-    // into the envelope (the Zod-strict magic-link response schema
-    // has no such field). The request ids are different on every
-    // request — fresh correlation id per call.
+    // Per P2-001 the envelope's `requestId` is the PUBLIC
+    // correlation id (mapped from the adapter's
+    // `correlationId`). It is NOT a verification credential —
+    // the service never accepts it as input to `verifySignIn`.
     assert.ok(a.envelope.requestId.length > 0);
     assert.ok(b.envelope.requestId.length > 0);
     assert.notEqual(a.envelope.requestId, b.envelope.requestId);
@@ -52,19 +54,20 @@ describe("AuthenticationService", () => {
     assert.equal(b.envelope.devVerificationUrl, undefined);
   });
 
-  test("the envelope never exposes the private verifierToken (P0-001)", async () => {
-    // Direct adapter call: the verifierToken is the operator-only
-    // credential; the envelope the service produces MUST NOT carry
-    // it. The deterministic adapter only emits it on the adapter's
-    // return value (where the test harness can read it). The
-    // service explicitly forwards only `requestId` and the optional
-    // `devVerificationUrl` into the envelope.
+  test("the envelope never exposes the private verificationToken (P0-001, P2-001)", async () => {
+    // Direct adapter call: the verificationToken is the
+    // operator-only credential; the envelope the service
+    // produces MUST NOT carry it. The deterministic adapter only
+    // emits it on the adapter's return value (where the test
+    // harness can read it). The service explicitly forwards only
+    // `correlationId` (renamed `requestId` on the envelope) and
+    // the optional `devVerificationUrl` into the envelope.
     const raw = await adapter.requestSignIn({ email: "buyer@example.com" });
-    assert.ok(raw.verifierToken);
+    assert.ok(raw.verificationToken);
     const envelope = (await service.requestSignIn({ email: "buyer@example.com" })).envelope;
     assert.ok(envelope);
-    assert.equal("verifierToken" in envelope, false);
-    assert.equal(envelope.requestId === raw.verifierToken, false);
+    assert.equal("verificationToken" in envelope, false);
+    assert.equal(envelope.requestId === raw.verificationToken, false);
   });
 
   test("requestSignIn forwards the operator-mode URL only to the operator sink, not the response (P1-002)", async () => {
@@ -88,21 +91,16 @@ describe("AuthenticationService", () => {
       assert.ok(envelope, "envelope must be defined");
       assert.ok(envelope.requestId, "envelope.requestId must be defined");
       assert.ok(envelope.requestId.length > 0);
-      // The response MUST NOT carry the URL even in operator mode.
       assert.equal(envelope.devVerificationUrl, undefined);
-      // The URL goes to the operator's log sink instead. The log
-      // carries the verifierToken (which the operator must drive
-      // verifySignIn with); the envelope carries the public
-      // correlation id only.
       const adapterResult = await operatorAdapter.requestSignIn({
         email: "buyer2@example.com",
       });
-      assert.ok(adapterResult.verifierToken);
+      assert.ok(adapterResult.verificationToken);
       assert.ok(
         logs.some(
           (line) =>
             line.includes("operator-mode verification URL") &&
-            line.includes(adapterResult.verifierToken ?? ""),
+            line.includes(adapterResult.verificationToken ?? ""),
         ),
       );
     } finally {
@@ -112,7 +110,9 @@ describe("AuthenticationService", () => {
 
   test("verifySignIn returns a server session and resolves the UserAccount", async () => {
     const request = await adapter.requestSignIn({ email: "buyer@example.com" });
-    const result = await service.verifySignIn({ requestId: request.verifierToken ?? "" });
+    const result = await service.verifySignIn({
+      verificationToken: request.verificationToken ?? "",
+    });
     assert.equal(result.publicUser.identityProvider, "deterministic");
     assert.equal(result.publicUser.email, "buyer@example.com");
     assert.equal(result.publicUser.workspaces.length, 0);
@@ -120,32 +120,33 @@ describe("AuthenticationService", () => {
     assert.equal(result.session.revokedAt, null);
   });
 
-  test("verifySignIn rejects the public correlationId so a browser cannot become a demo identity (P0-001)", async () => {
+  test("verifySignIn rejects the public correlationId so a browser cannot become a demo identity (P0-001, P2-001)", async () => {
     const envelope = (await service.requestSignIn({ email: "demo.buyer@soundhub.example" }))
       .envelope;
     assert.ok(envelope);
-    // The browser has only the public correlationId from the
-    // envelope; presenting it to verify-token must NOT mint a
-    // session. The adapter's pending map is keyed by the private
-    // verifierToken, not the correlationId.
+    // The browser has only the public correlationId (envelope
+    // requestId) from the magic-link response; presenting it to
+    // verifySignIn must NOT mint a session. The adapter's pending
+    // map is keyed by the private verificationToken, not the
+    // correlationId.
     await assert.rejects(
-      () => service.verifySignIn({ requestId: envelope.requestId }),
+      () => service.verifySignIn({ verificationToken: envelope.requestId }),
       (err: unknown) => err instanceof AuthenticationError && err.code === "AUTH_FAILED",
     );
   });
 
   test("verifySignIn is single-use (a successful verify cannot issue a second session)", async () => {
     const request = await adapter.requestSignIn({ email: "buyer@example.com" });
-    await service.verifySignIn({ requestId: request.verifierToken ?? "" });
+    await service.verifySignIn({ verificationToken: request.verificationToken ?? "" });
     await assert.rejects(
-      () => service.verifySignIn({ requestId: request.verifierToken ?? "" }),
+      () => service.verifySignIn({ verificationToken: request.verificationToken ?? "" }),
       (err: unknown) => err instanceof AuthenticationError && err.code === "AUTH_FAILED",
     );
   });
 
-  test("verifySignIn returns AUTH_FAILED for an unknown request id", async () => {
+  test("verifySignIn returns AUTH_FAILED for an unknown verification token", async () => {
     await assert.rejects(
-      () => service.verifySignIn({ requestId: "never-issued" }),
+      () => service.verifySignIn({ verificationToken: "never-issued" }),
       (err: unknown) => err instanceof AuthenticationError && err.code === "AUTH_FAILED",
     );
   });
@@ -153,7 +154,7 @@ describe("AuthenticationService", () => {
   test("verifySignIn returns AUTH_FAILED when the adapter returns null", async () => {
     const failingAdapter = {
       providerKey: "deterministic" as const,
-      requestSignIn: async () => ({ requestId: "x", verifierToken: "x" }),
+      requestSignIn: async () => ({ correlationId: "x", verificationToken: "x" }),
       verifySignIn: async () => null,
     };
     const brokenService = new AuthenticationService({
@@ -161,7 +162,7 @@ describe("AuthenticationService", () => {
       authRepository: authRepo,
     });
     await assert.rejects(
-      () => brokenService.verifySignIn({ requestId: "x" }),
+      () => brokenService.verifySignIn({ verificationToken: "x" }),
       (err: unknown) => err instanceof AuthenticationError && err.code === "AUTH_FAILED",
     );
   });
@@ -174,7 +175,9 @@ describe("AuthenticationService", () => {
 
   test("resolveSession returns the public user for an active session", async () => {
     const request = await adapter.requestSignIn({ email: "buyer@example.com" });
-    const { session } = await service.verifySignIn({ requestId: request.verifierToken ?? "" });
+    const { session } = await service.verifySignIn({
+      verificationToken: request.verificationToken ?? "",
+    });
     const user = await service.resolveSession(session.sessionId);
     assert.ok(user);
     assert.equal(user.email, "buyer@example.com");
@@ -182,7 +185,9 @@ describe("AuthenticationService", () => {
 
   test("signOut revokes the current session", async () => {
     const request = await adapter.requestSignIn({ email: "buyer@example.com" });
-    const { session } = await service.verifySignIn({ requestId: request.verifierToken ?? "" });
+    const { session } = await service.verifySignIn({
+      verificationToken: request.verificationToken ?? "",
+    });
     const revoked = await service.signOut(session.sessionId);
     assert.equal(revoked, true);
     const user = await service.resolveSession(session.sessionId);
@@ -191,15 +196,18 @@ describe("AuthenticationService", () => {
 
   test("signOut is idempotent (revoking an already-revoked session returns false)", async () => {
     const request = await adapter.requestSignIn({ email: "buyer@example.com" });
-    const { session } = await service.verifySignIn({ requestId: request.verifierToken ?? "" });
+    const { session } = await service.verifySignIn({
+      verificationToken: request.verificationToken ?? "",
+    });
     assert.equal(await service.signOut(session.sessionId), true);
     assert.equal(await service.signOut(session.sessionId), false);
   });
 
   test("an expired session is rejected by resolveSession without throwing", async () => {
     const request = await adapter.requestSignIn({ email: "buyer@example.com" });
-    const { session } = await service.verifySignIn({ requestId: request.verifierToken ?? "" });
-    // Advance the clock past the session expiry.
+    const { session } = await service.verifySignIn({
+      verificationToken: request.verificationToken ?? "",
+    });
     now += 60 * 60 * 1000 + 1;
     const user = await service.resolveSession(session.sessionId);
     assert.equal(user, null);
@@ -207,20 +215,21 @@ describe("AuthenticationService", () => {
 
   test("a UserAccount is created only on first sign-in and reused thereafter", async () => {
     const request1 = await adapter.requestSignIn({ email: "buyer@example.com" });
-    const first = await service.verifySignIn({ requestId: request1.verifierToken ?? "" });
-    // Sign in again with the same email — the deterministic adapter
-    // produces a stable subject, so the second verify must resolve
-    // to the SAME UserAccount.
+    const first = await service.verifySignIn({
+      verificationToken: request1.verificationToken ?? "",
+    });
     const request2 = await adapter.requestSignIn({ email: "buyer@example.com" });
-    const second = await service.verifySignIn({ requestId: request2.verifierToken ?? "" });
+    const second = await service.verifySignIn({
+      verificationToken: request2.verificationToken ?? "",
+    });
     assert.equal(first.publicUser.userAccountId, second.publicUser.userAccountId);
   });
 
   test("two different emails produce two different UserAccounts", async () => {
     const a = await adapter.requestSignIn({ email: "a@example.com" });
     const b = await adapter.requestSignIn({ email: "b@example.com" });
-    const aResult = await service.verifySignIn({ requestId: a.verifierToken ?? "" });
-    const bResult = await service.verifySignIn({ requestId: b.verifierToken ?? "" });
+    const aResult = await service.verifySignIn({ verificationToken: a.verificationToken ?? "" });
+    const bResult = await service.verifySignIn({ verificationToken: b.verificationToken ?? "" });
     assert.notEqual(aResult.publicUser.userAccountId, bResult.publicUser.userAccountId);
   });
 });

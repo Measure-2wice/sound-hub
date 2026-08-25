@@ -7,6 +7,10 @@
 // cookie, acting-Workspace command rejected for non-members, and
 // acting-Workspace command rejected for a legacy ownerUserId without
 // current membership.
+//
+// Per ticket #59 P2-001 the verify-token request body carries the
+// PRIVATE `verificationToken`; the PUBLIC correlation id from the
+// magic-link response is NOT accepted.
 
 /* eslint-disable @typescript-eslint/no-floating-promises */
 /* eslint-disable @typescript-eslint/no-unsafe-assignment */
@@ -32,10 +36,6 @@ const SELLER_WORKSPACE_ID = "ws-route-seller";
 
 describe("BG1 auth routes (in-memory, deterministic adapter)", () => {
   const adapter = new DeterministicIdentityAdapter({ allowDevVerificationUrl: true });
-  // The deterministic adapter derives the provider subject from the
-  // email address (sha256 of "deterministic|<email>"). The test seeds
-  // use the same hashing so the seeded identity mapping matches the
-  // mapping the AuthenticationService computes at verify-time.
   const buyerSubject = deterministicSubjectFor("buyer-route@example.com");
   const sellerSubject = deterministicSubjectFor("seller-route@example.com");
   const authRepo = new InMemoryAuthRepository([
@@ -97,7 +97,7 @@ describe("BG1 auth routes (in-memory, deterministic adapter)", () => {
     prismaClient: stubPrisma,
   });
 
-  test("POST /api/auth/magic-link returns the neutral envelope with the public correlation id (P0-001)", async () => {
+  test("POST /api/auth/magic-link returns the neutral envelope with the public correlation id (P0-001, P2-001)", async () => {
     const response = await request(app)
       .post("/api/auth/magic-link")
       .send({ email: "buyer-route@example.com" })
@@ -105,22 +105,20 @@ describe("BG1 auth routes (in-memory, deterministic adapter)", () => {
     assert.equal(response.status, 200);
     assert.equal(response.body.ok, true);
     assert.ok(response.body.requestId);
-    // Per P0-001 the deterministic adapter's public response is
-    // the correlation id; the private verifierToken never crosses
-    // the route boundary and the schema does not declare it.
-    assert.equal("verifierToken" in response.body, false);
-    // Per P1-002 the deployed deterministic fallback NEVER exposes
-    // a usable login credential to any browser — even when the
-    // deterministic adapter runs in operator mode, the URL is
-    // logged to the operator's sink instead of crossing the
-    // response boundary.
+    // Per P0-001 / P2-001 the deterministic adapter's public
+    // response is the correlation id; the private
+    // verificationToken never crosses the route boundary and
+    // the schema does not declare it.
+    assert.equal("verificationToken" in response.body, false);
+    // Per P1-002 the deployed deterministic fallback NEVER
+    // exposes a usable login credential to any browser — even
+    // when the deterministic adapter runs in operator mode, the
+    // URL is logged to the operator's sink instead of crossing
+    // the response boundary.
     assert.equal(response.body.devVerificationUrl, undefined);
   });
 
   test("POST /api/auth/magic-link never returns a devVerificationUrl regardless of operator mode (P1-002)", async () => {
-    // Same contract as the test above but with a fresh
-    // adapter that has allowDevVerificationUrl:false. The
-    // deployed browser never receives a usable URL.
     const restrictedAdapter = new DeterministicIdentityAdapter();
     const { app: restrictedApp } = buildApp({
       authenticationService: new AuthenticationService({
@@ -151,37 +149,34 @@ describe("BG1 auth routes (in-memory, deterministic adapter)", () => {
     assert.equal(response.body.error.code, "INVALID_AUTH_REQUEST");
   });
 
-  test("POST /api/auth/verify-token rejects the public correlationId — the browser cannot become a demo identity (P0-001)", async () => {
-    // The browser only has the public correlationId from
-    // /api/auth/magic-link. Submitting it to /verify-token must
-    // NOT mint a session.
+  test("POST /api/auth/verify-token rejects the public correlationId — the browser cannot become a demo identity (P0-001, P2-001)", async () => {
     const magic = await request(app)
       .post("/api/auth/magic-link")
       .send({ email: "buyer-route@example.com" })
       .set("Content-Type", "application/json");
     assert.equal(magic.status, 200);
-    const requestId = magic.body.requestId as string;
+    const correlationId = magic.body.requestId as string;
+    // Submitting the public correlationId (envelope requestId)
+    // to verify-token must NOT mint a session — per P2-001 the
+    // accepted field is `verificationToken`, not the correlation
+    // id, and the adapter's pending map is keyed by the private
+    // verificationToken only.
     const verify = await request(app)
       .post("/api/auth/verify-token")
-      .send({ requestId })
+      .send({ verificationToken: correlationId })
       .set("Content-Type", "application/json");
     assert.equal(verify.status, 500);
     assert.equal(verify.body.error.code, "AUTH_FAILED");
-    // No session cookie is set on a failed verify.
     const setCookie = verify.headers["set-cookie"];
     assert.equal(setCookie, undefined);
   });
 
-  test("POST /api/auth/verify-token with the private verifierToken sets the session cookie and returns the public user (P0-001)", async () => {
-    // The operator/test seam: drive the verifierToken directly
-    // from the adapter. The public route still receives the
-    // verifierToken; the response carries the public user view
-    // and the HttpOnly cookie.
+  test("POST /api/auth/verify-token with the private verificationToken sets the session cookie and returns the public user (P0-001, P2-001)", async () => {
     const magic = await adapter.requestSignIn({ email: "buyer-route@example.com" });
-    assert.ok(magic.verifierToken);
+    assert.ok(magic.verificationToken);
     const verify = await request(app)
       .post("/api/auth/verify-token")
-      .send({ requestId: magic.verifierToken })
+      .send({ verificationToken: magic.verificationToken })
       .set("Content-Type", "application/json");
     assert.equal(verify.status, 200);
     assert.equal(verify.body.ok, true);
@@ -203,10 +198,25 @@ describe("BG1 auth routes (in-memory, deterministic adapter)", () => {
     assert.ok(cookieHeader.toLowerCase().includes("httponly"));
   });
 
-  test("POST /api/auth/verify-token fails with AUTH_FAILED for an unknown request id", async () => {
+  test("POST /api/auth/verify-token rejects a request body with the wrong field name (P2-001)", async () => {
+    // The legacy `requestId` field is no longer accepted; the
+    // shared contract is strict and uses `verificationToken`
+    // (per ticket #59 P2-001). The route must reject the legacy
+    // payload with INVALID_AUTH_REQUEST so a future drift
+    // detector catches a client that still submits the public
+    // correlation id.
     const verify = await request(app)
       .post("/api/auth/verify-token")
-      .send({ requestId: "definitely-not-a-real-request" })
+      .send({ requestId: "any-value" })
+      .set("Content-Type", "application/json");
+    assert.equal(verify.status, 400);
+    assert.equal(verify.body.error.code, "INVALID_AUTH_REQUEST");
+  });
+
+  test("POST /api/auth/verify-token fails with AUTH_FAILED for an unknown verification token", async () => {
+    const verify = await request(app)
+      .post("/api/auth/verify-token")
+      .send({ verificationToken: "definitely-not-a-real-token" })
       .set("Content-Type", "application/json");
     assert.equal(verify.status, 500);
     assert.equal(verify.body.error.code, "AUTH_FAILED");
@@ -225,34 +235,27 @@ describe("BG1 auth routes (in-memory, deterministic adapter)", () => {
     assert.equal(me.body.user, null);
   });
 
-  test("verify-token and /me responses never include the provider subject or verifierToken (privacy boundary)", async () => {
-    // The provider subject and the verifierToken are credential
-    // material. They MUST NOT cross a public DTO in any response
-    // shape. The session cookie remains the server-side identity
-    // signal; the public payload only carries the durable
-    // UserAccount id and the user's workspaces.
+  test("verify-token and /me responses never include the provider subject or verificationToken (privacy boundary)", async () => {
     const cookie = await signIn(app, adapter, "buyer-route@example.com");
     const me = await request(app).get("/api/auth/me").set("Cookie", cookie);
     assert.equal(me.status, 200);
     assert.equal("identitySubject" in me.body.user, false);
-    assert.equal("verifierToken" in me.body.user, false);
+    assert.equal("verificationToken" in me.body.user, false);
     const serialized = JSON.stringify(me.body);
     assert.equal(serialized.includes("buyer-route-subject"), false);
 
-    // Re-sign-in via the adapter seam to inspect the verify-token
-    // response shape directly.
     const magic = await adapter.requestSignIn({ email: "buyer-route@example.com" });
-    assert.ok(magic.verifierToken);
+    assert.ok(magic.verificationToken);
     const verify = await request(app)
       .post("/api/auth/verify-token")
-      .send({ requestId: magic.verifierToken })
+      .send({ verificationToken: magic.verificationToken })
       .set("Content-Type", "application/json");
     assert.equal(verify.status, 200);
     assert.equal("identitySubject" in verify.body.user, false);
-    assert.equal("verifierToken" in verify.body.user, false);
+    assert.equal("verificationToken" in verify.body.user, false);
     const verifySerialized = JSON.stringify(verify.body);
     assert.equal(verifySerialized.includes("buyer-route-subject"), false);
-    assert.equal(verifySerialized.includes(magic.verifierToken ?? ""), false);
+    assert.equal(verifySerialized.includes(magic.verificationToken ?? ""), false);
   });
 
   test("POST /api/auth/acting-workspace authorizes a current member (GS 4)", async () => {
@@ -305,18 +308,13 @@ async function signIn(
   adapter: DeterministicIdentityAdapter,
   email: string,
 ): Promise<string> {
-  // P0-001: drive the verify step with the private verifierToken
-  // the adapter exposes for tests (and the operator recovery path
-  // reads from the server log). The public /api/auth/magic-link
-  // route only returns the public correlationId, which is NOT a
-  // verify credential.
   const magic = await adapter.requestSignIn({ email });
-  if (!magic.verifierToken) {
-    throw new Error("verifierToken missing from adapter result");
+  if (!magic.verificationToken) {
+    throw new Error("verificationToken missing from adapter result");
   }
   const verify = await request(app)
     .post("/api/auth/verify-token")
-    .send({ requestId: magic.verifierToken })
+    .send({ verificationToken: magic.verificationToken })
     .set("Content-Type", "application/json");
   return extractCookie(verify.headers["set-cookie"]);
 }
@@ -329,23 +327,10 @@ function extractCookie(headers: string | string[] | undefined): string {
   return cookie.split(";")[0]!;
 }
 
-// Mirror the deterministic adapter's subject derivation so the test
-// seeds line up with the mapping AuthenticationService computes at
-// verify-time. The hash is opaque to the rest of the system; the
-// only requirement is internal consistency between the seed and
-// the adapter.
 function deterministicSubjectFor(email: string): string {
-  // Inline copy of the adapter's hash so the test doesn't import
-  // a private helper. Keep in sync with
-  // deterministic-identity-adapter.ts.
   return createHash("sha256").update(`deterministic|${email.trim().toLowerCase()}`).digest("hex");
 }
 
-// Skip the Prisma integration test if the disposable test database is
-// not running. The unit suite above already exercises every
-// authorization path with the in-memory adapter; the integration
-// test below proves the Prisma adapter converges on the same
-// behaviour.
 describe("BG1 auth routes (Prisma, disposable PostgreSQL)", () => {
   let skip = false;
   let prisma: ReturnType<typeof createPrismaClient> | null = null;

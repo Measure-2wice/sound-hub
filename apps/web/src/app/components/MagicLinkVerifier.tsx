@@ -2,12 +2,19 @@
 
 // Magic-link verification shared component.
 //
-// Background: both the Supabase callback URL (`/auth/callback?token=...`)
-// and the deterministic adapter's dev verification URL
-// (`/auth/verify?request_id=...`) POST the request id to the API. The
-// shared component encapsulates the call so the two pages cannot
-// drift in their handling of expired / already-used / network-
-// failure outcomes.
+// Background: both the Supabase callback URL
+// (`/auth/callback?token=...`) and the deterministic adapter's dev
+// verification URL (`/auth/verify?token=...`) POST the private
+// verification credential to the API. The shared component
+// encapsulates the call so the two pages cannot drift in their
+// handling of expired / already-used / network-failure outcomes.
+//
+// Per ticket #59 P2-001 the credential field is named
+// `verificationToken` on the wire — distinct from the public
+// `requestId` correlation id returned from `/api/auth/magic-link`.
+// Presenting the public correlation id to `/api/auth/verify-token`
+// is rejected as an unknown credential, so the component must
+// always read the private token from the URL query parameter.
 
 import { useEffect, type ReactNode } from "react";
 import { useRouter, useSearchParams } from "next/navigation";
@@ -23,15 +30,15 @@ export function MagicLinkVerifier({ paramName, children }: MagicLinkVerifierProp
   const searchParams = useSearchParams();
 
   useEffect(() => {
-    const requestId = searchParams.get(paramName);
-    if (!requestId) {
+    const verificationToken = searchParams.get(paramName);
+    if (!verificationToken) {
       router.replace("/login");
       return;
     }
     let cancelled = false;
     void (async () => {
       try {
-        await verifyToken({ requestId });
+        await verifyToken({ verificationToken });
         if (!cancelled) router.replace("/dashboard");
       } catch {
         if (!cancelled) router.replace("/login");

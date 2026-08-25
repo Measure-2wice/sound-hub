@@ -10,13 +10,17 @@
 // Routes:
 //   POST /api/auth/magic-link
 //     Body: { email }.
-//     Response: { ok: true, devVerificationUrl? }. Neutral on
-//     well-formed requests regardless of whether the email is
+//     Response: { ok: true, requestId, devVerificationUrl? }. Neutral
+//     on well-formed requests regardless of whether the email is
 //     registered, so the surface cannot be used to enumerate
-//     accounts.
+//     accounts. The `requestId` is the PUBLIC correlation id; the
+//     private verification credential is never exposed.
 //
 //   POST /api/auth/verify-token
-//     Body: { requestId }.
+//     Body: { verificationToken }. The field is the PRIVATE one-time
+//     credential the browser extracted from the magic-link callback
+//     URL. The PUBLIC correlation id from `/magic-link` is NOT
+//     acceptable (per ticket #59 P2-001).
 //     Response: { ok: true, user } and a `Set-Cookie: soundhub_session`
 //     header carrying the opaque session id.
 //
@@ -161,7 +165,7 @@ async function handleVerifyToken(req: Request, res: Response, deps: AuthRouteDep
 
   try {
     const { session, publicUser } = await deps.authenticationService.verifySignIn({
-      requestId: parsed.requestId,
+      verificationToken: parsed.verificationToken,
     });
     setSessionCookie(res, session.sessionId, session.expiresAt);
     const body = bg1VerifyTokenResponseV1Schema.parse({ ok: true, user: publicUser });
