@@ -63,6 +63,16 @@ export interface IdentityAdapterFactoryOptions {
    * on the deployed fallback decision without spelunking the code.
    */
   readonly log?: (message: string) => void;
+  /**
+   * Operator-controlled escape hatch for the deterministic
+   * fallback. When `true`, the deterministic adapter returns the
+   * `devVerificationUrl` so the operator-driven recovery UI can
+   * complete sign-in without email delivery. Defaults to `false`;
+   * the deployed process enables it only when
+   * `BG1_DETERMINISTIC_OPERATOR_MODE=1`. Tests pass `true` so the
+   * existing automated journeys continue to work end to end.
+   */
+  readonly allowDeterministicOperatorMode?: boolean;
 }
 
 export interface BuiltIdentityAdapters {
@@ -83,7 +93,11 @@ export interface BuiltIdentityAdapters {
 export function buildIdentityAdapters(
   options: IdentityAdapterFactoryOptions = {},
 ): BuiltIdentityAdapters {
-  const deterministic = new DeterministicIdentityAdapter();
+  const operatorMode =
+    options.allowDeterministicOperatorMode ?? process.env.BG1_DETERMINISTIC_OPERATOR_MODE === "1";
+  const deterministic = new DeterministicIdentityAdapter({
+    allowDevVerificationUrl: operatorMode,
+  });
   const managed = new ManagedIdentityAdapter({
     supabaseUrl: options.supabase?.url,
     supabaseAnonKey: options.supabase?.anonKey,

@@ -37,11 +37,50 @@ describe("AuthenticationService", () => {
     const b = await service.requestSignIn({ email: "buyer@example.com" });
     assert.equal(a.envelope.ok, true);
     assert.equal(b.envelope.ok, true);
-    // The dev verification URL is present (deterministic adapter);
-    // the request ids are different (every request is fresh).
-    assert.ok(a.envelope.devVerificationUrl);
-    assert.ok(b.envelope.devVerificationUrl);
-    assert.notEqual(a.envelope.devVerificationUrl, b.envelope.devVerificationUrl);
+    // The opaque requestId is always present; the
+    // devVerificationUrl is operator-only and never crosses the
+    // public response boundary. The request ids are different
+    // (every request is fresh).
+    assert.ok(a.envelope.requestId.length > 0);
+    assert.ok(b.envelope.requestId.length > 0);
+    assert.notEqual(a.envelope.requestId, b.envelope.requestId);
+    assert.equal(a.envelope.devVerificationUrl, undefined);
+    assert.equal(b.envelope.devVerificationUrl, undefined);
+  });
+
+  test("requestSignIn forwards the operator-mode URL only to the operator sink, not the response (P1-002)", async () => {
+    const originalLog = console.log;
+    const logs: string[] = [];
+    console.log = (msg: string) => {
+      logs.push(msg);
+    };
+    try {
+      const operatorAdapter = new DeterministicIdentityAdapter({
+        now: () => now,
+        allowDevVerificationUrl: true,
+      });
+      const operatorService = new AuthenticationService({
+        identityAdapter: operatorAdapter,
+        authRepository: authRepo,
+        now: () => now,
+      });
+      const result = await operatorService.requestSignIn({ email: "buyer@example.com" });
+      const envelope = result.envelope;
+      assert.ok(envelope, "envelope must be defined");
+      assert.ok(envelope.requestId, "envelope.requestId must be defined");
+      assert.ok(envelope.requestId.length > 0);
+      // The response MUST NOT carry the URL even in operator mode.
+      assert.equal(envelope.devVerificationUrl, undefined);
+      // The URL goes to the operator's log sink instead.
+      assert.ok(
+        logs.some(
+          (line) =>
+            line.includes("operator-mode verification URL") && line.includes(envelope.requestId),
+        ),
+      );
+    } finally {
+      console.log = originalLog;
+    }
   });
 
   test("verifySignIn returns a server session and resolves the UserAccount", async () => {

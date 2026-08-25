@@ -17,6 +17,8 @@ import type { MetadataRepository } from "./repositories/metadata.repository.js";
 import type { AuthRepository } from "./auth-repository/auth-repository.js";
 import type { IdentityAdapter } from "./identity/identity-adapter.js";
 import { buildIdentityAdapters } from "./identity/identity-adapter-factory.js";
+import { ManagedIdentityAdapter, type SmokeResult } from "./identity/managed-identity-adapter.js";
+import { runStartupSmoke } from "./identity/startup-smoke.js";
 import { buildSafeError, generateRequestId, writeSafeError } from "./lib/errors.js";
 
 export interface AppOptions {
@@ -27,6 +29,15 @@ export interface AppOptions {
   readonly workspaceAuthorizationService?: WorkspaceAuthorizationService;
   readonly authRepository?: AuthRepository;
   readonly identityAdapter?: IdentityAdapter;
+  /**
+   * Pre-computed bounded smoke result. When the caller has already
+   * run the bounded deployed-provider smoke (e.g. via
+   * `runStartupSmoke`), pass the result here so the factory's
+   * managed-vs-deterministic selection is driven by a real
+   * network probe. When omitted, the factory treats the smoke as
+   * missing and selects the deterministic fallback.
+   */
+  readonly managedSmoke?: SmokeResult;
 }
 
 export interface BuiltApp {
@@ -55,12 +66,7 @@ export function buildApp(options: AppOptions = {}): BuiltApp {
     log: (message) => {
       console.log(`[bg1] ${message}`);
     },
-    // The async smoke result is not awaited here so the
-    // composition root stays synchronous. The factory falls back
-    // to deterministic when the smoke result is missing; the
-    // deployable process can run `await identityAdapters.managed.smoke()`
-    // before calling `buildApp` to get a real probe.
-    managedSmoke: undefined,
+    managedSmoke: options.managedSmoke,
   });
   const identityAdapter = options.identityAdapter ?? identityAdapters.active;
   const authenticationService =
@@ -136,4 +142,25 @@ export function buildApp(options: AppOptions = {}): BuiltApp {
     authRepository,
     identityAdapter,
   };
+}
+
+/**
+ * Run the bounded deployed-provider smoke and assemble the app with
+ * the smoke result. This is the deployed-process entry point; it
+ * makes the managed-vs-deterministic selection drive from a real
+ * bounded network probe so production startup never silently picks
+ * the deterministic fallback. Test code continues to call
+ * {@link buildApp} directly with mocked services.
+ */
+export async function buildAppWithSmoke(
+  options: Omit<AppOptions, "managedSmoke"> = {},
+): Promise<BuiltApp> {
+  const managed = new ManagedIdentityAdapter({
+    supabaseUrl: process.env.SUPABASE_URL,
+    supabaseAnonKey: process.env.SUPABASE_ANON_KEY,
+    supabaseServiceRoleKey: process.env.SUPABASE_SERVICE_ROLE_KEY,
+    emailRedirectTo: process.env.AUTH_CALLBACK_URL,
+  });
+  const smokeResult = await runStartupSmoke({ managed });
+  return buildApp({ ...options, managedSmoke: smokeResult });
 }

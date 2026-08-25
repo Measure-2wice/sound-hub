@@ -61,9 +61,8 @@ import {
   type SafeErrorResponse,
 } from "../lib/errors.js";
 import { SESSION_COOKIE, setSessionCookie, clearSessionCookie } from "../lib/session-cookie.js";
-import type { AuthRepository, PublicUserView } from "../auth-repository/auth-repository.js";
+import type { AuthRepository } from "../auth-repository/auth-repository.js";
 import { toPublicUser } from "../dto/public-mappers.js";
-import type { Bg1PublicUserV1 } from "@soundhub/types";
 
 export interface AuthRouteDeps {
   readonly authenticationService: AuthenticationService;
@@ -179,7 +178,7 @@ async function handleMe(req: Request, res: Response, deps: AuthRouteDeps): Promi
   res.setHeader("x-request-id", requestId);
   const sessionId = readSessionCookie(req);
   const view = await deps.authenticationService.resolveSession(sessionId);
-  const body = bg1SessionInfoV1Schema.parse({ user: view ? toPublicUserView(view) : null });
+  const body = bg1SessionInfoV1Schema.parse({ user: view ? toPublicUser(view) : null });
   res.status(200).json(body);
 }
 
@@ -384,10 +383,4 @@ function writeAuthError(res: Response, err: unknown, requestId: string, route: s
       requestId,
     ),
   );
-}
-
-function toPublicUserView(view: PublicUserView): Bg1PublicUserV1 {
-  // Defer to the shared mapper so the route cannot drift from the
-  // authentication service or the workspace authorization service.
-  return toPublicUser(view);
 }

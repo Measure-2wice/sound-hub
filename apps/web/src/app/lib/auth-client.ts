@@ -6,6 +6,13 @@
 // session cookie rides on the request. Responses are parsed against
 // the shared Zod schemas from `@soundhub/types` so the browser cannot
 // drift from the contract.
+//
+// Per ticket #59 P1-002, the deployed process never returns a
+// `devVerificationUrl`; the operator-driven recovery workflow reads
+// it from server logs. The browser uses the opaque `requestId`
+// (managed: SoundHub UUID; deterministic: operator-side) to drive
+// verify-token when the magic-link callback URL is configured to
+// route through the deterministic fallback.
 
 import type {
   Bg1MagicLinkRequestV1,

@@ -5,7 +5,8 @@
 //
 //   1. Automated tests, where waiting on real email delivery and
 //      signing in through the Supabase SSR callback would be
-//      prohibitive.
+//      prohibitive. Tests opt in to the dev verification URL via
+//      the `allowDevVerificationUrl` constructor option.
 //   2. The approved emergency fallback path: if managed email
 //      delivery, callback/session integration, or deployment
 //      configuration cannot pass the bounded provider smoke, this
@@ -15,12 +16,15 @@
 //      every other layer (session store, authorization service,
 //      route handler) is identical to the managed path.
 //
-// The adapter generates a single-use opaque request id, stores it
-// in an in-memory map keyed by request id, and returns a
-// `devVerificationUrl` so the test harness (or the emergency
-// fallback UI) can verify without email delivery. The URL embeds
-// the request id verbatim; consumers extract it with
-// `verifySignIn({ requestId })`.
+// Per ticket #59 P1-002, the deterministic fallback must NOT
+// return a usable login credential to any browser that merely
+// supplies a demo email. The dev verification URL is gated behind
+// the `allowDevVerificationUrl` constructor option (default
+// `false`), which the operator enables only in an explicit
+// allow-listed recovery mode (set via `BG1_DETERMINISTIC_OPERATOR_MODE=1`).
+// When disabled, the adapter still proves possession of the email
+// (via `verifySignIn({ requestId })`) but only the operator —
+// reading the requestId from the server log — can mint a session.
 //
 // Per ADR 0004 the adapter never touches UserAccount, Workspace, or
 // membership tables — those live in `PrismaAuthRepository`.
@@ -59,10 +63,23 @@ export interface DeterministicIdentityAdapterOptions {
    */
   readonly ttlMs?: number;
   /**
+   * Operator-controlled escape hatch. When `true`, the adapter
+   * returns a `devVerificationUrl` that an operator-driven UI
+   * (or a test harness) can follow to verify without email
+   * delivery. Defaults to `false` so the deployed process never
+   * exposes a usable login credential to an unauthenticated
+   * browser that merely supplies an email. Tests pass `true`
+   * explicitly; the operator enables the allow-listed recovery
+   * mode by setting `BG1_DETERMINISTIC_OPERATOR_MODE=1` in the
+   * deployed process.
+   */
+  readonly allowDevVerificationUrl?: boolean;
+  /**
    * Optional override of the path the returned dev verification URL
    * points at. Defaults to `/auth/verify`. Tests can override this
    * to assert the contract independently from the Next.js route
-   * placement.
+   * placement. Only honoured when `allowDevVerificationUrl` is
+   * `true`.
    */
   readonly verificationPathPrefix?: string;
 }
@@ -77,11 +94,13 @@ export class DeterministicIdentityAdapter implements IdentityAdapter {
   private readonly pending = new Map<string, PendingRequest>();
   private readonly now: () => number;
   private readonly ttlMs: number;
+  private readonly allowDevVerificationUrl: boolean;
   private readonly verificationPathPrefix: string;
 
   constructor(options: DeterministicIdentityAdapterOptions = {}) {
     this.now = options.now ?? (() => Date.now());
     this.ttlMs = options.ttlMs ?? DEFAULT_TTL_MS;
+    this.allowDevVerificationUrl = options.allowDevVerificationUrl ?? false;
     this.verificationPathPrefix = options.verificationPathPrefix ?? "/auth/verify";
   }
 
@@ -118,6 +137,17 @@ export class DeterministicIdentityAdapter implements IdentityAdapter {
     return count;
   }
 
+  /**
+   * Returns the opaque requestId the operator (or test harness)
+   * must pass to {@link verifySignIn}. Per ticket #59 P1-002,
+   * the dev verification URL is NEVER returned to the browser —
+   * the deployed deterministic fallback must not expose a usable
+   * login credential to any browser that merely supplies a demo
+   * email. When `allowDevVerificationUrl` is `true`, the URL is
+   * emitted to the operator's log sink so the operator-driven
+   * recovery workflow can drive verifySignIn through a separate
+   * internal boundary the browser cannot reach.
+   */
   async requestSignIn(input: { readonly email: string }): Promise<SignInRequestResult> {
     const normalizedEmail = input.email.trim().toLowerCase();
     const requestId = randomUUID();
@@ -128,10 +158,17 @@ export class DeterministicIdentityAdapter implements IdentityAdapter {
       expiresAt: this.now() + this.ttlMs,
       consumed: false,
     });
-    return Promise.resolve({
-      requestId,
-      devVerificationUrl: `${this.verificationPathPrefix}?request_id=${encodeURIComponent(requestId)}`,
-    });
+    if (this.allowDevVerificationUrl) {
+      const url = `${this.verificationPathPrefix}?request_id=${encodeURIComponent(requestId)}`;
+      // Operator-mode log sink: the URL is recorded so the
+      // operator can drive the recovery flow. The browser MUST
+      // NEVER receive the URL — the response carries only the
+      // opaque requestId.
+      console.log(
+        `[bg1-deterministic] operator-mode verification URL for ${normalizedEmail}: ${url}`,
+      );
+    }
+    return Promise.resolve({ requestId });
   }
 
   async verifySignIn(input: { readonly requestId: string }): Promise<VerifiedIdentity | null> {

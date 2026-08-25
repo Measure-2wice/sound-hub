@@ -11,7 +11,6 @@
 /* eslint-disable @typescript-eslint/no-floating-promises */
 /* eslint-disable @typescript-eslint/no-unsafe-assignment */
 /* eslint-disable @typescript-eslint/no-unsafe-member-access */
-/* eslint-disable @typescript-eslint/no-unsafe-argument */
 /* eslint-disable @typescript-eslint/no-unsafe-call */
 /* eslint-disable @typescript-eslint/consistent-type-imports */
 
@@ -32,7 +31,7 @@ const SELLER_USER_ID = "user-route-seller";
 const SELLER_WORKSPACE_ID = "ws-route-seller";
 
 describe("BG1 auth routes (in-memory, deterministic adapter)", () => {
-  const adapter = new DeterministicIdentityAdapter();
+  const adapter = new DeterministicIdentityAdapter({ allowDevVerificationUrl: true });
   // The deterministic adapter derives the provider subject from the
   // email address (sha256 of "deterministic|<email>"). The test seeds
   // use the same hashing so the seeded identity mapping matches the
@@ -98,15 +97,46 @@ describe("BG1 auth routes (in-memory, deterministic adapter)", () => {
     prismaClient: stubPrisma,
   });
 
-  test("POST /api/auth/magic-link returns the neutral envelope and a devVerificationUrl", async () => {
+  test("POST /api/auth/magic-link returns the neutral envelope with the opaque requestId and never a browser-facing devVerificationUrl (P1-002)", async () => {
     const response = await request(app)
       .post("/api/auth/magic-link")
       .send({ email: "buyer-route@example.com" })
       .set("Content-Type", "application/json");
     assert.equal(response.status, 200);
     assert.equal(response.body.ok, true);
-    assert.ok(response.body.devVerificationUrl);
-    assert.ok(response.body.devVerificationUrl.includes("request_id="));
+    assert.ok(response.body.requestId);
+    // The deployed deterministic fallback NEVER exposes a usable
+    // login credential to any browser that merely supplies a demo
+    // email — even when the deterministic adapter runs in operator
+    // mode, the URL is logged to the operator's sink instead of
+    // crossing the response boundary. The browser therefore cannot
+    // pick a demo identity by email.
+    assert.equal(response.body.devVerificationUrl, undefined);
+  });
+
+  test("POST /api/auth/magic-link never returns a devVerificationUrl regardless of operator mode (P1-002)", async () => {
+    // Same contract as the test above but with a fresh
+    // adapter that has allowDevVerificationUrl:false. The
+    // deployed browser never receives a usable URL.
+    const restrictedAdapter = new DeterministicIdentityAdapter();
+    const { app: restrictedApp } = buildApp({
+      authenticationService: new AuthenticationService({
+        identityAdapter: restrictedAdapter,
+        authRepository: authRepo,
+      }),
+      workspaceAuthorizationService,
+      authRepository: authRepo,
+      identityAdapter: restrictedAdapter,
+      prismaClient: stubPrisma,
+    });
+    const response = await request(restrictedApp)
+      .post("/api/auth/magic-link")
+      .send({ email: "buyer-route@example.com" })
+      .set("Content-Type", "application/json");
+    assert.equal(response.status, 200);
+    assert.equal(response.body.ok, true);
+    assert.ok(response.body.requestId);
+    assert.equal(response.body.devVerificationUrl, undefined);
   });
 
   test("POST /api/auth/magic-link rejects malformed input with INVALID_AUTH_REQUEST", async () => {
@@ -134,9 +164,9 @@ describe("BG1 auth routes (in-memory, deterministic adapter)", () => {
       .post("/api/auth/magic-link")
       .send({ email: "buyer-route@example.com" })
       .set("Content-Type", "application/json");
-    const requestId = new URL(magic.body.devVerificationUrl, "http://localhost").searchParams.get(
-      "request_id",
-    );
+    assert.equal(magic.status, 200);
+    assert.ok(magic.body.requestId);
+    const requestId = magic.body.requestId as string;
     const verify2 = await request(app)
       .post("/api/auth/verify-token")
       .send({ requestId })
@@ -201,9 +231,8 @@ describe("BG1 auth routes (in-memory, deterministic adapter)", () => {
       .post("/api/auth/magic-link")
       .send({ email: "buyer-route@example.com" })
       .set("Content-Type", "application/json");
-    const requestId = new URL(magic.body.devVerificationUrl, "http://localhost").searchParams.get(
-      "request_id",
-    );
+    assert.equal(magic.status, 200);
+    const requestId = magic.body.requestId as string;
     const verify = await request(app)
       .post("/api/auth/verify-token")
       .send({ requestId })
@@ -264,9 +293,7 @@ async function signIn(app: import("express").Application, email: string): Promis
     .post("/api/auth/magic-link")
     .send({ email })
     .set("Content-Type", "application/json");
-  const requestId = new URL(magic.body.devVerificationUrl, "http://localhost").searchParams.get(
-    "request_id",
-  );
+  const requestId = magic.body.requestId as string;
   const verify = await request(app)
     .post("/api/auth/verify-token")
     .send({ requestId })

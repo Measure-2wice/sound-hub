@@ -15,12 +15,55 @@ import { deriveDeterministicSubject } from "@soundhub/types";
 import { DeterministicIdentityAdapter } from "./deterministic-identity-adapter.js";
 
 describe("DeterministicIdentityAdapter", () => {
-  test("requestSignIn returns a non-empty request id and a devVerificationUrl", async () => {
+  test("requestSignIn returns the requestId but NEVER a browser-facing devVerificationUrl, even in operator mode (P1-002)", async () => {
+    const adapter = new DeterministicIdentityAdapter({ allowDevVerificationUrl: true });
+    const result = await adapter.requestSignIn({ email: "buyer@example.com" });
+    assert.ok(result.requestId.length > 0);
+    // The URL is operator-only and is logged to the operator's
+    // sink; it MUST NOT cross the public response boundary.
+    assert.equal(result.devVerificationUrl, undefined);
+  });
+
+  test("requestSignIn OMITS the devVerificationUrl by default so the deployed fallback never exposes a usable login credential (P1-002)", async () => {
     const adapter = new DeterministicIdentityAdapter();
     const result = await adapter.requestSignIn({ email: "buyer@example.com" });
     assert.ok(result.requestId.length > 0);
-    assert.ok(result.devVerificationUrl);
-    assert.ok(result.devVerificationUrl.includes(result.requestId));
+    assert.equal(result.devVerificationUrl, undefined);
+  });
+
+  test("requestSignIn still produces a verifiable requestId when devVerificationUrl is disabled (P1-002)", async () => {
+    const adapter = new DeterministicIdentityAdapter();
+    const request = await adapter.requestSignIn({ email: "buyer@example.com" });
+    // The operator (or test harness) drives verifySignIn directly
+    // with the requestId — no browser-facing URL is needed.
+    const verified = await adapter.verifySignIn({ requestId: request.requestId });
+    assert.ok(verified);
+    assert.equal(verified.provider, "deterministic");
+    assert.equal(verified.providerEmail, "buyer@example.com");
+  });
+
+  test("operator-mode requestSignIn logs the verification URL to the operator sink without surfacing it in the response (P1-002)", async () => {
+    const logs: string[] = [];
+    const originalLog = console.log;
+    console.log = (msg: string) => {
+      logs.push(msg);
+    };
+    try {
+      const adapter = new DeterministicIdentityAdapter({ allowDevVerificationUrl: true });
+      const result = await adapter.requestSignIn({ email: "buyer@example.com" });
+      assert.equal(result.devVerificationUrl, undefined);
+      assert.ok(
+        logs.some(
+          (line) =>
+            line.includes("operator-mode verification URL") &&
+            line.includes(result.requestId) &&
+            line.includes("buyer@example.com"),
+        ),
+        "operator-mode URL must be logged for the operator's recovery workflow",
+      );
+    } finally {
+      console.log = originalLog;
+    }
   });
 
   test("verifySignIn returns null for an unknown request id", async () => {
@@ -114,12 +157,28 @@ describe("DeterministicIdentityAdapter", () => {
     assert.equal(adapter.pendingCount(), 0);
   });
 
-  test("the verificationPathPrefix is reflected in devVerificationUrl", async () => {
-    const adapter = new DeterministicIdentityAdapter({
-      verificationPathPrefix: "/api/auth/dev-verify",
-    });
-    const result = await adapter.requestSignIn({ email: "buyer@example.com" });
-    assert.ok(result.devVerificationUrl?.startsWith("/api/auth/dev-verify?request_id="));
+  test("the verificationPathPrefix is reflected in the operator-mode log when allowDevVerificationUrl is true (P1-002)", async () => {
+    const logs: string[] = [];
+    const originalLog = console.log;
+    console.log = (msg: string) => {
+      logs.push(msg);
+    };
+    try {
+      const adapter = new DeterministicIdentityAdapter({
+        allowDevVerificationUrl: true,
+        verificationPathPrefix: "/api/auth/dev-verify",
+      });
+      const result = await adapter.requestSignIn({ email: "buyer@example.com" });
+      assert.equal(result.devVerificationUrl, undefined);
+      assert.ok(
+        logs.some(
+          (line) =>
+            line.includes("/api/auth/dev-verify?request_id=") && line.includes(result.requestId),
+        ),
+      );
+    } finally {
+      console.log = originalLog;
+    }
   });
 
   test("the seed-derived subject and the adapter-derived subject agree for the BG1 demo emails", async () => {

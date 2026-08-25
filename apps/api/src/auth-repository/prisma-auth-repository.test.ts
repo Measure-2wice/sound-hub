@@ -44,7 +44,7 @@ describe("PrismaAuthRepository", () => {
     assert.equal(mapping.providerEmail, "demo.buyer@soundhub.example");
   });
 
-  test("createUserForIdentity links to a pre-existing UserAccount when its email matches and no identity provider exists yet (P1-002)", async (t) => {
+  test("createUserForIdentity attaches every new provider credential to the SAME SoundHub UserAccount for that email (P1-001)", async (t) => {
     if (skip || !repo || !prisma) {
       t.skip();
       return;
@@ -57,103 +57,62 @@ describe("PrismaAuthRepository", () => {
       where: { providerEmail: "linked-user@soundhub.example" },
     });
     await prisma.identityProvider.deleteMany({
-      where: { subject: { in: ["first-credential", "second-credential"] } },
+      where: { subject: { in: ["first-credential", "second-credential", "third-credential"] } },
     });
     await prisma.userAccount.deleteMany({
       where: { email: "linked-user@soundhub.example" },
     });
     // Pre-create a UserAccount with an email and NO IdentityProvider
     // mappings. This models the application-owned linking seam: a
-    // soundhub-managed account exists before the human first signs
+    // SoundHub-managed account exists before the human first signs
     // in via a provider.
     const precreated = await prisma.userAccount.create({
       data: { email: "linked-user@soundhub.example" },
     });
     try {
-      const mapping = await repo.createUserForIdentity({
+      const first = await repo.createUserForIdentity({
         provider: "managed-magic-link",
         subject: "first-credential",
         providerEmail: "linked-user@soundhub.example",
       });
       // The new IdentityProvider must point to the PRE-EXISTING
       // UserAccount, not a freshly-created one.
-      assert.equal(mapping.userAccountId, precreated.id);
+      assert.equal(first.userAccountId, precreated.id);
 
-      // Once a SoundHub-managed UserAccount has its first
-      // IdentityProvider mapping, additional credentials for the
-      // same email are TREATED AS A DIFFERENT HUMAN. The repository
-      // creates a fresh UserAccount so the existing marketplace
-      // identity is never silently extended. The seeded email
-      // already represents a real SoundHub user once any provider
-      // has claimed it.
+      // Application-owned verified linking: a second provider for
+      // the same email attaches to the SAME UserAccount. The
+      // marketplace identity does not change when the human
+      // changes providers.
       const second = await repo.createUserForIdentity({
         provider: "deterministic",
         subject: "second-credential",
         providerEmail: "linked-user@soundhub.example",
       });
-      assert.notEqual(second.userAccountId, precreated.id);
+      assert.equal(second.userAccountId, precreated.id);
 
-      // The first link still attaches the new IdentityProvider to
-      // precreated; the second call created a separate account.
+      // A third credential (yet another provider) keeps linking to
+      // the same UserAccount; the user accumulates providers but
+      // never loses their marketplace identity.
+      const third = await repo.createUserForIdentity({
+        provider: "managed-magic-link",
+        subject: "third-credential",
+        providerEmail: "linked-user@soundhub.example",
+      });
+      assert.equal(third.userAccountId, precreated.id);
+
       const mappings = await prisma.identityProvider.findMany({
         where: { userAccountId: precreated.id },
       });
-      assert.equal(mappings.length, 1);
+      assert.equal(mappings.length, 3);
     } finally {
       void prisma.identityProvider.deleteMany({
         where: { providerEmail: "linked-user@soundhub.example" },
       });
       void prisma.identityProvider.deleteMany({
-        where: { subject: { in: ["first-credential", "second-credential"] } },
+        where: { subject: { in: ["first-credential", "second-credential", "third-credential"] } },
       });
       void prisma.userAccount.deleteMany({
         where: { email: "linked-user@soundhub.example" },
-      });
-    }
-  });
-
-  test("createUserForIdentity does NOT link when the email UserAccount already has an identity provider (P1-002)", async (t) => {
-    if (skip || !repo || !prisma) {
-      t.skip();
-      return;
-    }
-    // Clean up any leftover rows from a previous run so the test
-    // sees a clean email namespace.
-    void (await prisma.identityProvider.deleteMany({
-      where: { providerEmail: "owner@soundhub.example" },
-    }));
-    void (await prisma.userAccount.deleteMany({
-      where: { email: "owner@soundhub.example" },
-    }));
-    // A UserAccount that already has an IdentityProvider mapping
-    // represents a different human sharing the email. The link seam
-    // must NOT silently merge it with a new credential.
-    const existing = await prisma.userAccount.create({
-      data: { email: "owner@soundhub.example" },
-    });
-    const existingMapping = await prisma.identityProvider.create({
-      data: {
-        provider: "deterministic",
-        subject: "owner-subject",
-        providerEmail: "owner@soundhub.example",
-        userAccountId: existing.id,
-      },
-    });
-    try {
-      const second = await repo.createUserForIdentity({
-        provider: "managed-magic-link",
-        subject: "impostor-subject",
-        providerEmail: "owner@soundhub.example",
-      });
-      assert.notEqual(second.userAccountId, existing.id);
-    } finally {
-      void prisma.identityProvider.delete({ where: { id: existingMapping.id } });
-      void prisma.userAccount.delete({ where: { id: existing.id } });
-      void prisma.identityProvider.deleteMany({
-        where: { subject: "impostor-subject" },
-      });
-      void prisma.userAccount.deleteMany({
-        where: { email: "owner@soundhub.example" },
       });
     }
   });

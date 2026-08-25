@@ -569,12 +569,22 @@ export const bg1MagicLinkResponseV1Schema = z
     // request; rate-limited or otherwise rejected requests produce the
     // standard safe error envelope instead.
     ok: z.literal(true),
-    // Deterministic-adapter only: a one-time verification URL that the
-    // browser can follow in the absence of email delivery. Production
-    // Supabase magic-link emails render this field absent. The contract
-    // documents the field name verbatim so a contract-drift detector
-    // can catch a managed adapter that begins leaking the verification
-    // URL to production.
+    // Opaque SoundHub-side correlation id for the magic-link request.
+    // The managed adapter returns a SoundHub-side UUID; the
+    // deterministic adapter returns its internal request id. The
+    // managed callback flow never uses this value — the Supabase
+    // token arrives in the email link. The deterministic fallback
+    // uses it to drive the operator-controlled verify-token call.
+    requestId: z.string().min(1).max(256),
+    // Deterministic-adapter operator-mode only: a one-time
+    // verification URL that the operator-driven recovery UI can
+    // follow in the absence of email delivery. Production Supabase
+    // magic-link emails render this field absent; the deployed
+    // deterministic fallback also renders it absent so an
+    // unauthenticated browser cannot choose a demo identity by
+    // email. The contract documents the field name verbatim so a
+    // contract-drift detector can catch an adapter that begins
+    // leaking the verification URL to a deployed browser.
     devVerificationUrl: z.string().min(1).max(2048).optional(),
   })
   .strict();

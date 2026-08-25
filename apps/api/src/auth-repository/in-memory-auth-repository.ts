@@ -94,7 +94,34 @@ export class InMemoryAuthRepository implements AuthRepository {
   }): Promise<UserIdentityMapping> {
     const existing = await this.findUserByIdentity(input);
     if (existing) return existing;
-    const userAccountId = randomUUID();
+    // Application-owned verified linking (ticket #59 P1-001): when
+    // the provider surfaces an email that already maps to a known
+    // UserAccount, the new provider mapping attaches to that same
+    // UserAccount. The (provider, subject) tuple remains unique.
+    let userAccountId: string | null = null;
+    if (input.providerEmail) {
+      for (const candidate of this.usersById.values()) {
+        if (candidate.email === input.providerEmail) {
+          userAccountId = candidate.userAccountId;
+          break;
+        }
+      }
+    }
+    if (!userAccountId) {
+      userAccountId = randomUUID();
+      this.usersById.set(userAccountId, {
+        userAccountId,
+        email: input.providerEmail,
+        displayName: null,
+        identityProvider: input.provider,
+        identitySubject: input.subject,
+        workspaces: [],
+      });
+    } else {
+      // Attach the new provider identity to the existing
+      // UserAccount. The existing memberships and provider list
+      // are preserved; the (provider, subject) tuple is added.
+    }
     const mapping: UserIdentityMapping = {
       provider: input.provider,
       subject: input.subject,
@@ -102,14 +129,6 @@ export class InMemoryAuthRepository implements AuthRepository {
       userAccountId,
     };
     this.usersByIdentity.set(`${input.provider}|${input.subject}`, mapping);
-    this.usersById.set(userAccountId, {
-      userAccountId,
-      email: input.providerEmail,
-      displayName: null,
-      identityProvider: input.provider,
-      identitySubject: input.subject,
-      workspaces: [],
-    });
     return mapping;
   }
 

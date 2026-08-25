@@ -67,12 +67,17 @@ export interface RequestSignInResult {
   /**
    * Neutral envelope returned to the browser. Identical regardless of
    * whether the email is registered, so the public surface cannot be
-   * used to enumerate accounts. The `devVerificationUrl` is set only
-   * when the active adapter is the deterministic adapter (test +
-   * emergency fallback path).
+   * used to enumerate accounts. The `requestId` is the opaque
+   * SoundHub-side correlation id (managed: SoundHub UUID;
+   * deterministic: internal request id) and is required by the BG1
+   * shared contract. The `devVerificationUrl` is set only when the
+   * deterministic adapter runs in operator mode (`BG1_DETERMINISTIC_OPERATOR_MODE=1`)
+   * so the deployed fallback never exposes a usable login credential
+   * to an unauthenticated browser that merely supplies a demo email.
    */
   readonly envelope: {
     readonly ok: true;
+    readonly requestId: string;
     readonly devVerificationUrl?: string;
   };
 }
@@ -105,7 +110,7 @@ export class AuthenticationService {
       this.identityAdapter.requestSignIn({ email: input.email }),
     );
     return {
-      envelope: withOptionalDevUrl(result),
+      envelope: withRequestIdAndOptionalDevUrl(result),
     };
   }
 
@@ -226,20 +231,27 @@ export class AuthenticationService {
 // ---------- Mapping helpers (DTO boundary) ----------
 
 /**
- * The verify-token response carries only allow-listed identity and
- * membership facts; provider subjects live in the public user view
- * but never cross the buyer-facing seller DTO. This helper is the
- * single source of truth for the mapping so route handlers and
- * future server-side consumers cannot drift.
+ * The magic-link envelope forwards the adapter's opaque
+ * `requestId` plus the optional `devVerificationUrl`. The
+ * `requestId` is the correlation id the managed and
+ * deterministic adapters return from `requestSignIn`; the
+ * `devVerificationUrl` is operator-only and absent in the
+ * deployed deterministic fallback so an unauthenticated
+ * browser cannot pick a demo identity by email.
  */
-function withOptionalDevUrl(result: SignInRequestResult): {
+function withRequestIdAndOptionalDevUrl(result: SignInRequestResult): {
   ok: true;
+  requestId: string;
   devVerificationUrl?: string;
 } {
   if (result.devVerificationUrl === undefined) {
-    return { ok: true };
+    return { ok: true, requestId: result.requestId };
   }
-  return { ok: true, devVerificationUrl: result.devVerificationUrl };
+  return {
+    ok: true,
+    requestId: result.requestId,
+    devVerificationUrl: result.devVerificationUrl,
+  };
 }
 
 // Re-export the shared mapper for callers that imported it from this
