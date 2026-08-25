@@ -50,7 +50,10 @@ export default function LoginPage() {
 
   const handleDevVerification = async () => {
     if (!devVerificationUrl) return;
-    // Parse ?token=... from the verification URL.
+    // Parse ?token=... from the verification URL. The
+    // deterministic adapter (and the managed callback URL) emit
+    // the one-time credential as `token`; the public correlation
+    // id `requestId` is NEVER a credential.
     const url = new URL(devVerificationUrl, window.location.origin);
     const verificationToken = url.searchParams.get("token");
     if (!verificationToken) {

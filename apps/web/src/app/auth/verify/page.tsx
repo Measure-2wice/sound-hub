@@ -5,10 +5,13 @@
 // Background: the deterministic identity adapter returns a
 // `devVerificationUrl` from `POST /api/auth/magic-link` so the
 // buildathon E2E journey can sign in without real email delivery.
-// The URL points at `/auth/verify?request_id=...`; this page
-// extracts the request id and posts it to the verify-token
-// endpoint exactly like the production callback page. The two
-// pages never diverge because they share the verifier component.
+// The URL points at `/auth/verify?token=<verificationToken>`; this
+// page extracts the PRIVATE one-time credential and posts it to
+// the verify-token endpoint exactly like the production callback
+// page. The two pages never diverge because they share the verifier
+// component AND both configure `paramName="token"` — the
+// canonical credential query parameter the managed and
+// deterministic producers emit (per ticket #59 P0-001).
 
 import { Suspense } from "react";
 import { MagicLinkVerifier } from "../../components/MagicLinkVerifier";
@@ -26,7 +29,7 @@ export default function DevVerifyPage() {
         </Card.Content>
       </Card>
       <Suspense fallback={null}>
-        <MagicLinkVerifier paramName="request_id" />
+        <MagicLinkVerifier paramName="token" />
       </Suspense>
     </div>
   );

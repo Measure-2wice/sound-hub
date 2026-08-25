@@ -222,6 +222,48 @@ describe("BG1 auth routes (in-memory, deterministic adapter)", () => {
     assert.equal(verify.body.error.code, "AUTH_FAILED");
   });
 
+  test("emitted magic-link URL → callback reads ?token= → verify-token succeeds (P0-001 round-trip)", async () => {
+    // End-to-end regression for ticket #59 P0-001:
+    //   1. requestSignIn returns a `correlationId` (public) and a
+    //      `verificationToken` (private one-time credential).
+    //   2. The deterministic adapter's dev verification URL is
+    //      `<path>?token=<verificationToken>` — the credential is
+    //      carried as `token`, NOT as `request_id`.
+    //   3. The browser callback page reads `?token=<credential>`
+    //      and POSTs it to `/api/auth/verify-token` as
+    //      `verificationToken` — this is the round-trip.
+    //   4. The POST must succeed and return the HttpOnly session
+    //      cookie.
+    const req = await adapter.requestSignIn({
+      email: "buyer-route@example.com",
+    });
+    assert.ok(req.verificationToken);
+    const captured = req.verificationToken;
+    // Construct the URL the callback page would land on.
+    const callbackUrl = new URL("/auth/verify", "http://localhost:3000");
+    callbackUrl.searchParams.set("token", captured);
+    // The browser would extract `token` (NOT `request_id`) and
+    // POST it as `verificationToken` to the API.
+    const extracted = callbackUrl.searchParams.get("token");
+    assert.equal(extracted, captured, "callback page MUST read the credential from ?token=");
+    assert.equal(
+      callbackUrl.searchParams.get("request_id"),
+      null,
+      "the producer does NOT emit a 'request_id' query parameter",
+    );
+    const verify = await request(app)
+      .post("/api/auth/verify-token")
+      .send({ verificationToken: extracted })
+      .set("Content-Type", "application/json");
+    assert.equal(verify.status, 200);
+    assert.equal(verify.body.ok, true);
+    assert.equal(verify.body.user.email, "buyer-route@example.com");
+    const setCookie = verify.headers["set-cookie"];
+    assert.ok(Array.isArray(setCookie));
+    const cookieHeader = setCookie.find((c: string) => c.startsWith("soundhub_session="));
+    assert.ok(cookieHeader, "round-trip MUST issue the HttpOnly session cookie");
+  });
+
   test("GET /api/auth/me returns the authenticated user when the cookie is valid", async () => {
     const cookie = await signIn(app, adapter, "buyer-route@example.com");
     const me = await request(app).get("/api/auth/me").set("Cookie", cookie);

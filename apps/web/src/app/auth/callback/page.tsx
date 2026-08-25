@@ -3,13 +3,21 @@
 // Magic-link callback page.
 //
 // Background: managed providers redirect the browser back to a
-// callback URL with the magic-link token as a query parameter. The
-// BG1 architecture keeps the API boundary authoritative: the browser
-// POSTs the request id to `/api/auth/verify-token`, the server
-// validates the token, issues a session, and sets the HttpOnly
-// cookie. This page is the URL target the provider redirects to —
-// it pulls the request id from `?request_id=...` and posts it to
-// the API.
+// callback URL with the magic-link credential as a query parameter.
+// The BG1 architecture keeps the API boundary authoritative: the
+// browser POSTs the private one-time credential to
+// `/api/auth/verify-token` as `verificationToken`, the server
+// validates it, issues a session, and sets the HttpOnly cookie.
+// This page is the URL target the managed provider redirects to —
+// it pulls the PRIVATE credential from `?token=...` (per ticket
+// #59 P0-001) and posts it to the API.
+//
+// IMPORTANT: the producer (Supabase) and the consumer (this page)
+// MUST agree on the query parameter name. Supabase appends the
+// one-time credential as `?token=...` to the configured
+// `emailRedirectTo` URL; this page reads the same `token`
+// parameter. `requestId` is reserved for the PUBLIC correlation id
+// emitted by `/api/auth/magic-link` and is NOT accepted here.
 
 import { Suspense } from "react";
 import { MagicLinkVerifier } from "../../components/MagicLinkVerifier";
@@ -27,7 +35,7 @@ export default function AuthCallbackPage() {
         </Card.Content>
       </Card>
       <Suspense fallback={null}>
-        <MagicLinkVerifier paramName="request_id" />
+        <MagicLinkVerifier paramName="token" />
       </Suspense>
     </div>
   );
