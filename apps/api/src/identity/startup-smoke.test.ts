@@ -6,7 +6,8 @@
 // selects. These tests pin the smoke's contract: health →
 // request → session probe. The smoke is FAIL-CLOSED — `ok:
 // true` is only returned after EVERY step succeeds, including
-// the application-boundary session probe (ticket #59 P1-001).
+// the application-boundary session probe (ticket #59 P1-001)
+// AND the explicit session revocation (ticket #59 P0-001).
 //
 // Per ticket #59 P1-001 (next iteration) the captured token is
 // exchanged EXACTLY ONCE through the serving authentication seam.
@@ -14,17 +15,24 @@
 // independently — the `sessionProbe` is the sole exchange path.
 //
 // Per ticket #59 P1-001 (this iteration) the smoke ties the
-// OTP probe to the operator-controlled `smokeMailbox` — the
-// SAME mailbox the operator receives the captured link on —
-// so the bounded smoke traverses the link produced by the
-// deployed email-template configuration.
+// OTP probe to the operator-controlled `smokeMailbox` AND
+// embeds a per-attempt `smokeAttemptId` correlation marker in
+// the OTP request. The bounded smoke therefore traverses the
+// link produced by the deployed email-template configuration
+// for THIS specific smoke attempt — a stale same-mailbox
+// token issued before the smoke attempt has no matching
+// `smokeAttemptId` in `user_metadata` and fails closed.
 //
 // Per ticket #59 P0-001 (this iteration) the smoke never logs
 // bearer session identifiers or account identifiers; the
-// session probe revokes the smoke-created session before
-// returning and returns only non-secret pass/fail evidence plus
-// the verified provider email (for the smoke's
-// mailbox-correlation assertion).
+// session probe revokes the smoke-created session explicitly
+// and a `false` revoke result OR a thrown revoke error
+// surfaces as a probe failure. The smoke is FAIL-CLOSED when
+// revocation cannot be confirmed.
+//
+// Per ticket #59 P2-001 BG1 only supports magic-link
+// verification; the serving adapter pins `type: "magiclink"`
+// for the `/auth/v1/verify` call (no runtime switch).
 //
 // Per ticket #59 P2-001 the captured token is the PRIVATE
 // `verificationToken` extracted from the magic-link callback URL.
@@ -91,15 +99,16 @@ function configure(overrides: { fetchImpl?: typeof fetch } = {}) {
 
 /**
  * Realistic Supabase verify envelope (per ticket #59 P1-001) —
- * mirrors the documented response shape including `expires_at`
- * and other forward-compatible fields. This fixture is NOT used
- * by the smoke itself (the smoke delegates the verify to the
- * session probe), but it documents the envelope the production
- * seam expects.
+ * mirrors the documented response shape including `expires_at`,
+ * `provider_token`, and other forward-compatible fields. The
+ * `user_metadata` payload is the channel the bounded smoke uses
+ * to assert the captured token was issued for its specific
+ * attempt (per ticket #59 P1-001).
  */
 function supabaseVerifyEnvelope(overrides: {
   readonly id: string;
   readonly email: string | null;
+  readonly userMetadata?: Record<string, unknown>;
 }): Record<string, unknown> {
   return {
     access_token: "access-token-fixture",
@@ -107,16 +116,33 @@ function supabaseVerifyEnvelope(overrides: {
     expires_in: 3600,
     expires_at: Math.floor(Date.now() / 1000) + 3600,
     refresh_token: "refresh-token-fixture",
-    user: { id: overrides.id, email: overrides.email },
+    user: {
+      id: overrides.id,
+      aud: "authenticated",
+      role: "authenticated",
+      email: overrides.email,
+      email_confirmed_at: "2025-01-01T00:00:00.000Z",
+      phone: "",
+      confirmed_at: "2025-01-01T00:00:00.000Z",
+      last_sign_in_at: "2025-01-01T00:00:00.000Z",
+      app_metadata: { provider: "email" },
+      user_metadata: overrides.userMetadata ?? {},
+      identities: [],
+      created_at: "2025-01-01T00:00:00.000Z",
+      updated_at: "2025-01-01T00:00:00.000Z",
+    },
   };
 }
 
 const SMOKE_MAILBOX = "bg1-smoke@soundhub.example";
 const STALE_TOKEN_MAILBOX = "stale-attacker@soundhub.example";
+const SMOKE_ATTEMPT_ID = "11111111-1111-4111-8111-111111111111";
 
 describe("runStartupSmoke", () => {
-  test("returns ok:true only when every step (health, otp, session probe, mailbox correlation) succeeds (P0-001, P1-001)", async () => {
+  test("returns ok:true only when every step succeeds (P0-001, P1-001)", async () => {
     let verifyCount = 0;
+    let revokeCalls = 0;
+    let revokedSessionId: string | undefined;
     const { fetchImpl, calls } = makeFetch({
       responses: [
         { url: "https://example.supabase.co/auth/v1/health", status: 200, body: {} },
@@ -127,11 +153,18 @@ describe("runStartupSmoke", () => {
       managed: configure({ fetchImpl }),
       smokeMailbox: SMOKE_MAILBOX,
       verifyToken: "captured-verification-token",
+      generateAttemptId: () => SMOKE_ATTEMPT_ID,
       sessionProbe: async () => {
         verifyCount += 1;
+        // Mirror the production `buildSessionProbe` revocation
+        // path so we can assert the smoke never returns ok:true
+        // while a bearer session may remain active.
+        revokedSessionId = `sess-${verifyCount}`;
+        revokeCalls += 1;
         return {
           ok: true,
           verifiedEmail: SMOKE_MAILBOX,
+          providerMetadata: { smokeAttemptId: SMOKE_ATTEMPT_ID },
         };
       },
     });
@@ -152,21 +185,24 @@ describe("runStartupSmoke", () => {
       "smoke detail MUST NOT embed account identifiers",
     );
     assert.equal(verifyCount, 1, "session probe must be the SOLE provider exchange");
-    // The OTP request MUST target the operator-configured smoke
-    // mailbox (per ticket #59 P1-001 deployed magic-link
-    // contract) — NOT a sentinel `.example` address unrelated to
-    // the captured link.
+    assert.equal(revokeCalls, 1, "smoke-created session MUST be explicitly revoked");
+    assert.equal(revokedSessionId, "sess-1");
+    // Per ticket #59 P1-001 the OTP probe MUST embed the
+    // smoke's per-attempt correlation id in the request's
+    // `data` payload so Supabase stores it as `user_metadata`
+    // on the user record. The verify response carries the
+    // metadata back; the smoke asserts the captured token was
+    // issued by THIS smoke attempt.
     const otpCall = calls.find((c) => c.url.includes("/auth/v1/otp"));
     assert.ok(otpCall, "OTP request must be made");
     const otpBody = JSON.parse((otpCall.init?.body as string) ?? "{}") as Record<string, unknown>;
     assert.equal(otpBody.email, SMOKE_MAILBOX);
+    const data = otpBody.data as Record<string, unknown>;
+    assert.ok(data, "data payload must be threaded to Supabase");
+    assert.equal(data.smokeAttemptId, SMOKE_ATTEMPT_ID);
   });
 
-  test("returns ok:false (session-coverage-incomplete) when the verified email does not match the smoke mailbox (P1-001 stale token)", async () => {
-    // A stale token issued for some other account MUST fail
-    // closed. The smoke proves the captured credential was
-    // actually issued for the smoke mailbox; without this check,
-    // any still-valid Supabase token would pass the smoke.
+  test("returns ok:false (session-coverage-incomplete) when the verified email does not match the smoke mailbox (P1-001 stale mailbox)", async () => {
     const { fetchImpl } = makeFetch({
       responses: [
         { url: "https://example.supabase.co/auth/v1/health", status: 200, body: {} },
@@ -176,12 +212,12 @@ describe("runStartupSmoke", () => {
     const result = await runStartupSmoke({
       managed: configure({ fetchImpl }),
       smokeMailbox: SMOKE_MAILBOX,
-      verifyToken: "stale-token-from-different-account",
+      verifyToken: "stale-token-from-different-mailbox",
+      generateAttemptId: () => SMOKE_ATTEMPT_ID,
       sessionProbe: async () => ({
         ok: true,
-        // Stale token: the verified email is for a DIFFERENT
-        // account, not the configured smoke mailbox.
         verifiedEmail: STALE_TOKEN_MAILBOX,
+        providerMetadata: { smokeAttemptId: SMOKE_ATTEMPT_ID },
       }),
     });
     assert.equal(result.ok, false);
@@ -195,6 +231,134 @@ describe("runStartupSmoke", () => {
       false,
       "smoke detail MUST NOT embed the stale-attacker mailbox",
     );
+  });
+
+  test("returns ok:false (session-coverage-incomplete) when the verified metadata smokeAttemptId does not match the smoke attempt (P1-001 stale same-mailbox token)", async () => {
+    // A prior still-valid token for the same smoke mailbox would
+    // verify successfully and report the correct verified email,
+    // but the `user_metadata` payload would NOT carry THIS
+    // smoke attempt's `smokeAttemptId` (Supabase stored the
+    // metadata at the time the OTP request was made). The smoke
+    // therefore fails closed when the verified
+    // `user_metadata.smokeAttemptId` does not match the
+    // per-attempt correlation id, proving the captured
+    // credential was actually issued for this smoke attempt.
+    const { fetchImpl } = makeFetch({
+      responses: [
+        { url: "https://example.supabase.co/auth/v1/health", status: 200, body: {} },
+        { url: "https://example.supabase.co/auth/v1/otp", status: 200, body: {} },
+      ],
+    });
+    const result = await runStartupSmoke({
+      managed: configure({ fetchImpl }),
+      smokeMailbox: SMOKE_MAILBOX,
+      verifyToken: "stale-same-mailbox-token-from-prior-request",
+      generateAttemptId: () => SMOKE_ATTEMPT_ID,
+      sessionProbe: async () => ({
+        ok: true,
+        // The same mailbox passes the email-correlation check,
+        // but the user_metadata carries the OLD attempt id (from
+        // a prior smoke run). The smoke must reject this token.
+        verifiedEmail: SMOKE_MAILBOX,
+        providerMetadata: { smokeAttemptId: "old-attempt-id-from-prior-request" },
+      }),
+    });
+    assert.equal(result.ok, false);
+    assert.equal(result.reason, "session-coverage-incomplete");
+    assert.ok(result.detail?.includes("does not carry the smoke's per-attempt correlation id"));
+    // The detail MUST NOT embed the smokeAttemptId (private
+    // credential material) even when reporting the mismatch.
+    assert.equal(
+      result.detail?.includes(SMOKE_ATTEMPT_ID),
+      false,
+      "smoke detail MUST NOT embed the smokeAttemptId",
+    );
+    assert.equal(
+      result.detail?.includes("old-attempt-id-from-prior-request"),
+      false,
+      "smoke detail MUST NOT embed the verified user_metadata",
+    );
+  });
+
+  test("returns ok:false (session-coverage-incomplete) when the verified metadata omits the smokeAttemptId (P1-001)", async () => {
+    // The Supabase verify response omits the smokeAttemptId in
+    // `user_metadata` (e.g. the provider returned no metadata,
+    // or the metadata does not carry our correlation id). The
+    // smoke must fail closed — the captured token cannot be
+    // proven to belong to this smoke attempt.
+    const { fetchImpl } = makeFetch({
+      responses: [
+        { url: "https://example.supabase.co/auth/v1/health", status: 200, body: {} },
+        { url: "https://example.supabase.co/auth/v1/otp", status: 200, body: {} },
+      ],
+    });
+    const result = await runStartupSmoke({
+      managed: configure({ fetchImpl }),
+      smokeMailbox: SMOKE_MAILBOX,
+      verifyToken: "no-metadata-token",
+      generateAttemptId: () => SMOKE_ATTEMPT_ID,
+      sessionProbe: async () => ({
+        ok: true,
+        verifiedEmail: SMOKE_MAILBOX,
+        providerMetadata: {},
+      }),
+    });
+    assert.equal(result.ok, false);
+    assert.equal(result.reason, "session-coverage-incomplete");
+    assert.ok(result.detail?.includes("does not carry the smoke's per-attempt correlation id"));
+  });
+
+  test("returns ok:false (session-coverage-incomplete) when signOut returns false (P0-001)", async () => {
+    // Per ticket #59 P0-001 the probe MUST track the revoke
+    // outcome explicitly. A `false` revoke result overrides any
+    // earlier success and surfaces as a probe failure so the
+    // live bearer credential cannot remain active while the
+    // smoke reports success.
+    const { fetchImpl } = makeFetch({
+      responses: [
+        { url: "https://example.supabase.co/auth/v1/health", status: 200, body: {} },
+        { url: "https://example.supabase.co/auth/v1/otp", status: 200, body: {} },
+      ],
+    });
+    const result = await runStartupSmoke({
+      managed: configure({ fetchImpl }),
+      smokeMailbox: SMOKE_MAILBOX,
+      verifyToken: "captured-token",
+      generateAttemptId: () => SMOKE_ATTEMPT_ID,
+      sessionProbe: async () => ({
+        ok: false,
+        verifiedEmail: SMOKE_MAILBOX,
+        providerMetadata: { smokeAttemptId: SMOKE_ATTEMPT_ID },
+        detail: "session revoke returned false; smoke-created session may still be active",
+      }),
+    });
+    assert.equal(result.ok, false);
+    assert.equal(result.reason, "session-coverage-incomplete");
+    assert.ok(result.detail?.includes("session revoke returned false"));
+  });
+
+  test("returns ok:false (session-coverage-incomplete) when signOut throws (P0-001)", async () => {
+    const { fetchImpl } = makeFetch({
+      responses: [
+        { url: "https://example.supabase.co/auth/v1/health", status: 200, body: {} },
+        { url: "https://example.supabase.co/auth/v1/otp", status: 200, body: {} },
+      ],
+    });
+    const result = await runStartupSmoke({
+      managed: configure({ fetchImpl }),
+      smokeMailbox: SMOKE_MAILBOX,
+      verifyToken: "captured-token",
+      generateAttemptId: () => SMOKE_ATTEMPT_ID,
+      sessionProbe: async () => ({
+        ok: false,
+        verifiedEmail: SMOKE_MAILBOX,
+        providerMetadata: { smokeAttemptId: SMOKE_ATTEMPT_ID },
+        detail: "signed out failed: ECONNRESET",
+      }),
+    });
+    assert.equal(result.ok, false);
+    assert.equal(result.reason, "session-coverage-incomplete");
+    assert.ok(result.detail?.includes("ECONNRESET"));
   });
 
   test("returns ok:false (unconfigured) when env vars are missing", async () => {
@@ -331,10 +495,6 @@ describe("runStartupSmoke", () => {
 
 describe("runStartupSmoke token consumption (P0-001 single-exchange + revocation)", () => {
   test("the smoke itself never calls ManagedIdentityAdapter.verifySignIn independently", async () => {
-    // The smoke routes the captured token through the session
-    // probe ONLY. We construct a managed adapter that records
-    // verify-call attempts and assert the smoke NEVER calls
-    // `verifySignIn` itself — only the probe does.
     const adapter = new ManagedIdentityAdapter({
       supabaseUrl: "https://example.supabase.co",
       supabaseAnonKey: "anon-key",
@@ -348,8 +508,6 @@ describe("runStartupSmoke token consumption (P0-001 single-exchange + revocation
       return originalVerify(input);
     };
 
-    // Stub the underlying fetch so the smoke's requestSignIn
-    // probe (health + OTP) succeed without a network round trip.
     let fetchCallIndex = 0;
     const fetchImpl: typeof fetch = (input) => {
       const url = typeof input === "string" ? input : (input as URL).toString();
@@ -371,11 +529,10 @@ describe("runStartupSmoke token consumption (P0-001 single-exchange + revocation
     };
     (adapter as unknown as { fetchImpl: typeof fetch }).fetchImpl = fetchImpl;
 
-    // Stub the verify endpoint so the session probe can mint
-    // a session through the production `verifySignIn` boundary.
     const verifyEnvelope = supabaseVerifyEnvelope({
       id: "supabase-uuid-smoke",
       email: SMOKE_MAILBOX,
+      userMetadata: { smokeAttemptId: SMOKE_ATTEMPT_ID },
     });
     let verifyEndpointCalls = 0;
     let probeCalls = 0;
@@ -399,13 +556,9 @@ describe("runStartupSmoke token consumption (P0-001 single-exchange + revocation
       managed: adapter,
       smokeMailbox: SMOKE_MAILBOX,
       verifyToken: "captured-verification-token",
+      generateAttemptId: () => SMOKE_ATTEMPT_ID,
       sessionProbe: async ({ verificationToken }) => {
         probeCalls += 1;
-        // Drive the production boundary directly through the
-        // adapter the smoke was handed. This is the SOLE
-        // provider verification the smoke performs. The probe
-        // simulates the failure-safe revoke step (the real
-        // `buildSessionProbe` does this via the auth service).
         const verified = await adapter.verifySignIn({ verificationToken });
         if (!verified) {
           return { ok: false, detail: "adapter rejected the captured token" };
@@ -413,21 +566,15 @@ describe("runStartupSmoke token consumption (P0-001 single-exchange + revocation
         return {
           ok: true,
           verifiedEmail: verified.providerEmail,
+          providerMetadata: verified.providerMetadata,
         };
       },
     });
     assert.equal(result.ok, true);
     assert.ok(result.detail?.includes(SMOKE_MAILBOX));
-    // The smoke itself never calls `adapter.verifySignIn`. The
-    // adapter's verify count is owned entirely by the session
-    // probe, which the smoke invokes exactly once.
     assert.equal(adapterVerifyCalls, 1, "smoke must delegate verify to the probe exactly once");
     assert.equal(probeCalls, 1, "smoke must invoke the session probe exactly once");
     assert.equal(verifyEndpointCalls, 1, "Supabase verify endpoint called exactly once");
-    // Per ticket #59 P0-001 the smoke detail carries NO bearer
-    // session id or account identifier — the live credential
-    // cannot leak through the smoke detail, the factory log, or
-    // any error envelope.
     assert.equal(
       result.detail?.includes("supabase-uuid-smoke"),
       false,
@@ -464,12 +611,6 @@ describe("runStartupSmoke token consumption (P0-001 single-exchange + revocation
     };
     (adapter as unknown as { fetchImpl: typeof fetch }).fetchImpl = fetchImpl;
 
-    // Simulate a misuse: the "probe" itself exchanges the
-    // captured token once, then a second misuse-driven probe
-    // attempts to re-exchange the same token. The second attempt
-    // must be replay-rejected, proving the production seam
-    // enforces single-use and the smoke must NOT trigger such a
-    // double-exchange.
     const capturedToken = "replay-fixture-token";
     const first = await adapter.verifySignIn({ verificationToken: capturedToken });
     assert.ok(first, "first exchange of the captured token must succeed");

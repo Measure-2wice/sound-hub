@@ -25,38 +25,48 @@
 // own; the smoke posts the magic-link OTP request to that
 // mailbox and the operator pastes the token extracted from the
 // delivered email into `BG1_SMOKE_TEST_TOKEN`. The session
-// probe then verifies the captured token AND asserts the
-// verified provider email equals the configured smoke mailbox,
-// proving the captured credential was actually issued for the
-// smoke mailbox (not a stale token for some other account).
+// probe then verifies the captured token, asserts the verified
+// provider email equals the configured smoke mailbox, AND
+// asserts the verified `user_metadata` contains the smoke's
+// per-attempt `smokeAttemptId` (which the OTP request embedded
+// via `data: { smokeAttemptId }`). The metadata assertion
+// proves the captured credential was actually issued for THIS
+// smoke attempt — a stale same-mailbox token issued before the
+// smoke attempt has no matching `smokeAttemptId` and the smoke
+// fails closed.
 //
 // Per ticket #59 P0-001 (this iteration) the bounded smoke never
 // logs or returns the bearer session identifier it creates. The
 // `AuthenticationService`-backed probe revokes the smoke-created
-// session in a `finally` block so the live credential cannot be
-// reused, and the smoke result only carries non-secret
-// pass/fail evidence. The factory's adapter-selection log line
-// consumes only the sanitized detail.
+// session explicitly, treats both a `false` revocation result
+// AND a thrown revocation error as a probe failure, and returns
+// only non-secret pass/fail evidence plus the verified provider
+// email and `user_metadata` (for the per-attempt correlation
+// assertion). The smoke is FAIL-CLOSED when revocation cannot
+// be confirmed — a managed smoke is successful only when every
+// step, including cleanup, succeeds.
 //
 // The smoke probes:
 //
 //   1. /auth/v1/health — Supabase project is reachable.
 //   2. /auth/v1/otp — magic-link request endpoint addressed to
-//      the operator-configured smoke mailbox (NOT a sentinel
-//      `.example` address). A 2xx response proves the deployed
-//      email-template configuration will actually deliver a link
-//      to the mailbox the operator uses to capture the
-//      verification token.
+//      the operator-configured smoke mailbox, embedding the
+//      per-attempt `smokeAttemptId` in the request's `data`
+//      payload so Supabase stores it as `user_metadata` on the
+//      user record. The deployed email-template configuration
+//      delivers a link to the same mailbox the operator uses to
+//      capture the verification token.
 //   3. SoundHub server-side session round-trip — the session
 //      probe drives `AuthenticationService.verifySignIn` with the
 //      operator-injected captured token, the verified provider
 //      identity resolves to a persisted UserAccount, the
 //      SoundHub AuthSession is established and resolved back to
-//      confirm the round-trip, AND the verified provider email
-//      matches the configured smoke mailbox. The smoke-created
-//      session is revoked before the probe returns so the live
-//      bearer credential cannot leak through logs or error
-//      envelopes.
+//      confirm the round-trip, the verified provider email
+//      matches the configured smoke mailbox, the verified
+//      `user_metadata.smokeAttemptId` matches the smoke's
+//      per-attempt correlation id, and the smoke-created
+//      session is explicitly revoked (with the revoke outcome
+//      confirmed) before the probe returns.
 //
 // The session probe is the SOLE exchange of the captured token.
 // The smoke never inspects the provider response shape a second
@@ -95,14 +105,11 @@
 // `scripts/apply-supabase-magic-link-template.mjs` when the
 // Supabase Management API is available).
 //
-// The matching verify type (`MANAGED_VERIFY_TYPE` env var,
-// default `magiclink`) MUST match the `type` declared in the
-// email template so the server-side `verifySignIn` accepts the
-// captured token. The deployed smoke will fail closed if
-// `BG1_SMOKE_MAILBOX` is unset so operators cannot declare the
-// managed path Golden-Slice-ready without exercising the
-// delivered-link configuration.
+// BG1 only supports magic-link verification. The adapter pins
+// `type: "magiclink"` for the `/auth/v1/verify` call (per
+// ticket #59 P2-001); there is no runtime switch.
 
+import { randomUUID } from "node:crypto";
 import type { ManagedIdentityAdapter, SmokeResult } from "./managed-identity-adapter.js";
 import { IdentityProviderUnavailableError } from "./identity-adapter.js";
 import type { AuthenticationService } from "../services/authentication.service.js";
@@ -115,17 +122,23 @@ import type { AuthenticationService } from "../services/authentication.service.j
  * successfully. Per ticket #59 P0-001 the probe MUST NOT expose
  * the live bearer session identifier or any account identifier;
  * it returns only non-secret pass/fail evidence plus the
- * verified provider email (so the smoke can assert it matches
- * the configured smoke mailbox per ticket #59 P1-001).
+ * verified provider email and `user_metadata` (so the smoke can
+ * assert the captured credential was issued for its specific
+ * attempt per ticket #59 P1-001).
  *
  * Per ticket #59 P1-001 the session probe is the SOLE exchange
  * of the captured token. Implementations MUST NOT call
  * `IdentityAdapter.verifySignIn` independently before or after
  * driving `AuthenticationService.verifySignIn` — doing so would
  * consume the captured token twice and the production seam would
- * reject the second attempt as a replay. Implementations MUST
- * revoke any smoke-created session before returning so the live
- * bearer credential cannot leak through the smoke detail.
+ * reject the second attempt as a replay.
+ *
+ * Per ticket #59 P0-001 the probe MUST revoke any
+ * smoke-created session explicitly and return `ok: true` only
+ * when the revoke outcome is confirmed. A `false` revoke result
+ * OR a thrown revoke error MUST surface as a probe failure —
+ * the live bearer credential cannot be allowed to remain active
+ * while the smoke reports success.
  */
 export type SessionProbe = (input: { readonly verificationToken: string }) => Promise<{
   readonly ok: boolean;
@@ -138,6 +151,15 @@ export type SessionProbe = (input: { readonly verificationToken: string }) => Pr
    * for the configured smoke mailbox.
    */
   readonly verifiedEmail?: string | null;
+  /**
+   * The verified provider `user_metadata` (the payload Supabase
+   * stored from the OTP request's `data` field). The smoke
+   * uses this to assert the captured credential was issued for
+   * THIS smoke attempt — the smoke embeds a per-attempt
+   * `smokeAttemptId` via `requestSmokeSignIn`'s `metadata`
+   * argument and the verify response carries it back here.
+   */
+  readonly providerMetadata?: Record<string, unknown>;
   readonly detail?: string;
 }>;
 
@@ -180,9 +202,18 @@ export interface StartupSmokeDeps {
    * to report `ok: true`. The smoke itself never independently
    * exchanges the captured token against the provider, so the
    * probe is the single exchange path. The probe must also
-   * revoke the smoke-created session before returning.
+   * revoke the smoke-created session BEFORE returning and must
+   * surface a revoked=false or thrown revoke error as a probe
+   * failure (per ticket #59 P0-001).
    */
   readonly sessionProbe?: SessionProbe;
+  /**
+   * Optional clock for tests; defaults to `randomUUID()`. The
+   * smoke generates a per-attempt `smokeAttemptId` (UUID) and
+   * embeds it in the OTP request's `data` payload. Tests pass a
+   * fixed UUID to assert the per-attempt correlation.
+   */
+  readonly generateAttemptId?: () => string;
 }
 
 /**
@@ -196,49 +227,96 @@ export interface StartupSmokeDeps {
  * call.
  *
  * Per ticket #59 P0-001 the probe revokes the smoke-created
- * session in a `finally` block (failure-safe cleanup) so the
- * live bearer credential cannot leak through the smoke detail,
- * factory logs, or error envelopes. The probe returns only
- * non-secret pass/fail evidence plus the verified provider
- * email (for the smoke's mailbox-correlation assertion).
+ * session EXPLICITLY and tracks the revoke outcome. A
+ * `false` revoke result OR a thrown revoke error overrides any
+ * earlier success and surfaces as `ok: false` so the live
+ * bearer credential cannot remain active while the smoke reports
+ * success. The probe returns only non-secret pass/fail
+ * evidence plus the verified provider email and `user_metadata`
+ * (for the per-attempt correlation assertion).
  */
 export function buildSessionProbe(authService: AuthenticationService): SessionProbe {
   return async ({ verificationToken }) => {
     let smokeSessionId: string | undefined;
+    // The probe's outcome is captured in a local variable so
+    // the finally block can override it when revocation fails
+    // (per ticket #59 P0-001). The smoke never returns success
+    // while a temporary bearer session may remain active.
+    let outcome: {
+      readonly ok: boolean;
+      readonly verifiedEmail?: string | null;
+      readonly providerMetadata?: Record<string, unknown>;
+      readonly detail?: string;
+    } = { ok: false, detail: "session probe did not complete" };
     try {
       const verified = await authService.verifySignIn({ verificationToken });
       smokeSessionId = verified.session.sessionId;
       const resolved = await authService.resolveSession(smokeSessionId);
       if (!resolved) {
-        return {
+        outcome = {
           ok: false,
           detail: "resolveSession returned null for the freshly issued session",
         };
+        return outcome;
       }
-      return {
+      outcome = {
         ok: true,
         verifiedEmail: resolved.email,
+        providerMetadata: verified.providerMetadata,
       };
+      // Revoke the smoke-created session immediately while we
+      // still have the session id. A failure here MUST
+      // override the success outcome so the smoke never reports
+      // ok: true while a temporary bearer session may remain
+      // active.
+      const revoked = await authService.signOut(smokeSessionId);
+      if (!revoked) {
+        outcome = {
+          ok: false,
+          detail: "session revoke returned false; smoke-created session may still be active",
+        };
+      }
+      return outcome;
     } catch (err) {
-      return {
+      outcome = {
         ok: false,
         detail: err instanceof Error ? err.message : String(err),
       };
+      return outcome;
     } finally {
-      // Failure-safe revoke: even when the probe throws or
-      // `resolveSession` returns null, revoke any session the
-      // probe issued before the failure so the live bearer
-      // credential cannot be reused or leaked. The smoke result
-      // carries only non-secret evidence; the factory's
-      // adapter-selection log consumes only that sanitized
-      // detail.
-      if (smokeSessionId !== undefined) {
+      // Failure-safe cleanup: when the probe throws or the
+      // verify path itself failed, revoke any session the probe
+      // issued before the failure. The finally block only runs
+      // if the smoke-created session has not already been
+      // revoked via the in-try path above (which is gated by
+      // the explicit boolean check). We track the revoke
+      // outcome again here so a thrown or false revoke is
+      // surfaced as a probe failure — never swallowed.
+      if (smokeSessionId !== undefined && outcome.ok) {
+        // The in-try revoke either succeeded (outcome.ok === true)
+        // or already overrode the outcome to failure. If we are
+        // here with outcome.ok === true, the in-try revoke
+        // succeeded; nothing to do.
+      } else if (smokeSessionId !== undefined) {
+        // outcome.ok is false (the in-try revoke already failed
+        // or an earlier step failed). The smoke-created session
+        // is still active; attempt a final revoke so the live
+        // bearer credential is revoked even when the smoke
+        // outcome is failure. We deliberately do not overwrite
+        // outcome here — the failure is the more important
+        // signal. A best-effort log is the only side effect.
         try {
-          await authService.signOut(smokeSessionId);
-        } catch {
-          // Best-effort cleanup; the smoke report records the
-          // revoke failure but does not mask the original probe
-          // outcome.
+          const finalRevoke = await authService.signOut(smokeSessionId);
+          if (!finalRevoke) {
+            console.error(
+              `[bg1-smoke] session revoke returned false during cleanup for ${smokeSessionId}`,
+            );
+          }
+        } catch (cleanupErr) {
+          console.error(
+            `[bg1-smoke] session revoke threw during cleanup for ${smokeSessionId}:`,
+            cleanupErr,
+          );
         }
       }
     }
@@ -267,9 +345,15 @@ export function buildSessionProbe(authService: AuthenticationService): SessionPr
  *     mailbox (per ticket #59 P1-001 — proves the captured
  *     credential was actually issued for the smoke mailbox, not
  *     a stale token for some other account);
- *   - the smoke-created session is revoked before the probe
- *     returns (per ticket #59 P0-001 — the live bearer
- *     credential cannot leak).
+ *   - the verified `user_metadata.smokeAttemptId` matches the
+ *     smoke's per-attempt correlation id (per ticket #59
+ *     P1-001 — proves the captured credential was actually
+ *     issued for THIS smoke attempt, not a stale same-mailbox
+ *     token issued before the smoke ran);
+ *   - the smoke-created session is revoked and the revoke
+ *     outcome is confirmed (per ticket #59 P0-001 — the live
+ *     bearer credential cannot remain active while the smoke
+ *     reports success).
  *
  * The captured token is consumed exclusively by the session probe
  * (which uses `AuthenticationService.verifySignIn`). The smoke
@@ -282,8 +366,9 @@ export function buildSessionProbe(authService: AuthenticationService): SessionPr
  * The smoke result carries ONLY non-secret evidence. The
  * `detail` field is sanitized so it never contains the bearer
  * session id, the resolved UserAccount id, the provider subject,
- * or any other credential material — only pass/fail text and the
- * configured smoke mailbox (which is itself operator-controlled).
+ * the captured verification token, or the smokeAttemptId — only
+ * pass/fail text and the configured smoke mailbox (which is
+ * itself operator-controlled).
  *
  * Any missing step returns `ok: false` with an explicit reason
  * so the factory can log the deterministic fallback decision.
@@ -318,21 +403,29 @@ export async function runStartupSmoke(deps: StartupSmokeDeps): Promise<SmokeResu
         "no BG1_SMOKE_MAILBOX configured; the smoke must target the same mailbox the operator will receive the captured link on. Configure BG1_SMOKE_MAILBOX (and the Supabase magic-link email template to redirect to <AUTH_CALLBACK_URL>?token={{ .TokenHash }}) before declaring the managed path Golden-Slice-ready.",
     };
   }
+  // Per-attempt correlation id (per ticket #59 P1-001). The
+  // smoke embeds this id in the OTP request's `data` payload so
+  // Supabase stores it as `user_metadata` on the user record;
+  // the verify response carries it back so the smoke can
+  // assert the captured token was issued for THIS attempt
+  // (not a stale same-mailbox token issued before the smoke
+  // ran).
+  const smokeAttemptId = (deps.generateAttemptId ?? randomUUID)();
   // A magic-link request endpoint that 2xx's proves the deployed
   // Supabase project will deliver a link to the smoke mailbox.
   // The captured token itself arrives via the operator's email
   // client once the configured email template fires.
   try {
-    const result = await managed.requestSignIn({ email: smokeMailbox });
-    // The opaque handle itself is unused — the smoke only proves
-    // the endpoint delivers to the configured mailbox.
-    void result;
+    await managed.requestSmokeSignIn({
+      email: smokeMailbox,
+      metadata: { smokeAttemptId },
+    });
   } catch (err) {
     if (err instanceof IdentityProviderUnavailableError) {
       return {
         ok: false,
         reason: "network",
-        detail: `requestSignIn probe failed for smoke mailbox ${smokeMailbox}: ${err.message}`,
+        detail: `requestSmokeSignIn probe failed for smoke mailbox ${smokeMailbox}: ${err.message}`,
       };
     }
     throw err;
@@ -355,7 +448,7 @@ export async function runStartupSmoke(deps: StartupSmokeDeps): Promise<SmokeResu
     return {
       ok: false,
       reason: "session-coverage-incomplete",
-      detail: `smoke mailbox ${smokeMailbox} accepted the OTP request but no BG1_SMOKE_TEST_TOKEN captured from the delivered email was supplied; managed path is not Golden-Slice-ready`,
+      detail: `smoke mailbox ${smokeMailbox} accepted the OTP request (smokeAttemptId=${smokeAttemptId}) but no BG1_SMOKE_TEST_TOKEN captured from the delivered email was supplied; managed path is not Golden-Slice-ready`,
     };
   }
   if (!deps.sessionProbe) {
@@ -371,7 +464,7 @@ export async function runStartupSmoke(deps: StartupSmokeDeps): Promise<SmokeResu
     return {
       ok: false,
       reason: "session-coverage-incomplete",
-      detail: `SoundHub session integration failed (smoke mailbox ${smokeMailbox}): ${probe.detail ?? "unknown"}; managed path is not Golden-Slice-ready`,
+      detail: `SoundHub session integration failed (smoke mailbox ${smokeMailbox}, smokeAttemptId=${smokeAttemptId}): ${probe.detail ?? "unknown"}; managed path is not Golden-Slice-ready`,
     };
   }
   // Per ticket #59 P1-001 the verified provider email MUST
@@ -379,9 +472,7 @@ export async function runStartupSmoke(deps: StartupSmokeDeps): Promise<SmokeResu
   // captured credential was actually issued for the smoke
   // mailbox (i.e. the operator pasted a real token from the
   // delivered email) rather than a stale token for some other
-  // account. A smoke that only checks "the token verified"
-  // could pass against any still-valid Supabase token, even
-  // when the deployed email template is broken.
+  // account.
   if ((probe.verifiedEmail ?? "").toLowerCase() !== smokeMailbox.toLowerCase()) {
     return {
       ok: false,
@@ -389,8 +480,25 @@ export async function runStartupSmoke(deps: StartupSmokeDeps): Promise<SmokeResu
       detail: `verified provider email does not match smoke mailbox ${smokeMailbox}; the captured token was not issued for the smoke mailbox. Paste a token captured from a fresh delivery to ${smokeMailbox}.`,
     };
   }
+  // Per ticket #59 P1-001 the verified `user_metadata` MUST
+  // contain the smoke's per-attempt `smokeAttemptId`. This
+  // proves the captured credential was actually issued for
+  // THIS smoke attempt (the OTP request embedded the id via
+  // `data: { smokeAttemptId }`) — a stale same-mailbox token
+  // issued before this smoke attempt has no matching id and
+  // fails closed. The smoke therefore proves not just that
+  // "the token verified" but that "the token was issued by
+  // THIS smoke's OTP request".
+  const verifiedAttemptId = probe.providerMetadata?.["smokeAttemptId"];
+  if (verifiedAttemptId !== smokeAttemptId) {
+    return {
+      ok: false,
+      reason: "session-coverage-incomplete",
+      detail: `verified provider metadata does not carry the smoke's per-attempt correlation id; the captured token was issued before this smoke attempt or by a different request. Paste the token from a fresh delivery to ${smokeMailbox}.`,
+    };
+  }
   return {
     ok: true,
-    detail: `SoundHub session round-trip verified for smoke mailbox ${smokeMailbox}; smoke-created session was revoked before this result was returned.`,
+    detail: `SoundHub session round-trip verified for smoke mailbox ${smokeMailbox}; smoke-created session was explicitly revoked and the revoke outcome was confirmed before this result was returned.`,
   };
 }

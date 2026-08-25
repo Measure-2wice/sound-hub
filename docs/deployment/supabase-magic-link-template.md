@@ -26,9 +26,15 @@ The canonical HTML body is at
 [`supabase/magic-link-email-template.html`](../../supabase/magic-link-email-template.html).
 
 The matching verify `type` posted by the server to Supabase's
-`/auth/v1/verify` endpoint (`MANAGED_VERIFY_TYPE` env var,
-default `magiclink`) MUST match the email template's declared
-type so the verification call accepts the captured credential.
+`/auth/v1/verify` endpoint is pinned to `magiclink` by the
+serving adapter (`apps/api/src/identity/managed-identity-adapter.ts`).
+Per ticket #59 P2-001 the BG1 adapter has no runtime switch
+for this — BG1 only supports magic-link verification, so the
+email template MUST be the Supabase magic-link template (Studio
+→ Authentication → Email Templates → Magic Link). The template
+variables `{{ .TokenHash }}` and `{{ .SiteURL }}` are the ones
+the BG1 adapter consumes; the verify call's pinned
+`type: "magiclink"` matches the magic-link template contract.
 
 ## Applying the template
 

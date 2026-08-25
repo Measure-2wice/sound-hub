@@ -17,10 +17,13 @@
   Templates → Magic Link) before declaring the managed path
   Golden-Slice-ready.
 
-  The matching verify type (`MANAGED_VERIFY_TYPE` env var,
-  default `magiclink`) MUST match the `type` declared in the
-  email template so the server-side `verifySignIn` accepts the
-  captured token.
+  BG1 only supports magic-link verification. The serving adapter
+  (`ManagedIdentityAdapter`) pins `type: "magiclink"` for the
+  `/auth/v1/verify` call (per ticket #59 P2-001). The deployed
+  email template therefore MUST be the Supabase magic-link
+  template (Studio → Authentication → Email Templates → Magic
+  Link) — no runtime switch is exposed and no other verify type
+  is accepted by the BG1 serving adapter.
 
   Apply this template via one of:
 

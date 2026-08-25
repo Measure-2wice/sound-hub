@@ -41,8 +41,8 @@
 // Per ticket #59 P0-002 (this iteration), the adapter pins the
 // official Supabase REST contract: the magic-link OTP request uses
 // `redirect_to` as a query parameter (not a body field), the
-// token-hash verify endpoint posts `type: "email"` (the type
-// Supabase publishes for current token-hash verification), and the
+// token-hash verify endpoint posts `type: "magiclink"` (the
+// canonical type for the BG1 magic-link email template), and the
 // verify success response parses the full access-token/session
 // envelope Supabase returns. Identity derivation only reads the
 // allow-listed `id` and `email` fields from the parsed envelope so
@@ -55,6 +55,14 @@
 // response parser tolerates documented/provider-added fields, and
 // the parsed shape is discarded after identity derivation so
 // additional provider metadata never crosses a SoundHub DTO.
+//
+// Per ticket #59 P2-001 (this iteration), BG1 only supports
+// magic-link verification. The adapter pins `type: "magiclink"`
+// for the `/auth/v1/verify` call (no runtime switch). The
+// configured Supabase magic-link email template must therefore
+// use `{{ .TokenHash }}` against `<AUTH_CALLBACK_URL>` so the
+// browser's `MagicLinkVerifier` extracts the credential from
+// `?token=...`.
 
 import { randomUUID } from "node:crypto";
 import { z } from "zod";
@@ -191,14 +199,6 @@ export interface ManagedIdentityAdapterOptions {
    * single-use token tracker to bound in-memory growth.
    */
   readonly now?: () => number;
-  /**
-   * Optional Supabase verify-endpoint `type`. The current Supabase
-   * token-hash verification endpoint documents `email` as the
-   * canonical type for magic-link callbacks (per ticket #59
-   * P0-002). Tests can override to pin the request shape against
-   * a captured contract fixture.
-   */
-  readonly verifyType?: "magiclink" | "email" | "signup" | "recovery" | "invite" | "email_change";
 }
 
 export interface SmokeResult {
@@ -213,7 +213,13 @@ export interface SmokeResult {
 }
 
 const DEFAULT_SMOKE_TIMEOUT_MS = 5_000;
-const DEFAULT_VERIFY_TYPE = "email" as const;
+// BG1 only supports magic-link verification. The adapter pins
+// `type: "magiclink"` for the `/auth/v1/verify` call (per ticket
+// #59 P2-001). The configured Supabase magic-link email template
+// (see `supabase/magic-link-email-template.html`) MUST use the
+// matching magic-link template variables so Supabase accepts the
+// token-hash verification.
+const VERIFY_TYPE = "magiclink" as const;
 const SINGLE_USE_TTL_MS = 15 * 60 * 1000; // matches Supabase OTP TTL
 
 /**
@@ -231,7 +237,6 @@ export class ManagedIdentityAdapter implements IdentityAdapter {
   private readonly fetchImpl: typeof fetch;
   private readonly smokeTimeoutMs: number;
   private readonly now: () => number;
-  private readonly verifyType: NonNullable<ManagedIdentityAdapterOptions["verifyType"]>;
   /**
    * Single-use tracking for exchanged Supabase tokens. Once a
    * token is exchanged with Supabase, subsequent attempts return
@@ -245,7 +250,6 @@ export class ManagedIdentityAdapter implements IdentityAdapter {
     this.fetchImpl = options.fetchImpl ?? fetch;
     this.smokeTimeoutMs = options.smokeTimeoutMs ?? DEFAULT_SMOKE_TIMEOUT_MS;
     this.now = options.now ?? (() => Date.now());
-    this.verifyType = options.verifyType ?? DEFAULT_VERIFY_TYPE;
   }
 
   /**
@@ -339,6 +343,33 @@ export class ManagedIdentityAdapter implements IdentityAdapter {
    * field).
    */
   async requestSignIn(input: { readonly email: string }): Promise<SignInRequestResult> {
+    return this.requestSignInInternal(input.email, undefined);
+  }
+
+  /**
+   * Bounded-smoke extension of `requestSignIn` that threads a
+   * per-attempt `metadata` payload to Supabase. The metadata is
+   * stored as `user_metadata` on the user record and is returned
+   * by the subsequent `/auth/v1/verify` call — the bounded smoke
+   * uses this round-trip to prove the captured token was issued
+   * for the smoke's specific attempt (a stale token issued before
+   * this smoke attempt has no matching `smokeAttemptId` in
+   * `user_metadata` and is rejected).
+   *
+   * This is BG1-smoke-only and does NOT affect the
+   * provider-neutral `IdentityAdapter` contract.
+   */
+  async requestSmokeSignIn(input: {
+    readonly email: string;
+    readonly metadata: Record<string, unknown>;
+  }): Promise<SignInRequestResult> {
+    return this.requestSignInInternal(input.email, input.metadata);
+  }
+
+  private async requestSignInInternal(
+    email: string,
+    metadata: Record<string, unknown> | undefined,
+  ): Promise<SignInRequestResult> {
     this.assertConfigured();
     let url = `${this.options.supabaseUrl}/auth/v1/otp`;
     if (this.options.emailRedirectTo) {
@@ -348,9 +379,16 @@ export class ManagedIdentityAdapter implements IdentityAdapter {
       url = `${url}?redirect_to=${encodeURIComponent(this.options.emailRedirectTo)}`;
     }
     const body: Record<string, unknown> = {
-      email: input.email,
+      email,
       create_user: true,
     };
+    if (metadata) {
+      // Supabase stores the `data` payload on the user as
+      // `user_metadata`. The bounded smoke uses this to bind a
+      // per-attempt correlation id to the OTP request so the
+      // captured token can be asserted against the same attempt.
+      body.data = metadata;
+    }
     let response: Response;
     try {
       response = await this.fetchImpl(url, {
@@ -444,7 +482,7 @@ export class ManagedIdentityAdapter implements IdentityAdapter {
           apikey: this.options.supabaseAnonKey ?? "",
           Authorization: `Bearer ${this.options.supabaseServiceRoleKey ?? ""}`,
         },
-        body: JSON.stringify({ token_hash: trimmed, type: this.verifyType }),
+        body: JSON.stringify({ token_hash: trimmed, type: VERIFY_TYPE }),
       });
     } catch (err) {
       // Network failure or abort is provider unavailability —
@@ -471,6 +509,7 @@ export class ManagedIdentityAdapter implements IdentityAdapter {
       user: {
         id: string;
         email?: string | null | undefined;
+        user_metadata?: Record<string, unknown>;
       } | null;
     };
     try {
@@ -497,6 +536,16 @@ export class ManagedIdentityAdapter implements IdentityAdapter {
       // credential material and never crosses a public DTO.
       subject: user.id,
       providerEmail: user.email,
+      // Per ticket #59 P1-001 the bounded smoke reads back the
+      // verified `user_metadata` to assert the captured token
+      // was issued for THIS smoke attempt (the smoke embeds a
+      // per-attempt correlation id via
+      // `ManagedIdentityAdapter.requestSmokeSignIn`'s
+      // `metadata` argument). A stale token issued for a prior
+      // request has no matching smokeAttemptId and the smoke
+      // fails closed. The metadata is provider-internal and is
+      // not crossed into a public DTO — only the smoke reads it.
+      providerMetadata: parsed.user.user_metadata ?? {},
     };
   }
 

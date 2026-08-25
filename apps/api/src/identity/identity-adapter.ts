@@ -54,6 +54,16 @@ export interface VerifiedIdentity {
    * or when the provider does not assert an email at all.
    */
   readonly providerEmail: string | null;
+  /**
+   * The provider's `user_metadata` for the verified identity (the
+   * payload Supabase stored from the OTP request's `data` field).
+   * Populated by the managed adapter (per ticket #59 P1-001) so the
+   * bounded smoke can assert the captured token was issued for its
+   * specific attempt. The deterministic adapter does not populate
+   * this field. The metadata is provider-internal SoundHub
+   * credential material — it MUST NEVER cross a public DTO.
+   */
+  readonly providerMetadata?: Record<string, unknown>;
 }
 
 /**
