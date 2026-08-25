@@ -2,19 +2,19 @@
 //
 // Background: BG1 requires that the API composition root picks the
 // active adapter based on configuration AND a bounded deployed-
-// provider smoke. The deterministic adapter is the test + emergency
-// fallback path; the managed adapter is the deployed primary path.
-// The factory is the only place that knows which is which — every
-// higher layer consumes the `IdentityAdapter` interface and is
-// therefore agnostic to the deployment mode.
+// provider configuration smoke. The deterministic adapter is the
+// test + emergency fallback path; the managed adapter is the
+// deployed primary path. The factory is the only place that knows
+// which is which — every higher layer consumes the `IdentityAdapter`
+// interface and is therefore agnostic to the deployment mode.
 //
 // Selection rules (ticket #59 GS 2):
 //
 //   1. An explicit override always wins.
-//   2. Production requires the managed smoke to succeed. A
-//      failing smoke falls back to the deterministic adapter and
-//      records the decision in the factory log so the operator
-//      can act on it. Per the ticket: "If deployed email
+//   2. Production requires the managed configuration smoke to
+//      succeed. A failing smoke falls back to the deterministic
+//      adapter and records the decision in the factory log so the
+//      operator can act on it. Per the ticket: "If deployed email
 //      delivery, callback/session integration, or deployment
 //      configuration cannot pass the bounded provider smoke
 //      within that slice, the deterministic adapter is the
@@ -25,24 +25,22 @@
 //   3. Non-production defaults to the deterministic adapter so
 //      tests never accidentally contact a managed provider.
 //
-// Per ticket #59 P1-001, the async factory owns the smoke — the
-// smoke runs on the SAME adapter instance the factory selects,
-// so the smoke can never drift out of sync with the serving
-// adapter. The sync factory is preserved for tests that want to
-// inject a pre-computed smoke result.
+// Per ticket #59 the smoke is a bounded, non-destructive
+// configuration probe that validates managed-auth configuration
+// and constructs the managed adapter. The smoke does NOT
+// request, consume, or revoke a live Supabase OTP — end-to-end
+// managed email verification is validated by an explicit
+// bounded operational smoke procedure (see
+// `docs/deployment/managed-provider-smoke.md`).
 //
-// Per ticket #59 P1-002, the factory builds the managed adapter
-// ONCE and exposes it for the composition root to inject into
-// BOTH the smoke path and the serving routes. The
-// `emailRedirectTo` (read from `AUTH_CALLBACK_URL` by default) is
-// threaded through the same instance so the callback URL the
-// smoke validates is the same one serving uses.
+// The sync factory is preserved for tests that want to inject a
+// pre-computed smoke result.
 
 import type { Bg1IdentityProviderV1 } from "@soundhub/types";
 import { DeterministicIdentityAdapter } from "./deterministic-identity-adapter.js";
 import { ManagedIdentityAdapter, type SmokeResult } from "./managed-identity-adapter.js";
 import type { IdentityAdapter } from "./identity-adapter.js";
-import { runStartupSmoke, type SessionProbe } from "./startup-smoke.js";
+import { runStartupSmoke } from "./startup-smoke.js";
 
 export type { IdentityAdapter } from "./identity-adapter.js";
 
@@ -56,12 +54,12 @@ export interface IdentityAdapterFactoryOptions {
    */
   readonly override?: Bg1IdentityProviderV1;
   /**
-   * Optional pre-built managed adapter. Per ticket #59 P1-002 the
-   * composition root MUST build the managed adapter once and
-   * inject the SAME instance into both the smoke and the serving
-   * routes. When supplied, the factory reuses the instance
-   * (configuration is not re-read); otherwise the factory
-   * constructs one from the supplied Supabase configuration.
+   * Optional pre-built managed adapter. The composition root
+   * builds the managed adapter once and injects the SAME instance
+   * into both the smoke and the serving routes. When supplied, the
+   * factory reuses the instance (configuration is not re-read);
+   * otherwise the factory constructs one from the supplied
+   * Supabase configuration.
    */
   readonly managed?: ManagedIdentityAdapter;
   /**
@@ -77,8 +75,8 @@ export interface IdentityAdapterFactoryOptions {
   /**
    * Optional callback URL the magic-link email redirects to.
    * Default: `process.env.AUTH_CALLBACK_URL`. Threaded through the
-   * managed adapter so the same value the smoke validates is the
-   * value serving uses (per ticket #59 P1-002).
+   * managed adapter so the serving routes and the configuration
+   * smoke use the same callback URL.
    */
   readonly emailRedirectTo?: string;
   /**
@@ -88,36 +86,6 @@ export interface IdentityAdapterFactoryOptions {
    * this in favour of running the real smoke.
    */
   readonly managedSmoke?: SmokeResult;
-  /**
-   * Operator-controlled smoke mailbox. Per ticket #59 P1-001
-   * the bounded smoke ties the OTP probe to the SAME mailbox
-   * the operator will receive the captured link on — a sentinel
-   * `.example` address cannot receive real email and therefore
-   * cannot prove the deployed email-template configuration.
-   * Defaults to `process.env.BG1_SMOKE_MAILBOX` when unset; the
-   * async factory exposes the override so the composition root
-   * can read the env var exactly once.
-   */
-  readonly smokeMailbox?: string;
-  /**
-   * Operator-injected captured magic-link verification token
-   * (per ticket #59 P2-001). Forwarded to the startup smoke so
-   * the async factory can drive the verify step end-to-end.
-   * Defaults to `process.env.BG1_SMOKE_TEST_TOKEN` when unset;
-   * the async factory exposes the override so the composition
-   * root can read the env var exactly once.
-   */
-  readonly smokeVerifyToken?: string;
-  /**
-   * Optional SoundHub server-side session probe. Per ticket #59
-   * P1-001 the smoke must exercise the application boundary
-   * (AuthenticationService → AuthRepository → UserAccount +
-   * Session) before reporting the managed path ready. The async
-   * factory exposes the override so the composition root can
-   * build the probe against the real services before passing it
-   * in.
-   */
-  readonly sessionProbe?: SessionProbe;
   /**
    * Optional logger sink. The factory emits a single line when it
    * decides between managed and deterministic so operators can act
@@ -158,12 +126,12 @@ function buildAdaptersInternal(options: IdentityAdapterFactoryOptions): {
   const deterministic = new DeterministicIdentityAdapter({
     allowDevVerificationUrl: operatorMode,
   });
-  // Per ticket #59 P1-002: when the composition root has already
-  // built a managed adapter (so the smoke and serving can share the
-  // SAME instance), reuse it. Otherwise build one from the
+  // When the composition root has already built a managed adapter
+  // (so the configuration smoke and the serving routes can share
+  // the SAME instance), reuse it. Otherwise build one from the
   // supplied Supabase configuration. Either way the
-  // `emailRedirectTo` is threaded into the instance so the
-  // callback URL is identical across smoke and serving.
+  // `emailRedirectTo` is threaded into the instance so the callback
+  // URL is identical across the smoke and the serving routes.
   const emailRedirectTo = options.emailRedirectTo ?? process.env.AUTH_CALLBACK_URL;
   let managed: ManagedIdentityAdapter;
   if (options.managed) {
@@ -210,13 +178,13 @@ function selectActive(input: {
   if (nodeEnv === "production") {
     if (managed.isConfigured() && smokeResult.ok) {
       log(
-        `[identity] Managed magic-link smoke succeeded; using managed-magic-link adapter ` +
+        `[identity] Managed magic-link configuration smoke succeeded; using managed-magic-link adapter ` +
           `(${smokeResult.detail ?? "no detail"}).`,
       );
       return { active: managed, smokeResult };
     }
     log(
-      `[identity] Managed magic-link smoke failed (${smokeResult.reason ?? "unknown"}: ` +
+      `[identity] Managed magic-link configuration smoke failed (${smokeResult.reason ?? "unknown"}: ` +
         `${smokeResult.detail ?? ""}); falling back to deterministic adapter as the approved ` +
         "BG1 emergency path.",
     );
@@ -256,16 +224,19 @@ export function buildIdentityAdapters(
 }
 
 /**
- * Async factory that owns the bounded deployed-provider smoke. Per
- * ticket #59 P1-001 the smoke MUST run on the SAME adapter instance
+ * Async factory that owns the bounded deployed-provider
+ * configuration smoke. The smoke runs on the SAME adapter instance
  * the serving application uses so the smoke can never drift out of
  * sync with the production selection. Tests should keep using the
- * synchronous `buildIdentityAdapters` with an injected smoke result.
+ * synchronous `buildIdentityAdapters` with an injected smoke
+ * result.
  *
- * Per ticket #59 P1-002 the factory returns the full
- * `BuiltIdentityAdapters` bundle (managed + deterministic + smoke)
- * so the composition root can inject the SAME managed adapter into
- * both the smoke and the serving routes without rebuilding it.
+ * Per ticket #59 the configuration smoke is a bounded,
+ * non-destructive probe of the managed provider's `/auth/v1/health`
+ * endpoint — it does NOT request, consume, or revoke a live
+ * Supabase OTP. End-to-end managed email verification is validated
+ * by an explicit bounded operational smoke procedure (see
+ * `docs/deployment/managed-provider-smoke.md`).
  */
 export async function buildIdentityAdaptersAsync(
   options: IdentityAdapterFactoryOptions = {},
@@ -275,12 +246,7 @@ export async function buildIdentityAdaptersAsync(
   if (options.managedSmoke) {
     smokeResult = options.managedSmoke;
   } else {
-    smokeResult = await runStartupSmoke({
-      managed,
-      smokeMailbox: options.smokeMailbox ?? process.env.BG1_SMOKE_MAILBOX,
-      verifyToken: options.smokeVerifyToken ?? process.env.BG1_SMOKE_TEST_TOKEN,
-      sessionProbe: options.sessionProbe,
-    });
+    smokeResult = await runStartupSmoke({ managed });
   }
   const { active } = selectActive({
     managed,

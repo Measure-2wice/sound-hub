@@ -26,15 +26,18 @@ The canonical HTML body is at
 [`supabase/magic-link-email-template.html`](../../supabase/magic-link-email-template.html).
 
 The matching verify `type` posted by the server to Supabase's
-`/auth/v1/verify` endpoint is pinned to `magiclink` by the
-serving adapter (`apps/api/src/identity/managed-identity-adapter.ts`).
-Per ticket #59 P2-001 the BG1 adapter has no runtime switch
-for this — BG1 only supports magic-link verification, so the
-email template MUST be the Supabase magic-link template (Studio
-→ Authentication → Email Templates → Magic Link). The template
+`/auth/v1/verify` endpoint is `email` — Supabase's current
+wire-level type for token-hash verification (the user-facing
+product is still email magic-link authentication; `type: "email"`
+is Supabase's wire-level discriminator). The serving adapter
+(`apps/api/src/identity/managed-identity-adapter.ts`) pins this
+value internally. Per ticket #59 the BG1 adapter has no runtime
+switch — BG1 only supports this verification type, so the email
+template MUST be the Supabase magic-link template (Studio →
+Authentication → Email Templates → Magic Link). The template
 variables `{{ .TokenHash }}` and `{{ .SiteURL }}` are the ones
 the BG1 adapter consumes; the verify call's pinned
-`type: "magiclink"` matches the magic-link template contract.
+`type: "email"` matches the magic-link template contract.
 
 ## Applying the template
 
@@ -70,31 +73,15 @@ canonical template body and subject. Operators should still
 verify the Studio view after the script runs to confirm the
 template rendered correctly.
 
-## Verifying the deployed template (bounded deployed smoke)
+## Verifying the deployed template
 
-The BG1 startup smoke (`apps/api/src/identity/startup-smoke.ts`)
-proves the managed path is Golden-Slice-ready only when ALL of:
-
-- The configured smoke mailbox (`BG1_SMOKE_MAILBOX`) is reachable
-  via the deployed Supabase project (the OTP endpoint accepts a
-  request addressed to that mailbox).
-- The captured magic-link token resolves through the
-  `AuthenticationService` boundary into a persisted UserAccount
-  AND a SoundHub AuthSession (the session probe).
-- The **verified provider email** equals the configured smoke
-  mailbox — proving the captured credential was actually issued
-  for the smoke mailbox (not a stale token for some other
-  account).
-
-When `BG1_SMOKE_MAILBOX` is unset, the smoke reports
-`session-coverage-incomplete` and the factory selects the
-deterministic fallback as the approved deployed emergency path.
+Per ticket #59 the application-startup configuration smoke
+(`apps/api/src/identity/startup-smoke.ts`) only validates that
+the configured Supabase project's `/auth/v1/health` endpoint
+responds 2xx within the bounded timeout — it does NOT request,
+consume, or revoke a live Supabase OTP. End-to-end managed
+email verification is validated by the explicit bounded
+operational smoke procedure documented at
+[`docs/deployment/managed-provider-smoke.md`](./managed-provider-smoke.md).
 Operators cannot declare the managed path Golden-Slice-ready
-without exercising the delivered-link journey.
-
-The bounded smoke cannot directly read the deployed template's
-content (Supabase does not expose email template bodies via
-API), but the mailbox-correlation assertion proves the
-delivered credential was issued for the configured mailbox —
-which is what the browser will receive when it follows the
-deployed template's link.
+without successfully completing that procedure.

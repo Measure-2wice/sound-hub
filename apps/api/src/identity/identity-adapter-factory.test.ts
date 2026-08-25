@@ -138,20 +138,19 @@ describe("buildIdentityAdapters", () => {
     }
   });
 
-  test("production falls back to deterministic when the smoke reports partial coverage (P1-001)", () => {
-    // Per ticket #59 P1-001 the smoke is FAIL-CLOSED. A
-    // partial-coverage smoke (callback / session integration
-    // unproven) returns `ok: false` with reason
-    // `session-coverage-incomplete`; the factory MUST select the
+  test("production falls back to deterministic when the smoke fails (network reason)", () => {
+    // Per ticket #59 the configuration smoke is FAIL-CLOSED. A
+    // failing smoke (network unreachable, non-2xx, unconfigured)
+    // returns `ok: false`; the factory MUST select the
     // deterministic adapter as the approved deployed fallback
-    // rather than silently treat partial auth as healthy.
+    // rather than silently treat the managed path as healthy.
     const previousEnv = process.env.NODE_ENV;
     process.env.NODE_ENV = "production";
     try {
       const partialSmoke: SmokeResult = {
         ok: false,
-        reason: "session-coverage-incomplete",
-        detail: "no BG1_SMOKE_TEST_TOKEN supplied",
+        reason: "network",
+        detail: "ECONNREFUSED",
       };
       const logs: string[] = [];
       const { active } = buildIdentityAdapters({
@@ -165,7 +164,7 @@ describe("buildIdentityAdapters", () => {
         log: (msg) => logs.push(msg),
       });
       assert.equal(active.providerKey, "deterministic");
-      assert.ok(logs.some((line) => line.includes("session-coverage-incomplete")));
+      assert.ok(logs.some((line) => line.includes("network")));
     } finally {
       process.env.NODE_ENV = previousEnv;
     }

@@ -2,21 +2,23 @@
 //
 // Background: BG1 requires a managed adapter that implements the
 // same identity/session contract as the deterministic adapter.
-// The ticket also requires a "bounded deployed-provider smoke"
-// so the factory can fall back to the deterministic adapter when
-// the managed path is unreachable. These tests pin the contract:
-// every Supabase response is validated with a forward-compatible
-// Zod schema, the SoundHub request handle is opaque, verify
-// exchanges a real Supabase magic-link token, and a forged /
-// replayed / malformed token cannot mint a session.
+// The ticket also requires a "bounded deployed-provider
+// configuration smoke" so the factory can fall back to the
+// deterministic adapter when the managed path is unreachable.
+// These tests pin the contract: every Supabase response is
+// validated with a forward-compatible Zod schema, the SoundHub
+// request handle is opaque, verify exchanges a real Supabase
+// magic-link token, and a forged / replayed / malformed token
+// cannot mint a session.
 //
-// Per ticket #59 P0-002 the adapter pins the official Supabase
-// REST contract:
+// Per ticket #59 P0-001 the adapter pins the current Supabase
+// REST verify contract:
 //   - the magic-link OTP request uses `redirect_to` as a query
 //     parameter on the URL (not a body field);
-//   - the verify request posts `type: "magiclink"` (the canonical
-//     type for the BG1 magic-link email template, pinned per
-//     ticket #59 P2-001);
+//   - the verify request posts `type: "email"` (Supabase's
+//     current wire-level type for token-hash verification; the
+//     user-facing product remains email magic-link
+//     authentication);
 //   - the verify success response parses the real access-token /
 //     session envelope Supabase returns, with only the allow-listed
 //     `id` and `email` extracted into SoundHub identity.
@@ -28,10 +30,10 @@
 // reads the allow-listed fields and the parsed provider envelope
 // is discarded after identity is established.
 //
-// Per ticket #59 P2-001 `verifySignIn` accepts the PRIVATE
-// one-time `verificationToken` (the value the browser extracted
-// from the magic-link callback URL). The PUBLIC correlation id
-// returned by `requestSignIn` is NOT accepted here.
+// Per ticket #59 `verifySignIn` accepts the PRIVATE one-time
+// `verificationToken` (the value the browser extracted from the
+// magic-link callback URL). The PUBLIC correlation id returned by
+// `requestSignIn` is NOT accepted here.
 
 /* eslint-disable @typescript-eslint/no-floating-promises */
 
@@ -213,24 +215,52 @@ describe("ManagedIdentityAdapter", () => {
     assert.equal(result.reason, "network");
   });
 
-  test("requestSignIn returns a public correlationId under the documented field name (P2-001)", async () => {
+  test("smoke is a bounded configuration probe that never calls the OTP endpoint", async () => {
+    // Per ticket #59 the smoke is a non-destructive configuration
+    // probe that only contacts `/auth/v1/health`. Any call to the
+    // OTP or verify endpoints during startup smoke is a
+    // regression.
+    const calls: string[] = [];
+    const fetchImpl: typeof fetch = (input) => {
+      const url = typeof input === "string" ? input : (input as URL).toString();
+      calls.push(url);
+      if (url.includes("/auth/v1/health")) {
+        return Promise.resolve(
+          new Response(JSON.stringify({}), {
+            status: 200,
+            headers: { "Content-Type": "application/json" },
+          }),
+        );
+      }
+      throw new Error(`smoke must not contact ${url}`);
+    };
+    const adapter = configure({ fetchImpl });
+    const result = await adapter.smoke();
+    assert.equal(result.ok, true);
+    assert.ok(
+      calls.every((url) => url.endsWith("/auth/v1/health")),
+      "smoke must not call /auth/v1/otp or /auth/v1/verify",
+    );
+  });
+
+  test("requestSignIn returns a public correlationId under the documented field name", async () => {
     const { fetchImpl } = makeFetch({
       url: "https://example.supabase.co/auth/v1/otp",
       responses: [{ status: 200, body: {} }],
     });
     const adapter = configure({ fetchImpl });
     const result = await adapter.requestSignIn({ email: "buyer@example.com" });
-    // Per P2-001 the adapter returns a `correlationId` field
-    // (public, observability-only). The managed adapter never
-    // returns a `verificationToken` — Supabase owns the one-time
-    // credential and surfaces it in the magic-link callback URL
-    // the browser extracts.
+    // The adapter returns a `correlationId` field (public,
+    // observability-only). The managed adapter never returns a
+    // `verificationToken` — Supabase owns the one-time credential
+    // and surfaces it in the magic-link callback URL the browser
+    // extracts.
     assert.match(result.correlationId, /^managed-pending-[0-9a-f-]+$/);
     assert.equal(result.correlationId.includes("buyer@example.com"), false);
     assert.equal(result.verificationToken, undefined);
   });
 
-  test("requestSignIn sends the OTP body with `redirect_to` as a query parameter (P0-002)", async () => {
+  test("requestSignIn sends the OTP body with `redirect_to` as a query parameter", async () => {
     const { fetchImpl, calls } = makeFetch({
       url: "https://example.supabase.co/auth/v1/otp",
       responses: [{ status: 200, body: {} }],
@@ -257,59 +287,11 @@ describe("ManagedIdentityAdapter", () => {
     assert.equal(body.create_user, true);
     assert.equal("options" in body, false, "redirect must NOT be a body field");
     assert.equal("redirect_to" in body, false, "redirect must NOT be a body field");
-    // Per ticket #59 P1-001 the public `requestSignIn` does NOT
-    // embed per-attempt metadata so the bounded smoke uses
-    // `requestSmokeSignIn` for its correlation-binding path.
+    // The public requestSignIn does NOT embed per-attempt
+    // metadata; per ticket #59 no mutable user-metadata
+    // correlation is used to bind the captured token to its
+    // issuance.
     assert.equal("data" in body, false, "public requestSignIn must NOT embed metadata");
-  });
-
-  test("requestSmokeSignIn threads metadata (smokeAttemptId) into the OTP request body (P1-001)", async () => {
-    // Per ticket #59 P1-001 the bounded smoke embeds a
-    // per-attempt correlation id in the OTP request's `data`
-    // payload so Supabase stores it as `user_metadata` on the
-    // user record. The verify response carries the metadata
-    // back so the smoke can assert the captured token was
-    // issued by THIS smoke attempt (not a stale same-mailbox
-    // token issued before the smoke ran).
-    const { fetchImpl, calls } = makeFetch({
-      url: "https://example.supabase.co/auth/v1/otp",
-      responses: [{ status: 200, body: {} }],
-    });
-    const adapter = configure({
-      fetchImpl,
-      emailRedirectTo: "http://localhost:3000/auth/callback",
-    });
-    const smokeAttemptId = "11111111-1111-4111-8111-111111111111";
-    const result = await adapter.requestSmokeSignIn({
-      email: "bg1-smoke@soundhub.example",
-      metadata: { smokeAttemptId },
-    });
-    assert.match(result.correlationId, /^managed-pending-[0-9a-f-]+$/);
-    assert.equal(calls.length, 1);
-    const body = JSON.parse((calls[0]!.init?.body as string) ?? "{}") as Record<string, unknown>;
-    assert.equal(body.email, "bg1-smoke@soundhub.example");
-    assert.equal(body.create_user, true);
-    const data = body.data as Record<string, unknown>;
-    assert.ok(data, "data payload must be threaded to Supabase");
-    assert.equal(data.smokeAttemptId, smokeAttemptId);
-  });
-
-  test("verifySignIn returns the verified user_metadata (P1-001)", async () => {
-    const verifiedBody = supabaseVerifyEnvelope({
-      id: "supabase-uuid-metadata",
-      email: "bg1-smoke@soundhub.example",
-    });
-    (verifiedBody.user as Record<string, unknown>).user_metadata = {
-      smokeAttemptId: "captured-attempt-id",
-    };
-    const { fetchImpl } = makeFetch({
-      url: "https://example.supabase.co/auth/v1/verify",
-      responses: [{ status: 200, body: verifiedBody }],
-    });
-    const adapter = configure({ fetchImpl });
-    const verified = await adapter.verifySignIn({ verificationToken: "captured-token" });
-    assert.ok(verified);
-    assert.deepEqual(verified.providerMetadata, { smokeAttemptId: "captured-attempt-id" });
   });
 
   test("requestSignIn omits the redirect_to query when no emailRedirectTo is configured", async () => {
@@ -377,7 +359,7 @@ describe("ManagedIdentityAdapter", () => {
     assert.match(result.correlationId, /^managed-pending-[0-9a-f-]+$/);
   });
 
-  test('verifySignIn exchanges the Supabase token with type:"magiclink" and parses the real envelope (P0-002, P2-001)', async () => {
+  test('verifySignIn exchanges the Supabase token with type:"email" and parses the real envelope (P0-001)', async () => {
     const verifiedBody = supabaseVerifyEnvelope({
       id: "supabase-uuid-1",
       email: "buyer@example.com",
@@ -398,7 +380,7 @@ describe("ManagedIdentityAdapter", () => {
     assert.equal(calls[0]!.init?.method, "POST");
     const body = JSON.parse((calls[0]!.init?.body as string) ?? "{}") as Record<string, unknown>;
     assert.equal(body.token_hash, token);
-    assert.equal(body.type, "magiclink", "BG1 verify uses pinned type:magiclink");
+    assert.equal(body.type, "email", "Supabase token-hash verify uses type:email");
   });
 
   test("verifySignIn tolerates documented Supabase response fields like expires_at (P1-001)", async () => {
@@ -446,7 +428,7 @@ describe("ManagedIdentityAdapter", () => {
     );
   });
 
-  test("verifySignIn classifies a 5xx response as provider unavailability (P0-002)", async () => {
+  test("verifySignIn classifies a 5xx response as provider unavailability", async () => {
     const { fetchImpl } = makeFetch({
       url: "https://example.supabase.co/auth/v1/verify",
       responses: [{ status: 503, body: { error: { message: "Supabase is down" } } }],
@@ -459,7 +441,7 @@ describe("ManagedIdentityAdapter", () => {
     );
   });
 
-  test("verifySignIn fails closed when Supabase returns the reduced legacy shape (P0-002)", async () => {
+  test("verifySignIn fails closed when Supabase returns the reduced legacy shape", async () => {
     const { fetchImpl } = makeFetch({
       url: "https://example.supabase.co/auth/v1/verify",
       // Missing required access_token / token_type / refresh_token
@@ -504,7 +486,7 @@ describe("ManagedIdentityAdapter", () => {
     );
   });
 
-  test("verifySignIn rejects an extra field inside the user object (P0-002 strict user parser)", async () => {
+  test("verifySignIn rejects an extra field inside the user object", async () => {
     const verifiedBody = supabaseVerifyEnvelope({
       id: "supabase-uuid-6",
       email: "buyer@example.com",

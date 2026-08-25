@@ -177,19 +177,20 @@ export function buildApp(options: AppOptions = {}): BuiltApp {
 }
 
 /**
- * Run the bounded deployed-provider smoke AND assemble the app,
- * using the same managed adapter the smoke probed (per ticket
- * #59 P1-001 / P1-002). The factory owns the smoke so production
- * startup never silently picks the deterministic fallback, and
- * the smoke can never drift out of sync with the serving adapter
- * — the served adapter is the SAME instance the smoke validated.
+ * Run the bounded deployed-provider configuration smoke AND assemble
+ * the app, using the same managed adapter the smoke probed. The
+ * factory owns the smoke so production startup never silently
+ * picks the deterministic fallback, and the smoke can never drift
+ * out of sync with the serving adapter — the served adapter is the
+ * SAME instance the smoke validated.
  *
- * Per ticket #59 P1-001 the smoke is fail-closed; the factory
- * only selects the managed adapter when the smoke has proven
- * EVERY step: provider health, OTP request, callback verify,
- * AND the SoundHub server-side session round-trip. If any step
- * fails the factory selects the deterministic adapter as the
- * approved fallback.
+ * Per ticket #59 the configuration smoke is a bounded,
+ * non-destructive probe of the managed provider's `/auth/v1/health`
+ * endpoint. It does NOT request, consume, or revoke a live
+ * Supabase OTP. End-to-end managed email verification is validated
+ * by an explicit bounded operational smoke procedure (see
+ * `docs/deployment/managed-provider-smoke.md`), not by
+ * application startup.
  *
  * Test code continues to call {@link buildApp} directly with
  * mocked services so the unit suite remains network-free.
@@ -199,11 +200,11 @@ export async function buildAppWithSmoke(
 ): Promise<BuiltApp> {
   const prisma = options.prismaClient ?? createPrismaClient();
   const authRepository = options.authRepository ?? new PrismaAuthRepository(prisma);
-  // Build the managed adapter ONCE so the smoke and the serving
-  // routes share the SAME instance (per ticket #59 P1-002). The
-  // factory's `emailRedirectTo` defaults to AUTH_CALLBACK_URL so
-  // the callback URL the smoke validates is the exact value
-  // serving uses.
+  // Build the managed adapter ONCE so the configuration smoke and
+  // the serving routes share the SAME instance. The factory's
+  // `emailRedirectTo` defaults to AUTH_CALLBACK_URL so the
+  // callback URL the smoke validates is the exact value serving
+  // uses.
   const { ManagedIdentityAdapter } = await import("./identity/managed-identity-adapter.js");
   const managed = new ManagedIdentityAdapter({
     supabaseUrl: process.env.SUPABASE_URL,
@@ -211,33 +212,18 @@ export async function buildAppWithSmoke(
     supabaseServiceRoleKey: process.env.SUPABASE_SERVICE_ROLE_KEY,
     emailRedirectTo: process.env.AUTH_CALLBACK_URL,
   });
-  // The composition root also wires a SoundHub server-side session
-  // probe so the smoke proves the verified provider identity
-  // resolves to a persisted UserAccount and a SoundHub session
-  // (ticket #59 P1-001). The probe is built against a temporary
-  // AuthenticationService that uses the managed adapter the
-  // composition root just constructed — so the smoke exercises
-  // the application boundary the serving routes will use.
-  const probeService = new AuthenticationService({
-    identityAdapter: managed,
-    authRepository,
-  });
-  const { buildSessionProbe } = await import("./identity/startup-smoke.js");
-  const sessionProbe = buildSessionProbe(probeService);
-  // Run the smoke ONCE through the factory using the SAME managed
-  // adapter instance the composition root will serve. The factory
-  // returns the bundle whose `active` adapter is either the
-  // managed adapter (smoke passed) or the deterministic adapter
-  // (smoke failed) — and the bundle exposes the managed instance
-  // so tests can assert object identity with the serving adapter.
+  // Run the bounded configuration smoke ONCE through the factory
+  // using the SAME managed adapter instance the composition root
+  // will serve. The factory returns the bundle whose `active`
+  // adapter is either the managed adapter (smoke passed) or the
+  // deterministic adapter (smoke failed) — and the bundle exposes
+  // the managed instance so tests can assert object identity with
+  // the serving adapter.
   const bundle = await buildIdentityAdaptersAsync({
     managed,
     log: (message) => {
       console.log(`[bg1] ${message}`);
     },
-    smokeMailbox: process.env.BG1_SMOKE_MAILBOX,
-    smokeVerifyToken: process.env.BG1_SMOKE_TEST_TOKEN,
-    sessionProbe,
   });
   return buildApp({ ...options, identityAdapters: bundle, authRepository });
 }

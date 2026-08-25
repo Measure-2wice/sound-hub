@@ -17,9 +17,11 @@
   Templates → Magic Link) before declaring the managed path
   Golden-Slice-ready.
 
-  BG1 only supports magic-link verification. The serving adapter
-  (`ManagedIdentityAdapter`) pins `type: "magiclink"` for the
-  `/auth/v1/verify` call (per ticket #59 P2-001). The deployed
+  BG1 only supports magic-link verification. The user-facing
+  product is email magic-link authentication; the serving
+  adapter (`ManagedIdentityAdapter`) pins Supabase's current
+  wire-level verify type `type: "email"` for the
+  `/auth/v1/verify` call (per ticket #59 P0-001). The deployed
   email template therefore MUST be the Supabase magic-link
   template (Studio → Authentication → Email Templates → Magic
   Link) — no runtime switch is exposed and no other verify type

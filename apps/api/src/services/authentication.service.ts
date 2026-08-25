@@ -91,17 +91,6 @@ export interface RequestSignInResult {
 export interface VerifySignInResult {
   readonly session: SessionRecord;
   readonly publicUser: Bg1PublicUserV1;
-  /**
-   * The verified provider's `user_metadata` (the payload Supabase
-   * stored from the OTP request's `data` field). The bounded
-   * startup smoke uses this to assert the captured token was
-   * issued for its specific smoke attempt (per ticket #59
-   * P1-001). The deterministic adapter returns `undefined`.
-   * The metadata is provider-internal SoundHub credential
-   * material — it MUST NEVER appear in a public DTO, error
-   * envelope, or log line.
-   */
-  readonly providerMetadata?: Record<string, unknown>;
 }
 
 export class AuthenticationService {
@@ -184,13 +173,6 @@ export class AuthenticationService {
     return {
       session,
       publicUser: toPublicUser(publicUserView),
-      // Per ticket #59 P1-001 the bounded smoke reads the
-      // verified `user_metadata` to assert the captured token
-      // was issued for its specific attempt. The metadata is
-      // provider-internal credential material — only the
-      // bounded smoke (which never exposes it to a public DTO)
-      // consumes it.
-      providerMetadata: verified.providerMetadata,
     };
   }
 
