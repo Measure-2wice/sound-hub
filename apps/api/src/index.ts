@@ -16,9 +16,11 @@ import { PrismaAuthRepository } from "./auth-repository/prisma-auth-repository.j
 import type { MetadataRepository } from "./repositories/metadata.repository.js";
 import type { AuthRepository } from "./auth-repository/auth-repository.js";
 import type { IdentityAdapter } from "./identity/identity-adapter.js";
-import { buildIdentityAdapters } from "./identity/identity-adapter-factory.js";
-import { ManagedIdentityAdapter, type SmokeResult } from "./identity/managed-identity-adapter.js";
-import { runStartupSmoke } from "./identity/startup-smoke.js";
+import {
+  buildIdentityAdapters,
+  buildIdentityAdaptersAsync,
+} from "./identity/identity-adapter-factory.js";
+import type { SmokeResult } from "./identity/managed-identity-adapter.js";
 import { buildSafeError, generateRequestId, writeSafeError } from "./lib/errors.js";
 
 export interface AppOptions {
@@ -30,14 +32,20 @@ export interface AppOptions {
   readonly authRepository?: AuthRepository;
   readonly identityAdapter?: IdentityAdapter;
   /**
-   * Pre-computed bounded smoke result. When the caller has already
-   * run the bounded deployed-provider smoke (e.g. via
-   * `runStartupSmoke`), pass the result here so the factory's
-   * managed-vs-deterministic selection is driven by a real
-   * network probe. When omitted, the factory treats the smoke as
-   * missing and selects the deterministic fallback.
+   * Pre-computed bounded smoke result. Tests inject an explicit
+   * success/failure to exercise the factory decision without a
+   * real network round-trip. Production callers should leave this
+   * unset and use {@link buildAppWithSmoke} so the factory runs
+   * the smoke on its own managed adapter (per ticket #59 P1-001).
    */
   readonly managedSmoke?: SmokeResult;
+  /**
+   * Explicit override for the identity adapter selection. When
+   * supplied, the factory bypasses the smoke-driven selection
+   * entirely. The smoke is still skipped in this mode so test
+   * harnesses can stay network-free.
+   */
+  readonly identityAdapterOverride?: "managed-magic-link" | "deterministic";
 }
 
 export interface BuiltApp {
@@ -58,6 +66,7 @@ export function buildApp(options: AppOptions = {}): BuiltApp {
 
   const authRepository = options.authRepository ?? new PrismaAuthRepository(prisma);
   const identityAdapters = buildIdentityAdapters({
+    override: options.identityAdapterOverride,
     supabase: {
       url: process.env.SUPABASE_URL,
       anonKey: process.env.SUPABASE_ANON_KEY,
@@ -145,22 +154,28 @@ export function buildApp(options: AppOptions = {}): BuiltApp {
 }
 
 /**
- * Run the bounded deployed-provider smoke and assemble the app with
- * the smoke result. This is the deployed-process entry point; it
- * makes the managed-vs-deterministic selection drive from a real
- * bounded network probe so production startup never silently picks
- * the deterministic fallback. Test code continues to call
- * {@link buildApp} directly with mocked services.
+ * Run the bounded deployed-provider smoke AND assemble the app,
+ * using the same managed adapter the smoke probed (per ticket
+ * #59 P1-001). This is the deployed-process entry point; the
+ * factory owns the smoke so production startup never silently
+ * picks the deterministic fallback, and the smoke can never
+ * drift out of sync with the serving adapter. Test code
+ * continues to call {@link buildApp} directly with mocked
+ * services so the unit suite remains network-free.
  */
 export async function buildAppWithSmoke(
-  options: Omit<AppOptions, "managedSmoke"> = {},
+  options: Omit<AppOptions, "managedSmoke" | "identityAdapterOverride"> = {},
 ): Promise<BuiltApp> {
-  const managed = new ManagedIdentityAdapter({
-    supabaseUrl: process.env.SUPABASE_URL,
-    supabaseAnonKey: process.env.SUPABASE_ANON_KEY,
-    supabaseServiceRoleKey: process.env.SUPABASE_SERVICE_ROLE_KEY,
-    emailRedirectTo: process.env.AUTH_CALLBACK_URL,
+  const identityAdapters = await buildIdentityAdaptersAsync({
+    supabase: {
+      url: process.env.SUPABASE_URL,
+      anonKey: process.env.SUPABASE_ANON_KEY,
+      serviceRoleKey: process.env.SUPABASE_SERVICE_ROLE_KEY,
+    },
+    log: (message) => {
+      console.log(`[bg1] ${message}`);
+    },
+    smokeVerifyToken: process.env.BG1_SMOKE_TEST_TOKEN,
   });
-  const smokeResult = await runStartupSmoke({ managed });
-  return buildApp({ ...options, managedSmoke: smokeResult });
+  return buildApp({ ...options, managedSmoke: identityAdapters.smokeResult });
 }

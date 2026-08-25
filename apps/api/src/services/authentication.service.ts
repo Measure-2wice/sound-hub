@@ -233,11 +233,17 @@ export class AuthenticationService {
 /**
  * The magic-link envelope forwards the adapter's opaque
  * `requestId` plus the optional `devVerificationUrl`. The
- * `requestId` is the correlation id the managed and
- * deterministic adapters return from `requestSignIn`; the
- * `devVerificationUrl` is operator-only and absent in the
- * deployed deterministic fallback so an unauthenticated
- * browser cannot pick a demo identity by email.
+ * `requestId` is the public correlation id the managed and
+ * deterministic adapters return from `requestSignIn`; it is NOT a
+ * verify credential. The deterministic adapter additionally
+ * returns a private `verifierToken` on the adapter's return
+ * value — that field is intentionally NOT forwarded here. It is
+ * kept inside the adapter boundary so the public route layer can
+ * never expose it (the BG1 magic-link response schema is
+ * `.strict()` and does not declare a `verifierToken` field).
+ * The `devVerificationUrl` is operator-only and absent in the
+ * deployed deterministic fallback so an unauthenticated browser
+ * cannot pick a demo identity by email.
  */
 function withRequestIdAndOptionalDevUrl(result: SignInRequestResult): {
   ok: true;

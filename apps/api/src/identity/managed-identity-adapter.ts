@@ -37,6 +37,16 @@
 // the deterministic adapter without leaving an unconfigured managed
 // adapter selected. Per the ticket: "Provider unavailability never
 // permits an authentication or authorization bypass."
+//
+// Per ticket #59 P0-002 (this iteration), the adapter pins the
+// official Supabase REST contract: the magic-link OTP request uses
+// `redirect_to` as a query parameter (not a body field), the
+// token-hash verify endpoint posts `type: "email"` (the type
+// Supabase publishes for current token-hash verification), and the
+// verify success response parses the full access-token/session
+// envelope Supabase returns. Identity derivation only reads the
+// allow-listed `id` and `email` fields from the parsed envelope so
+// additional provider metadata never enters the SoundHub boundary.
 
 import { randomUUID } from "node:crypto";
 import { z } from "zod";
@@ -54,13 +64,29 @@ import {
 // Per AGENTS.md, runtime validation is required at untrusted
 // provider JSON boundaries. The schemas below are intentionally
 // strict (extra fields rejected) so a drifted Supabase payload
-// cannot enter identity derivation. Unknown success shapes and
-// error shapes are both validated.
+// cannot enter identity derivation. The verify success schema
+// mirrors the real Supabase access-token / session envelope
+// (access_token, token_type, expires_in, refresh_token, user with
+// the canonical user-shape fields) so a real magic-link callback
+// resolves through the strict parser. Identity derivation only
+// reads the allow-listed `id` and `email` from the parsed user
+// — provider metadata never enters the SoundHub boundary.
 
 const supabaseUserV1Schema = z
   .object({
     id: z.string().min(1).max(128),
     email: z.string().email().nullable().optional(),
+    aud: z.string().max(64).optional(),
+    role: z.string().max(64).optional(),
+    email_confirmed_at: z.string().max(64).nullable().optional(),
+    phone: z.string().max(64).nullable().optional(),
+    confirmed_at: z.string().max(64).nullable().optional(),
+    last_sign_in_at: z.string().max(64).nullable().optional(),
+    app_metadata: z.record(z.unknown()).optional(),
+    user_metadata: z.record(z.unknown()).optional(),
+    identities: z.array(z.record(z.unknown())).optional(),
+    created_at: z.string().max(64).nullable().optional(),
+    updated_at: z.string().max(64).nullable().optional(),
   })
   .strict();
 
@@ -80,8 +106,16 @@ const supabaseOtpErrorV1Schema = z
   })
   .strict();
 
+// Supabase verify response shape (current OpenAPI). The envelope
+// is the access-token/session shape with a strict `.strict()` user
+// schema on the inside. Extra top-level fields are rejected so a
+// drift in the envelope cannot silently enter identity derivation.
 const supabaseVerifySuccessV1Schema = z
   .object({
+    access_token: z.string().min(1).max(8192),
+    token_type: z.string().min(1).max(64),
+    expires_in: z.number().int().nonnegative(),
+    refresh_token: z.string().min(1).max(8192),
     user: supabaseUserV1Schema.nullable(),
   })
   .strict();
@@ -117,7 +151,9 @@ export interface ManagedIdentityAdapterOptions {
    * Optional callback URL the magic-link email redirects to. The
    * Supabase-issued token is appended to this URL by Supabase; the
    * browser extracts it from the `?request_id=...` query string
-   * and POSTs it to `/api/auth/verify-token`.
+   * and POSTs it to `/api/auth/verify-token`. Per the Supabase
+   * REST contract the value is passed as the `redirect_to` query
+   * parameter on `POST /auth/v1/otp`, not as a body field.
    */
   readonly emailRedirectTo?: string;
   /**
@@ -125,6 +161,14 @@ export interface ManagedIdentityAdapterOptions {
    * single-use token tracker to bound in-memory growth.
    */
   readonly now?: () => number;
+  /**
+   * Optional Supabase verify-endpoint `type`. The current Supabase
+   * token-hash verification endpoint documents `email` as the
+   * canonical type for magic-link callbacks (per ticket #59
+   * P0-002). Tests can override to pin the request shape against
+   * a captured contract fixture.
+   */
+  readonly verifyType?: "magiclink" | "email" | "signup" | "recovery" | "invite" | "email_change";
 }
 
 export interface SmokeResult {
@@ -134,6 +178,7 @@ export interface SmokeResult {
 }
 
 const DEFAULT_SMOKE_TIMEOUT_MS = 5_000;
+const DEFAULT_VERIFY_TYPE = "email" as const;
 const SINGLE_USE_TTL_MS = 15 * 60 * 1000; // matches Supabase OTP TTL
 
 /**
@@ -151,6 +196,7 @@ export class ManagedIdentityAdapter implements IdentityAdapter {
   private readonly fetchImpl: typeof fetch;
   private readonly smokeTimeoutMs: number;
   private readonly now: () => number;
+  private readonly verifyType: NonNullable<ManagedIdentityAdapterOptions["verifyType"]>;
   /**
    * Single-use tracking for exchanged Supabase tokens. Once a
    * token is exchanged with Supabase, subsequent attempts return
@@ -164,6 +210,7 @@ export class ManagedIdentityAdapter implements IdentityAdapter {
     this.fetchImpl = options.fetchImpl ?? fetch;
     this.smokeTimeoutMs = options.smokeTimeoutMs ?? DEFAULT_SMOKE_TIMEOUT_MS;
     this.now = options.now ?? (() => Date.now());
+    this.verifyType = options.verifyType ?? DEFAULT_VERIFY_TYPE;
   }
 
   /**
@@ -240,17 +287,27 @@ export class ManagedIdentityAdapter implements IdentityAdapter {
    * until the browser posts it back). Returns an OPAQUE SoundHub
    * handle used only for logging — the handle contains no user
    * identity and is not safe to authorize a session.
+   *
+   * Per ticket #59 P0-002 the request honours the official
+   * Supabase REST contract: the body carries only `email` and
+   * `create_user`; the optional email-redirect URL is passed as
+   * the `redirect_to` query parameter on the URL (NOT as a body
+   * field). Sending the redirect as a body field produced a
+   * 422 from Supabase in the prior iteration.
    */
   async requestSignIn(input: { readonly email: string }): Promise<SignInRequestResult> {
     this.assertConfigured();
-    const url = `${this.options.supabaseUrl}/auth/v1/otp`;
+    let url = `${this.options.supabaseUrl}/auth/v1/otp`;
+    if (this.options.emailRedirectTo) {
+      // Supabase expects `redirect_to` as a query parameter.
+      // encodeURIComponent keeps reserved characters from
+      // breaking the URL.
+      url = `${url}?redirect_to=${encodeURIComponent(this.options.emailRedirectTo)}`;
+    }
     const body: Record<string, unknown> = {
       email: input.email,
       create_user: true,
     };
-    if (this.options.emailRedirectTo) {
-      body.options = { emailRedirectTo: this.options.emailRedirectTo };
-    }
     let response: Response;
     try {
       response = await this.fetchImpl(url, {
@@ -300,6 +357,14 @@ export class ManagedIdentityAdapter implements IdentityAdapter {
    * token is treated as a Supabase credential — never as a
    * SoundHub-side authorization handle.
    *
+   * Per ticket #59 P0-002 the request body pins the current
+   * Supabase REST contract (`token_hash` + `type: "email"` for
+   * the current token-hash verification type). The success
+   * response is parsed against the full access-token / session
+   * envelope (access_token, token_type, expires_in, refresh_token,
+   * user); only the allow-listed `id` and `email` fields from the
+   * parsed user shape are forwarded into the SoundHub identity.
+   *
    * Returns `null` for replayed, expired, or invalid tokens. The
    * SoundHub request id format is intentionally irrelevant here;
    * we forward whatever the browser sent to Supabase's verify
@@ -326,7 +391,7 @@ export class ManagedIdentityAdapter implements IdentityAdapter {
           apikey: this.options.supabaseAnonKey ?? "",
           Authorization: `Bearer ${this.options.supabaseServiceRoleKey ?? ""}`,
         },
-        body: JSON.stringify({ token_hash: token, type: "magiclink" }),
+        body: JSON.stringify({ token_hash: token, type: this.verifyType }),
       });
     } catch (err) {
       // Network failure or abort is provider unavailability —
@@ -349,7 +414,12 @@ export class ManagedIdentityAdapter implements IdentityAdapter {
       }
       throw new IdentityVerificationFailedError(detail);
     }
-    let parsed: { user: { id: string; email?: string | null | undefined } | null };
+    let parsed: {
+      user: {
+        id: string;
+        email?: string | null | undefined;
+      } | null;
+    };
     try {
       parsed = supabaseVerifySuccessV1Schema.parse(raw);
     } catch {

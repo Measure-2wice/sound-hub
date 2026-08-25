@@ -38,16 +38,52 @@ export interface VerifiedIdentity {
 }
 
 /**
- * Result of `requestSignIn`. The adapter stores the opaque
- * `requestId` for later verification and (for managed providers)
- * emails a magic link containing it. The optional
- * `devVerificationUrl` is set only by the deterministic adapter to
- * enable automated tests and the approved emergency fallback path;
- * managed providers omit it so production deployments cannot leak a
- * usable verification URL.
+ * Result of `requestSignIn`. The adapter returns a public
+ * correlation id (`requestId`) and (for the deterministic adapter)
+ * an internal verify credential (`verifierToken`) and (only when
+ * operator mode is enabled) a one-shot URL the operator recovery
+ * flow can drive.
+ *
+ * The public route strips every field except `requestId` and the
+ * optional `devVerificationUrl` via the BG1 strict Zod schema so
+ * the verifier credential never crosses the browser boundary. The
+ * browser therefore cannot claim any returned value as a verify
+ * credential against `/api/auth/verify-token`. The deterministic
+ * adapter stores its pending request under the verifier token, not
+ * the public correlation id, so a browser that round-trips the
+ * correlation id is rejected as an unknown request.
+ *
+ * `devVerificationUrl` is set only when the deterministic adapter
+ * runs in operator mode (`BG1_DETERMINISTIC_OPERATOR_MODE=1`); the
+ * managed adapter never sets it. Even in operator mode the URL is
+ * emitted to the operator log sink only — the public response is
+ * restricted to `{ ok, requestId }` by the schema so a deployed
+ * browser can never receive a usable login credential.
  */
 export interface SignInRequestResult {
+  /**
+   * Public correlation id. The BG1 contract returns this value to
+   * the browser; it is NOT a verify credential. The deterministic
+   * adapter uses it for log correlation only; the managed adapter
+   * never reads it back.
+   */
   readonly requestId: string;
+  /**
+   * Operator-only verify credential. The deterministic adapter
+   * looks up its pending request by this value (not by the public
+   * requestId), so the browser never has a valid value to present
+   * to `/api/auth/verify-token`. The credential is exposed via
+   * the adapter's return value so test harnesses can drive the
+   * verify path directly; the deployed operator recovery path
+   * reads it from the operator log sink.
+   */
+  readonly verifierToken?: string;
+  /**
+   * Operator-only one-shot URL. Only the deterministic adapter sets
+   * it, and only when operator mode is enabled. Production
+   * deployments and the deployed deterministic fallback both
+   * render it absent.
+   */
   readonly devVerificationUrl?: string;
 }
 

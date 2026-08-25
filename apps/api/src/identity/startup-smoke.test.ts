@@ -1,9 +1,12 @@
 // Bounded deployed-provider smoke tests.
 //
 // Background: the bounded smoke runs at startup and drives the
-// factory's managed-vs-deterministic selection. These tests pin
-// the smoke's three-step contract (health → request → verify)
-// and verify the failure modes without a real network round-trip.
+// factory's managed-vs-deterministic selection. Per ticket #59
+// P1-001 the smoke MUST run on the same adapter the factory
+// selects. These tests pin the smoke's three-step contract
+// (health → request → verify with operator-injected captured
+// token) and verify the failure modes without a real network
+// round-trip.
 
 /* eslint-disable @typescript-eslint/no-floating-promises */
 
@@ -49,24 +52,39 @@ function configure(overrides: { fetchImpl?: typeof fetch } = {}) {
   });
 }
 
+function supabaseVerifyEnvelope(overrides: {
+  readonly id: string;
+  readonly email: string | null;
+}): Record<string, unknown> {
+  return {
+    access_token: "access-token-fixture",
+    token_type: "bearer",
+    expires_in: 3600,
+    refresh_token: "refresh-token-fixture",
+    user: { id: overrides.id, email: overrides.email },
+  };
+}
+
 describe("runStartupSmoke", () => {
-  test("returns ok:true when every step of the bounded smoke passes", async () => {
+  test("returns ok:true with operator-injected verify token when every step succeeds (P1-001)", async () => {
     const fetchImpl = makeFetch({
       responses: [
-        // Step 1: health
         { url: "https://example.supabase.co/auth/v1/health", status: 200, body: {} },
-        // Step 2: OTP
         { url: "https://example.supabase.co/auth/v1/otp", status: 200, body: {} },
-        // Step 3: verify (bad token → 401)
+        // Step 3: verify with the captured operator token → 200.
         {
           url: "https://example.supabase.co/auth/v1/verify",
-          status: 401,
-          body: { error: { message: "Invalid token" } },
+          status: 200,
+          body: supabaseVerifyEnvelope({ id: "captured-user-id", email: "buyer@soundhub.example" }),
         },
       ],
     });
-    const result = await runStartupSmoke({ managed: configure({ fetchImpl }) });
+    const result = await runStartupSmoke({
+      managed: configure({ fetchImpl }),
+      verifyToken: "captured-magic-link-token",
+    });
     assert.equal(result.ok, true);
+    assert.ok(result.detail?.includes("captured-user-id"));
   });
 
   test("returns ok:false (unconfigured) when env vars are missing", async () => {
@@ -76,7 +94,7 @@ describe("runStartupSmoke", () => {
     assert.equal(result.reason, "unconfigured");
   });
 
-  test("returns ok:false when the health endpoint is non-2xx (P0-002)", async () => {
+  test("returns ok:false when the health endpoint is non-2xx", async () => {
     const fetchImpl = makeFetch({
       responses: [
         {
@@ -126,7 +144,26 @@ describe("runStartupSmoke", () => {
     assert.equal(result.reason, "network");
   });
 
-  test("returns ok:true when verify endpoint rejects the bad token with 4xx (expected failure mode)", async () => {
+  test("returns ok:true with a partial-coverage detail when no operator token is supplied (P1-001)", async () => {
+    // Without an operator-injected token the smoke only proves the
+    // request path is reachable — it MUST NOT claim full coverage
+    // because a fabricated-token 4xx proves the endpoint is
+    // reachable but not the real callback contract.
+    const fetchImpl = makeFetch({
+      responses: [
+        { url: "https://example.supabase.co/auth/v1/health", status: 200, body: {} },
+        { url: "https://example.supabase.co/auth/v1/otp", status: 200, body: {} },
+      ],
+    });
+    const result = await runStartupSmoke({ managed: configure({ fetchImpl }) });
+    assert.equal(result.ok, true);
+    assert.ok(
+      result.detail?.includes("BG1_SMOKE_TEST_TOKEN"),
+      "operator must know to inject a captured token",
+    );
+  });
+
+  test("returns ok:false (non-2xx) when Supabase rejects the operator-injected captured token (P1-001)", async () => {
     const fetchImpl = makeFetch({
       responses: [
         { url: "https://example.supabase.co/auth/v1/health", status: 200, body: {} },
@@ -138,11 +175,15 @@ describe("runStartupSmoke", () => {
         },
       ],
     });
-    const result = await runStartupSmoke({ managed: configure({ fetchImpl }) });
-    assert.equal(result.ok, true);
+    const result = await runStartupSmoke({
+      managed: configure({ fetchImpl }),
+      verifyToken: "stale-captured-token",
+    });
+    assert.equal(result.ok, false);
+    assert.equal(result.reason, "non-2xx");
   });
 
-  test("returns ok:false when the verify endpoint returns 5xx", async () => {
+  test("returns ok:false (network) when the verify endpoint returns 5xx with an operator token (P1-001)", async () => {
     const fetchImpl = makeFetch({
       responses: [
         { url: "https://example.supabase.co/auth/v1/health", status: 200, body: {} },
@@ -154,18 +195,21 @@ describe("runStartupSmoke", () => {
         },
       ],
     });
-    const result = await runStartupSmoke({ managed: configure({ fetchImpl }) });
+    const result = await runStartupSmoke({
+      managed: configure({ fetchImpl }),
+      verifyToken: "captured-token",
+    });
     assert.equal(result.ok, false);
     assert.equal(result.reason, "network");
   });
 
-  test("returns ok:false (non-2xx) when the verify endpoint accepts a known-bad token", async () => {
+  test("returns ok:false when the captured token resolves to a non-envelope response (P0-002 strict parser)", async () => {
     const fetchImpl = makeFetch({
       responses: [
         { url: "https://example.supabase.co/auth/v1/health", status: 200, body: {} },
         { url: "https://example.supabase.co/auth/v1/otp", status: 200, body: {} },
-        // Supabase mistakenly accepts the bogus token — the smoke
-        // flags this as a verification failure.
+        // Supabase replies with the legacy reduced shape — the
+        // strict envelope parser rejects it.
         {
           url: "https://example.supabase.co/auth/v1/verify",
           status: 200,
@@ -173,8 +217,10 @@ describe("runStartupSmoke", () => {
         },
       ],
     });
-    const result = await runStartupSmoke({ managed: configure({ fetchImpl }) });
+    const result = await runStartupSmoke({
+      managed: configure({ fetchImpl }),
+      verifyToken: "captured-token",
+    });
     assert.equal(result.ok, false);
-    assert.equal(result.reason, "non-2xx");
   });
 });

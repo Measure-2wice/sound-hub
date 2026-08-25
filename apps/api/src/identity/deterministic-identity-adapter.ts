@@ -6,7 +6,9 @@
 //   1. Automated tests, where waiting on real email delivery and
 //      signing in through the Supabase SSR callback would be
 //      prohibitive. Tests opt in to the dev verification URL via
-//      the `allowDevVerificationUrl` constructor option.
+//      the `allowDevVerificationUrl` constructor option and
+//      drive `verifySignIn` directly with the adapter's
+//      `verifierToken` return value.
 //   2. The approved emergency fallback path: if managed email
 //      delivery, callback/session integration, or deployment
 //      configuration cannot pass the bounded provider smoke, this
@@ -16,15 +18,21 @@
 //      every other layer (session store, authorization service,
 //      route handler) is identical to the managed path.
 //
-// Per ticket #59 P1-002, the deterministic fallback must NOT
-// return a usable login credential to any browser that merely
-// supplies a demo email. The dev verification URL is gated behind
-// the `allowDevVerificationUrl` constructor option (default
-// `false`), which the operator enables only in an explicit
-// allow-listed recovery mode (set via `BG1_DETERMINISTIC_OPERATOR_MODE=1`).
-// When disabled, the adapter still proves possession of the email
-// (via `verifySignIn({ requestId })`) but only the operator —
-// reading the requestId from the server log — can mint a session.
+// Per ticket #59 P0-001 (this iteration), the deterministic fallback
+// must not expose a usable login credential to any browser that
+// merely supplies a demo email. The adapter therefore splits the
+// pending request into two opaque identifiers:
+//
+//   - `correlationId`: the public handle returned in
+//     `requestSignIn`'s response and carried into the public
+//     magic-link envelope. Safe to expose; cannot verify.
+//   - `verifierToken`: the internal credential the pending
+//     request is stored under. Returned on the adapter's
+//     `SignInRequestResult` so test harnesses can drive
+//     `verifySignIn` directly, and logged to the operator sink in
+//     operator mode so the deployed recovery path can complete
+//     sign-in through the same application boundary the managed
+//     path uses. Never returned in any public DTO.
 //
 // Per ADR 0004 the adapter never touches UserAccount, Workspace, or
 // membership tables — those live in `PrismaAuthRepository`.
@@ -138,41 +146,52 @@ export class DeterministicIdentityAdapter implements IdentityAdapter {
   }
 
   /**
-   * Returns the opaque requestId the operator (or test harness)
-   * must pass to {@link verifySignIn}. Per ticket #59 P1-002,
-   * the dev verification URL is NEVER returned to the browser —
-   * the deployed deterministic fallback must not expose a usable
-   * login credential to any browser that merely supplies a demo
-   * email. When `allowDevVerificationUrl` is `true`, the URL is
+   * Returns the public correlation id (in `requestId`) and the
+   * internal verifier credential (in `verifierToken`). The pending
+   * request is stored under `verifierToken` only; a browser that
+   * round-trips the public `requestId` to `/api/auth/verify-token`
+   * is rejected as an unknown request — the correlation id is not
+   * a lookup key. The dev verification URL is NEVER returned to the
+   * browser; when `allowDevVerificationUrl` is `true` the URL is
    * emitted to the operator's log sink so the operator-driven
-   * recovery workflow can drive verifySignIn through a separate
-   * internal boundary the browser cannot reach.
+   * recovery workflow can drive verifySignIn through the same
+   * application boundary the managed path uses, but without any
+   * usable value ever crossing the public response.
    */
   async requestSignIn(input: { readonly email: string }): Promise<SignInRequestResult> {
     const normalizedEmail = input.email.trim().toLowerCase();
-    const requestId = randomUUID();
+    const verifierToken = randomUUID();
+    const correlationId = randomUUID();
     const subject = deriveDeterministicSubject(normalizedEmail, sha256Hex);
-    this.pending.set(requestId, {
+    this.pending.set(verifierToken, {
       email: normalizedEmail,
       subject,
       expiresAt: this.now() + this.ttlMs,
       consumed: false,
     });
     if (this.allowDevVerificationUrl) {
-      const url = `${this.verificationPathPrefix}?request_id=${encodeURIComponent(requestId)}`;
+      const url = `${this.verificationPathPrefix}?request_id=${encodeURIComponent(verifierToken)}`;
       // Operator-mode log sink: the URL is recorded so the
       // operator can drive the recovery flow. The browser MUST
       // NEVER receive the URL — the response carries only the
-      // opaque requestId.
+      // opaque public correlationId. The verifierToken in the URL
+      // is the same value the adapter returned on the
+      // SignInRequestResult for test harnesses.
       console.log(
-        `[bg1-deterministic] operator-mode verification URL for ${normalizedEmail}: ${url}`,
+        `[bg1-deterministic] operator-mode verification URL for ${normalizedEmail} ` +
+          `(correlation=${correlationId}): ${url}`,
       );
     }
-    return Promise.resolve({ requestId });
+    return Promise.resolve({ requestId: correlationId, verifierToken });
   }
 
   async verifySignIn(input: { readonly requestId: string }): Promise<VerifiedIdentity | null> {
     this.gc();
+    // The pending request is keyed by the verifier token, not the
+    // public correlation id. The browser only ever sees the
+    // correlation id, so `pending.get(input.requestId)` here
+    // returns null for any browser-supplied value — the public
+    // correlation id is not a valid lookup key.
     const entry = this.pending.get(input.requestId);
     if (!entry) return null;
     if (entry.consumed) return null;

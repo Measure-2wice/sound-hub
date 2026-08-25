@@ -24,11 +24,18 @@
 //
 //   3. Non-production defaults to the deterministic adapter so
 //      tests never accidentally contact a managed provider.
+//
+// Per ticket #59 P1-001, the async factory owns the smoke — the
+// smoke runs on the SAME adapter instance the factory selects,
+// so the smoke can never drift out of sync with the serving
+// adapter. The sync factory is preserved for tests that want to
+// inject a pre-computed smoke result.
 
 import type { Bg1IdentityProviderV1 } from "@soundhub/types";
 import { DeterministicIdentityAdapter } from "./deterministic-identity-adapter.js";
 import { ManagedIdentityAdapter, type SmokeResult } from "./managed-identity-adapter.js";
 import type { IdentityAdapter } from "./identity-adapter.js";
+import { runStartupSmoke } from "./startup-smoke.js";
 
 export type { IdentityAdapter } from "./identity-adapter.js";
 
@@ -54,9 +61,18 @@ export interface IdentityAdapterFactoryOptions {
   /**
    * Optional override for the managed smoke result. Tests pass an
    * explicit success/failure to exercise the factory decision
-   * without a real network round-trip.
+   * without a real network round-trip. The async factory ignores
+   * this in favour of running the real smoke.
    */
   readonly managedSmoke?: SmokeResult;
+  /**
+   * Operator-injected captured magic-link token. Forwarded to the
+   * startup smoke so the async factory can drive the verify step
+   * end-to-end. Defaults to `process.env.BG1_SMOKE_TEST_TOKEN`
+   * when unset; the async factory exposes the override so the
+   * composition root can read the env var exactly once.
+   */
+  readonly smokeVerifyToken?: string;
   /**
    * Optional logger sink. The factory emits a single line when it
    * decides between managed and deterministic so operators can act
@@ -86,13 +102,12 @@ export interface BuiltIdentityAdapters {
   readonly smokeResult: SmokeResult;
 }
 
-/**
- * Resolve the active adapter from environment, smoke, and an optional
- * test override.
- */
-export function buildIdentityAdapters(
-  options: IdentityAdapterFactoryOptions = {},
-): BuiltIdentityAdapters {
+function buildAdaptersInternal(options: IdentityAdapterFactoryOptions): {
+  deterministic: DeterministicIdentityAdapter;
+  managed: ManagedIdentityAdapter;
+  log: (message: string) => void;
+  operatorMode: boolean;
+} {
   const operatorMode =
     options.allowDeterministicOperatorMode ?? process.env.BG1_DETERMINISTIC_OPERATOR_MODE === "1";
   const deterministic = new DeterministicIdentityAdapter({
@@ -103,50 +118,111 @@ export function buildIdentityAdapters(
     supabaseAnonKey: options.supabase?.anonKey,
     supabaseServiceRoleKey: options.supabase?.serviceRoleKey,
   });
-  const log = options.log ?? ((message) => console.log(message));
+  return {
+    deterministic,
+    managed,
+    log: options.log ?? ((message) => console.log(message)),
+    operatorMode,
+  };
+}
 
-  if (options.override === "deterministic") {
+function selectActive(input: {
+  readonly managed: ManagedIdentityAdapter;
+  readonly deterministic: DeterministicIdentityAdapter;
+  readonly smokeResult: SmokeResult;
+  readonly override: Bg1IdentityProviderV1 | undefined;
+  readonly log: (message: string) => void;
+}): { active: IdentityAdapter; smokeResult: SmokeResult } {
+  const { managed, deterministic, override, log, smokeResult } = input;
+  if (override === "deterministic") {
     return {
       active: deterministic,
-      managed,
-      deterministic,
       smokeResult: { ok: false, reason: "unconfigured", detail: "override=deterministic" },
     };
   }
-  if (options.override === "managed-magic-link") {
+  if (override === "managed-magic-link") {
     if (!managed.isConfigured()) {
       throw new Error(
         "Managed magic-link adapter requested but not configured (SUPABASE_URL, SUPABASE_ANON_KEY, SUPABASE_SERVICE_ROLE_KEY missing).",
       );
     }
-    return { active: managed, managed, deterministic, smokeResult: { ok: true } };
+    return { active: managed, smokeResult };
   }
-
-  // The smoke runs unless the caller injected a deterministic result.
-  // We resolve the smoke synchronously here by reading the optional
-  // override; the caller can run `managed.smoke()` themselves when
-  // they want a real probe before calling `buildIdentityAdapters`.
-  const smokeResult = options.managedSmoke ?? {
-    ok: false,
-    reason: "unconfigured",
-    detail: "no smoke result supplied",
-  };
-
   const nodeEnv = process.env.NODE_ENV ?? "development";
   if (nodeEnv === "production") {
     if (managed.isConfigured() && smokeResult.ok) {
-      log("[identity] Managed magic-link smoke succeeded; using managed-magic-link adapter.");
-      return { active: managed, managed, deterministic, smokeResult };
+      log(
+        `[identity] Managed magic-link smoke succeeded; using managed-magic-link adapter ` +
+          `(${smokeResult.detail ?? "no detail"}).`,
+      );
+      return { active: managed, smokeResult };
     }
     log(
-      `[identity] Managed magic-link smoke failed (${smokeResult.reason ?? "unknown"}: ${smokeResult.detail ?? ""}); ` +
-        "falling back to deterministic adapter as the approved BG1 emergency path.",
+      `[identity] Managed magic-link smoke failed (${smokeResult.reason ?? "unknown"}: ` +
+        `${smokeResult.detail ?? ""}); falling back to deterministic adapter as the approved ` +
+        "BG1 emergency path.",
     );
-    return { active: deterministic, managed, deterministic, smokeResult };
+    return { active: deterministic, smokeResult };
   }
   // Non-production defaults to the deterministic adapter so tests
   // and the local browser journey never accidentally contact a
   // managed provider. Operators may opt in by injecting a
   // successful smoke result.
-  return { active: deterministic, managed, deterministic, smokeResult };
+  return { active: deterministic, smokeResult };
+}
+
+/**
+ * Resolve the active adapter from environment, smoke, and an optional
+ * test override. The smoke result is supplied by the caller (tests
+ * inject a synthetic result); production code uses the async
+ * variant below so the factory itself runs the smoke on its own
+ * adapter instance.
+ */
+export function buildIdentityAdapters(
+  options: IdentityAdapterFactoryOptions = {},
+): BuiltIdentityAdapters {
+  const { managed, deterministic, log } = buildAdaptersInternal(options);
+  const smokeResult: SmokeResult = options.managedSmoke ?? {
+    ok: false,
+    reason: "unconfigured",
+    detail: "no smoke result supplied",
+  };
+  const { active } = selectActive({
+    managed,
+    deterministic,
+    smokeResult,
+    override: options.override,
+    log,
+  });
+  return { active, managed, deterministic, smokeResult };
+}
+
+/**
+ * Async factory that owns the bounded deployed-provider smoke. Per
+ * ticket #59 P1-001 the smoke MUST run on the SAME adapter instance
+ * the serving application uses so the smoke can never drift out of
+ * sync with the production selection. Tests should keep using the
+ * synchronous `buildIdentityAdapters` with an injected smoke result.
+ */
+export async function buildIdentityAdaptersAsync(
+  options: IdentityAdapterFactoryOptions = {},
+): Promise<BuiltIdentityAdapters> {
+  const { managed, deterministic, log } = buildAdaptersInternal(options);
+  let smokeResult: SmokeResult;
+  if (options.managedSmoke) {
+    smokeResult = options.managedSmoke;
+  } else {
+    smokeResult = await runStartupSmoke({
+      managed,
+      verifyToken: options.smokeVerifyToken ?? process.env.BG1_SMOKE_TEST_TOKEN,
+    });
+  }
+  const { active } = selectActive({
+    managed,
+    deterministic,
+    smokeResult,
+    override: options.override,
+    log,
+  });
+  return { active, managed, deterministic, smokeResult };
 }
