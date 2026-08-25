@@ -12,9 +12,12 @@
 // exchanged EXACTLY ONCE through the serving authentication seam.
 // The smoke itself NEVER calls `ManagedIdentityAdapter.verifySignIn`
 // independently — the `sessionProbe` is the sole exchange path.
-// The unit tests below exercise the smoke with a session probe
-// that counts provider verification calls to prove the smoke
-// never reuses the captured token.
+//
+// Per ticket #59 P1-001 (this iteration) the smoke ties the
+// OTP probe to the operator-controlled `smokeMailbox` — the
+// SAME mailbox the operator receives the captured link on —
+// so the bounded smoke traverses the link produced by the
+// deployed email-template configuration.
 //
 // Per ticket #59 P2-001 the captured token is the PRIVATE
 // `verificationToken` extracted from the magic-link callback URL.
@@ -27,6 +30,11 @@ import { describe, test } from "node:test";
 import { ManagedIdentityAdapter } from "./managed-identity-adapter.js";
 import { runStartupSmoke } from "./startup-smoke.js";
 
+interface FetchCall {
+  readonly url: string;
+  readonly init?: RequestInit;
+}
+
 interface FetchScenario {
   readonly responses: ReadonlyArray<{
     readonly url: string;
@@ -35,7 +43,11 @@ interface FetchScenario {
   }>;
 }
 
-function makeFetch(scenario: FetchScenario): typeof fetch {
+function makeFetch(scenario: FetchScenario): {
+  readonly calls: FetchCall[];
+  readonly fetchImpl: typeof fetch;
+} {
+  const calls: FetchCall[] = [];
   let index = 0;
   const fetchImpl: typeof fetch = (input, init) => {
     const url = typeof input === "string" ? input : (input as URL).toString();
@@ -43,8 +55,8 @@ function makeFetch(scenario: FetchScenario): typeof fetch {
     if (!url.startsWith(response.url)) {
       throw new Error(`unexpected fetch call to ${url}`);
     }
+    calls.push({ url, init });
     index += 1;
-    void init;
     return Promise.resolve(
       new Response(JSON.stringify(response.body ?? {}), {
         status: response.status,
@@ -52,7 +64,7 @@ function makeFetch(scenario: FetchScenario): typeof fetch {
       }),
     );
   };
-  return fetchImpl;
+  return { calls, fetchImpl };
 }
 
 function configure(overrides: { fetchImpl?: typeof fetch } = {}) {
@@ -60,6 +72,12 @@ function configure(overrides: { fetchImpl?: typeof fetch } = {}) {
     supabaseUrl: "https://example.supabase.co",
     supabaseAnonKey: "anon-key",
     supabaseServiceRoleKey: "service-role-key",
+    // The smoke mailbox fixture relies on a real callback URL
+    // being threaded into the deployed Supabase project so the
+    // configured email template can embed
+    // `?token={{ .TokenHash }}` against the same URL the browser
+    // callback page reads.
+    emailRedirectTo: "https://app.example.com/auth/callback",
     fetchImpl: overrides.fetchImpl,
   });
 }
@@ -86,6 +104,8 @@ function supabaseVerifyEnvelope(overrides: {
   };
 }
 
+const SMOKE_MAILBOX = "bg1-smoke@soundhub.example";
+
 describe("runStartupSmoke", () => {
   test("returns ok:true only when every step (health, otp, session probe) succeeds (P1-001)", async () => {
     // Per ticket #59 P1-001 the smoke delegates the verify to
@@ -94,7 +114,7 @@ describe("runStartupSmoke", () => {
     // verification calls and asserts the smoke makes exactly
     // zero independent verify attempts.
     let verifyCount = 0;
-    const fetchImpl = makeFetch({
+    const { fetchImpl, calls } = makeFetch({
       responses: [
         { url: "https://example.supabase.co/auth/v1/health", status: 200, body: {} },
         { url: "https://example.supabase.co/auth/v1/otp", status: 200, body: {} },
@@ -102,6 +122,7 @@ describe("runStartupSmoke", () => {
     });
     const result = await runStartupSmoke({
       managed: configure({ fetchImpl }),
+      smokeMailbox: SMOKE_MAILBOX,
       verifyToken: "captured-verification-token",
       sessionProbe: async () => {
         verifyCount += 1;
@@ -110,7 +131,16 @@ describe("runStartupSmoke", () => {
     });
     assert.equal(result.ok, true);
     assert.ok(result.detail?.includes("sess-1"));
+    assert.ok(result.detail?.includes(SMOKE_MAILBOX));
     assert.equal(verifyCount, 1, "session probe must be the SOLE provider exchange");
+    // The OTP request MUST target the operator-configured smoke
+    // mailbox (per ticket #59 P1-001 deployed magic-link
+    // contract) — NOT a sentinel `.example` address unrelated to
+    // the captured link.
+    const otpCall = calls.find((c) => c.url.includes("/auth/v1/otp"));
+    assert.ok(otpCall, "OTP request must be made");
+    const otpBody = JSON.parse((otpCall.init?.body as string) ?? "{}") as Record<string, unknown>;
+    assert.equal(otpBody.email, SMOKE_MAILBOX);
   });
 
   test("returns ok:false (unconfigured) when env vars are missing", async () => {
@@ -121,7 +151,7 @@ describe("runStartupSmoke", () => {
   });
 
   test("returns ok:false when the health endpoint is non-2xx", async () => {
-    const fetchImpl = makeFetch({
+    const { fetchImpl } = makeFetch({
       responses: [
         {
           url: "https://example.supabase.co/auth/v1/health",
@@ -130,7 +160,10 @@ describe("runStartupSmoke", () => {
         },
       ],
     });
-    const result = await runStartupSmoke({ managed: configure({ fetchImpl }) });
+    const result = await runStartupSmoke({
+      managed: configure({ fetchImpl }),
+      smokeMailbox: SMOKE_MAILBOX,
+    });
     assert.equal(result.ok, false);
     assert.equal(result.reason, "non-2xx");
   });
@@ -148,14 +181,17 @@ describe("runStartupSmoke", () => {
       }
       return Promise.reject(new Error("ECONNREFUSED"));
     };
-    const result = await runStartupSmoke({ managed: configure({ fetchImpl }) });
+    const result = await runStartupSmoke({
+      managed: configure({ fetchImpl }),
+      smokeMailbox: SMOKE_MAILBOX,
+    });
     assert.equal(result.ok, false);
     assert.equal(result.reason, "network");
     assert.ok(result.detail?.includes("ECONNREFUSED"));
   });
 
   test("returns ok:false when the OTP endpoint returns 5xx", async () => {
-    const fetchImpl = makeFetch({
+    const { fetchImpl } = makeFetch({
       responses: [
         { url: "https://example.supabase.co/auth/v1/health", status: 200, body: {} },
         {
@@ -165,35 +201,22 @@ describe("runStartupSmoke", () => {
         },
       ],
     });
-    const result = await runStartupSmoke({ managed: configure({ fetchImpl }) });
+    const result = await runStartupSmoke({
+      managed: configure({ fetchImpl }),
+      smokeMailbox: SMOKE_MAILBOX,
+    });
     assert.equal(result.ok, false);
     assert.equal(result.reason, "network");
   });
 
-  test("returns ok:false (session-coverage-incomplete) when no operator token is supplied (P1-001)", async () => {
-    // Per ticket #59 P1-001 the smoke is FAIL-CLOSED. Without
-    // an operator-supplied captured verification token the
-    // smoke cannot prove the callback / session integration and
-    // the factory must select the deterministic fallback. A
-    // successful magic-link request alone is NOT enough.
-    const fetchImpl = makeFetch({
-      responses: [
-        { url: "https://example.supabase.co/auth/v1/health", status: 200, body: {} },
-        { url: "https://example.supabase.co/auth/v1/otp", status: 200, body: {} },
-      ],
-    });
-    const result = await runStartupSmoke({ managed: configure({ fetchImpl }) });
-    assert.equal(result.ok, false);
-    assert.equal(result.reason, "session-coverage-incomplete");
-    assert.ok(result.detail?.includes("BG1_SMOKE_TEST_TOKEN"));
-  });
-
-  test("returns ok:false (session-coverage-incomplete) when the session probe is missing (P1-001)", async () => {
-    // The provider endpoints are reachable but no session probe
-    // is supplied — the smoke cannot prove the SoundHub
-    // server-side session issuance and the factory must select
+  test("returns ok:false (session-coverage-incomplete) when no smoke mailbox is configured (P1-001)", async () => {
+    // Per ticket #59 P1-001 the smoke must tie the OTP probe
+    // to the SAME mailbox the captured link arrives on. Without
+    // an operator-configured smoke mailbox the smoke cannot
+    // prove the deployed email-template configuration delivers
+    // a link the operator can capture; the factory must select
     // the deterministic fallback.
-    const fetchImpl = makeFetch({
+    const { fetchImpl } = makeFetch({
       responses: [
         { url: "https://example.supabase.co/auth/v1/health", status: 200, body: {} },
         { url: "https://example.supabase.co/auth/v1/otp", status: 200, body: {} },
@@ -201,6 +224,43 @@ describe("runStartupSmoke", () => {
     });
     const result = await runStartupSmoke({
       managed: configure({ fetchImpl }),
+      // smokeMailbox omitted intentionally.
+    });
+    assert.equal(result.ok, false);
+    assert.equal(result.reason, "session-coverage-incomplete");
+    assert.ok(result.detail?.includes("BG1_SMOKE_MAILBOX"));
+  });
+
+  test("returns ok:false (session-coverage-incomplete) when no operator token is supplied (P1-001)", async () => {
+    // The OTP request to the configured smoke mailbox succeeded
+    // (delivery proved) but no captured token was injected — the
+    // operator still needs to receive the delivered email and
+    // paste the token.
+    const { fetchImpl } = makeFetch({
+      responses: [
+        { url: "https://example.supabase.co/auth/v1/health", status: 200, body: {} },
+        { url: "https://example.supabase.co/auth/v1/otp", status: 200, body: {} },
+      ],
+    });
+    const result = await runStartupSmoke({
+      managed: configure({ fetchImpl }),
+      smokeMailbox: SMOKE_MAILBOX,
+    });
+    assert.equal(result.ok, false);
+    assert.equal(result.reason, "session-coverage-incomplete");
+    assert.ok(result.detail?.includes("BG1_SMOKE_TEST_TOKEN"));
+  });
+
+  test("returns ok:false (session-coverage-incomplete) when the session probe is missing (P1-001)", async () => {
+    const { fetchImpl } = makeFetch({
+      responses: [
+        { url: "https://example.supabase.co/auth/v1/health", status: 200, body: {} },
+        { url: "https://example.supabase.co/auth/v1/otp", status: 200, body: {} },
+      ],
+    });
+    const result = await runStartupSmoke({
+      managed: configure({ fetchImpl }),
+      smokeMailbox: SMOKE_MAILBOX,
       verifyToken: "captured-verification-token",
     });
     assert.equal(result.ok, false);
@@ -208,7 +268,7 @@ describe("runStartupSmoke", () => {
   });
 
   test("returns ok:false (session-coverage-incomplete) when the session probe reports failure (P1-001)", async () => {
-    const fetchImpl = makeFetch({
+    const { fetchImpl } = makeFetch({
       responses: [
         { url: "https://example.supabase.co/auth/v1/health", status: 200, body: {} },
         { url: "https://example.supabase.co/auth/v1/otp", status: 200, body: {} },
@@ -216,6 +276,7 @@ describe("runStartupSmoke", () => {
     });
     const result = await runStartupSmoke({
       managed: configure({ fetchImpl }),
+      smokeMailbox: SMOKE_MAILBOX,
       verifyToken: "captured-verification-token",
       sessionProbe: async () => ({ ok: false, detail: "resolveSession returned null" }),
     });
@@ -280,7 +341,7 @@ describe("runStartupSmoke token consumption (P1-001 single-exchange)", () => {
     // a session through the production `verifySignIn` boundary.
     const verifyEnvelope = supabaseVerifyEnvelope({
       id: "supabase-uuid-smoke",
-      email: "buyer@soundhub.example",
+      email: SMOKE_MAILBOX,
     });
     let verifyEndpointCalls = 0;
     let probeCalls = 0;
@@ -302,6 +363,7 @@ describe("runStartupSmoke token consumption (P1-001 single-exchange)", () => {
 
     const result = await runStartupSmoke({
       managed: adapter,
+      smokeMailbox: SMOKE_MAILBOX,
       verifyToken: "captured-verification-token",
       sessionProbe: async ({ verificationToken }) => {
         probeCalls += 1;
@@ -321,6 +383,7 @@ describe("runStartupSmoke token consumption (P1-001 single-exchange)", () => {
     });
     assert.equal(result.ok, true);
     assert.ok(result.detail?.includes("session-1"));
+    assert.ok(result.detail?.includes(SMOKE_MAILBOX));
     // The smoke itself never calls `adapter.verifySignIn`. The
     // adapter's verify count is owned entirely by the session
     // probe, which the smoke invokes exactly once.

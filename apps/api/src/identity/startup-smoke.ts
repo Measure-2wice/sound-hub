@@ -17,14 +17,29 @@
 // independently, so the captured token cannot be replay-rejected
 // by the production boundary the smoke is meant to validate.
 //
+// Per ticket #59 P1-001 (this iteration) the smoke ties the OTP
+// probe to the SAME mailbox the operator will receive the
+// captured link on, so the bounded smoke traverses the link
+// produced by the deployed email-template configuration. The
+// operator configures `BG1_SMOKE_MAILBOX` to a real mailbox they
+// own; the smoke posts the magic-link OTP request to that
+// mailbox and the operator pastes the token extracted from the
+// delivered email into `BG1_SMOKE_TEST_TOKEN`. The smoke
+// therefore proves the END-TO-END contract the deployed browser
+// journey will use: an email arrives at the configured mailbox,
+// the delivered link embeds `?token=<token_hash>` against the
+// configured `AUTH_CALLBACK_URL`, and the application boundary
+// exchanges the credential exactly once.
+//
 // The smoke probes:
 //
 //   1. /auth/v1/health — Supabase project is reachable.
-//   2. /auth/v1/otp — magic-link request endpoint (with the
-//      official `redirect_to` query parameter and current
-//      request body shape). The probe uses a sentinel `.example`
-//      mailbox because the smoke does not own a real mailbox;
-//      delivery evidence is the captured token itself.
+//   2. /auth/v1/otp — magic-link request endpoint addressed to
+//      the operator-configured smoke mailbox (NOT a sentinel
+//      `.example` address). A 2xx response proves the deployed
+//      email-template configuration will actually deliver a link
+//      to the mailbox the operator uses to capture the
+//      verification token.
 //   3. SoundHub server-side session round-trip — the session
 //      probe drives `AuthenticationService.verifySignIn` with the
 //      operator-injected captured token, the verified provider
@@ -44,6 +59,32 @@
 // returns { ok: false, reason, detail } on every failure mode so
 // the factory can log the fallback decision and operators can act
 // without spelunking the code.
+//
+// ----------------------------------------------------------------
+// DEPLOYED SUPABASE MAGIC-LINK CONTRACT (per ticket #59 P1-001).
+// ----------------------------------------------------------------
+// The deployed managed path requires the Supabase project's
+// magic-link email template to deliver a link of the form:
+//
+//     <AUTH_CALLBACK_URL>?token=<token_hash>
+//
+// i.e. the email template's action link MUST be
+// `{{ .SiteURL }}/auth/callback?token={{ .TokenHash }}` (or
+// `<AUTH_CALLBACK_URL>?token={{ .TokenHash }}`) so the browser's
+// `MagicLinkVerifier` extracts the credential from `?token=...`
+// and POSTs it to `/api/auth/verify-token`. The Supabase
+// default magic-link email does NOT append the raw token hash
+// to the redirect — operators MUST configure the custom email
+// template (Supabase Studio → Authentication → Email Templates
+// → Magic Link) for the deployed Golden Slice.
+//
+// The matching verify type (`MANAGED_VERIFY_TYPE` env var,
+// default `magiclink`) MUST match the `type` declared in the
+// email template so the server-side `verifySignIn` accepts the
+// captured token. The deployed smoke will fail closed if
+// `BG1_SMOKE_MAILBOX` is unset so operators cannot declare the
+// managed path Golden-Slice-ready without exercising the
+// delivered-link configuration.
 
 import type { ManagedIdentityAdapter, SmokeResult } from "./managed-identity-adapter.js";
 import { IdentityProviderUnavailableError } from "./identity-adapter.js";
@@ -71,6 +112,23 @@ export type SessionProbe = (input: { readonly verificationToken: string }) => Pr
 
 export interface StartupSmokeDeps {
   readonly managed: ManagedIdentityAdapter;
+  /**
+   * Operator-controlled mailbox the bounded smoke will request
+   * the magic link from. The mailbox MUST be a real address the
+   * operator owns so they can receive the delivered email and
+   * paste the captured `token_hash` into `BG1_SMOKE_TEST_TOKEN`.
+   * Per ticket #59 P1-001 the smoke ties the OTP probe to the
+   * SAME mailbox the captured link arrives on; a sentinel
+   * `.example` mailbox cannot receive real email and cannot
+   * prove the deployed email-template configuration.
+   *
+   * When omitted, the smoke reports
+   * `session-coverage-incomplete` and the factory selects the
+   * deterministic fallback — the managed path cannot be declared
+   * Golden-Slice-ready without the operator exercising the
+   * delivered-link configuration.
+   */
+  readonly smokeMailbox?: string;
   /**
    * Operator-injected captured magic-link verification token
    * (per ticket #59 P2-001). When supplied, the smoke delegates
@@ -139,7 +197,9 @@ export function buildSessionProbe(authService: AuthenticationService): SessionPr
  * captured token EXACTLY ONCE. `ok: true` is only returned after
  * EVERY step succeeds:
  *   - provider health endpoint is reachable;
- *   - OTP request endpoint is reachable;
+ *   - OTP request endpoint delivers to the operator-configured
+ *     smoke mailbox (the same mailbox the captured link is
+ *     received on);
  *   - the captured verification token resolves through the
  *     application seam (`AuthenticationService.verifySignIn`)
  *     into a verified provider identity;
@@ -170,33 +230,39 @@ export async function runStartupSmoke(deps: StartupSmokeDeps): Promise<SmokeResu
   // Step 1: Supabase project health.
   const health = await managed.smoke();
   if (!health.ok) return health;
-  // Step 2: magic-link request endpoint. Supabase emails the
-  // request; the smoke does not need to receive the email. A
-  // 2xx response proves the endpoint is reachable AND that the
-  // request body / `redirect_to` query parameter contract is
-  // honoured (Supabase 422s when the body carries an
-  // `options.emailRedirectTo` field per the prior iteration's
-  // misuse). A 4xx response (e.g. rate limit) is acceptable for
-  // the smoke because it still proves the endpoint round-trips.
-  //
-  // The probe targets a sentinel `.example` mailbox because the
-  // smoke does not own a real mailbox. Delivery evidence for
-  // the captured link is the captured token itself — the
-  // operator received it via Supabase's email channel before
-  // pasting it into BG1_SMOKE_TEST_TOKEN.
+  // Step 2: operator-configured smoke mailbox. Per ticket #59
+  // P1-001 the OTP probe must target the SAME mailbox the
+  // operator will receive the captured link on — a sentinel
+  // `.example` address cannot receive email and therefore
+  // cannot prove the deployed email-template configuration.
+  // The smoke fails closed when no smoke mailbox is configured
+  // so operators cannot declare the managed path
+  // Golden-Slice-ready without exercising the delivered-link
+  // journey.
+  const smokeMailbox = deps.smokeMailbox?.trim();
+  if (!smokeMailbox) {
+    return {
+      ok: false,
+      reason: "session-coverage-incomplete",
+      detail:
+        "no BG1_SMOKE_MAILBOX configured; the smoke must target the same mailbox the operator will receive the captured link on. Configure BG1_SMOKE_MAILBOX (and the Supabase magic-link email template to redirect to <AUTH_CALLBACK_URL>?token={{ .TokenHash }}) before declaring the managed path Golden-Slice-ready.",
+    };
+  }
+  // A magic-link request endpoint that 2xx's proves the deployed
+  // Supabase project will deliver a link to the smoke mailbox.
+  // The captured token itself arrives via the operator's email
+  // client once the configured email template fires.
   try {
-    const result = await managed.requestSignIn({
-      email: "bg1-startup-smoke@soundhub.example",
-    });
+    const result = await managed.requestSignIn({ email: smokeMailbox });
     // The opaque handle itself is unused — the smoke only proves
-    // the endpoint is reachable.
+    // the endpoint delivers to the configured mailbox.
     void result;
   } catch (err) {
     if (err instanceof IdentityProviderUnavailableError) {
       return {
         ok: false,
         reason: "network",
-        detail: `requestSignIn probe failed: ${err.message}`,
+        detail: `requestSignIn probe failed for smoke mailbox ${smokeMailbox}: ${err.message}`,
       };
     }
     throw err;
@@ -214,25 +280,13 @@ export async function runStartupSmoke(deps: StartupSmokeDeps): Promise<SmokeResu
     typeof deps.verifyToken !== "string" ||
     deps.verifyToken.trim() === ""
   ) {
-    // No operator-injected token. Per ticket #59 P1-001 a
-    // missing token does NOT return `ok: true`. The smoke has
-    // proven the request path is reachable but the
-    // callback/session integration is unproven; the operator
-    // MUST inject a captured token before declaring the deployed
-    // managed path Golden-Slice-ready. The factory then selects
-    // the deterministic fallback.
     return {
       ok: false,
       reason: "session-coverage-incomplete",
-      detail:
-        "request path exercised but no BG1_SMOKE_TEST_TOKEN supplied; managed path is not Golden-Slice-ready",
+      detail: `smoke mailbox ${smokeMailbox} accepted the OTP request but no BG1_SMOKE_TEST_TOKEN captured from the delivered email was supplied; managed path is not Golden-Slice-ready`,
     };
   }
   if (!deps.sessionProbe) {
-    // The provider endpoint is reachable but the smoke has no
-    // way to cross the application boundary; the smoke reports
-    // session coverage as incomplete and the factory selects
-    // the deterministic fallback.
     return {
       ok: false,
       reason: "session-coverage-incomplete",
@@ -245,11 +299,11 @@ export async function runStartupSmoke(deps: StartupSmokeDeps): Promise<SmokeResu
     return {
       ok: false,
       reason: "session-coverage-incomplete",
-      detail: `SoundHub session integration failed: ${probe.detail ?? "unknown"}; managed path is not Golden-Slice-ready`,
+      detail: `SoundHub session integration failed (smoke mailbox ${smokeMailbox}): ${probe.detail ?? "unknown"}; managed path is not Golden-Slice-ready`,
     };
   }
   return {
     ok: true,
-    detail: `request + SoundHub session round-trip exercised against Supabase; resolved subject via sessionId=${probe.sessionId ?? "<unset>"}; userAccountId=${probe.userAccountId ?? "<unset>"}`,
+    detail: `OTP delivered to smoke mailbox ${smokeMailbox}; SoundHub session round-trip exercised against Supabase; sessionId=${probe.sessionId ?? "<unset>"}; userAccountId=${probe.userAccountId ?? "<unset>"}`,
   };
 }

@@ -235,6 +235,7 @@ export async function buildAppWithSmoke(
     log: (message) => {
       console.log(`[bg1] ${message}`);
     },
+    smokeMailbox: process.env.BG1_SMOKE_MAILBOX,
     smokeVerifyToken: process.env.BG1_SMOKE_TEST_TOKEN,
     sessionProbe,
   });

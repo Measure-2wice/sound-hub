@@ -89,6 +89,17 @@ export interface IdentityAdapterFactoryOptions {
    */
   readonly managedSmoke?: SmokeResult;
   /**
+   * Operator-controlled smoke mailbox. Per ticket #59 P1-001
+   * the bounded smoke ties the OTP probe to the SAME mailbox
+   * the operator will receive the captured link on — a sentinel
+   * `.example` address cannot receive real email and therefore
+   * cannot prove the deployed email-template configuration.
+   * Defaults to `process.env.BG1_SMOKE_MAILBOX` when unset; the
+   * async factory exposes the override so the composition root
+   * can read the env var exactly once.
+   */
+  readonly smokeMailbox?: string;
+  /**
    * Operator-injected captured magic-link verification token
    * (per ticket #59 P2-001). Forwarded to the startup smoke so
    * the async factory can drive the verify step end-to-end.
@@ -266,6 +277,7 @@ export async function buildIdentityAdaptersAsync(
   } else {
     smokeResult = await runStartupSmoke({
       managed,
+      smokeMailbox: options.smokeMailbox ?? process.env.BG1_SMOKE_MAILBOX,
       verifyToken: options.smokeVerifyToken ?? process.env.BG1_SMOKE_TEST_TOKEN,
       sessionProbe: options.sessionProbe,
     });
