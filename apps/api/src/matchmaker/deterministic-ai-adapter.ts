@@ -130,11 +130,22 @@ const LOCATION_PHRASES: ReadonlyArray<{
   readonly region?: string;
 }> = [
   // City -> country shortcuts the seed uses. Kept explicit so the
-  // fallback cannot accidentally broaden a buyer request.
+  // fallback cannot accidentally broaden a buyer request. The
+  // first matching phrase wins (declaration order matters); each
+  // city therefore has the most natural phrasing (e.g. "in
+  // brooklyn") listed first, followed by alternates the buyer
+  // UI may emit ("brooklyn-based", "based in brooklyn", the
+  // documented default brief wording).
   { phrase: "in brooklyn", countryCode: "US", city: "Brooklyn", region: "NY" },
+  { phrase: "brooklyn-based", countryCode: "US", city: "Brooklyn", region: "NY" },
+  { phrase: "based in brooklyn", countryCode: "US", city: "Brooklyn", region: "NY" },
+  { phrase: "from brooklyn", countryCode: "US", city: "Brooklyn", region: "NY" },
   { phrase: "in toronto", countryCode: "CA", city: "Toronto", region: "ON" },
+  { phrase: "toronto-based", countryCode: "CA", city: "Toronto", region: "ON" },
   { phrase: "in london", countryCode: "GB", city: "London" },
+  { phrase: "london-based", countryCode: "GB", city: "London" },
   { phrase: "in santo domingo", countryCode: "DO", city: "Santo Domingo" },
+  { phrase: "santo domingo-based", countryCode: "DO", city: "Santo Domingo" },
   { phrase: "in nassau", countryCode: "BS", city: "Nassau" },
   { phrase: "in kingston", countryCode: "JM", city: "Kingston" },
   { phrase: "in port of spain", countryCode: "TT", city: "Port of Spain" },

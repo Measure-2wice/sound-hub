@@ -352,6 +352,30 @@ test("ImpalaAiAdapter throws when the candidate fails bg3MatchmakerCriteriaV1Sch
   );
 });
 
+test("ImpalaAiAdapter throws when the upstream body is JSON null", async () => {
+  // JSON.parse("null") returns the literal null. Without the
+  // envelope-shape guard, reading .choices throws a TypeError
+  // that bypasses the adapter's fallback path; the application
+  // service then surfaces MATCHMAKER_FAILED instead of routing
+  // the failure to the deterministic adapter. The guard must
+  // translate the malformed envelope into AiUnavailableError so
+  // the existing fallback logic takes over.
+  const transport = new FakeHttpTransport();
+  transport.enqueueResponse(200, "null");
+  const adapter = new ImpalaAiAdapter(
+    { baseUrl: "https://ht.getimpala.ai/v1", apiKey: "k", model: "qwen3.6-27b" },
+    transport,
+  );
+  let caught: unknown;
+  try {
+    await adapter.interpretBrief(VALID_INPUT);
+  } catch (err) {
+    caught = err;
+  }
+  assert.ok(caught instanceof Error);
+  assert.equal(caught.name, "AiUnavailableError");
+});
+
 test("ImpalaAiAdapter throws when the chat envelope is missing choices", async () => {
   const transport = new FakeHttpTransport();
   transport.enqueueResponse(200, JSON.stringify({ id: "x", model: "qwen3.6-27b" }));

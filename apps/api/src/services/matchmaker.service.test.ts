@@ -37,7 +37,11 @@ import {
   WorkspaceAuthorizationService,
 } from "./workspace-authorization.service.js";
 import { MatchmakerService, MatchmakerError } from "./matchmaker.service.js";
-import { AiUnavailableError, type AiAdapter } from "../matchmaker/ai-adapter.js";
+import {
+  AiUnavailableError,
+  AiInvalidOutputError,
+  type AiAdapter,
+} from "../matchmaker/ai-adapter.js";
 import { DeterministicAiAdapter } from "../matchmaker/deterministic-ai-adapter.js";
 import { InMemoryProjectBriefRepository } from "../matchmaker/in-memory-project-brief.repository.js";
 import type {
@@ -170,6 +174,18 @@ class MalformedManagedAdapter implements AiAdapter {
 class UnavailableManagedAdapter implements AiAdapter {
   async interpretBrief(_input: Bg3AiInterpretInputV1): Promise<Bg3AiInterpretOutputV1> {
     throw new AiUnavailableError("managed provider offline");
+  }
+}
+
+// A primary adapter that surfaces the same AiInvalidOutputError the
+// deterministic fallback throws on punctuation-only input. This
+// proves the service translates the error into
+// MATCHMAKER_INVALID_REQUEST (HTTP 400) rather than the generic
+// MATCHMAKER_FAILED (HTTP 500) that the prior code path produced
+// when deterministic was the primary adapter.
+class InvalidOutputManagedAdapter implements AiAdapter {
+  async interpretBrief(_input: Bg3AiInterpretInputV1): Promise<Bg3AiInterpretOutputV1> {
+    throw new AiInvalidOutputError("managed adapter produced invalid output");
   }
 }
 
@@ -381,4 +397,67 @@ test("MatchmakerService surfaces additional matching offerings end-to-end", asyn
   assert.equal(rec.bestMatchingOfferingId, "of-marc-dancehall");
   assert.equal(rec.additionalMatchingOfferings.length, 1);
   assert.equal(rec.additionalMatchingOfferings[0]?.offeringId, "of-marc-mixing");
+});
+
+test("MatchmakerService maps punctuation-only brief to MATCHMAKER_INVALID_REQUEST", async () => {
+  // Deterministic is the primary adapter. A punctuation-only
+  // brief carries no usable axes (no recognised category /
+  // location / mode and no valid query after normalization); the
+  // adapter self-validates and throws AiInvalidOutputError. The
+  // service must translate this to MATCHMAKER_INVALID_REQUEST
+  // (HTTP 400) rather than the generic MATCHMAKER_FAILED
+  // (HTTP 500) that the prior path produced when deterministic
+  // was the primary adapter. No search or persistence may
+  // occur.
+  const { service, search } = buildService({});
+  await assert.rejects(
+    service.submitBrief({
+      userAccountId: BUYER_USER_ID,
+      actingWorkspaceId: BUYER_WORKSPACE_ID,
+      briefText: "--------",
+    }),
+    (err: unknown) => err instanceof MatchmakerError && err.code === "MATCHMAKER_INVALID_REQUEST",
+  );
+  assert.equal(search.calls.length, 0, "search must not run for unusable input");
+});
+
+test("MatchmakerService maps unavailable-primary + unusable-fallback to MATCHMAKER_INVALID_REQUEST", async () => {
+  // Managed adapter surfaces AiUnavailableError so the service
+  // falls back to deterministic. The deterministic fallback
+  // then self-validates the punctuation-only brief and throws
+  // AiInvalidOutputError. Both errors are recoverable; the
+  // service must translate the chain failure to
+  // MATCHMAKER_INVALID_REQUEST (HTTP 400), not
+  // MATCHMAKER_FAILED (HTTP 500).
+  const { service, search } = buildService({
+    aiAdapter: new UnavailableManagedAdapter(),
+  });
+  await assert.rejects(
+    service.submitBrief({
+      userAccountId: BUYER_USER_ID,
+      actingWorkspaceId: BUYER_WORKSPACE_ID,
+      briefText: "--------",
+    }),
+    (err: unknown) => err instanceof MatchmakerError && err.code === "MATCHMAKER_INVALID_REQUEST",
+  );
+  assert.equal(search.calls.length, 0, "search must not run for unusable input");
+});
+
+test("MatchmakerService maps managed-invalid-output + unusable-fallback to MATCHMAKER_INVALID_REQUEST", async () => {
+  // Managed adapter surfaces AiInvalidOutputError (e.g. schema
+  // rejection). The deterministic fallback also fails on a
+  // punctuation-only brief. The service must surface
+  // MATCHMAKER_INVALID_REQUEST so the route returns HTTP 400.
+  const { service, search } = buildService({
+    aiAdapter: new InvalidOutputManagedAdapter(),
+  });
+  await assert.rejects(
+    service.submitBrief({
+      userAccountId: BUYER_USER_ID,
+      actingWorkspaceId: BUYER_WORKSPACE_ID,
+      briefText: "--------",
+    }),
+    (err: unknown) => err instanceof MatchmakerError && err.code === "MATCHMAKER_INVALID_REQUEST",
+  );
+  assert.equal(search.calls.length, 0);
 });

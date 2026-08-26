@@ -127,6 +127,32 @@ test("deterministic fallback always produces a candidate that passes the M1+BG3 
   }
 });
 
+test("deterministic fallback preserves the shipped default brief's Brooklyn required location", async () => {
+  // The buyer UI ships DEFAULT_BRIEF verbatim:
+  //   "I need a Brooklyn-based producer for a remote Haitian
+  //   dancehall single, ideally delivered before March 14."
+  // GS 14 forbids silently dropping or relaxing required
+  // constraints; a Brooklyn-based requirement must survive the
+  // deterministic interpretation. Without the "brooklyn-based"
+  // phrase in LOCATION_PHRASES, the required.basedIn axis was
+  // absent and the talent search surfaced sellers outside
+  // Brooklyn.
+  const criteria = await interpret(
+    "I need a Brooklyn-based producer for a remote Haitian dancehall single, ideally delivered before March 14.",
+  );
+  assert.ok(criteria.required.serviceModes?.includes("Remote"));
+  assert.ok(criteria.required.primaryCategoryKeys?.some((k) => k === "music-production"));
+  assert.equal(
+    criteria.required.basedIn?.countryCode,
+    "US",
+    "Brooklyn-based must survive as a required US basedIn",
+  );
+  assert.equal(criteria.required.basedIn?.city, "Brooklyn");
+  assert.equal(criteria.required.basedIn?.region, "NY");
+  assert.ok(criteria.preferred?.genreTags?.includes("dancehall"));
+  assert.ok(criteria.preferred?.caribbeanAffiliationCodes?.includes("HT"));
+});
+
 test("deterministic fallback refuses to emit an unvalidated criteria payload (punctuation-only brief)", async () => {
   // Punctuation-only briefs have no recognised axis and produce a
   // query value that normalizedQuerySchema rejects. The adapter

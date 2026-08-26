@@ -53,7 +53,20 @@ class FakeMatchmakerService {
   readonly submitCalls: unknown[] = [];
   readonly getCalls: unknown[] = [];
 
+  // Toggle to simulate the deterministic-fallback self-validation
+  // rejection path. When true, submitBrief throws a real
+  // MatchmakerError(MATCHMAKER_INVALID_REQUEST) — the same shape
+  // the real service produces when the buyer's brief is
+  // unusable.
+  static INVALID_REQUEST = false;
+
   async submitBrief(input: unknown): Promise<Bg3SubmitBriefResponseV1> {
+    if (FakeMatchmakerService.INVALID_REQUEST) {
+      throw new MatchmakerError(
+        "ProjectBrief cannot be interpreted into valid search criteria.",
+        "MATCHMAKER_INVALID_REQUEST",
+      );
+    }
     this.submitCalls.push(input);
     if (
       typeof input === "object" &&

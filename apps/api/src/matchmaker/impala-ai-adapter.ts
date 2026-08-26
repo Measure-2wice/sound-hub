@@ -308,6 +308,15 @@ function safeParseChatResponse(body: string): ImpalaChatResponse | null {
   } catch {
     return null;
   }
+  // JSON.parse can legally return null, a primitive, or a non-object
+  // value (e.g. "null", "[]", "42"). Reading `.choices` on any of
+  // those throws a TypeError that bypasses the fallback path; the
+  // adapter must validate the envelope shape before any property
+  // access so an unusable body translates into an unavailable
+  // error rather than an unhandled crash.
+  if (parsed === null || typeof parsed !== "object" || Array.isArray(parsed)) {
+    return null;
+  }
   const choices = (parsed as { choices?: unknown }).choices;
   if (!Array.isArray(choices) || choices.length === 0) {
     return null;

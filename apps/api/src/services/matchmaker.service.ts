@@ -37,7 +37,7 @@ import type {
   TalentSearchResponseV1,
 } from "@soundhub/types";
 import { bg3MatchmakerCriteriaV1Schema, publicOfferingSummaryV1Schema } from "@soundhub/types";
-import type { AiAdapter, AiUnavailableError } from "../matchmaker/ai-adapter.js";
+import type { AiAdapter } from "../matchmaker/ai-adapter.js";
 import { DeterministicAiAdapter } from "../matchmaker/deterministic-ai-adapter.js";
 import type {
   PersistedBrief,
@@ -164,11 +164,34 @@ export class MatchmakerService {
     try {
       aiOutput = await this.primaryAi.interpretBrief(aiInput);
     } catch (err) {
-      if (!isUnavailableError(err)) {
+      // Both AiUnavailableError (network / timeout / 5xx / config
+      // miss) and AiInvalidOutputError (deterministic self-
+      // validation rejection, e.g. a punctuation-only brief that
+      // carries no usable axes) are recoverable: re-route to the
+      // deterministic fallback. Anything else is unexpected and
+      // surfaces as a generic MATCHMAKER_FAILED.
+      if (!isRecoverableAiError(err)) {
         throw new MatchmakerError("AI interpretation failed unexpectedly.", "MATCHMAKER_FAILED");
       }
-      usedFallback = true;
-      aiOutput = await this.fallbackAi.interpretBrief(aiInput);
+      try {
+        usedFallback = true;
+        aiOutput = await this.fallbackAi.interpretBrief(aiInput);
+      } catch (fallbackErr) {
+        // The deterministic fallback itself is unavailable or
+        // produced unusable output. Surface the safe invalid-
+        // request envelope so the route returns HTTP 400 rather
+        // than a generic MATCHMAKER_FAILED (HTTP 500). This
+        // covers the punctuation-only path through deterministic-
+        // as-primary AND the managed-unavailable +
+        // deterministic-rejects chain.
+        if (isRecoverableAiError(fallbackErr)) {
+          throw new MatchmakerError(
+            "ProjectBrief cannot be interpreted into valid search criteria.",
+            "MATCHMAKER_INVALID_REQUEST",
+          );
+        }
+        throw new MatchmakerError("AI interpretation failed unexpectedly.", "MATCHMAKER_FAILED");
+      }
     }
 
     let criteria: Bg3MatchmakerCriteriaV1;
@@ -190,15 +213,29 @@ export class MatchmakerService {
           // persisted alongside `aiFallbackUsed: true`).
           aiOutput = fallbackOutput;
           usedFallback = true;
-        } catch {
-          throw new MatchmakerError(
-            "AI interpretation produced an invalid criteria payload and the deterministic fallback also failed.",
-            "MATCHMAKER_INVALID_REQUEST",
-          );
+        } catch (fallbackErr) {
+          // Either the deterministic fallback produced output that
+          // fails runtime validation (AiInvalidOutputError) or
+          // the fallback itself became unavailable mid-flight.
+          // Both conditions mean the buyer's brief cannot yield
+          // a usable criteria payload; surface the safe
+          // invalid-request envelope (HTTP 400 via the route's
+          // status table) rather than a generic MATCHMAKER_FAILED.
+          if (isRecoverableAiError(fallbackErr)) {
+            throw new MatchmakerError(
+              "ProjectBrief cannot be interpreted into valid search criteria.",
+              "MATCHMAKER_INVALID_REQUEST",
+            );
+          }
+          throw new MatchmakerError("AI interpretation failed unexpectedly.", "MATCHMAKER_FAILED");
         }
       } else {
+        // The deterministic fallback ran as the primary path and
+        // produced an unparseable payload. Surface the safe
+        // invalid-request envelope so the route maps it to HTTP
+        // 400 (MATCHMAKER_INVALID_REQUEST) — NOT a generic 500.
         throw new MatchmakerError(
-          "Deterministic fallback produced an invalid criteria payload.",
+          "ProjectBrief cannot be interpreted into valid search criteria.",
           "MATCHMAKER_INVALID_REQUEST",
         );
       }
@@ -303,10 +340,21 @@ export class MatchmakerService {
   }
 }
 
-function isUnavailableError(err: unknown): err is AiUnavailableError {
+/**
+ * Both `AiUnavailableError` (managed adapter network / config /
+ * upstream-shape failure) and `AiInvalidOutputError` (deterministic
+ * self-validation rejection of a punctuation-only brief with no
+ * usable axes) are recoverable: re-route to the deterministic
+ * fallback so a second parse attempt has a chance to succeed. A
+ * non-Error throw or an unrelated error type is treated as
+ * unexpected.
+ */
+function isRecoverableAiError(err: unknown): boolean {
   return (
     err instanceof Error &&
-    (err.name === "AiUnavailableError" || err.name === "IdentityProviderUnavailableError")
+    (err.name === "AiUnavailableError" ||
+      err.name === "AiInvalidOutputError" ||
+      err.name === "IdentityProviderUnavailableError")
   );
 }
 
