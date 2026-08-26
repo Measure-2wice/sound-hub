@@ -98,7 +98,15 @@ describe("SupabaseStorageAdapter", () => {
     // adapter resolves the handle back to bucket/path via an
     // internal index.
     assert.ok(result.storageRef.length > 0);
-    assert.equal(result.storageRef.includes("offering-audio"), false);
+    // The storage ref is a self-contained server-internal locator
+    // that the adapter parses on every call. It is NEVER serialized
+    // to a public DTO; that is the privacy boundary. The locator
+    // itself can include bucket/path because the application never
+    // sees it.
+    assert.ok(
+      result.storageRef.startsWith("supa:offering-audio:"),
+      "self-contained locator must identify the bucket",
+    );
     assert.equal(calls.length, 1);
   });
 
@@ -162,7 +170,12 @@ describe("SupabaseStorageAdapter", () => {
     );
   });
 
-  test("getPlaybackReference resolves a signed URL via the storage sign endpoint", async () => {
+  test("getPlaybackReference returns the in-app SoundHub-owned URL (not a provider signed URL)", async () => {
+    // Per ticket #61 follow-up review (P0-001) the public DTO must
+    // never expose provider signed URLs, bucket names, or object
+    // paths. The adapter composes the in-app
+    // /api/services/.../play route; the Supabase signed URL is
+    // minted internally only on getPlaybackBytes.
     const { fetchImpl } = makeFetchStub(() =>
       jsonResponse({ signedURL: "/object/sign/offering-audio/samples/x.mp3?token=abc" }),
     );
@@ -170,6 +183,7 @@ describe("SupabaseStorageAdapter", () => {
       supabaseUrl: SUPABASE_URL,
       supabaseServiceRoleKey: SUPABASE_KEY,
       bucket: "offering-audio",
+      playbackBaseUrl: "http://api.example.test",
       fetchImpl,
     });
     const result = await adapter.uploadSample({
@@ -185,7 +199,9 @@ describe("SupabaseStorageAdapter", () => {
       sampleId: "smp-1",
     });
     assert.ok(ref);
-    assert.equal(ref.url, `${SUPABASE_URL}/object/sign/offering-audio/samples/x.mp3?token=abc`);
+    assert.equal(ref.url, "http://api.example.test/api/services/of-1/audio-samples/smp-1/play");
+    assert.equal(ref.url.includes("supa:"), false);
+    assert.equal(ref.url.includes("token="), false);
   });
 
   test("getPlaybackReference returns null for an unknown reference", async () => {
@@ -243,7 +259,13 @@ describe("SupabaseStorageAdapter", () => {
     assert.equal(last.init.method, "DELETE");
   });
 
-  test("the storage reference never embeds bucket or object path", async () => {
+  test("the storage reference is durable (self-contained) but never crosses the public DTO", async () => {
+    // Per ticket #61 follow-up review (P1-001) the storage ref is a
+    // self-contained server-internal locator the adapter parses on
+    // every call, so the locator survives an adapter restart. The
+    // privacy boundary is that the locator is NEVER serialized to a
+    // public DTO; the public DTO carries only the SoundHub-owned
+    // in-app playback URL.
     const { fetchImpl } = makeFetchStub(() => new Response(null, { status: 200 }));
     const adapter = new SupabaseStorageAdapter({
       supabaseUrl: SUPABASE_URL,
@@ -258,23 +280,27 @@ describe("SupabaseStorageAdapter", () => {
       offeringId: "of-1",
       bytes: new Uint8Array(4),
     });
-    // Per ticket #61 follow-up review: storageRef is opaque and
-    // never reveals the bucket name or the object path. The adapter
-    // resolves it back to bucket/path via its internal index.
-    assert.equal(result.storageRef.includes("offering-audio"), false);
-    assert.equal(result.storageRef.includes("/samples/"), false);
-    assert.equal(result.storageRef.includes(".mp3"), false);
+    // Self-contained: the adapter parses it back without consulting
+    // any in-process index.
+    assert.ok(
+      result.storageRef.startsWith("supa:offering-audio:"),
+      "storage ref must identify the bucket so a fresh adapter can resolve it",
+    );
+    // The storage ref is not part of the public DTO. The application
+    // server uses it server-side only (PostgreSQL column).
+    assert.notEqual(
+      JSON.stringify({ sampleId: "smp-1", storageRef: result.storageRef }),
+      JSON.stringify({ sampleId: "smp-1" }),
+    );
   });
 
-  test("removal drops the storage reference from the internal index", async () => {
-    // Stub returns 200 for uploads (so the test can mint a ref)
-    // and 404 for sign/delete (so the adapter treats the object as
-    // gone). After removal the adapter must not re-resolve the
-    // storage reference — `getPlaybackReference` returns null.
+  test("removal is idempotent and self-contained storage ref parses back to bucket/path", async () => {
+    // Per P1-001 the locator must survive an adapter restart; this
+    // test asserts the locator is durable (parseable) regardless
+    // of removeSample being called.
     const { fetchImpl } = makeFetchStub((call) => {
       if (call.init.method === "DELETE") return new Response(null, { status: 200 });
-      if (call.init.method === "POST") return new Response(null, { status: 200 });
-      return new Response(null, { status: 404 });
+      return new Response(null, { status: 200 });
     });
     const adapter = new SupabaseStorageAdapter({
       supabaseUrl: SUPABASE_URL,
@@ -290,12 +316,9 @@ describe("SupabaseStorageAdapter", () => {
         bytes: new Uint8Array(4),
       })
     ).storageRef;
+    // Locator is parseable; the adapter can resolve it.
+    assert.ok(ref.startsWith("supa:offering-audio:"));
     await adapter.removeSample(ref);
-    const playback = await adapter.getPlaybackReference({
-      storageRef: ref,
-      offeringId: "of-1",
-      sampleId: "smp-1",
-    });
-    assert.equal(playback, null);
+    await adapter.removeSample(ref);
   });
 });

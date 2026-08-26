@@ -243,7 +243,7 @@ describe("BG2 audio samples routes (in-memory, deterministic adapter)", () => {
       file: {
         name: "sample.mp3",
         type: "audio/mpeg",
-        bytes: Buffer.from([0x49, 0x44, 0x33]),
+        bytes: Buffer.from([0xff, 0xfb, 0x90, 0x00, 0x00, 0x00, 0x00, 0x00]),
       },
     });
     const res = await request(app)
@@ -263,7 +263,7 @@ describe("BG2 audio samples routes (in-memory, deterministic adapter)", () => {
       file: {
         name: "sample.mp3",
         type: "audio/mpeg",
-        bytes: Buffer.from([0x49, 0x44, 0x33]),
+        bytes: Buffer.from([0xff, 0xfb, 0x90, 0x00, 0x00, 0x00, 0x00, 0x00]),
       },
     });
     const upload = await request(app)
@@ -274,7 +274,7 @@ describe("BG2 audio samples routes (in-memory, deterministic adapter)", () => {
     assert.equal(upload.status, 200, JSON.stringify(upload.body));
     assert.equal(upload.body.ok, true);
     assert.equal(upload.body.sample.label, "Demo sample");
-    assert.equal(upload.body.sample.byteSize, 3);
+    assert.equal(upload.body.sample.byteSize, 8);
     assert.equal(upload.body.sample.displayOrder, 1);
     assert.ok(upload.body.sample.playbackUrl);
     assert.equal("storageRef" in upload.body.sample, false);
@@ -309,7 +309,7 @@ describe("BG2 audio samples routes (in-memory, deterministic adapter)", () => {
       file: {
         name: "sample.mp3",
         type: "audio/mpeg",
-        bytes: Buffer.from([0x49, 0x44, 0x33]),
+        bytes: Buffer.from([0xff, 0xfb, 0x90, 0x00, 0x00, 0x00, 0x00, 0x00]),
       },
     });
     const res = await request(app)
@@ -333,7 +333,7 @@ describe("BG2 audio samples routes (in-memory, deterministic adapter)", () => {
       file: {
         name: "sample.mp3",
         type: "audio/mpeg",
-        bytes: Buffer.from([0x49, 0x44, 0x33]),
+        bytes: Buffer.from([0xff, 0xfb, 0x90, 0x00, 0x00, 0x00, 0x00, 0x00]),
       },
     });
     const res = await request(app)
@@ -351,7 +351,7 @@ describe("BG2 audio samples routes (in-memory, deterministic adapter)", () => {
       file: {
         name: "sample.mp3",
         type: "audio/mpeg",
-        bytes: Buffer.from([0x49, 0x44, 0x33]),
+        bytes: Buffer.from([0xff, 0xfb, 0x90, 0x00, 0x00, 0x00, 0x00, 0x00]),
       },
     });
     const okRes = await request(app)
@@ -415,7 +415,7 @@ describe("BG2 audio samples routes (in-memory, deterministic adapter)", () => {
         file: {
           name: `sample-${i}.mp3`,
           type: "audio/mpeg",
-          bytes: Buffer.from([0x49, 0x44, 0x33]),
+          bytes: Buffer.from([0xff, 0xfb, 0x90, 0x00, 0x00, 0x00, 0x00, 0x00]),
         },
       });
       const res = await request(app)
@@ -431,7 +431,7 @@ describe("BG2 audio samples routes (in-memory, deterministic adapter)", () => {
       file: {
         name: "sample-4.mp3",
         type: "audio/mpeg",
-        bytes: Buffer.from([0x49, 0x44, 0x33]),
+        bytes: Buffer.from([0xff, 0xfb, 0x90, 0x00, 0x00, 0x00, 0x00, 0x00]),
       },
     });
     const fourth = await request(app)
@@ -458,7 +458,7 @@ describe("BG2 audio samples routes (in-memory, deterministic adapter)", () => {
   test("buyer-facing playback returns audio/mpeg bytes for an Active offering", async () => {
     const { app, adapter } = buildTestHarness();
     const cookie = await signIn(app, adapter, "seller-route@example.com");
-    const bytes = Buffer.from([0x49, 0x44, 0x33, 0x04]);
+    const bytes = Buffer.from([0xff, 0xfb, 0x90, 0x04, 0x00, 0x00, 0x00, 0x00]);
     const { body: mp3Body, contentType } = buildMultipart({
       actingWorkspaceId: SELLER_WORKSPACE_ID,
       label: "Play",
@@ -492,7 +492,7 @@ describe("BG2 audio samples routes (in-memory, deterministic adapter)", () => {
       file: {
         name: "sample.mp3",
         type: "audio/mpeg",
-        bytes: Buffer.from([0x49, 0x44, 0x33]),
+        bytes: Buffer.from([0xff, 0xfb, 0x90, 0x00, 0x00, 0x00, 0x00, 0x00]),
       },
     });
     await request(app)
@@ -520,7 +520,7 @@ describe("BG2 audio samples routes (in-memory, deterministic adapter)", () => {
       file: {
         name: "sample.mp3",
         type: "audio/mpeg",
-        bytes: Buffer.from([0x49, 0x44, 0x33]),
+        bytes: Buffer.from([0xff, 0xfb, 0x90, 0x00, 0x00, 0x00, 0x00, 0x00]),
       },
     });
     const res = await request(app)
@@ -542,7 +542,7 @@ describe("BG2 audio samples routes (in-memory, deterministic adapter)", () => {
       file: {
         name: "sample.mp3",
         type: "audio/mpeg",
-        bytes: Buffer.from([0x49, 0x44, 0x33]),
+        bytes: Buffer.from([0xff, 0xfb, 0x90, 0x00, 0x00, 0x00, 0x00, 0x00]),
       },
     });
     const res = await request(app)
@@ -594,7 +594,11 @@ describe("BG2 audio samples routes (in-memory, deterministic adapter)", () => {
         `Content-Type: audio/mpeg\r\n\r\n`,
     );
     const tail = Buffer.from(`\r\n--${boundary}--\r\n`);
-    const body = Buffer.concat([head, Buffer.from([0x49, 0x44, 0x33]), tail]);
+    const body = Buffer.concat([
+      head,
+      Buffer.from([0xff, 0xfb, 0x90, 0x00, 0x00, 0x00, 0x00, 0x00]),
+      tail,
+    ]);
     const res = await request(app)
       .post(`/api/services/${OFFERING_ID}/audio-samples`)
       .set("Cookie", cookie)

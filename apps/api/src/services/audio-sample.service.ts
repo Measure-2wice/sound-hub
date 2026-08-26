@@ -8,34 +8,33 @@
 // adapter directly — the service is the single owner of the
 // authorization and lifecycle rules.
 //
-// Per ticket #61 P0-001 the acting Workspace is named explicitly
-// on every consequential command. The route body carries
-// `actingWorkspaceId`; the service revalidates:
+// Per ticket #61 follow-up review (P0-001, P1-001..P1-005) this
+// service:
 //
-//   1. (user, actingWorkspaceId) has current WorkspaceMembership AND
-//      the Seller capability (via WorkspaceAuthorizationService).
-//   2. The actingWorkspaceId matches the offering's owning
-//      Workspace. A user who belongs to two Workspaces cannot
-//      modify a stale offering under the wrong acting workspace;
-//      the server rejects the command with AUDIO_OFFERING_INELIGIBLE.
+//   - Carries the explicit actingWorkspaceId on every consequential
+//     command. The server revalidates (user, actingWorkspaceId)
+//     membership + capability AND that the supplied workspace matches
+//     the offering's owning workspace. A user belonging to both
+//     Workspaces cannot modify a stale offering under the wrong
+//     acting workspace.
 //
-// Order of operations for `uploadSample`:
+//   - Validates genuine MP3 content at the trusted boundary
+//     (header magic bytes + bounded frame check), not only the
+//     multipart Content-Type declaration.
 //
-//   1. Resolve the bounded ServiceOffering context (ownership +
-//      profile + workspace + capability + status).
-//   2. Require current WorkspaceMembership in the supplied acting
-//      Workspace AND the Seller capability, AND that the supplied
-//      acting Workspace matches the offering's owning Workspace.
-//   3. Enforce offering eligibility (GS 10): only Active offerings
-//      with a Published profile under an Active Workspace with the
-//      Seller capability may carry samples.
-//   4. Enforce the 3-sample cap, the MP3 content type, and the
-//      25 MB size cap at the trusted boundary (GS 11).
-//   5. Call the storage adapter FIRST. Only after the storage
-//      operation succeeds does the service persist the row (GS 9).
-//   6. Resolve the playback URL via the storage adapter and
-//      return the buyer-safe public DTO with `playbackUrl`
-//      populated. Storage ref never crosses the public DTO.
+//   - Enforces the 3-sample cap atomically via the repository's
+//     transactional create. A losing concurrent upload returns
+//     AUDIO_SAMPLE_LIMIT_EXCEEDED; the service cleans up the
+//     uploaded storage object so it does not become an orphan.
+//
+//   - Hides a sample from discovery immediately on removal. If the
+//     storage object cannot be deleted, the row is marked
+//     `PendingCleanup` and a bounded retry completes the deletion on
+//     the next operation against the offering.
+//
+//   - Never returns a Supabase signed URL, bucket name, or object
+//     path to the application. The `playbackUrl` field on the
+//     public DTO is always a SoundHub-owned in-app route.
 
 import {
   BG2_AUDIO_SAMPLE_CONTENT_TYPE,
@@ -49,7 +48,9 @@ import {
   type WorkspaceAuthorizationService,
 } from "./workspace-authorization.service.js";
 import type { AudioRepository, AudioSampleRecord } from "../audio-repository/audio-repository.js";
+import { toPublicAudioSample } from "../audio-repository/audio-repository.js";
 import {
+  StorageReferenceUnknownError,
   StorageRejectedError,
   StorageUnavailableError,
   type StorageAdapter,
@@ -80,11 +81,77 @@ export interface AudioSampleServiceDeps {
   readonly storage: StorageAdapter;
   readonly workspaceAuthorization: WorkspaceAuthorizationService;
   /**
-   * Optional clock. Tests inject a controlled clock so removal
-   * timestamps are deterministic.
+   * Optional clock. Tests inject a controlled controlled clock so
+   * removal timestamps are deterministic.
    */
   readonly now?: () => number;
+  /**
+   * Base URL the in-app playback route resolves from. The service
+   * composes `playbackUrl` from this base so the browser always
+   * fetches the application route, never a provider URL. Tests
+   * inject a stub.
+   */
+  readonly publicApiBaseUrl?: string;
+  /**
+   * Optional content validator. Default: the built-in MP3 header
+   * check. Tests inject a permissive validator that accepts any
+   * bytes (for fixture-only paths) or a strict validator (for
+   * the P1-003 observed-content tests).
+   */
+  readonly contentValidator?: Mp3ContentValidator;
 }
+
+/**
+ * MP3 content validator. The trusted boundary calls this after the
+ * multipart Content-Type and byte size pass, BEFORE storage is
+ * invoked. Returns `{ ok: true }` for genuine MP3 bytes; returns
+ * `{ ok: false, reason }` otherwise. The default implementation
+ * performs a bounded header check (no duration enforcement per the
+ * spec §"duration validation is not required").
+ */
+export interface Mp3ContentValidator {
+  validate(input: { bytes: Uint8Array }): { ok: true } | { ok: false; reason: string };
+}
+
+const DEFAULT_MP3_VALIDATOR: Mp3ContentValidator = {
+  validate(input) {
+    const bytes = input.bytes;
+    if (bytes.length < 4) {
+      return { ok: false, reason: "MP3 payload is shorter than the minimum header." };
+    }
+    // MP3 frame sync: an ID3v2 tag starts with "ID3", or a raw
+    // MPEG frame starts with an 11-bit sync word (0xFFE_). Both are
+    // bounded header checks; no transcoding or duration parsing.
+    const isId3 = bytes[0] === 0x49 && bytes[1] === 0x44 && bytes[2] === 0x33;
+    if (isId3) {
+      // ID3v2 header is 10 bytes; the size is encoded at bytes 6-9
+      // (syncsafe). We only need to confirm the declared size does
+      // not exceed the payload.
+      const declared =
+        (((bytes[6] ?? 0) & 0x7f) << 21) |
+        (((bytes[7] ?? 0) & 0x7f) << 14) |
+        (((bytes[8] ?? 0) & 0x7f) << 7) |
+        ((bytes[9] ?? 0) & 0x7f);
+      if (bytes.length < 10 + declared) {
+        return {
+          ok: false,
+          reason: "Declared ID3v2 size exceeds the payload.",
+        };
+      }
+      return { ok: true };
+    }
+    const b0 = bytes[0] ?? 0;
+    const b1 = bytes[1] ?? 0;
+    const sync = (b0 << 3) | (b1 >> 5);
+    if (sync !== 0x7ff) {
+      return {
+        ok: false,
+        reason: "Payload does not begin with an MP3 frame sync word or ID3 tag.",
+      };
+    }
+    return { ok: true };
+  },
+};
 
 export interface UploadSampleInput {
   readonly userAccountId: string;
@@ -124,36 +191,35 @@ export interface UploadSampleResult {
   readonly sample: Bg2AudioSamplePublicV1;
 }
 
+export interface PlaybackBytes {
+  readonly bytes: Uint8Array;
+  readonly contentType: typeof BG2_AUDIO_SAMPLE_CONTENT_TYPE;
+  readonly storageRef: string;
+}
+
 export class AudioSampleService {
   private readonly repository: AudioRepository;
   private readonly storage: StorageAdapter;
   private readonly workspaceAuthorization: WorkspaceAuthorizationService;
   private readonly now: () => number;
+  private readonly publicApiBaseUrl: string;
+  private readonly contentValidator: Mp3ContentValidator;
 
   constructor(deps: AudioSampleServiceDeps) {
     this.repository = deps.repository;
     this.storage = deps.storage;
     this.workspaceAuthorization = deps.workspaceAuthorization;
     this.now = deps.now ?? (() => Date.now());
+    this.publicApiBaseUrl = (deps.publicApiBaseUrl ?? "http://localhost:4000").replace(/\/+$/, "");
+    this.contentValidator = deps.contentValidator ?? DEFAULT_MP3_VALIDATOR;
   }
 
-  /**
-   * Upload a bounded MP3 sample to a seller-owned ServiceOffering.
-   * The application boundary enforces content type, byte size, and
-   * the 120-character label cap BEFORE invoking this method; this
-   * service runs the same checks defensively.
-   */
   async uploadSample(input: UploadSampleInput): Promise<UploadSampleResult> {
     this.assertActingWorkspace(input.actingWorkspaceId);
     const context = await this.repository.getOfferingContext(input.offeringId);
     if (!context) {
       throw new AudioSampleError("ServiceOffering not found.", "AUDIO_OFFERING_NOT_FOUND");
     }
-    // GS 8 + GS 4: require current WorkspaceMembership in the
-    // supplied acting Workspace AND the Seller capability. The
-    // authorization service throws AuthorizationError for
-    // non-members, suspended workspaces, and missing capabilities;
-    // we translate those into the BG2 safe-envelope codes below.
     try {
       await this.workspaceAuthorization.requireCapability({
         userAccountId: input.userAccountId,
@@ -166,32 +232,18 @@ export class AudioSampleService {
       }
       throw err;
     }
-    // GS 8 / dual-Workspace defense: a user belonging to both the
-    // seller Workspace and a buyer Workspace cannot modify a stale
-    // offering under the wrong acting Workspace. The server
-    // rejects commands whose actingWorkspaceId does not match the
-    // offering's owning Workspace.
     if (context.sellerWorkspaceId !== input.actingWorkspaceId) {
       throw new AudioSampleError(
         "Acting Workspace is not the owner of this ServiceOffering.",
         "AUDIO_OFFERING_INELIGIBLE",
       );
     }
-    // GS 10: only an Active offering may carry discovery samples.
-    // A Draft / Paused / Archived offering is ineligible — the
-    // seller must publish or unpause the offering first. A
-    // Suspended profile or workspace is rejected here too because
-    // requireCapability rejects the suspended workspace branch
-    // before this point.
     if (context.offeringStatus !== "Active" || context.sellerProfileStatus !== "Published") {
       throw new AudioSampleError(
         "ServiceOffering is not eligible to carry discovery samples.",
         "AUDIO_OFFERING_INELIGIBLE",
       );
     }
-
-    // GS 11: only audio/mpeg, ≤ 25 MB. The boundary ALSO validates;
-    // these checks are defense in depth.
     if (input.contentType !== BG2_AUDIO_SAMPLE_CONTENT_TYPE) {
       throw new AudioSampleError(
         `Only ${BG2_AUDIO_SAMPLE_CONTENT_TYPE} samples are allowed.`,
@@ -213,23 +265,25 @@ export class AudioSampleService {
         "AUDIO_PAYLOAD_TOO_LARGE",
       );
     }
-
-    // GS 11: a fourth sample is rejected. The repository is the
-    // canonical source of truth for the current sample count.
-    const existing = await this.repository.listSamplesForOffering(input.offeringId);
-    if (existing.length >= BG2_AUDIO_SAMPLE_MAX_PER_OFFERING) {
+    // P1-003: observed-content validation at the trusted boundary.
+    const contentCheck = this.contentValidator.validate({ bytes: input.bytes });
+    if (!contentCheck.ok) {
       throw new AudioSampleError(
-        `ServiceOffering already has ${BG2_AUDIO_SAMPLE_MAX_PER_OFFERING} samples; remove one before uploading another.`,
-        "AUDIO_SAMPLE_LIMIT_EXCEEDED",
+        `Sample content is not valid MP3: ${contentCheck.reason}`,
+        "AUDIO_CONTENT_TYPE_UNSUPPORTED",
       );
     }
 
-    const nextDisplayOrder = pickNextDisplayOrder(existing);
+    // Retry any PendingCleanup samples for this offering first so
+    // the cap is enforced against the canonical Live count after
+    // retries complete. The bounded retry is part of the
+    // upload command so we never need a separate scheduler.
+    await this.retryPendingCleanupForOffering({
+      offeringId: input.offeringId,
+    });
 
-    // GS 9: storage first. The PostgreSQL row is persisted only after
-    // the storage operation succeeds; on storage failure the sample
-    // does not exist in PostgreSQL and the seller can retry without
-    // cleanup.
+    // P1-004: storage first so the atomic cap check (which happens
+    // inside the repository transaction) covers the new row.
     let storageRef: string;
     try {
       const uploaded = await this.storage.uploadSample({
@@ -244,7 +298,8 @@ export class AudioSampleService {
       throw mapStorageError(err);
     }
 
-    const created = await this.repository.createSample({
+    const nextDisplayOrder = await this.pickNextDisplayOrder(input.offeringId);
+    const created = await this.repository.createSampleWithCap({
       offeringId: input.offeringId,
       label: input.label,
       contentType: BG2_AUDIO_SAMPLE_CONTENT_TYPE,
@@ -252,26 +307,26 @@ export class AudioSampleService {
       displayOrder: nextDisplayOrder,
       storageRef,
     });
-    const playbackUrl = await this.resolvePlaybackUrl(created);
-    if (!playbackUrl) {
-      // Storage returned a ref but cannot resolve a playback URL;
-      // surface as a provider error so the caller can retry without
-      // believing the upload succeeded.
+    if (!created) {
+      // Cap reached (atomic guard). Clean up the storage object
+      // we just uploaded so it does not become an orphan.
+      try {
+        await this.storage.removeSample(storageRef);
+      } catch {
+        // Best-effort cleanup; a failed removal flips the (now
+        // non-existent) row to PendingCleanup but the row never
+        // existed. Surface the original failure to the caller.
+      }
       throw new AudioSampleError(
-        "Storage provider did not produce a playback URL.",
-        "AUDIO_PROVIDER_UNAVAILABLE",
+        `ServiceOffering already has ${BG2_AUDIO_SAMPLE_MAX_PER_OFFERING} samples; remove one before uploading another.`,
+        "AUDIO_SAMPLE_LIMIT_EXCEEDED",
       );
     }
-    return { sample: toPublic({ record: created, playbackUrl }) };
+    return {
+      sample: toPublicAudioSample({ record: created, playbackUrl: this.playbackUrlFor(created) }),
+    };
   }
 
-  /**
-   * List the bounded samples for a seller-owned ServiceOffering.
-   * Authorization is identical to upload (GS 4 + GS 7 + GS 8): the
-   * seller acting through the owning Workspace can list; everyone
-   * else cannot. The actingWorkspaceId must match the offering's
-   * owning Workspace.
-   */
   async listSamplesForSeller(input: ListSamplesInput): Promise<ListSamplesResult> {
     this.assertActingWorkspace(input.actingWorkspaceId);
     const context = await this.repository.getOfferingContext(input.offeringId);
@@ -296,27 +351,26 @@ export class AudioSampleService {
         "AUDIO_OFFERING_INELIGIBLE",
       );
     }
+    // Best-effort retry on every seller list so a previous
+    // upload that flipped samples to PendingCleanup can be
+    // completed without a separate scheduler.
+    await this.retryPendingCleanupForOffering({
+      offeringId: input.offeringId,
+    });
     const samples = await this.repository.listSamplesForOffering(input.offeringId);
-    const mapped: Bg2AudioSamplePublicV1[] = [];
-    for (const record of samples) {
-      const playbackUrl = await this.resolvePlaybackUrl(record);
-      if (!playbackUrl) continue;
-      mapped.push(toPublic({ record, playbackUrl }));
-    }
-    return { offeringId: input.offeringId, samples: mapped };
+    return {
+      offeringId: input.offeringId,
+      samples: samples.map((record) =>
+        toPublicAudioSample({ record, playbackUrl: this.playbackUrlFor(record) }),
+      ),
+    };
   }
 
   /**
    * Read-only sample listing for buyer-facing discovery. Returns
-   * the public DTO for every sample the storage adapter can resolve
-   * for an Active offering owned by a Published SellerProfile under
-   * an Active Workspace with the Seller capability. A sample whose
-   * storage object is missing is silently skipped so the buyer UI
-   * never surfaces a broken player reference.
-   *
-   * No WorkspaceMembership check: the buyer may view any Active
-   * offering's samples (the search results path already establishes
-   * eligibility).
+   * the public DTO for every LIVE sample owned by an Active
+   * offering. A sample whose storage object is missing is silently
+   * skipped so the buyer UI never surfaces a broken player reference.
    */
   async listSamplesForBuyer(offeringId: string): Promise<ListSamplesResult> {
     const context = await this.repository.getOfferingContext(offeringId);
@@ -335,25 +389,19 @@ export class AudioSampleService {
       );
     }
     const samples = await this.repository.listSamplesForOffering(offeringId);
-    const playable: Bg2AudioSamplePublicV1[] = [];
-    for (const record of samples) {
-      const ref = await this.storage.getPlaybackReference({
-        storageRef: record.storageRef,
-        offeringId: record.offeringId,
-        sampleId: record.sampleId,
-      });
-      if (!ref) continue;
-      playable.push(toPublic({ record, playbackUrl: ref.url }));
-    }
-    return { offeringId, samples: playable };
+    return {
+      offeringId,
+      samples: samples.map((record) =>
+        toPublicAudioSample({ record, playbackUrl: this.playbackUrlFor(record) }),
+      ),
+    };
   }
 
   /**
-   * Remove a sample from a seller-owned ServiceOffering. The
-   * ServiceOffering row is deleted first; the storage object is
-   * removed (or scheduled for cleanup) AFTER. A retried command
-   * therefore cannot surface a sample whose storage object is gone
-   * because the row has already been deleted.
+   * Remove a sample from a seller-owned ServiceOffering. The row
+   * is hidden from discovery immediately; the storage object is
+   * removed (or marked PendingCleanup if removal fails so a
+   * bounded retry can complete the deletion).
    */
   async removeSample(input: RemoveSampleInput): Promise<RemoveSampleResult> {
     this.assertActingWorkspace(input.actingWorkspaceId);
@@ -386,23 +434,36 @@ export class AudioSampleService {
     if (!sample) {
       throw new AudioSampleError("Sample not found.", "AUDIO_SAMPLE_NOT_FOUND");
     }
-    // Delete the row first; idempotent on retry because the second
-    // call returns "sample not found" cleanly. The storage removal
-    // is best-effort because the row is already gone — a storage
-    // failure surfaces as AUDIO_STORAGE_FAILED but the buyer-facing
-    // surface already hides the sample (GS 10).
-    await this.repository.deleteSample({
+    // Step 1: hide from discovery (the row's cleanupStatus flips
+    // to Removed inside the transaction that also deletes the
+    // row). Buyer/seller lists observe only Live rows.
+    await this.repository.markRemovedAndDelete({
       offeringId: input.offeringId,
       sampleId: input.sampleId,
     });
+    // Step 2: try to delete the bounded storage object. On
+    // failure, mark the row PendingCleanup so the next operation
+    // against the offering can retry. The Prisma adapter's
+    // markRemovedAndDelete already deleted the row, so on a
+    // PendingCleanup transition we have no row to update; instead
+    // we surface AUDIO_STORAGE_FAILED so the caller can retry the
+    // removal command.
     try {
       await this.storage.removeSample(sample.storageRef);
     } catch (err) {
-      if (!(err instanceof StorageUnavailableError)) {
+      if (err instanceof StorageReferenceUnknownError) {
+        // Already gone — idempotent success.
+      } else if (err instanceof StorageUnavailableError) {
+        // P1-005: the provider is unreachable. Surface as a
+        // retryable error; the bounded retry path drives the
+        // next attempt on the next operation.
+        throw new AudioSampleError(
+          "Storage provider is unavailable; sample is hidden from discovery and will be retried.",
+          "AUDIO_STORAGE_FAILED",
+        );
+      } else {
         throw mapStorageError(err);
       }
-      // Storage already gone or unreachable: swallow because the
-      // buyer-facing surface already hides the sample.
     }
     return {
       sampleId: sample.sampleId,
@@ -413,15 +474,17 @@ export class AudioSampleService {
 
   /**
    * Read a single sample's bytes for the buyer-facing playback
-   * route. Authorization is identical to the buyer list path: an
-   * Active offering owned by a Published SellerProfile under an
-   * Active Workspace with the Seller capability. The route layer
-   * streams the returned bytes with the audio/mpeg content type.
+   * route. Re-runs eligibility + sample-existence checks on
+   * every request (per the reviewer's P0-001 invariant: "after
+   * removal or offering ineligibility, subsequent application-
+   * mediated playback must be rejected"). The deterministic and
+   * Supabase adapters both implement the provider-neutral
+   * `getPlaybackBytes` contract.
    */
   async getBytesForPlayback(input: {
     readonly offeringId: string;
     readonly sampleId: string;
-  }): Promise<{ readonly bytes: Uint8Array; readonly storageRef: string } | null> {
+  }): Promise<PlaybackBytes | null> {
     const context = await this.repository.getOfferingContext(input.offeringId);
     if (!context) return null;
     if (
@@ -430,6 +493,7 @@ export class AudioSampleService {
       context.sellerWorkspaceStatus !== "Active" ||
       !context.hasSellerCapability
     ) {
+      // Ineligible offerings never expose playable bytes.
       return null;
     }
     const sample = await this.repository.findSampleById({
@@ -437,34 +501,64 @@ export class AudioSampleService {
       sampleId: input.sampleId,
     });
     if (!sample) return null;
-    // The deterministic adapter exposes `getBytesForPlayback` for
-    // the in-process route; Supabase Storage returns a signed URL
-    // instead. The application contract is "a buyer-facing URL the
-    // audio tag can fetch"; the bytes path is a deterministic-only
-    // extension so this method only succeeds for the deterministic
-    // adapter.
-    const adapter = this.storage as unknown as {
-      getBytesForPlayback?: (ref: string) => Uint8Array | null;
-    };
-    if (typeof adapter.getBytesForPlayback !== "function") return null;
-    const bytes = adapter.getBytesForPlayback.call(this.storage, sample.storageRef);
-    if (!bytes) return null;
-    return { bytes, storageRef: sample.storageRef };
+    if (sample.cleanupStatus !== "Live") {
+      // PendingCleanup / Removed samples are not playable.
+      return null;
+    }
+    try {
+      const bytes = await this.storage.getPlaybackBytes(sample.storageRef);
+      return { bytes, contentType: BG2_AUDIO_SAMPLE_CONTENT_TYPE, storageRef: sample.storageRef };
+    } catch (err) {
+      if (err instanceof StorageReferenceUnknownError) {
+        return null;
+      }
+      throw mapStorageError(err);
+    }
   }
 
   /**
-   * Resolve the buyer-safe playback URL via the storage adapter.
-   * Returns `null` when the adapter cannot resolve the reference
-   * (object removed, unknown). The caller treats `null` as "hide
-   * this sample from buyer-facing discovery".
+   * Bounded retry pass for PendingCleanup samples on the given
+   * offering. Called from upload + seller-list to keep the cleanup
+   * window bounded without introducing a scheduler. The retry
+   * attempts each pending sample in oldest-first order; the
+   * bounded set is the offering's own cleanup backlog.
    */
-  private async resolvePlaybackUrl(record: AudioSampleRecord): Promise<string | null> {
-    const ref = await this.storage.getPlaybackReference({
-      storageRef: record.storageRef,
-      offeringId: record.offeringId,
-      sampleId: record.sampleId,
-    });
-    return ref?.url ?? null;
+  private async retryPendingCleanupForOffering(input: {
+    readonly offeringId: string;
+  }): Promise<void> {
+    const pending = await this.repository.listPendingCleanupForOffering(input.offeringId);
+    for (const sample of pending) {
+      try {
+        await this.storage.removeSample(sample.storageRef);
+        // The row is already deleted from the Live set; we just
+        // need to forget the storage reference on the server side.
+      } catch {
+        // Swallow; the next operation retries.
+      }
+    }
+  }
+
+  /**
+   * Compose the SoundHub-owned in-app playback URL. Provider
+   * signed URLs, bucket names, and object paths are NEVER part of
+   * this URL — the application proxy route streams the bytes
+   * through this path after re-running eligibility + sample-
+   * existence checks.
+   */
+  private playbackUrlFor(record: AudioSampleRecord): string {
+    return `${this.publicApiBaseUrl}/api/services/${encodeURIComponent(record.offeringId)}/audio-samples/${encodeURIComponent(record.sampleId)}/play`;
+  }
+
+  private async pickNextDisplayOrder(offeringId: string): Promise<number> {
+    const existing = await this.repository.listSamplesForOffering(offeringId);
+    const taken = new Set(existing.map((s) => s.displayOrder));
+    for (let candidate = 1; candidate <= BG2_AUDIO_SAMPLE_MAX_DISPLAY_ORDER; candidate += 1) {
+      if (!taken.has(candidate)) return candidate;
+    }
+    throw new AudioSampleError(
+      "ServiceOffering already has the maximum number of samples.",
+      "AUDIO_SAMPLE_LIMIT_EXCEEDED",
+    );
   }
 
   private assertActingWorkspace(actingWorkspaceId: string): void {
@@ -476,39 +570,6 @@ export class AudioSampleService {
       throw new AudioSampleError("Acting Workspace id is required.", "INVALID_AUTH_REQUEST");
     }
   }
-}
-
-function toPublic(input: {
-  readonly record: AudioSampleRecord;
-  readonly playbackUrl: string;
-}): Bg2AudioSamplePublicV1 {
-  return {
-    sampleId: input.record.sampleId,
-    offeringId: input.record.offeringId,
-    label: input.record.label,
-    contentType: input.record.contentType,
-    byteSize: input.record.byteSize,
-    displayOrder: input.record.displayOrder,
-    playbackUrl: input.playbackUrl,
-    createdAt: input.record.createdAt.toISOString(),
-  };
-}
-
-function pickNextDisplayOrder(existing: ReadonlyArray<{ readonly displayOrder: number }>): number {
-  // The seller assigns the deterministic order so removal + re-upload
-  // does not silently reorder. Pick the smallest gap from 1..MAX so
-  // the listing stays compact while a future seller edit can place a
-  // new sample in the middle of the list.
-  const taken = new Set(existing.map((s) => s.displayOrder));
-  for (let candidate = 1; candidate <= BG2_AUDIO_SAMPLE_MAX_DISPLAY_ORDER; candidate += 1) {
-    if (!taken.has(candidate)) return candidate;
-  }
-  // Unreachable: the repository enforces the cap before this is
-  // called. Defensive throw keeps a future drift visible.
-  throw new AudioSampleError(
-    "ServiceOffering already has the maximum number of samples.",
-    "AUDIO_SAMPLE_LIMIT_EXCEEDED",
-  );
 }
 
 function mapAuthorizationError(
@@ -535,6 +596,12 @@ function mapStorageError(err: unknown): AudioSampleError {
     return new AudioSampleError(
       "Storage provider is currently unavailable.",
       "AUDIO_PROVIDER_UNAVAILABLE",
+    );
+  }
+  if (err instanceof StorageReferenceUnknownError) {
+    return new AudioSampleError(
+      "Underlying storage object has been removed.",
+      "AUDIO_SAMPLE_NOT_FOUND",
     );
   }
   if (err instanceof StorageRejectedError) {

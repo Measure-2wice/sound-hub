@@ -10,6 +10,7 @@ import { createAuthRouter } from "./routes/auth.js";
 import { createAudioSamplesRouter } from "./routes/audio-samples.js";
 import { createOfferingCatalogRouter } from "./routes/offering-catalog.js";
 import { createMatchmakerRouter } from "./routes/matchmaker.js";
+import { PrismaOfferingCatalogRepository } from "./repositories/prisma-offering-catalog.repository.js";
 import { TalentSearchService } from "./services/talent-search.service.js";
 import { AuthenticationService } from "./services/authentication.service.js";
 import { WorkspaceAuthorizationService } from "./services/workspace-authorization.service.js";
@@ -206,7 +207,7 @@ export function buildApp(options: AppOptions = {}): BuiltApp {
       signedUrlExpiresInSeconds: process.env.SUPABASE_STORAGE_SIGNED_URL_TTL_SECONDS
         ? Number(process.env.SUPABASE_STORAGE_SIGNED_URL_TTL_SECONDS)
         : undefined,
-      playbackBaseUrl: process.env.SUPABASE_STORAGE_PLAYBACK_BASE_URL,
+      playbackBaseUrl: process.env.PUBLIC_API_BASE_URL ?? "http://localhost:4000",
     });
   const storageAdapter: StorageAdapter = options.storageAdapterOverride ?? storageBundle.active;
 
@@ -217,6 +218,10 @@ export function buildApp(options: AppOptions = {}): BuiltApp {
       repository: audioRepository,
       storage: storageAdapter,
       workspaceAuthorization: workspaceAuthorizationService,
+      // The in-app playback route resolves relative to the API
+      // origin. The browser fetches this URL for `<audio src=>`; the
+      // route proxy-streams the bytes from the storage adapter.
+      publicApiBaseUrl: process.env.PUBLIC_API_BASE_URL ?? "http://localhost:4000",
     });
 
   const app: Application = express();
@@ -243,7 +248,8 @@ export function buildApp(options: AppOptions = {}): BuiltApp {
   app.use("/api/health", healthRoutes);
   app.use("/api/search", createSearchRouter({ service }));
   app.use("/api/metadata", createMetadataRouter({ repository: metadataRepository }));
-  app.use("/api/metadata", createOfferingCatalogRouter({ prisma }));
+  const catalogRepository = new PrismaOfferingCatalogRepository(prisma);
+  app.use("/api/metadata", createOfferingCatalogRouter({ catalogRepository }));
   app.use(
     "/api/auth",
     createAuthRouter({
@@ -378,7 +384,7 @@ export async function buildAppWithSmoke(
       signedUrlExpiresInSeconds: process.env.SUPABASE_STORAGE_SIGNED_URL_TTL_SECONDS
         ? Number(process.env.SUPABASE_STORAGE_SIGNED_URL_TTL_SECONDS)
         : undefined,
-      playbackBaseUrl: process.env.SUPABASE_STORAGE_PLAYBACK_BASE_URL,
+      playbackBaseUrl: process.env.PUBLIC_API_BASE_URL ?? "http://localhost:4000",
     });
   return buildApp({
     ...options,

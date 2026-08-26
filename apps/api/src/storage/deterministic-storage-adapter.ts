@@ -12,21 +12,24 @@
 //   - dev-mode seeded demos and emergency fallback.
 //
 // The adapter stores the raw bytes in a `Map<storageRef, Uint8Array>`
-// scoped to the process. `storageRef` is an opaque `det:<cuid>`
-// string so the application cannot accidentally read it as a
-// Supabase-style signed URL; the contract is identical to the
-// deployed adapter. `getPlaybackReference` composes the in-app
-// buyer-safe playback route (`/api/services/<offeringId>/audio-
-// samples/<sampleId>/play`) which re-runs eligibility and removal
-// checks on every request. Stored bytes are NOT subject to a
-// per-sample TTL: a sample lives until `removeSample` is called or
-// the process restarts, matching the spec rule "Removal makes the
-// sample unavailable."
+// scoped to the process. `storageRef` is a self-contained
+// `det:<offeringId>:<uuid>` string the application persists in
+// PostgreSQL and passes back to `getPlaybackBytes` and
+// `removeSample`. Across a process restart, the seeded
+// `deterministic-samples` fixture re-mints the same bytes, so the
+// locator still resolves — the in-process index is rebuilt by the
+// seed ingestion path, not by a cold start of an empty adapter.
+//
+// `getPlaybackReference` returns the in-app
+// `${apiOrigin}/api/services/{offeringId}/audio-samples/{sampleId}/play`
+// URL; the application proxy route streams the bytes through that
+// path after re-running eligibility checks.
 
 import { randomUUID } from "node:crypto";
 import { BG2_AUDIO_SAMPLE_CONTENT_TYPE, BG2_AUDIO_SAMPLE_MAX_BYTE_SIZE } from "@soundhub/types";
 import {
   StorageRejectedError,
+  StorageReferenceUnknownError,
   StorageUnavailableError,
   type StorageAdapter,
   type StoragePlaybackInput,
@@ -39,10 +42,11 @@ const DET_STORAGE_REF_PREFIX = "det:" as const;
 
 export interface DeterministicStorageAdapterOptions {
   /**
-   * Base URL the deterministic playback route resolves from.
-   * Defaults to `http://localhost:4000` so the dev server's
-   * `/api/services/.../play` route resolves against the API origin.
-   * Tests pass a stub to assert the URL composition deterministically.
+   * Base URL the in-app playback route resolves from. Defaults to
+   * `http://localhost:4000` so the dev server's
+   * `/api/services/.../play` route resolves against the API
+   * origin. Tests pass a stub to assert the URL composition
+   * deterministically.
    */
   readonly playbackBaseUrl?: string;
   /**
@@ -116,20 +120,39 @@ export class DeterministicStorageAdapter implements StorageAdapter {
   }
 
   /**
-   * Compose the in-app buyer-safe playback route. The route re-runs
-   * eligibility and removal checks on every request, so a removed
-   * sample's URL still resolves to a 404 — the buyer-facing UI
-   * never surfaces a broken player.
+   * Compose the SoundHub-owned in-app playback URL. The URL
+   * always points at the application route; the application
+   * proxy-streams the bytes through that path after eligibility
+   * checks. Returns `null` when the storage ref is unknown.
    */
   getPlaybackReference(input: StoragePlaybackInput): Promise<StoragePlaybackReference | null> {
-    const obj = this.objects.get(input.storageRef);
-    if (!obj) return Promise.resolve(null);
+    if (!this.objects.has(input.storageRef)) return Promise.resolve(null);
     const baseUrl = this.playbackBaseUrl.replace(/\/+$/, "");
     const url = `${baseUrl}/api/services/${encodeURIComponent(input.offeringId)}/audio-samples/${encodeURIComponent(input.sampleId)}/play`;
     return Promise.resolve({
       url,
       cacheControlHint: "private, max-age=60",
     });
+  }
+
+  /**
+   * Return the raw MP3 bytes for the given storage ref. The
+   * application calls this only after eligibility + sample-
+   * existence checks have run on the in-app route.
+   */
+  getPlaybackBytes(storageRef: string): Promise<Uint8Array> {
+    if (!storageRef.startsWith(DET_STORAGE_REF_PREFIX)) {
+      return Promise.reject(
+        new StorageReferenceUnknownError("Storage reference is not managed by this adapter."),
+      );
+    }
+    const obj = this.objects.get(storageRef);
+    if (!obj) {
+      return Promise.reject(
+        new StorageReferenceUnknownError("Storage reference has been removed."),
+      );
+    }
+    return Promise.resolve(obj.bytes);
   }
 
   removeSample(storageRef: string): Promise<void> {
@@ -140,17 +163,6 @@ export class DeterministicStorageAdapter implements StorageAdapter {
     }
     this.objects.delete(storageRef);
     return Promise.resolve();
-  }
-
-  /**
-   * Internal accessor used by the deterministic playback route to
-   * fetch the bytes for a given storage ref. Returns `null` when the
-   * object is unknown. No TTL-based eviction: a sample lives until
-   * `removeSample` is called or the process restarts.
-   */
-  getBytesForPlayback(storageRef: string): Uint8Array | null {
-    const obj = this.objects.get(storageRef);
-    return obj ? obj.bytes : null;
   }
 
   private makeStorageRef(offeringId: string): string {

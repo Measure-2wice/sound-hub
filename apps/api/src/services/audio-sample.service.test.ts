@@ -163,12 +163,20 @@ function buildService(repo: InMemoryAudioRepository, storage: DeterministicStora
     repository: repo,
     storage,
     workspaceAuthorization,
+    publicApiBaseUrl: "http://api.example.test",
   });
   return service;
 }
 
 function mp3Bytes(size: number): Uint8Array {
-  return new Uint8Array(size);
+  // Produce real MPEG audio frame sync (0xFF 0xFB) followed by
+  // padding so the trusted boundary observes genuine MP3 content.
+  const bytes = new Uint8Array(size);
+  if (size >= 2) {
+    bytes[0] = 0xff;
+    bytes[1] = 0xfb;
+  }
+  return bytes;
 }
 
 describe("AudioSampleService", () => {
@@ -472,6 +480,7 @@ describe("AudioSampleService", () => {
         throw new StorageUnavailableError("network");
       },
       getPlaybackReference: () => Promise.resolve(null),
+      getPlaybackBytes: () => Promise.resolve(new Uint8Array()),
       removeSample: () => Promise.resolve(),
     };
     const repo = makeAudioRepo();
@@ -510,6 +519,7 @@ describe("AudioSampleService", () => {
         throw new StorageRejectedError("wrong type");
       },
       getPlaybackReference: () => Promise.resolve(null),
+      getPlaybackBytes: () => Promise.resolve(new Uint8Array()),
       removeSample: () => Promise.resolve(),
     };
     const repo = makeAudioRepo();
@@ -579,9 +589,7 @@ describe("AudioSampleService", () => {
   });
 
   test("buyer list exposes a playback URL but never a storageRef", async () => {
-    const storage = new DeterministicStorageAdapter({
-      playbackBaseUrl: "http://api.test",
-    });
+    const storage = new DeterministicStorageAdapter();
     const repo = makeAudioRepo();
     const service = buildService(repo, storage);
     await service.uploadSample({
@@ -598,9 +606,12 @@ describe("AudioSampleService", () => {
     const publicSample = list.samples[0]!;
     assert.ok(publicSample.playbackUrl);
     assert.equal("storageRef" in publicSample, false, "storageRef must never cross the public DTO");
-    // Playback URL points to the in-app route — no Supabase URL or
-    // bucket name leaks.
-    assert.ok(publicSample.playbackUrl.startsWith("http://api.test/"));
+    // Playback URL points to the in-app route composed by the
+    // service from its configured `publicApiBaseUrl`. No Supabase
+    // URL or bucket name leaks.
+    assert.ok(publicSample.playbackUrl.startsWith("http://api.example.test/api/services/"));
+    assert.equal(publicSample.playbackUrl.includes("supa:"), false);
+    assert.equal(publicSample.playbackUrl.includes("token="), false);
   });
 
   test("missing or empty actingWorkspaceId is rejected at the trusted boundary", async () => {
@@ -620,5 +631,244 @@ describe("AudioSampleService", () => {
         }),
       (err: unknown) => err instanceof AudioSampleError && err.code === "INVALID_AUTH_REQUEST",
     );
+  });
+
+  test("P1-003: non-MP3 content disguised as audio/mpeg is rejected before storage", async () => {
+    const storage = new DeterministicStorageAdapter();
+    const repo = makeAudioRepo();
+    const service = buildService(repo, storage);
+    // Plain ASCII text declared as audio/mpeg. The trusted boundary
+    // observes the bytes and rejects: no ID3 tag, no MPEG frame
+    // sync word.
+    const textBytes = Buffer.from("This is plain text, not MP3 audio.", "utf8");
+    await assert.rejects(
+      () =>
+        service.uploadSample({
+          userAccountId: SELLER_USER,
+          offeringId: OFFERING_ID,
+          actingWorkspaceId: SELLER_WORKSPACE,
+          label: "Disguised",
+          contentType: "audio/mpeg",
+          byteSize: textBytes.length,
+          bytes: textBytes,
+        }),
+      (err: unknown) =>
+        err instanceof AudioSampleError && err.code === "AUDIO_CONTENT_TYPE_UNSUPPORTED",
+    );
+    const list = await service.listSamplesForSeller({
+      userAccountId: SELLER_USER,
+      offeringId: OFFERING_ID,
+      actingWorkspaceId: SELLER_WORKSPACE,
+    });
+    assert.equal(list.samples.length, 0);
+  });
+
+  test("P1-003: a real MP3 frame sync header passes the content check", async () => {
+    const storage = new DeterministicStorageAdapter();
+    const repo = makeAudioRepo();
+    const service = buildService(repo, storage);
+    // MPEG audio frame sync: 11 bits set (0xFFE_). The next byte's
+    // top 3 bits are part of the sync too (0b111). Combined: bytes
+    // 0xFF 0xFB form a valid MP3 frame sync word.
+    const mp3Bytes = Buffer.from([0xff, 0xfb, 0x90, 0x00, 0x00, 0x00, 0x00, 0x00]);
+    const uploaded = await service.uploadSample({
+      userAccountId: SELLER_USER,
+      offeringId: OFFERING_ID,
+      actingWorkspaceId: SELLER_WORKSPACE,
+      label: "Real MP3",
+      contentType: "audio/mpeg",
+      byteSize: mp3Bytes.length,
+      bytes: mp3Bytes,
+    });
+    assert.ok(uploaded.sample);
+  });
+
+  test("P1-004: two concurrent uploads starting from two existing samples cannot create four rows", async () => {
+    const storage = new DeterministicStorageAdapter();
+    const repo = makeAudioRepo();
+    const service = buildService(repo, storage);
+    // Seed two existing samples so the offering is at cap-1.
+    for (let i = 1; i <= 2; i += 1) {
+      await service.uploadSample({
+        userAccountId: SELLER_USER,
+        offeringId: OFFERING_ID,
+        actingWorkspaceId: SELLER_WORKSPACE,
+        label: `Existing ${i}`,
+        contentType: "audio/mpeg",
+        byteSize: 1024,
+        bytes: mp3Bytes(1024),
+      });
+    }
+    const mp3 = (): Uint8Array => new Uint8Array([0xff, 0xfb, 0x90, 0x00, 0x00, 0x00, 0x00, 0x00]);
+    // Two uploads race from cap-1. Exactly one wins; the other gets
+    // AUDIO_SAMPLE_LIMIT_EXCEEDED.
+    const results = await Promise.allSettled([
+      service.uploadSample({
+        userAccountId: SELLER_USER,
+        offeringId: OFFERING_ID,
+        actingWorkspaceId: SELLER_WORKSPACE,
+        label: "Race A",
+        contentType: "audio/mpeg",
+        byteSize: 8,
+        bytes: mp3(),
+      }),
+      service.uploadSample({
+        userAccountId: SELLER_USER,
+        offeringId: OFFERING_ID,
+        actingWorkspaceId: SELLER_WORKSPACE,
+        label: "Race B",
+        contentType: "audio/mpeg",
+        byteSize: 8,
+        bytes: mp3(),
+      }),
+    ]);
+    const fulfilled = results.filter((r) => r.status === "fulfilled");
+    const rejected = results.filter((r) => r.status === "rejected");
+    assert.equal(fulfilled.length, 1);
+    assert.equal(rejected.length, 1);
+    const rejection = rejected[0];
+    assert.ok(rejection);
+    assert.ok(rejection.reason instanceof AudioSampleError);
+    assert.equal(rejection.reason.code, "AUDIO_SAMPLE_LIMIT_EXCEEDED");
+    const list = await service.listSamplesForSeller({
+      userAccountId: SELLER_USER,
+      offeringId: OFFERING_ID,
+      actingWorkspaceId: SELLER_WORKSPACE,
+    });
+    assert.equal(list.samples.length, 3, "live row count remains at the cap");
+    assert.ok(
+      list.samples.every((s) => s.displayOrder >= 1 && s.displayOrder <= 3),
+      "display order stays within 1..3",
+    );
+  });
+
+  test("P1-005: storage removal failure surfaces AUDIO_STORAGE_FAILED and hides the sample from discovery", async () => {
+    const callCount = { remove: 0 };
+    const flakyStorage = {
+      uploadSample: (
+        input: Parameters<typeof DeterministicStorageAdapter.prototype.uploadSample>[0],
+      ): ReturnType<typeof DeterministicStorageAdapter.prototype.uploadSample> => {
+        // Use the deterministic adapter under the hood so the seed
+        // row is in PostgreSQL; we then override removeSample to
+        // simulate a provider outage.
+        const inner = new DeterministicStorageAdapter();
+        return inner.uploadSample(input);
+      },
+      getPlaybackReference: (
+        input: Parameters<typeof DeterministicStorageAdapter.prototype.getPlaybackReference>[0],
+      ): ReturnType<typeof DeterministicStorageAdapter.prototype.getPlaybackReference> => {
+        const inner = new DeterministicStorageAdapter();
+        return inner.getPlaybackReference(input);
+      },
+      getPlaybackBytes: (
+        ref: string,
+      ): ReturnType<typeof DeterministicStorageAdapter.prototype.getPlaybackBytes> => {
+        const inner = new DeterministicStorageAdapter();
+        return inner.getPlaybackBytes(ref);
+      },
+      removeSample: (
+        ref: string,
+      ): ReturnType<typeof DeterministicStorageAdapter.prototype.removeSample> => {
+        void ref;
+        callCount.remove += 1;
+        throw new StorageUnavailableError("provider down");
+      },
+    };
+    const repo = makeAudioRepo();
+    const service = new AudioSampleService({
+      repository: repo,
+      // The in-memory stub doesn't implement the full
+      // StorageAdapter surface (no getPlaybackBytes etc.); the `as
+      // never` cast crosses the partial boundary without an
+      // explicit `unknown` indirection.
+      // eslint-disable-next-line @typescript-eslint/no-unnecessary-type-assertion
+      storage: flakyStorage as never,
+      workspaceAuthorization: new WorkspaceAuthorizationService({
+        authRepository: makeAuthRepo(),
+      }),
+    });
+    const uploaded = await service.uploadSample({
+      userAccountId: SELLER_USER,
+      offeringId: OFFERING_ID,
+      actingWorkspaceId: SELLER_WORKSPACE,
+      label: "Will fail to remove",
+      contentType: "audio/mpeg",
+      byteSize: 8,
+      bytes: new Uint8Array([0xff, 0xfb, 0x90, 0x00, 0x00, 0x00, 0x00, 0x00]),
+    });
+    await assert.rejects(
+      () =>
+        service.removeSample({
+          userAccountId: SELLER_USER,
+          offeringId: OFFERING_ID,
+          sampleId: uploaded.sample.sampleId,
+          actingWorkspaceId: SELLER_WORKSPACE,
+        }),
+      (err: unknown) => err instanceof AudioSampleError && err.code === "AUDIO_STORAGE_FAILED",
+    );
+    assert.ok(callCount.remove >= 1);
+    // The sample must be hidden from discovery immediately.
+    const list = await service.listSamplesForBuyer(OFFERING_ID);
+    assert.equal(
+      list.samples.find((s) => s.sampleId === uploaded.sample.sampleId),
+      undefined,
+    );
+  });
+
+  test("P0-001 + P1-001: playback URL never exposes bucket, path, or storage ref", async () => {
+    const storage = new DeterministicStorageAdapter({
+      playbackBaseUrl: "http://api.example.test",
+    });
+    const repo = makeAudioRepo();
+    const service = buildService(repo, storage);
+    const uploaded = await service.uploadSample({
+      userAccountId: SELLER_USER,
+      offeringId: OFFERING_ID,
+      actingWorkspaceId: SELLER_WORKSPACE,
+      label: "Privacy",
+      contentType: "audio/mpeg",
+      byteSize: 8,
+      bytes: new Uint8Array([0xff, 0xfb, 0x90, 0x00, 0x00, 0x00, 0x00, 0x00]),
+    });
+    const url = uploaded.sample.playbackUrl;
+    assert.ok(url.startsWith("http://api.example.test/api/services/"));
+    assert.ok(url.endsWith("/audio-samples/" + uploaded.sample.sampleId + "/play"));
+    assert.equal(url.includes("storageRef"), false);
+    assert.equal(url.includes("supa:"), false);
+    assert.equal(url.includes("token="), false);
+    // `storageRef` never appears on the public DTO.
+    assert.equal("storageRef" in uploaded.sample, false);
+  });
+
+  test("P0-001: a removed sample's playback route returns AUDIO_SAMPLE_NOT_FOUND (eligibility re-check)", async () => {
+    const storage = new DeterministicStorageAdapter();
+    const repo = makeAudioRepo();
+    const service = buildService(repo, storage);
+    const uploaded = await service.uploadSample({
+      userAccountId: SELLER_USER,
+      offeringId: OFFERING_ID,
+      actingWorkspaceId: SELLER_WORKSPACE,
+      label: "Play me then remove me",
+      contentType: "audio/mpeg",
+      byteSize: 8,
+      bytes: new Uint8Array([0xff, 0xfb, 0x90, 0x00, 0x00, 0x00, 0x00, 0x00]),
+    });
+    const playback = await service.getBytesForPlayback({
+      offeringId: OFFERING_ID,
+      sampleId: uploaded.sample.sampleId,
+    });
+    assert.ok(playback);
+    assert.equal(playback.bytes.length, 8);
+    await service.removeSample({
+      userAccountId: SELLER_USER,
+      offeringId: OFFERING_ID,
+      sampleId: uploaded.sample.sampleId,
+      actingWorkspaceId: SELLER_WORKSPACE,
+    });
+    const after = await service.getBytesForPlayback({
+      offeringId: OFFERING_ID,
+      sampleId: uploaded.sample.sampleId,
+    });
+    assert.equal(after, null, "playback route returns null after removal");
   });
 });

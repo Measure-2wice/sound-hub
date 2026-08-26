@@ -9,6 +9,7 @@ import { randomUUID } from "node:crypto";
 import type {
   AudioOfferingContext,
   AudioRepository,
+  AudioSampleCleanupStatus,
   AudioSampleRecord,
 } from "./audio-repository.js";
 
@@ -34,11 +35,13 @@ export interface InMemoryAudioSampleSeed {
   readonly byteSize: number;
   readonly displayOrder: number;
   readonly storageRef: string;
+  readonly cleanupStatus?: AudioSampleCleanupStatus;
+  readonly cleanupAttempts?: number;
 }
 
 export class InMemoryAudioRepository implements AudioRepository {
   private readonly contexts = new Map<string, AudioOfferingContext>();
-  private readonly samples = new Map<string, AudioSampleRecord>();
+  private readonly samples = new Map<string, AudioSampleRecord & { readonly _seeded?: boolean }>();
 
   constructor(fixture: InMemoryAudioFixture = {}) {
     for (const offering of fixture.offerings ?? []) {
@@ -63,20 +66,22 @@ export class InMemoryAudioRepository implements AudioRepository {
         byteSize: seed.byteSize,
         displayOrder: seed.displayOrder,
         storageRef: seed.storageRef,
+        cleanupStatus: seed.cleanupStatus ?? "Live",
+        cleanupAttempts: seed.cleanupAttempts ?? 0,
         createdAt: now,
         updatedAt: now,
       });
     }
   }
 
-  async getOfferingContext(offeringId: string): Promise<AudioOfferingContext | null> {
+  getOfferingContext(offeringId: string): Promise<AudioOfferingContext | null> {
     return Promise.resolve(this.contexts.get(offeringId) ?? null);
   }
 
-  async listSamplesForOffering(offeringId: string): Promise<readonly AudioSampleRecord[]> {
+  listSamplesForOffering(offeringId: string): Promise<readonly AudioSampleRecord[]> {
     return Promise.resolve(
       [...this.samples.values()]
-        .filter((s) => s.offeringId === offeringId)
+        .filter((s) => s.offeringId === offeringId && s.cleanupStatus === "Live")
         .sort((a, b) => {
           if (a.displayOrder !== b.displayOrder) return a.displayOrder - b.displayOrder;
           return a.createdAt.getTime() - b.createdAt.getTime();
@@ -84,14 +89,23 @@ export class InMemoryAudioRepository implements AudioRepository {
     );
   }
 
-  async createSample(input: {
+  /**
+   * Atomic guarded insert mirroring the Prisma adapter's
+   * transaction. Two concurrent calls in the same state observe
+   * the same count; both can't succeed when the cap is hit.
+   */
+  createSampleWithCap(input: {
     offeringId: string;
     label: string;
     contentType: "audio/mpeg";
     byteSize: number;
     displayOrder: number;
     storageRef: string;
-  }): Promise<AudioSampleRecord> {
+  }): Promise<AudioSampleRecord | null> {
+    const liveCount = [...this.samples.values()].filter(
+      (s) => s.offeringId === input.offeringId && s.cleanupStatus === "Live",
+    ).length;
+    if (liveCount >= 3) return Promise.resolve(null);
     const id = `smp-${randomUUID().slice(0, 12)}`;
     const now = new Date();
     const record: AudioSampleRecord = {
@@ -102,6 +116,8 @@ export class InMemoryAudioRepository implements AudioRepository {
       byteSize: input.byteSize,
       displayOrder: input.displayOrder,
       storageRef: input.storageRef,
+      cleanupStatus: "Live",
+      cleanupAttempts: 0,
       createdAt: now,
       updatedAt: now,
     };
@@ -109,7 +125,7 @@ export class InMemoryAudioRepository implements AudioRepository {
     return Promise.resolve(record);
   }
 
-  async findSampleById(input: {
+  findSampleById(input: {
     offeringId: string;
     sampleId: string;
   }): Promise<AudioSampleRecord | null> {
@@ -119,11 +135,34 @@ export class InMemoryAudioRepository implements AudioRepository {
     return Promise.resolve(sample);
   }
 
-  deleteSample(input: { offeringId: string; sampleId: string }): Promise<void> {
+  markRemovedAndDelete(input: { offeringId: string; sampleId: string }): Promise<void> {
     const sample = this.samples.get(input.sampleId);
     if (!sample) return Promise.resolve();
     if (sample.offeringId !== input.offeringId) return Promise.resolve();
     this.samples.delete(input.sampleId);
     return Promise.resolve();
+  }
+
+  markPendingCleanup(input: { offeringId: string; sampleId: string }): Promise<void> {
+    const sample = this.samples.get(input.sampleId);
+    if (!sample) return Promise.resolve();
+    if (sample.offeringId !== input.offeringId) return Promise.resolve();
+    if (sample.cleanupStatus !== "Live") return Promise.resolve();
+    const now = new Date();
+    this.samples.set(input.sampleId, {
+      ...sample,
+      cleanupStatus: "PendingCleanup",
+      cleanupAttempts: sample.cleanupAttempts + 1,
+      updatedAt: now,
+    });
+    return Promise.resolve();
+  }
+
+  listPendingCleanupForOffering(offeringId: string): Promise<readonly AudioSampleRecord[]> {
+    return Promise.resolve(
+      [...this.samples.values()]
+        .filter((s) => s.offeringId === offeringId && s.cleanupStatus === "PendingCleanup")
+        .sort((a, b) => a.updatedAt.getTime() - b.updatedAt.getTime()),
+    );
   }
 }

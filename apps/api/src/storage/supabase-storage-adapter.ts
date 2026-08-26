@@ -11,22 +11,33 @@
 //   1. `uploadSample` issues a POST against
 //      `${SUPABASE_URL}/storage/v1/object/{bucket}/{path}`. The bucket
 //      is server-side-only (SUPABASE_STORAGE_BUCKET env var); the
-//      adapter validates it is configured and refuses to upload to a
-//      public bucket because MP3 samples are private bytes owned by
-//      the seller. The returned `storageRef` is an opaque per-sample
-//      id; the bucket/path mapping is held inside the adapter and
-//      never serialized to a public DTO.
+//      adapter validates it is configured. The returned `storageRef`
+//      is a self-contained server-internal locator `supa:{bucket}:{path}`
+//      the application persists in PostgreSQL; the adapter parses
+//      the locator on every subsequent call without consulting any
+//      in-process index, so the locator is durable across adapter
+//      restarts. The application NEVER serializes the locator to a
+//      public DTO.
 //
-//   2. `getPlaybackReference` derives a narrowly scoped signed URL
-//      via the Storage REST `POST /storage/v1/object/sign/{bucket}/
-//      {path}` endpoint. The URL is the only value returned to the
-//      application; bucket name, signing key, and path never cross
-//      the application boundary through the public DTO.
+//   2. `getPlaybackReference` composes the in-app
+//      `${apiOrigin}/api/services/{offeringId}/audio-samples/{sampleId}/play`
+//      URL. Provider signed URLs, bucket names, and object paths are
+//      NEVER returned to the application or serialized to a public
+//      DTO. The application proxy route streams the bytes through
+//      that path after re-running eligibility + sample-existence
+//      checks on every request.
 //
-//   3. `removeSample` issues `DELETE /storage/v1/object/{bucket}/
-//      {path}` and never throws for a 404 (idempotent removal per
-//      the adapter contract). The storage-ref → bucket/path mapping
-//      is removed from the adapter's internal index on success.
+//   3. `getPlaybackBytes` mints a narrowly scoped signed URL via
+//      the Storage REST `POST /storage/v1/object/sign/{bucket}/{path}`
+//      endpoint, fetches the bytes through the SDK-supplied `fetch`,
+//      and returns the bytes. The application calls this only
+//      after eligibility checks have run. The signed URL never
+//      appears in a public DTO; the bytes are returned as a
+//      streaming response from the in-app route.
+//
+//   4. `removeSample` issues `DELETE /storage/v1/object/{bucket}/{path}`
+//      and never throws for a 404 (idempotent removal per the
+//      adapter contract).
 //
 // Defense in depth: every adapter method validates content type and
 // size BEFORE contacting Supabase. The application boundary ALSO
@@ -36,6 +47,7 @@
 import { BG2_AUDIO_SAMPLE_CONTENT_TYPE, BG2_AUDIO_SAMPLE_MAX_BYTE_SIZE } from "@soundhub/types";
 import {
   StorageRejectedError,
+  StorageReferenceUnknownError,
   StorageUnavailableError,
   type StorageAdapter,
   type StoragePlaybackInput,
@@ -52,6 +64,13 @@ export interface SupabaseStorageAdapterOptions {
    * to operate if the bucket is missing.
    */
   readonly bucket?: string;
+  /**
+   * Base URL the in-app playback route resolves from. Defaults to
+   * `http://localhost:4000`. The playback URL returned to the
+   * application is composed from this base so the browser fetches
+   * the in-app route, not the Supabase endpoint.
+   */
+  readonly playbackBaseUrl?: string;
   /**
    * Signed-URL lifetime in seconds. Defaults to 300 (5 minutes), the
    * minimum window needed for an audio player to start playback
@@ -73,34 +92,20 @@ interface SignSuccessBody {
   readonly signedURL: string;
 }
 
-interface UploadedObject {
-  readonly bucket: string;
-  readonly objectPath: string;
-}
-
 export class SupabaseStorageAdapter implements StorageAdapter {
   private readonly supabaseUrl: string | undefined;
   private readonly supabaseServiceRoleKey: string | undefined;
   private readonly bucket: string;
+  private readonly playbackBaseUrl: string;
   private readonly signedUrlExpiresInSeconds: number;
   private readonly fetchImpl: typeof fetch;
   private readonly pathPrefix: string;
-  /**
-   * Per-sample mapping from opaque storage ref to bucket/object path.
-   * The index lives in-process for the buildathon scope; a future
-   * scope may persist it (Supabase object metadata or a side column
-   * on `ServiceOfferingAudioSample`). The reference returned to the
-   * application is opaque and never reveals bucket/path through any
-   * public DTO — the application reads it back only via
-   * `getPlaybackReference` and `removeSample`, both of which go
-   * through this index.
-   */
-  private readonly index = new Map<string, UploadedObject>();
 
   constructor(options: SupabaseStorageAdapterOptions = {}) {
     this.supabaseUrl = options.supabaseUrl;
     this.supabaseServiceRoleKey = options.supabaseServiceRoleKey;
     this.bucket = options.bucket ?? "offering-audio";
+    this.playbackBaseUrl = options.playbackBaseUrl ?? "http://localhost:4000";
     this.signedUrlExpiresInSeconds = options.signedUrlExpiresInSeconds ?? 300;
     this.fetchImpl = options.fetchImpl ?? fetch;
     this.pathPrefix = options.pathPrefix ?? "samples";
@@ -164,61 +169,71 @@ export class SupabaseStorageAdapter implements StorageAdapter {
         `Supabase Storage rejected the upload with status ${String(response.status)}.`,
       );
     }
-    const storageRef = this.makeStorageRef();
-    this.index.set(storageRef, { bucket: this.bucket, objectPath });
-    return { storageRef };
+    return { storageRef: this.encodeStorageRef(this.bucket, objectPath) };
   }
 
-  async getPlaybackReference(
-    input: StoragePlaybackInput,
-  ): Promise<StoragePlaybackReference | null> {
+  /**
+   * Compose the in-app SoundHub-owned playback URL. The URL is
+   * always rooted at the application route; the application
+   * proxy-streams the bytes through this path. The Supabase
+   * signed URL is minted internally only on `getPlaybackBytes`.
+   * Returns `null` when the storage ref is unparseable or
+   * addresses a different bucket than this adapter is wired for.
+   */
+  getPlaybackReference(input: StoragePlaybackInput): Promise<StoragePlaybackReference | null> {
+    const parsed = this.decodeStorageRef(input.storageRef);
+    if (!parsed || parsed.bucket !== this.bucket) {
+      return Promise.resolve(null);
+    }
+    const baseUrl = this.playbackBaseUrl.replace(/\/+$/, "");
+    const url = `${baseUrl}/api/services/${encodeURIComponent(input.offeringId)}/audio-samples/${encodeURIComponent(input.sampleId)}/play`;
+    return Promise.resolve({
+      url,
+      cacheControlHint: "private, max-age=60",
+    });
+  }
+
+  /**
+   * Resolve the storage ref to raw MP3 bytes by minting a scoped
+   * signed URL and fetching the bytes. The application calls this
+   * only after eligibility + sample-existence checks have run.
+   * The signed URL never appears in a public DTO; the bytes are
+   * returned as a streaming response from the in-app route.
+   */
+  async getPlaybackBytes(storageRef: string): Promise<Uint8Array> {
     this.assertConfigured();
-    const record = this.index.get(input.storageRef);
-    if (!record) return null;
-    const url = `${this.supabaseUrl}/storage/v1/object/sign/${record.bucket}/${record.objectPath}`;
+    const parsed = this.decodeStorageRef(storageRef);
+    if (!parsed) {
+      throw new StorageReferenceUnknownError("Storage reference is unparseable.");
+    }
+    const { bucket, objectPath } = parsed;
+    const signedUrl = await this.mintSignedUrl(bucket, objectPath);
+    if (!signedUrl) {
+      throw new StorageReferenceUnknownError("Underlying storage object has been removed.");
+    }
     let response: Response;
     try {
-      response = await this.fetchImpl(url, {
-        method: "POST",
-        headers: {
-          "Content-Type": "application/json",
-          Authorization: `Bearer ${this.supabaseServiceRoleKey}`,
-          apikey: this.supabaseServiceRoleKey ?? "",
-        },
-        body: JSON.stringify({ expiresIn: this.signedUrlExpiresInSeconds }),
-      });
+      response = await this.fetchImpl(signedUrl, { method: "GET" });
     } catch (err) {
       throw new StorageUnavailableError(err instanceof Error ? err.message : String(err));
     }
-    if (response.status === 404 || response.status === 400) {
-      // A removed or never-existed object returns 4xx from Supabase
-      // Storage. The application must hide the sample from buyer-
-      // facing discovery rather than surface a player URL.
-      return null;
-    }
     if (!response.ok) {
+      if (response.status === 404 || response.status === 400) {
+        throw new StorageReferenceUnknownError("Underlying storage object has been removed.");
+      }
       throw new StorageUnavailableError(
-        `Supabase Storage sign returned ${String(response.status)}.`,
+        `Supabase Storage fetch returned ${String(response.status)}.`,
       );
     }
-    const raw: unknown = await response.json().catch(() => null);
-    const parsed = parseSignSuccessBody(raw);
-    if (!parsed) {
-      throw new StorageUnavailableError(
-        "Supabase Storage sign response did not match the expected schema.",
-      );
-    }
-    return {
-      url: `${this.supabaseUrl}${parsed.signedURL}`,
-      cacheControlHint: "private, max-age=60",
-    };
+    const buf = await response.arrayBuffer();
+    return new Uint8Array(buf);
   }
 
   async removeSample(storageRef: string): Promise<void> {
     this.assertConfigured();
-    const record = this.index.get(storageRef);
+    const record = this.decodeStorageRef(storageRef);
     if (!record) {
-      // Idempotent: an unknown reference is treated as already
+      // Idempotent: an unparseable reference is treated as already
       // removed so a retried command never raises.
       return;
     }
@@ -236,9 +251,7 @@ export class SupabaseStorageAdapter implements StorageAdapter {
       throw new StorageUnavailableError(err instanceof Error ? err.message : String(err));
     }
     if (response.status === 404) {
-      // Already gone — idempotent success. Drop the index entry
-      // either way so a subsequent remove is also a no-op.
-      this.index.delete(storageRef);
+      // Already gone — idempotent success.
       return;
     }
     if (!response.ok) {
@@ -246,7 +259,6 @@ export class SupabaseStorageAdapter implements StorageAdapter {
         `Supabase Storage delete returned ${String(response.status)}.`,
       );
     }
-    this.index.delete(storageRef);
   }
 
   /**
@@ -261,11 +273,62 @@ export class SupabaseStorageAdapter implements StorageAdapter {
   }
 
   /**
-   * Mint a per-sample opaque id. The application never parses it;
-   * the adapter resolves it back to bucket/path via the index.
+   * Self-contained server-internal locator. The application
+   * persists this value in PostgreSQL; the adapter parses it on
+   * every subsequent call without consulting any in-process
+   * index. The reference is NEVER serialized to a public DTO.
+   *
+   * The bucket name is is included in the locator because the
+   * adapter may be wired with one of several buckets in the
+   * future (e.g. bucket-per-tenant migrations); the application
+   * does not parse the locator and does not see the bucket name.
    */
-  private makeStorageRef(): string {
-    return `${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 12)}`;
+  private encodeStorageRef(bucket: string, objectPath: string): string {
+    return `supa:${bucket}:${objectPath}`;
+  }
+
+  private decodeStorageRef(storageRef: string): { bucket: string; objectPath: string } | null {
+    if (typeof storageRef !== "string") return null;
+    const parts = storageRef.split(":");
+    if (parts.length < 3 || parts[0] !== "supa") return null;
+    const bucket = parts[1] ?? "";
+    const objectPath = parts.slice(2).join(":");
+    if (bucket.length === 0 || objectPath.length === 0) return null;
+    return { bucket, objectPath };
+  }
+
+  private async mintSignedUrl(bucket: string, objectPath: string): Promise<string | null> {
+    const url = `${this.supabaseUrl}/storage/v1/object/sign/${bucket}/${objectPath}`;
+    let response: Response;
+    try {
+      response = await this.fetchImpl(url, {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+          Authorization: `Bearer ${this.supabaseServiceRoleKey}`,
+          apikey: this.supabaseServiceRoleKey ?? "",
+        },
+        body: JSON.stringify({ expiresIn: this.signedUrlExpiresInSeconds }),
+      });
+    } catch (err) {
+      throw new StorageUnavailableError(err instanceof Error ? err.message : String(err));
+    }
+    if (response.status === 404 || response.status === 400) {
+      return null;
+    }
+    if (!response.ok) {
+      throw new StorageUnavailableError(
+        `Supabase Storage sign returned ${String(response.status)}.`,
+      );
+    }
+    const raw: unknown = await response.json().catch(() => null);
+    const parsed = parseSignSuccessBody(raw);
+    if (!parsed) {
+      throw new StorageUnavailableError(
+        "Supabase Storage sign response did not match the expected schema.",
+      );
+    }
+    return `${this.supabaseUrl}${parsed.signedURL}`;
   }
 
   private makeCuid(): string {

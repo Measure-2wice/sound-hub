@@ -38,10 +38,13 @@
 //     AUDIO_SAMPLE_NOT_FOUND.
 //
 //   GET    /api/services/:offeringId/audio-samples/:sampleId/play
-//     Read-only stream of an Active offering's sample bytes for the
-//     deterministic adapter. The Supabase path returns a signed
-//     URL in the public DTO instead, so this route never streams
-//     bytes for the deployed backend.
+//     Read-only stream of an Active offering's sample bytes. The
+//     route is the ONLY application-mediated playback surface for
+//     both adapters; the Supabase adapter resolves its signed URL
+//     internally and the application proxy-streams the bytes here
+//     after re-running eligibility + sample-existence checks. No
+//     provider URL ever appears in a public DTO, response header,
+//     or error envelope.
 
 import { Router, type NextFunction, type Request, type Response } from "express";
 import {

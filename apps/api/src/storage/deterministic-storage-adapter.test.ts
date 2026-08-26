@@ -167,7 +167,7 @@ describe("DeterministicStorageAdapter", () => {
       sampleId: "smp-1",
     });
     assert.ok(playbackRef, "playback reference survives the previous TTL window");
-    const bytes = adapter.getBytesForPlayback(uploaded.storageRef);
+    const bytes = await adapter.getPlaybackBytes(uploaded.storageRef);
     assert.ok(bytes);
     assert.equal(bytes.length, 4);
   });
@@ -188,6 +188,9 @@ describe("DeterministicStorageAdapter", () => {
       sampleId: "smp-1",
     });
     assert.equal(ref, null);
-    assert.equal(adapter.getBytesForPlayback(uploaded.storageRef), null);
+    await assert.rejects(
+      () => adapter.getPlaybackBytes(uploaded.storageRef),
+      (err: unknown) => err instanceof Error && err.name === "StorageReferenceUnknownError",
+    );
   });
 });

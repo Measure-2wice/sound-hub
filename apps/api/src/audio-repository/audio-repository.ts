@@ -10,6 +10,8 @@
 
 import type { Bg2AudioSamplePublicV1 } from "@soundhub/types";
 
+export type AudioSampleCleanupStatus = "Live" | "PendingCleanup" | "Removed";
+
 export interface AudioSampleRecord {
   readonly sampleId: string;
   readonly offeringId: string;
@@ -18,6 +20,8 @@ export interface AudioSampleRecord {
   readonly byteSize: number;
   readonly displayOrder: number;
   readonly storageRef: string;
+  readonly cleanupStatus: AudioSampleCleanupStatus;
+  readonly cleanupAttempts: number;
   readonly createdAt: Date;
   readonly updatedAt: Date;
 }
@@ -43,25 +47,35 @@ export interface AudioRepository {
   getOfferingContext(offeringId: string): Promise<AudioOfferingContext | null>;
 
   /**
-   * List all samples for an offering, ordered by `displayOrder` then
-   * creation time. The repository does NOT enforce the 3-sample cap;
-   * the application service does so at the trusted boundary.
+   * List all LIVE samples for an offering, ordered by `displayOrder`
+   * then creation time. Pending-cleanup and removed samples are
+   * hidden from this view; the application service uses the
+   * PendingCleanup list for the bounded retry path.
+   *
+   * The repository does NOT enforce the 3-sample cap; the
+   * application service does so at the trusted boundary.
    */
   listSamplesForOffering(offeringId: string): Promise<readonly AudioSampleRecord[]>;
 
   /**
-   * Persist a new sample row. The application service guarantees
-   * the row count has not yet reached the cap. The repository
-   * performs no further authorization.
+   * Persist a new sample row inside a database transaction that
+   * ALSO enforces the 3-sample cap at the persistence boundary
+   * (P1-004). Two concurrent uploads starting with two existing
+   * samples both observe a free slot via a non-transactional count;
+   * the transactional create with a `WHERE NOT EXISTS` guard
+   * makes one of them fail atomically.
+   *
+   * Returns `null` when the cap is hit (the row was NOT inserted).
+   * Throws for other persistence failures.
    */
-  createSample(input: {
+  createSampleWithCap(input: {
     readonly offeringId: string;
     readonly label: string;
     readonly contentType: "audio/mpeg";
     readonly byteSize: number;
     readonly displayOrder: number;
     readonly storageRef: string;
-  }): Promise<AudioSampleRecord>;
+  }): Promise<AudioSampleRecord | null>;
 
   /**
    * Look up a single sample by id within an offering. Returns
@@ -74,24 +88,44 @@ export interface AudioRepository {
   }): Promise<AudioSampleRecord | null>;
 
   /**
-   * Delete a sample row inside a transaction. The caller MUST have
-   * already removed the storage object (or scheduled its cleanup).
-   * The repository never throws for a missing row — deletion is
-   * idempotent at the persistence layer.
+   * Mark a sample as `Removed` and delete its row inside a single
+   * transaction. Idempotent: deleting an already-removed row is a
+   * no-op. The repository never throws for a missing row.
    */
-  deleteSample(input: { readonly offeringId: string; readonly sampleId: string }): Promise<void>;
+  markRemovedAndDelete(input: {
+    readonly offeringId: string;
+    readonly sampleId: string;
+  }): Promise<void>;
+
+  /**
+   * Mark a sample as `PendingCleanup` and increment
+   * `cleanupAttempts`. Idempotent: the row count is updated only
+   * when the sample is currently `Live`. The bounded retry path
+   * uses this when storage removal fails on the first attempt.
+   */
+  markPendingCleanup(input: {
+    readonly offeringId: string;
+    readonly sampleId: string;
+  }): Promise<void>;
+
+  /**
+   * List the bounded set of `PendingCleanup` samples for retry.
+   * Used by the application service to drive a bounded, no-job
+   * cleanup pass at the next operation against the offering.
+   */
+  listPendingCleanupForOffering(offeringId: string): Promise<readonly AudioSampleRecord[]>;
 }
 
 /**
  * Public mapper. The repository returns internal `AudioSampleRecord`
  * views; the service maps them to the allow-listed public DTO.
  *
- * The mapper does NOT carry `storageRef` or any provider-internal
- * shape across the public boundary. The service populates
- * `playbackUrl` after consulting the storage adapter so the
- * serialized DTO only carries buyer-safe fields. Storage
- * credentials, bucket names, object keys, and provider subjects
- * never appear here.
+ * The mapper does NOT carry `storageRef`, `cleanupStatus`,
+ * `cleanupAttempts`, or any provider-internal shape across the
+ * public boundary. The service populates `playbackUrl` after
+ * consulting the storage adapter so the serialized DTO only
+ * carries buyer-safe fields. Storage credentials, bucket names,
+ * object keys, and provider subjects never appear here.
  */
 export function toPublicAudioSample(input: {
   readonly record: AudioSampleRecord;

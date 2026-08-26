@@ -11,6 +11,7 @@ import { isControlledRequiredPath } from "../lib/field-error-paths";
 import { Card } from "./ui/Card";
 import { SearchForm } from "./SearchForm";
 import { RequiredFilters } from "./RequiredFilters";
+import { AudioSamplesPanel } from "./AudioSamplesPanel";
 import { formatPricing } from "../lib/pricing";
 import {
   categoryMetadataResponseV1Schema,
@@ -623,6 +624,13 @@ function BestOfferingCard({
           ? "This seller has not advertised pricing. Any pricing discussed later is non-binding until it is incorporated into approved terms."
           : "Advertised pricing is non-binding and not a quote. It binds no one until it is incorporated into approved terms."}
       </p>
+
+      {/* Buyer-discovery audio playback (ticket #61 follow-up P1-002).
+          Loads samples for this offering from the public endpoint and
+          renders a bounded set of audio players. Removed or
+          ineligible samples never appear because the application
+          re-runs eligibility checks on every playback request. */}
+      <AudioSamplesPanel offeringId={offering.offeringId} offeringTitle={offering.title} />
     </div>
   );
 }

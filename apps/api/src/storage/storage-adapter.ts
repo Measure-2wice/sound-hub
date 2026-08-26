@@ -8,28 +8,40 @@
 // so the higher layers (routes, services, repositories) cannot drift
 // based on which provider is wired.
 //
-// Application contract invariants:
+// Application contract invariants (post review P0-001):
 //
 //   1. `uploadSample` returns an opaque `storageRef` whose content
 //      the application MUST treat as a handle to the storage backend.
 //      The application NEVER parses, logs, or reconstructs the
-//      storage reference; only the adapter that produced it can
-//      resolve it back to a playable reference via `getPlaybackReference`.
-//      This keeps provider bucket names, object keys, and private
-//      credentials inside the adapter boundary.
+//      storage reference to derive bucket/path/provider URLs; only
+//      the adapter that produced it can resolve it back via
+//      `getPlaybackBytes`. PostgreSQL is the only place the
+//      reference is persisted; it never crosses the public DTO.
 //
-//   2. `removeSample` deletes the bounded object (or schedules
+//   2. `getPlaybackReference` returns a SoundHub-owned playback URL
+//      that points at the application route
+//      `${apiOrigin}/api/services/{offeringId}/audio-samples/{sampleId}/play`.
+//      The application proxy-streams the bytes through this route
+//      after re-running eligibility and removal checks on every
+//      request. Provider signed URLs, bucket names, and object
+//      paths are NEVER serialized to a public DTO, response header,
+//      or error envelope. The Supabase adapter mints the signed URL
+//      internally and resolves the bytes; the bytes never appear
+//      on the public HTTP boundary in a provider-typed form.
+//
+//   3. `getPlaybackBytes` returns the raw MP3 bytes for the given
+//      storage ref. The deterministic adapter returns its in-memory
+//      bytes; the Supabase adapter fetches the signed URL
+//      internally and returns the bytes. The application runs
+//      offering eligibility + sample existence checks before
+//      calling this method.
+//
+//   4. `removeSample` deletes the bounded object (or schedules
 //      cleanup) and is idempotent. Repeated removals of the same
 //      reference never throw — the application may retry without
 //      surfacing a provider error.
 //
-//   3. `getPlaybackReference` returns a player URL the buyer-facing
-//      UI can attach to an `<audio>` element. The reference is a
-//      fully-formed URL (signed URL for Supabase; opaque handle for
-//      the deterministic adapter). The application never receives
-//      bucket names, signed headers, or other provider internals.
-//
-//   4. Provider failure maps to a stable `StorageUnavailableError`
+//   5. Provider failure maps to a stable `StorageUnavailableError`
 //      so the route layer can surface `AUDIO_PROVIDER_UNAVAILABLE`
 //      without leaking adapter internals.
 
@@ -69,29 +81,23 @@ export interface StorageUploadInput {
 
 export interface StorageUploadResult {
   /**
-   * Opaque storage reference. The application persists this value
-   * in PostgreSQL as the `storageRef` column and passes it back to
-   * `getPlaybackReference` and `removeSample`. The adapter that
-   * produced it is the only component that can parse it. This
-   * reference is intentionally NEVER serialized to public DTOs;
-   * the buyer-facing surface uses the public `playbackUrl` instead.
+   * Self-contained server-internal locator. The application persists
+   * this value in PostgreSQL as the `storageRef` column and passes
+   * it back to `getPlaybackBytes` and `removeSample`. The adapter
+   * that produced it is the only component that parses it. The
+   * reference is NEVER serialized to public DTOs, response
+   * headers, or error envelopes.
    */
   readonly storageRef: string;
 }
 
 /**
- * Inputs to `getPlaybackReference`. Both adapters need the offering
- * and sample identifiers to compose a playable URL that the
- * application can hand to the buyer-facing UI without further
- * resolution:
- *
- *   - Supabase Storage uses the persisted `storageRef` to resolve a
- *     signed URL; the offering/sample ids are returned to the
- *     application for logging only.
- *   - The deterministic adapter composes
- *     `${apiOrigin}/api/services/${offeringId}/audio-samples/${sampleId}/play`
- *     so the in-app route streams the persisted bytes after the
- *     service runs its eligibility and removal checks.
+ * Inputs to `getPlaybackReference`. The adapter always returns a
+ * SoundHub-owned playback URL rooted at the application route
+ * `${apiOrigin}/api/services/{offeringId}/audio-samples/{sampleId}/play`.
+ * `storageRef` lets the deterministic adapter verify the object
+ * exists before composing the URL; the Supabase adapter composes
+ * the same URL regardless of the storage ref.
  */
 export interface StoragePlaybackInput {
   readonly storageRef: string;
@@ -101,19 +107,18 @@ export interface StoragePlaybackInput {
 
 export interface StoragePlaybackReference {
   /**
-   * Fully-formed URL the buyer-facing UI may attach to an `<audio>`
-   * tag. For Supabase Storage this is a narrowly scoped signed URL;
-   * for the deterministic adapter this is the in-app
-   * `/api/services/:offeringId/audio-samples/:sampleId/play` route
-   * which re-runs eligibility and removal checks on every request.
-   * The application renders the URL but never inspects its
-   * internals; the adapter alone owns the URL's semantics.
+   * SoundHub-owned playback URL the buyer-facing UI may attach to
+   * an `<audio>` tag. Always rooted at the application route
+   * `${apiOrigin}/api/services/{offeringId}/audio-samples/{sampleId}/play`.
+   * The application proxy-streams the bytes through this route after
+   * re-running eligibility + removal checks on every request.
+   * Provider internals (bucket name, signed URL, object path)
+   * never appear in this URL.
    */
   readonly url: string;
   /**
    * Suggested `Cache-Control` hint the application MAY forward to
-   * the browser. Defaults to a short browser cache so a stale signed
-   * URL does not survive its expiry.
+   * the browser. Defaults to a short browser cache.
    */
   readonly cacheControlHint?: string;
 }
@@ -132,6 +137,13 @@ export class StorageRejectedError extends Error {
   }
 }
 
+export class StorageReferenceUnknownError extends Error {
+  constructor(message: string) {
+    super(message);
+    this.name = "StorageReferenceUnknownError";
+  }
+}
+
 /**
  * Provider-neutral storage adapter.
  *
@@ -140,19 +152,25 @@ export class StorageRejectedError extends Error {
  *   trusted boundary. The application ALSO validates; defense in
  *   depth so an adapter cannot be tricked into accepting non-MP3 or
  *   oversize objects by a malicious or buggy caller.
- * - Return an opaque `storageRef` from `uploadSample`. The reference
- *   MUST be unique per object. The application persists the
- *   reference in PostgreSQL and passes it back to `getPlaybackReference`
- *   and `removeSample`. The application NEVER serializes the
- *   reference to a public DTO; the buyer-facing surface receives
- *   the fully-formed `playbackUrl` instead.
+ * - Return a self-contained `storageRef` from `uploadSample` so a
+ *   fresh adapter instance can resolve the locator after process
+ *   restart. The reference must never expose bucket names,
+ *   private object keys, provider subjects, or storage credentials
+ *   to the application: only the adapter knows its format. The
+ *   application NEVER serializes the reference to public DTOs,
+ *   response headers, or error envelopes.
+ * - Resolve `storageRef` back to MP3 bytes via `getPlaybackBytes`
+ *   for the application proxy. Throws `StorageReferenceUnknownError`
+ *   when the underlying object has been removed (idempotent on
+ *   retries; the application surfaces this as `AUDIO_SAMPLE_NOT_FOUND`).
  * - Never expose bucket names, private object keys, provider subjects,
- *   or storage credentials through any return value or error message.
+ *   or storage credentials through any return value, URL fragment,
+ *   header, or error message.
  */
 export interface StorageAdapter {
   /**
-   * Upload one bounded MP3 sample. Returns the opaque storage
-   * reference the application persists in PostgreSQL.
+   * Upload one bounded MP3 sample. Returns the self-contained
+   * storage reference the application persists in PostgreSQL.
    *
    * Throws `StorageRejectedError` for declared type / size policy
    * violations the adapter enforces defensively. Throws
@@ -162,18 +180,33 @@ export interface StorageAdapter {
   uploadSample(input: StorageUploadInput): Promise<StorageUploadResult>;
 
   /**
-   * Resolve an opaque storage reference back to a fully-formed
-   * playable URL. Returns `null` when the reference is unknown or
-   * the underlying object has been removed. The application uses
-   * `null` to hide the sample from buyer-facing discovery without
-   * crashing.
+   * Compose the SoundHub-owned in-app playback URL for a sample.
+   * The URL always points at the application route that
+   * proxy-streams the bytes after re-running eligibility checks.
+   * Returns `null` when the storage ref is unknown to the adapter
+   * (the application treats this as "remove from buyer-facing
+   * discovery").
    *
-   * `offeringId` and `sampleId` let the deterministic adapter
-   * compose the in-app playback route (`/api/services/.../play`).
-   * The Supabase adapter ignores them and uses the persisted
-   * `storageRef` to mint a signed URL.
+   * The deterministic adapter verifies the object still exists in
+   * its in-memory index; the Supabase adapter composes the URL
+   * without contacting the provider (the eligibility check happens
+   * on the application route).
    */
   getPlaybackReference(input: StoragePlaybackInput): Promise<StoragePlaybackReference | null>;
+
+  /**
+   * Resolve the storage ref to raw MP3 bytes. Called only by the
+   * application proxy route AFTER eligibility + sample-existence
+   * checks have run. The deterministic adapter returns its
+   * in-memory bytes; the Supabase adapter mints a scoped signed
+   * URL internally, fetches the bytes, and returns them.
+   *
+   * Throws `StorageReferenceUnknownError` when the underlying
+   * object is unknown (already removed or never existed).
+   * Throws `StorageUnavailableError` for transient provider
+   * failures.
+   */
+  getPlaybackBytes(storageRef: string): Promise<Uint8Array>;
 
   /**
    * Remove a previously uploaded sample. Idempotent: removing an

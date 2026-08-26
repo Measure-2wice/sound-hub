@@ -54,6 +54,7 @@ export function buildStorageAdapters(deps: StorageFactoryDeps = {}): BuiltStorag
     bucket: deps.bucket,
     signedUrlExpiresInSeconds: deps.signedUrlExpiresInSeconds,
     fetchImpl: deps.fetchImpl,
+    playbackBaseUrl: deps.playbackBaseUrl,
   });
   const deterministic = new DeterministicStorageAdapter({
     playbackBaseUrl: deps.playbackBaseUrl,

@@ -68,6 +68,22 @@ enum PurchaseMode {
   BundleOnly
 }
 
+// Audio sample cleanup lifecycle.
+//
+//   - `Live`           — visible in buyer-facing discovery; default.
+//   - `PendingCleanup` — the seller removed the sample but the
+//     storage object could not be deleted (e.g. provider outage).
+//     The row is preserved so a bounded retry can complete the
+//     bounded object cleanup later. Hidden from buyer-facing
+//     discovery immediately.
+//   - `Removed`        — the storage object has been removed; the
+//     row will be deleted at the next transactional sweep.
+enum AudioSampleCleanupStatus {
+  Live
+  PendingCleanup
+  Removed
+}
+
 // ---------- Identity and authority ----------
 
 model UserAccount {
@@ -494,11 +510,26 @@ model ServiceOfferingAudioSample {
   // application treats it as an opaque string; only the adapter that
   // produced it can resolve it back to a playable reference.
   storageRef    String
+  // Cleanup lifecycle (ticket #61 follow-up review P1-005). Default
+  // `Live`. `PendingCleanup` means the seller removed the sample but
+  // the bounded object could not be deleted at provider removal time;
+  // the row is preserved so a bounded retry can complete the
+  // cleanup. `Removed` is a transient state during the row delete.
+  cleanupStatus AudioSampleCleanupStatus @default(Live)
+  // Number of storage-removal attempts that have failed for this
+  // row while it is in `PendingCleanup`. Bounded by the application
+  // (no generalized retry infrastructure).
+  cleanupAttempts Int @default(0)
+  // Last cleanup failure timestamp (UTC). Used to surface the most
+  // recent provider failure without logging the provider error
+  // message.
+  cleanupLastFailureAt DateTime?
   createdAt     DateTime @default(now())
   updatedAt     DateTime @updatedAt
 
   offering ServiceOffering @relation(fields: [offeringId], references: [id], onDelete: Cascade)
 
   @@index([offeringId])
+  @@index([cleanupStatus])
   @@map("offering_audio_samples")
 }
