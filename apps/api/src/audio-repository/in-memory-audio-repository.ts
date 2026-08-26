@@ -177,4 +177,40 @@ export class InMemoryAudioRepository implements AudioRepository {
         .sort((a, b) => a.updatedAt.getTime() - b.updatedAt.getTime()),
     );
   }
+
+  private readonly orphans = new Map<
+    string,
+    {
+      storageRef: string;
+      offeringId: string;
+      cleanupAttempts: number;
+      updatedAt: Date;
+    }
+  >();
+
+  async recordOrphanedStorage(input: { offeringId: string; storageRef: string }): Promise<void> {
+    this.orphans.set(input.storageRef, {
+      storageRef: input.storageRef,
+      offeringId: input.offeringId,
+      cleanupAttempts: 0,
+      updatedAt: new Date(),
+    });
+    return Promise.resolve();
+  }
+
+  async listOrphanedStorageForOffering(
+    offeringId: string,
+  ): Promise<readonly { readonly storageRef: string; readonly cleanupAttempts: number }[]> {
+    return Promise.resolve(
+      [...this.orphans.values()]
+        .filter((o) => o.offeringId === offeringId)
+        .sort((a, b) => a.updatedAt.getTime() - b.updatedAt.getTime())
+        .map((o) => ({ storageRef: o.storageRef, cleanupAttempts: o.cleanupAttempts })),
+    );
+  }
+
+  async removeOrphanedStorage(storageRef: string): Promise<void> {
+    this.orphans.delete(storageRef);
+    return Promise.resolve();
+  }
 }

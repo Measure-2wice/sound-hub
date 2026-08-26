@@ -83,25 +83,29 @@ export class PrismaAudioRepository implements AudioRepository {
   }
 
   /**
-   * Per-offering advisory lock key. The two-int variant of
-   * `pg_advisory_xact_lock(class, key)` provides a stable, name-
-   * spaced bigint derived from the offering id. The lock is
-   * automatically released at commit/rollback so there is no
-   * leak path. A stable hash keeps the lock key independent of
-   * any user-facing value; a collision only causes two offerings
-   * to serialize unnecessarily, never a correctness gap.
+   * Per-offering advisory lock key. PostgreSQL exposes only two
+   * advisory-lock signatures for `pg_advisory_xact_lock`: a single
+   * `bigint` argument or two `integer` arguments. The two-int
+   * variant gives us a name-space class (this adapter) plus a
+   * per-offering hash that fits inside a signed 32-bit integer.
+   *
+   * The function returns the per-offering `key` (the second int).
+   * The first int (class) is fixed at `AUDIO_SAMPLE_LOCK_CLASS`
+   * below. The hash is FNV-1a 32-bit so the resulting int always
+   * fits and the value is stable across processes. A collision
+   * only causes two offerings to serialize unnecessarily, never a
+   * correctness gap.
    */
-  private lockKeyForOffering(offeringId: string): bigint {
-    // FNV-1a 64-bit. Stable across processes and languages.
-    let hash = 0xcbf29ce484222325n;
-    const prime = 0x100000001b3n;
-    const mask = 0xffffffffffffffffn;
+  private lockKeyForOffering(offeringId: string): number {
+    // FNV-1a 32-bit. Stable across processes and languages.
+    let hash = 0x811c9dc5;
     for (let i = 0; i < offeringId.length; i++) {
-      hash ^= BigInt(offeringId.charCodeAt(i));
-      hash = (hash * prime) & mask;
+      hash ^= offeringId.charCodeAt(i);
+      hash = Math.imul(hash, 0x01000193);
     }
-    // XOR-fold to fit a signed 32-bit second argument.
-    return hash ^ (hash >> 32n);
+    // Force into a signed 32-bit range as required by the
+    // pg_advisory_xact_lock(int, int) signature.
+    return hash | 0;
   }
 
   /**
@@ -129,9 +133,14 @@ export class PrismaAudioRepository implements AudioRepository {
     return this.prisma.$transaction(async (tx) => {
       // Acquire the per-offering advisory lock so concurrent
       // writers serialize. The lock is held until commit/rollback.
+      // PostgreSQL exposes only two pg_advisory_xact_lock overloads:
+      // one bigint argument or two integer arguments. We use the
+      // two-int form: the class is fixed at AUDIO_SAMPLE_LOCK_CLASS
+      // (a stable namespace for audio-sample locks) and the per-
+      // offering key is a signed 32-bit FNV-1a hash.
       const lockKey = this.lockKeyForOffering(input.offeringId);
       await tx.$executeRaw(
-        Prisma.sql`SELECT pg_advisory_xact_lock(${AUDIO_SAMPLE_LOCK_CLASS}::int, ${lockKey}::bigint)`,
+        Prisma.sql`SELECT pg_advisory_xact_lock(${AUDIO_SAMPLE_LOCK_CLASS}::int, ${lockKey}::int)`,
       );
       const liveRows = await tx.serviceOfferingAudioSample.findMany({
         where: {
@@ -240,6 +249,44 @@ export class PrismaAudioRepository implements AudioRepository {
       orderBy: [{ updatedAt: "asc" }],
     });
     return rows.map(toRecord);
+  }
+
+  async recordOrphanedStorage(input: { offeringId: string; storageRef: string }): Promise<void> {
+    // Upsert so concurrent orphan-detect paths converge on a
+    // single durable locator row. On overwrite we reset the
+    // attempt counter so a fresh failure is recorded as such.
+    await this.prisma.audioSampleOrphanedStorage.upsert({
+      where: { storageRef: input.storageRef },
+      create: {
+        storageRef: input.storageRef,
+        offeringId: input.offeringId,
+        cleanupAttempts: 0,
+      },
+      update: {
+        offeringId: input.offeringId,
+        cleanupAttempts: 0,
+        cleanupLastFailureAt: new Date(),
+      },
+    });
+  }
+
+  async listOrphanedStorageForOffering(
+    offeringId: string,
+  ): Promise<readonly { readonly storageRef: string; readonly cleanupAttempts: number }[]> {
+    const rows = await this.prisma.audioSampleOrphanedStorage.findMany({
+      where: { offeringId },
+      orderBy: [{ updatedAt: "asc" }],
+    });
+    return rows.map((row) => ({
+      storageRef: row.storageRef,
+      cleanupAttempts: row.cleanupAttempts,
+    }));
+  }
+
+  async removeOrphanedStorage(storageRef: string): Promise<void> {
+    await this.prisma.audioSampleOrphanedStorage.deleteMany({
+      where: { storageRef },
+    });
   }
 }
 

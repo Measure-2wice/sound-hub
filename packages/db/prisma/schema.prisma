@@ -310,6 +310,7 @@ model ServiceOffering {
   serviceAreas     ServiceOfferingServiceArea[]
   pricing          ServiceOfferingPricing?
   audioSamples     ServiceOfferingAudioSample[]
+  orphanedAudioStorage AudioSampleOrphanedStorage[]
 
   @@index([sellerProfileId])
   @@index([primaryCategoryId])
@@ -532,4 +533,36 @@ model ServiceOfferingAudioSample {
   @@index([offeringId])
   @@index([cleanupStatus])
   @@map("offering_audio_samples")
+}
+
+// Audio sample orphaned storage locator.
+//
+// Per ticket #61 follow-up review (P1-002): when an upload succeeds
+// in storage but the DB counterpart never persists (DB write fails or
+// the cap guard rejects the row), and the immediate storage-delete
+// also fails, the storage reference would otherwise be lost. This
+// table is the durable recovery record: a row keyed by `storageRef`
+// carries the offering id and a bounded retry counter so the next
+// operation against the offering can discover and complete the
+// storage-side cleanup. Rows are deleted when the storage-side
+// delete confirms success or the storage object is reported
+// already-gone.
+model AudioSampleOrphanedStorage {
+  storageRef           String   @id
+  // Owning offering. Used to scope the bounded retry pass and to
+  // cascade when the offering is removed.
+  offeringId           String
+  // Number of storage-removal attempts that have failed for this
+  // orphan. Bounded by the application (no generalized retry
+  // infrastructure).
+  cleanupAttempts      Int      @default(0)
+  // Last cleanup failure timestamp (UTC).
+  cleanupLastFailureAt DateTime?
+  createdAt            DateTime @default(now())
+  updatedAt            DateTime @updatedAt
+
+  offering ServiceOffering @relation(fields: [offeringId], references: [id], onDelete: Cascade)
+
+  @@index([offeringId])
+  @@map("audio_sample_orphaned_storage")
 }

@@ -821,6 +821,87 @@ describe("AudioSampleService", () => {
     );
   });
 
+  test("P1-001: a truncated MPEG-1 frame is rejected (correct table for MPEG-1 = 128 kbps at 44.1 kHz requires 417 bytes)", async () => {
+    // Per ticket #61 follow-up review (P1-001): the bitrate table
+    // for MPEG-1 lives at index 1. A 300-byte payload with header
+    // 0xFF 0xFB 0x90 0x00 (MPEG-1, Layer III, 128 kbps index 9,
+    // 44.1 kHz) requires a 417-byte frame; 300 bytes is truncated.
+    const storage = new DeterministicStorageAdapter();
+    const repo = makeAudioRepo();
+    const service = buildService(repo, storage);
+    const truncated = new Uint8Array(300);
+    truncated[0] = 0xff;
+    truncated[1] = 0xfb;
+    truncated[2] = 0x90;
+    truncated[3] = 0x00;
+    await assert.rejects(
+      () =>
+        service.uploadSample({
+          userAccountId: SELLER_USER,
+          offeringId: OFFERING_ID,
+          actingWorkspaceId: SELLER_WORKSPACE,
+          label: "Truncated MPEG-1",
+          contentType: "audio/mpeg",
+          byteSize: truncated.length,
+          bytes: truncated,
+        }),
+      (err: unknown) =>
+        err instanceof AudioSampleError && err.code === "AUDIO_CONTENT_TYPE_UNSUPPORTED",
+    );
+  });
+
+  test("P1-001: a valid MPEG-2 frame at 64 kbps / 22.05 kHz is accepted (correct table for MPEG-2)", async () => {
+    // Header 0xFF 0xF3 ... → MPEG-2 (version bits = 10), Layer III,
+    // bitrate index 9 = 64 kbps (MPEG-2 table), sample-rate index
+    // 0 = 22.05 kHz. Frame size = floor(576 * 64000 / (8 * 22050))
+    // + 0 = 209 bytes. A 261-byte payload is more than enough.
+    const storage = new DeterministicStorageAdapter();
+    const repo = makeAudioRepo();
+    const service = buildService(repo, storage);
+    const mpeg2Frame = new Uint8Array(261);
+    mpeg2Frame[0] = 0xff;
+    mpeg2Frame[1] = 0xf3; // MPEG-2 Layer III, no CRC
+    mpeg2Frame[2] = 0x90; // bitrate index 9 = 64 kbps (MPEG-2), 22.05 kHz, no padding
+    mpeg2Frame[3] = 0x00;
+    const uploaded = await service.uploadSample({
+      userAccountId: SELLER_USER,
+      offeringId: OFFERING_ID,
+      actingWorkspaceId: SELLER_WORKSPACE,
+      label: "Valid MPEG-2",
+      contentType: "audio/mpeg",
+      byteSize: mpeg2Frame.length,
+      bytes: mpeg2Frame,
+    });
+    assert.ok(uploaded.sample);
+  });
+
+  test("P1-001: a truncated MPEG-2 frame is rejected (computed frame size exceeds the payload)", async () => {
+    // Same MPEG-2 header as above but only 100 bytes total. The
+    // validator must compute 209 bytes and reject.
+    const storage = new DeterministicStorageAdapter();
+    const repo = makeAudioRepo();
+    const service = buildService(repo, storage);
+    const truncated = new Uint8Array(100);
+    truncated[0] = 0xff;
+    truncated[1] = 0xf3;
+    truncated[2] = 0x90;
+    truncated[3] = 0x00;
+    await assert.rejects(
+      () =>
+        service.uploadSample({
+          userAccountId: SELLER_USER,
+          offeringId: OFFERING_ID,
+          actingWorkspaceId: SELLER_WORKSPACE,
+          label: "Truncated MPEG-2",
+          contentType: "audio/mpeg",
+          byteSize: truncated.length,
+          bytes: truncated,
+        }),
+      (err: unknown) =>
+        err instanceof AudioSampleError && err.code === "AUDIO_CONTENT_TYPE_UNSUPPORTED",
+    );
+  });
+
   test("P1-004: two concurrent uploads starting from two existing samples cannot create four rows", async () => {
     const storage = new DeterministicStorageAdapter();
     const repo = makeAudioRepo();
@@ -1023,6 +1104,100 @@ describe("AudioSampleService", () => {
       1,
       "exactly one storage remove call cleans up the orphaned object",
     );
+  });
+
+  test("P1-002: simultaneous DB failure + storage-delete failure persists a durable orphan locator", async () => {
+    // Per ticket #61 follow-up review (P1-002): when the DB create
+    // throws AND the immediate storage-delete also fails, the
+    // service must record a durable orphan locator so the bounded
+    // retry path on the next operation can complete the cleanup
+    // across service restarts.
+    let attempt = 0;
+    const providerDownStorage = {
+      uploadSample: (
+        input: Parameters<typeof DeterministicStorageAdapter.prototype.uploadSample>[0],
+      ): ReturnType<typeof DeterministicStorageAdapter.prototype.uploadSample> => {
+        const inner = new DeterministicStorageAdapter();
+        return inner.uploadSample(input);
+      },
+      getPlaybackReference: (
+        input: Parameters<typeof DeterministicStorageAdapter.prototype.getPlaybackReference>[0],
+      ): ReturnType<typeof DeterministicStorageAdapter.prototype.getPlaybackReference> => {
+        const inner = new DeterministicStorageAdapter();
+        return inner.getPlaybackReference(input);
+      },
+      getPlaybackBytes: (
+        ref: string,
+      ): ReturnType<typeof DeterministicStorageAdapter.prototype.getPlaybackBytes> => {
+        const inner = new DeterministicStorageAdapter();
+        return inner.getPlaybackBytes(ref);
+      },
+      removeSample: (
+        ref: string,
+      ): ReturnType<typeof DeterministicStorageAdapter.prototype.removeSample> => {
+        void ref;
+        attempt += 1;
+        // Provider is "down" for the immediate cleanup. The retry
+        // path will see attempt > 1; on the second call the
+        // provider recovers.
+        if (attempt === 1) {
+          throw new StorageUnavailableError("provider down");
+        }
+        const inner = new DeterministicStorageAdapter();
+        return inner.removeSample(ref);
+      },
+    };
+    const baseRepo = makeAudioRepo();
+    const failingRepo = Object.create(baseRepo) as typeof baseRepo;
+    failingRepo.createSampleWithCap = () => {
+      throw new Error("simulated DB write failure");
+    };
+    const service = new AudioSampleService({
+      repository: failingRepo,
+      // eslint-disable-next-line @typescript-eslint/no-unnecessary-type-assertion
+      storage: providerDownStorage as never,
+      workspaceAuthorization: new WorkspaceAuthorizationService({
+        authRepository: makeAuthRepo(),
+      }),
+    });
+    await assert.rejects(() =>
+      service.uploadSample({
+        userAccountId: SELLER_USER,
+        offeringId: OFFERING_ID,
+        actingWorkspaceId: SELLER_WORKSPACE,
+        label: "Both fail",
+        contentType: "audio/mpeg",
+        byteSize: 512,
+        bytes: mp3Bytes(512),
+      }),
+    );
+    // Exactly one immediate remove attempt; it failed because the
+    // provider was "down".
+    assert.equal(attempt, 1, "immediate storage-delete attempted exactly once");
+    // A durable orphan locator must have been recorded so the
+    // bounded retry path can complete the cleanup.
+    const orphans = await baseRepo.listOrphanedStorageForOffering(OFFERING_ID);
+    assert.equal(orphans.length, 1, "one durable orphan locator recorded");
+    // Simulate a service restart by constructing a fresh service
+    // against the same repository (the locator survives because it
+    // is durably persisted). The retry path must drive the
+    // provider's recovery on the next operation.
+    const freshService = new AudioSampleService({
+      repository: baseRepo,
+      // eslint-disable-next-line @typescript-eslint/no-unnecessary-type-assertion
+      storage: providerDownStorage as never,
+      workspaceAuthorization: new WorkspaceAuthorizationService({
+        authRepository: makeAuthRepo(),
+      }),
+    });
+    await freshService.listSamplesForSeller({
+      userAccountId: SELLER_USER,
+      offeringId: OFFERING_ID,
+      actingWorkspaceId: SELLER_WORKSPACE,
+    });
+    assert.ok(attempt >= 2, "retry attempt invoked removeSample after recovery");
+    const afterRetry = await baseRepo.listOrphanedStorageForOffering(OFFERING_ID);
+    assert.equal(afterRetry.length, 0, "orphan locator is finalized after successful cleanup");
   });
 
   test("P1-005: storage removal failure surfaces AUDIO_STORAGE_FAILED and hides the sample from discovery", async () => {

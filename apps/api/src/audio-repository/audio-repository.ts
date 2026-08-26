@@ -117,6 +117,37 @@ export interface AudioRepository {
    * cleanup pass at the next operation against the offering.
    */
   listPendingCleanupForOffering(offeringId: string): Promise<readonly AudioSampleRecord[]>;
+
+  /**
+   * Record a durable orphan-cleanup locator for a storage object
+   * whose DB counterpart never persisted and whose immediate
+   * storage-delete also failed. Per P1-002 the bounded retry path
+   * uses this row to discover and complete the storage-side
+   * cleanup across service restarts.
+   *
+   * Idempotent: a duplicate `storageRef` overwrites the existing
+   * row so concurrent failure paths converge.
+   */
+  recordOrphanedStorage(input: {
+    readonly offeringId: string;
+    readonly storageRef: string;
+  }): Promise<void>;
+
+  /**
+   * List the bounded set of orphaned-storage locators for an
+   * offering. The retry pass drives each locator to completion
+   * (success deletes the row; failure increments attempts).
+   */
+  listOrphanedStorageForOffering(
+    offeringId: string,
+  ): Promise<readonly { readonly storageRef: string; readonly cleanupAttempts: number }[]>;
+
+  /**
+   * Idempotent: delete the orphan locator when the storage-side
+   * delete confirms success (or the storage object is reported
+   * already-gone).
+   */
+  removeOrphanedStorage(storageRef: string): Promise<void>;
 }
 
 /**

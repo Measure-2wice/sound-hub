@@ -219,7 +219,16 @@ const DEFAULT_MP3_VALIDATOR: Mp3ContentValidator = {
     if (sampleRateHz === undefined) {
       return { ok: false, reason: "MPEG sample rate index is out of range." };
     }
-    const bitrateKbps = MPEG_L3_BITRATE_KBPS[mpegVersionBits === 0x03 ? 0 : 1]?.[bitrateIndex];
+    // Per ticket #61 follow-up review (P1-001): the MPEG-1 Layer III
+    // bitrate table (higher bitrates, samples-per-frame = 1152) lives
+    // at index 1, and the MPEG-2/2.5 Layer III table (lower bitrates,
+    // samples-per-frame = 576) lives at index 0. Selecting table 0 for
+    // MPEG-1 underestimates the frame size and accepts truncated
+    // payloads; selecting table 1 for MPEG-2/2.5 overestimates and
+    // rejects valid-length frames. Map the version to the correct
+    // table here.
+    const bitrateTableIndex = mpegVersionBits === 0x03 ? 1 : 0;
+    const bitrateKbps = MPEG_L3_BITRATE_KBPS[bitrateTableIndex]?.[bitrateIndex];
     if (bitrateKbps === undefined) {
       return { ok: false, reason: "MPEG bitrate index is out of range." };
     }
@@ -392,6 +401,13 @@ export class AudioSampleService {
     await this.retryPendingCleanupForOffering({
       offeringId: input.offeringId,
     });
+    // P1-002: also retry any orphaned storage locators so a
+    // previously-recorded orphan (created when the immediate
+    // post-upload storage-delete failed) can be completed across
+    // service restarts. Bounded by the offering's own backlog.
+    await this.retryOrphanedStorageForOffering({
+      offeringId: input.offeringId,
+    });
 
     // P1-004: pre-flight cap check before any storage write so a
     // known-full offering never produces an orphan object. The
@@ -438,7 +454,10 @@ export class AudioSampleService {
         // Concurrent writer beat us to the slot under the
         // per-offering advisory lock. Clean up the storage object
         // we just uploaded so it does not become an orphan.
-        await this.cleanupOrphanedStorage(storageRef);
+        await this.cleanupOrphanedStorage({
+          offeringId: input.offeringId,
+          storageRef,
+        });
         throw new AudioSampleError(
           `ServiceOffering already has ${BG2_AUDIO_SAMPLE_MAX_PER_OFFERING} samples; remove one before uploading another.`,
           "AUDIO_SAMPLE_LIMIT_EXCEEDED",
@@ -451,32 +470,62 @@ export class AudioSampleService {
         }),
       };
     } catch (err) {
-      // P1-004: any non-cap failure during the DB create must not
-      // leak the uploaded storage object. Best-effort delete; if
-      // even that fails we surface the original DB error to the
-      // caller and leave the storage object for the bounded retry
-      // path on the next operation. The retry path looks up the
-      // row by storageRef via a dedicated query, so an orphan is
-      // bounded and discoverable.
-      await this.cleanupOrphanedStorage(storageRef);
+      // P1-004 + P1-002: any non-cap failure during the DB create
+      // must not leak the uploaded storage object. Best-effort
+      // delete; if even that fails we surface the original DB
+      // error to the caller AND record a durable orphan locator so
+      // the bounded retry path on the next operation can complete
+      // the storage-side cleanup across service restarts.
+      await this.cleanupOrphanedStorage({
+        offeringId: input.offeringId,
+        storageRef,
+      });
       throw err;
     }
   }
 
   /**
    * Best-effort cleanup for an uploaded storage object whose DB
-   * counterpart did not persist. On failure the call is
-   * deliberately swallowed so the caller's primary error
-   * propagates. The bounded retry path on the next operation
-   * against the offering scans PendingCleanup rows, so any
-   * orphan here is finite and discoverable.
+   * counterpart did not persist. The helper returns whether the
+   * storage-side delete confirmed success (or the object was
+   * already gone). When the helper returns `false`, the caller
+   * records a durable orphan locator so the bounded retry path on
+   * the next operation can discover and complete the storage
+   * cleanup across service restarts. Per ticket #61 follow-up
+   * review (P1-002) the previous implementation silently swallowed
+   * the failure and dropped the storage ref; this implementation
+   * makes the locator durable.
    */
-  private async cleanupOrphanedStorage(storageRef: string): Promise<void> {
+  private async tryCleanupOrphanedStorage(storageRef: string): Promise<boolean> {
     try {
       await this.storage.removeSample(storageRef);
+      return true;
     } catch (err) {
-      if (err instanceof StorageReferenceUnknownError) return;
-      // Surface nothing; the bounded retry handles this.
+      if (err instanceof StorageReferenceUnknownError) return true;
+      return false;
+    }
+  }
+
+  /**
+   * Best-effort cleanup wrapper used by the upload path. On
+   * failure, a durable orphan locator is recorded so the bounded
+   * retry can complete the cleanup later. The caller's primary
+   * error always propagates.
+   */
+  private async cleanupOrphanedStorage(input: {
+    readonly offeringId: string;
+    readonly storageRef: string;
+  }): Promise<void> {
+    const ok = await this.tryCleanupOrphanedStorage(input.storageRef);
+    if (!ok) {
+      try {
+        await this.repository.recordOrphanedStorage(input);
+      } catch {
+        // The orphan record write itself failed. The caller's
+        // primary error still propagates; the bounded retry is the
+        // only remaining recovery path and will retry on the next
+        // operation.
+      }
     }
   }
 
@@ -508,6 +557,10 @@ export class AudioSampleService {
     // upload that flipped samples to PendingCleanup can be
     // completed without a separate scheduler.
     await this.retryPendingCleanupForOffering({
+      offeringId: input.offeringId,
+    });
+    // P1-002: also drive the bounded orphan-locator retry pass.
+    await this.retryOrphanedStorageForOffering({
       offeringId: input.offeringId,
     });
     const samples = await this.repository.listSamplesForOffering(input.offeringId);
@@ -721,6 +774,30 @@ export class AudioSampleService {
           // Swallow; the next operation retries the finalize.
         }
       }
+    }
+  }
+
+  /**
+   * Bounded retry pass for orphaned storage locators (P1-002).
+   * Called from upload + seller-list so the cleanup window stays
+   * bounded without a scheduler. Each orphan is attempted in
+   * oldest-first order; success deletes the locator row, failure
+   * leaves it for the next pass.
+   */
+  private async retryOrphanedStorageForOffering(input: {
+    readonly offeringId: string;
+  }): Promise<void> {
+    const orphans = await this.repository.listOrphanedStorageForOffering(input.offeringId);
+    for (const orphan of orphans) {
+      const ok = await this.tryCleanupOrphanedStorage(orphan.storageRef);
+      if (ok) {
+        try {
+          await this.repository.removeOrphanedStorage(orphan.storageRef);
+        } catch {
+          // Swallow; the next operation retries.
+        }
+      }
+      // On failure we leave the row so the next pass retries.
     }
   }
 
