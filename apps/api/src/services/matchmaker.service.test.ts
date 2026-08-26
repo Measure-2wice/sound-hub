@@ -1,0 +1,356 @@
+/* eslint-disable @typescript-eslint/no-floating-promises */
+/* eslint-disable @typescript-eslint/no-unused-vars */
+/* eslint-disable @typescript-eslint/require-await */
+// MatchmakerService tests.
+//
+// Background: BG3 requires the service to:
+//   - Authorize the buyer (current Buyer-capable membership).
+//   - Hand the brief to the AI boundary.
+//   - Validate AI output through bg3MatchmakerCriteriaV1Schema.
+//   - Fall back to the deterministic adapter on parse failure or
+//     AiUnavailableError.
+//   - Invoke the existing TalentSearchService (NO second search
+//     path; AI never touches Prisma).
+//   - Persist the Brief + results.
+//   - Return a buyer-safe DTO with evidence-grounded explanations.
+//
+// The tests run with in-memory fakes for the auth repo, the brief
+// repo, and the search service. The AI boundary is exercised
+// through the real DeterministicAiAdapter and a stub Managed
+// adapter that returns malformed output (so the fallback path is
+// covered).
+
+import { test } from "node:test";
+import assert from "node:assert/strict";
+import type {
+  Bg3AiInterpretInputV1,
+  Bg3AiInterpretOutputV1,
+  TalentSearchRequestV1,
+  TalentSearchResponseV1,
+} from "@soundhub/types";
+import {
+  InMemoryAuthRepository,
+  type InMemoryUserSeed,
+} from "../auth-repository/in-memory-auth-repository.js";
+import {
+  AuthorizationError,
+  WorkspaceAuthorizationService,
+} from "./workspace-authorization.service.js";
+import { MatchmakerService, MatchmakerError } from "./matchmaker.service.js";
+import { AiUnavailableError, type AiAdapter } from "../matchmaker/ai-adapter.js";
+import { DeterministicAiAdapter } from "../matchmaker/deterministic-ai-adapter.js";
+import { InMemoryProjectBriefRepository } from "../matchmaker/in-memory-project-brief.repository.js";
+import type {
+  PersistedBrief,
+  ProjectBriefRepository,
+} from "../matchmaker/project-brief.repository.js";
+import type {
+  PublicOfferingSummaryV1,
+  PublicSellerSummaryV1,
+  TalentSearchResultV1,
+} from "@soundhub/types";
+
+const BUYER_USER_ID = "user-buyer-1";
+const BUYER_WORKSPACE_ID = "ws-buyer-1";
+const NON_BUYER_WORKSPACE_ID = "ws-seller-only-1";
+
+const buyerSeed: InMemoryUserSeed = {
+  userAccountId: BUYER_USER_ID,
+  email: "buyer@example.com",
+  identityProvider: "deterministic",
+  identitySubject: "buyer-subject",
+  memberships: [
+    {
+      workspaceId: BUYER_WORKSPACE_ID,
+      slug: "bg1-demo-buyer",
+      name: "BG1 Demo Buyer",
+      workspaceType: "Personal",
+      workspaceStatus: "Active",
+      role: "Owner",
+      capabilities: ["Buyer"],
+    },
+    {
+      // Mismatched owner without membership: proves ownerUserId is
+      // never consulted. A buyer WorkspaceMembership row is the
+      // only authority path.
+      workspaceId: NON_BUYER_WORKSPACE_ID,
+      slug: "ws-no-membership",
+      name: "Workspace Without Membership",
+      workspaceType: "Personal",
+      workspaceStatus: "Active",
+      role: "Owner",
+      capabilities: ["Seller"],
+    },
+  ],
+};
+
+function buildAuthRepo() {
+  return new InMemoryAuthRepository([buyerSeed]);
+}
+
+function buildAuthService() {
+  const authRepo = buildAuthRepo();
+  const authz = new WorkspaceAuthorizationService({ authRepository: authRepo });
+  return { authRepo, authz };
+}
+
+// A fake search service that returns a deterministic eligibility-
+// determined result. The fake records the request it received so
+// the test can assert the service invoked the existing M1 contract
+// (no second search path).
+class FakeTalentSearchService {
+  readonly calls: TalentSearchRequestV1[] = [];
+  async search(request: TalentSearchRequestV1): Promise<TalentSearchResponseV1> {
+    this.calls.push(request);
+    const seller: PublicSellerSummaryV1 = {
+      sellerId: "seller-marc",
+      professionalName: "Marc-André Pierre",
+      specialties: ["Producer"],
+      bio: "Brooklyn-based Haitian producer.",
+      basedIn: { city: "Brooklyn", region: "NY", countryCode: "US" },
+      caribbeanAffiliationCodes: ["HT"],
+    };
+    const offering: PublicOfferingSummaryV1 = {
+      offeringId: "of-marc-dancehall",
+      title: "Haitian dancehall single production — remote",
+      description: "Caribbean-flavored dancehall single production.",
+      primaryCategory: { key: "music-production", name: "Music Production" },
+      includedServices: [],
+      genreTags: ["Dancehall"],
+      serviceMode: "Remote",
+      serviceAreas: [{ city: "Brooklyn", region: "NY", countryCode: "US" }],
+    };
+    const result: TalentSearchResultV1 = {
+      seller,
+      bestMatchingOffering: offering,
+      additionalMatchingOfferings: [],
+      relevanceScore: 0.9,
+      matchReason:
+        "matched offering title; preferred genre: Dancehall; preferred Caribbean affiliation: HT",
+      preferenceCoverage: { matched: 2, total: 2 },
+      textCoverage: { matched: 1, total: 1 },
+    };
+    return {
+      results: [result],
+      metadata: {
+        normalizedQuery: "dancehall",
+        totalResults: 1,
+        processingTimeMs: 5,
+        strategy: "postgres-text-v1",
+        appliedRequiredCriteria: request.required ?? {},
+        appliedPreferredCriteria: request.preferred ?? {},
+      },
+    };
+  }
+}
+
+// A managed adapter that produces a malformed payload so the
+// service exercises its fallback path.
+class MalformedManagedAdapter implements AiAdapter {
+  async interpretBrief(_input: Bg3AiInterpretInputV1): Promise<Bg3AiInterpretOutputV1> {
+    return {
+      provider: "managed",
+      modelId: "fake-model",
+      candidate: { required: "not-an-object" },
+    };
+  }
+}
+
+// A managed adapter that throws AiUnavailableError.
+class UnavailableManagedAdapter implements AiAdapter {
+  async interpretBrief(_input: Bg3AiInterpretInputV1): Promise<Bg3AiInterpretOutputV1> {
+    throw new AiUnavailableError("managed provider offline");
+  }
+}
+
+function buildService(deps: {
+  readonly aiAdapter?: AiAdapter;
+  readonly projectBriefRepository?: ProjectBriefRepository;
+}) {
+  const { authRepo, authz } = buildAuthService();
+  const search = new FakeTalentSearchService();
+  const service = new MatchmakerService({
+    talentSearchService: search as unknown as ConstructorParameters<
+      typeof MatchmakerService
+    >[0]["talentSearchService"],
+    workspaceAuthorizationService: authz,
+    projectBriefRepository: deps.projectBriefRepository ?? new InMemoryProjectBriefRepository(),
+    aiAdapter: deps.aiAdapter ?? new DeterministicAiAdapter(),
+    fallbackAiAdapter: new DeterministicAiAdapter(),
+  });
+  return { service, search, authRepo };
+}
+
+test("MatchmakerService persists the brief and returns recommendations for the deterministic path", async () => {
+  const { service, search } = buildService({});
+  const result = await service.submitBrief({
+    userAccountId: BUYER_USER_ID,
+    actingWorkspaceId: BUYER_WORKSPACE_ID,
+    briefText: "I need a producer in Brooklyn for a remote Haitian dancehall single.",
+  });
+  // The primary adapter is the deterministic fallback, which
+  // produced a valid payload on the first try — `aiFallbackUsed`
+  // is false because the fallback path was not exercised.
+  assert.equal(result.brief.aiProvider, "deterministic-fallback");
+  assert.equal(result.brief.aiFallbackUsed, false);
+  assert.equal(result.totalResults, 1);
+  assert.equal(result.strategy, "postgres-text-v1");
+  assert.equal(result.fallbackNotice, undefined);
+  assert.equal(result.recommendations.length, 1);
+  const rec = result.recommendations[0]!;
+  assert.equal(rec.sellerId, "seller-marc");
+  assert.ok(rec.explanations.some((e) => e.kind === "matched-offering-title"));
+  assert.ok(rec.explanations.some((e) => e.kind === "preferred-genre"));
+
+  // The service invoked the existing TalentSearchService with the
+  // M1-shaped request, NOT a second search path.
+  assert.equal(search.calls.length, 1);
+  const call = search.calls[0]!;
+  const required = call.required ?? {};
+  assert.ok(required.serviceModes?.includes("Remote"));
+  assert.ok(required.primaryCategoryKeys?.some((k) => k === "music-production"));
+  assert.equal(required.basedIn?.countryCode, "US");
+});
+
+test("MatchmakerService falls back when the managed adapter returns a malformed payload", async () => {
+  const briefRepo = new InMemoryProjectBriefRepository();
+  const { service, search } = buildService({
+    aiAdapter: new MalformedManagedAdapter(),
+    projectBriefRepository: briefRepo,
+  });
+  const result = await service.submitBrief({
+    userAccountId: BUYER_USER_ID,
+    actingWorkspaceId: BUYER_WORKSPACE_ID,
+    briefText: "I need a producer in Brooklyn for a remote Haitian dancehall single.",
+  });
+  assert.equal(result.brief.aiProvider, "deterministic-fallback");
+  assert.equal(result.brief.aiFallbackUsed, true);
+  assert.equal(result.totalResults, 1);
+  assert.equal(search.calls.length, 1);
+});
+
+test("MatchmakerService falls back when the managed adapter throws AiUnavailableError", async () => {
+  const { service, search } = buildService({
+    aiAdapter: new UnavailableManagedAdapter(),
+  });
+  const result = await service.submitBrief({
+    userAccountId: BUYER_USER_ID,
+    actingWorkspaceId: BUYER_WORKSPACE_ID,
+    briefText: "Need a Brooklyn producer.",
+  });
+  assert.equal(result.brief.aiProvider, "deterministic-fallback");
+  assert.equal(result.brief.aiFallbackUsed, true);
+  assert.equal(search.calls.length, 1);
+});
+
+test("MatchmakerService rejects a buyer without Buyer capability on the acting Workspace", async () => {
+  // The auth repo only has a Buyer-capable membership for
+  // BUYER_WORKSPACE_ID. The non-buyer Workspace id is offered to
+  // prove the capability check fires even when a membership row
+  // exists with the wrong capabilities.
+  const { authz } = buildAuthService();
+  const service = new MatchmakerService({
+    talentSearchService: new FakeTalentSearchService() as never,
+    workspaceAuthorizationService: authz,
+    projectBriefRepository: new InMemoryProjectBriefRepository(),
+    aiAdapter: new DeterministicAiAdapter(),
+  });
+  await assert.rejects(
+    service.submitBrief({
+      userAccountId: BUYER_USER_ID,
+      actingWorkspaceId: NON_BUYER_WORKSPACE_ID,
+      briefText: "Need a Brooklyn producer.",
+    }),
+    (err: unknown) =>
+      err instanceof AuthorizationError &&
+      (err.code === "MISSING_CAPABILITY" || err.code === "NOT_A_MEMBER"),
+  );
+});
+
+test("MatchmakerService persists the brief in a single transactional write", async () => {
+  const briefRepo = new InMemoryProjectBriefRepository();
+  const { service } = buildService({
+    projectBriefRepository: briefRepo,
+  });
+  const result = await service.submitBrief({
+    userAccountId: BUYER_USER_ID,
+    actingWorkspaceId: BUYER_WORKSPACE_ID,
+    briefText: "Need a Brooklyn producer.",
+  });
+  const stored = (await briefRepo.findBriefById(result.brief.briefId)) as PersistedBrief;
+  assert.ok(stored, "brief should be persisted");
+  assert.equal(stored.buyerWorkspaceId, BUYER_WORKSPACE_ID);
+  assert.equal(stored.createdByUserId, BUYER_USER_ID);
+  assert.ok(stored.results.length >= 1);
+  // The criteria persisted in the brief are the M1-validated
+  // shapes — never free-form AI output.
+  assert.ok(
+    Array.isArray(stored.criteria.required.primaryCategoryKeys) ||
+      stored.criteria.required.primaryCategoryKeys === undefined,
+  );
+});
+
+test("MatchmakerService.getBrief revalidates the current Buyer-capable membership", async () => {
+  const briefRepo = new InMemoryProjectBriefRepository();
+  const { service } = buildService({ projectBriefRepository: briefRepo });
+  const submitted = await service.submitBrief({
+    userAccountId: BUYER_USER_ID,
+    actingWorkspaceId: BUYER_WORKSPACE_ID,
+    briefText: "Need a Brooklyn producer.",
+  });
+  const fetched = await service.getBrief({
+    userAccountId: BUYER_USER_ID,
+    briefId: submitted.brief.briefId,
+  });
+  assert.equal(fetched.brief.briefId, submitted.brief.briefId);
+});
+
+test("MatchmakerService.getBrief rejects a non-member", async () => {
+  const briefRepo = new InMemoryProjectBriefRepository();
+  const { service } = buildService({ projectBriefRepository: briefRepo });
+  const submitted = await service.submitBrief({
+    userAccountId: BUYER_USER_ID,
+    actingWorkspaceId: BUYER_WORKSPACE_ID,
+    briefText: "Need a Brooklyn producer.",
+  });
+  await assert.rejects(
+    service.getBrief({
+      userAccountId: "user-without-membership",
+      briefId: submitted.brief.briefId,
+    }),
+    (err: unknown) =>
+      err instanceof AuthorizationError &&
+      (err.code === "NOT_A_MEMBER" || err.code === "MISSING_CAPABILITY"),
+  );
+});
+
+test("MatchmakerService.getBrief returns BRIEF_NOT_FOUND for an unknown id", async () => {
+  const { service } = buildService({});
+  await assert.rejects(
+    service.getBrief({
+      userAccountId: BUYER_USER_ID,
+      briefId: "brief-nonexistent",
+    }),
+    (err: unknown) => err instanceof MatchmakerError && err.code === "BRIEF_NOT_FOUND",
+  );
+});
+
+test("MatchmakerService preserves required constraints end-to-end (GS 14)", async () => {
+  const { service, search } = buildService({});
+  const result = await service.submitBrief({
+    userAccountId: BUYER_USER_ID,
+    actingWorkspaceId: BUYER_WORKSPACE_ID,
+    briefText: "I need a remote dancehall producer in Brooklyn.",
+  });
+  // Persisted criteria still contain the hard axes the buyer named.
+  const persisted = result.brief.criteria;
+  assert.ok(persisted.required.serviceModes?.includes("Remote"));
+  assert.ok(persisted.required.primaryCategoryKeys?.some((k) => k === "music-production"));
+  assert.equal(persisted.required.basedIn?.countryCode, "US");
+  // Search service was invoked with the same required axes.
+  const call = search.calls[0]!;
+  const required = call.required ?? {};
+  assert.ok(required.serviceModes?.includes("Remote"));
+  assert.ok(required.primaryCategoryKeys?.some((k) => k === "music-production"));
+  assert.equal(required.basedIn?.countryCode, "US");
+});

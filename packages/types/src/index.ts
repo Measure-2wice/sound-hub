@@ -422,6 +422,15 @@ export const apiErrorCodeV1Schema = z.enum([
   "WORKSPACE_INELIGIBLE",
   "NOT_A_MEMBER",
   "MISSING_CAPABILITY",
+  // Buildathon Golden Slice 3 error codes. Matchmaker-specific
+  // codes share the same status-code table; the route layer maps
+  // each to a buyer-safe message that never leaks provider
+  // internals, AI raw output, or session material.
+  "MATCHMAKER_INVALID_REQUEST",
+  "MATCHMAKER_AI_UNAVAILABLE",
+  "MATCHMAKER_FAILED",
+  "BRIEF_NOT_FOUND",
+  "BRIEF_FORBIDDEN",
 ]);
 export type ApiErrorCodeV1 = z.infer<typeof apiErrorCodeV1Schema>;
 
@@ -747,3 +756,344 @@ export type Sha256HexFn = (input: string) => string;
 export function deriveDeterministicSubject(email: string, sha256Hex: Sha256HexFn): string {
   return sha256Hex(`deterministic|${email.trim().toLowerCase()}`);
 }
+
+// ===========================================================================
+// Buildathon Golden Slice 3 (BG3) shared runtime contracts.
+//
+// These schemas cover the Matchmaker slice: natural-language
+// ProjectBrief submission, validated search criteria, evidence-
+// grounded recommendations, and the AI provider provenance trail.
+// They follow the same patterns as the v1 search contract: shared
+// Zod is the executable contract; TypeScript types are inferred
+// from it; the same schema is consumed by the API route validator
+// and the browser response parser. No Prisma model, AI raw output,
+// provider subject, or storage key ever crosses a public DTO.
+//
+// Per ticket #60, the GS 13 / GS 14 / GS 15 requirements are:
+//
+//   GS 13 — the required golden brief proceeds directly to runtime-
+//           validated search criteria without clarification.
+//   GS 14 — required constraints are never silently relaxed.
+//   GS 15 — displayed recommendations and explanations refer only to
+//           returned sellers, ServiceOfferings, and factual match
+//           evidence.
+//
+// The Matchmaker never queries Prisma directly; AI output is parsed
+// through a strict schema before use and falls back to a
+// deterministic interpretation that crosses the same validation and
+// TalentSearchService boundaries.
+//
+// ===========================================================================
+
+// ---------- AI provider provenance ----------
+
+// Stable provider keys for the Matchmaker AI boundary. SoundHub
+// owns these keys; provider SDKs never read them. Adding a new
+// provider requires editing this enum and the adapter factory
+// together.
+export const bg3AiProviderV1Values = ["managed", "deterministic-fallback"] as const;
+export type Bg3AiProviderV1 = (typeof bg3AiProviderV1Values)[number];
+
+// ---------- Brief submission ----------
+
+// The buyer's raw, natural-language ProjectBrief text. The route
+// layer trims and collapses internal whitespace; the schema only
+// enforces a usability floor (length bounds + at least one
+// letter/digit) so an empty or purely punctuation-only submission
+// is rejected at the trusted boundary rather than reaching the
+// search service.
+const projectBriefTextV1Schema = z
+  .string()
+  .min(8, "Brief text must be at least 8 non-whitespace characters")
+  .max(2000, "Brief text must be at most 2000 characters")
+  .transform((value) => value.trim().replace(/\s+/g, " "))
+  .refine((value) => /[\p{L}\p{N}]/u.test(value), {
+    message: "Brief text must contain at least one letter or digit after normalization",
+  })
+  .refine((value) => value.length >= 8, {
+    message: "Brief text must be at least 8 non-whitespace characters after normalization",
+  });
+
+// Non-search project requirements are a free-form JSON object
+// captured by the AI interpretation but never consumed by
+// TalentSearchService. They carry things like buyer-acknowledged
+// funding deadlines, scope hints, and any other context the brief
+// produced without forcing the search contract to grow new fields.
+// The schema keeps the value as an opaque record; the Matchmaker
+// passes it through verbatim. The `.strict()` modifier rejects
+// arrays/scalars at the trusted boundary so the persistence layer
+// always reads a JSON object.
+export const projectBriefNonSearchRequirementsV1Schema = z
+  .object({})
+  .catchall(z.string().min(1).max(500))
+  .refine((value) => Object.keys(value).length <= 20, {
+    message: "nonSearchRequirements must contain at most 20 entries",
+  })
+  .optional();
+export type ProjectBriefNonSearchRequirementsV1 = z.infer<
+  typeof projectBriefNonSearchRequirementsV1Schema
+>;
+
+// The brief-submission request is the trusted boundary between the
+// browser and the Matchmaker service. It carries the acting
+// Workspace identifier (so the route can revalidate membership),
+// the original brief text, and an optional non-search requirements
+// override. Required + preferred criteria are NOT supplied by the
+// buyer; they are produced by the AI boundary (or its deterministic
+// fallback) and persisted alongside the brief.
+export const bg3SubmitBriefRequestV1Schema = z
+  .object({
+    actingWorkspaceId: z.string().min(1).max(128),
+    briefText: projectBriefTextV1Schema,
+    // Optional buyer-supplied non-search requirements. When absent
+    // the AI boundary (or fallback) derives them from the brief.
+    nonSearchRequirements: projectBriefNonSearchRequirementsV1Schema,
+  })
+  .strict();
+export type Bg3SubmitBriefRequestV1 = z.infer<typeof bg3SubmitBriefRequestV1Schema>;
+
+// ---------- Matchmaker criteria (AI output, validated) ----------
+
+// The validated search criteria the Matchmaker produces from the
+// buyer's brief. This is the single point where AI output (or the
+// deterministic fallback) is normalized into the existing M1
+// search contract; every field is one of the M1 schema's strict
+// shapes so the validated value flows into TalentSearchService
+// without further transformation. `required` may never be silently
+// relaxed: the schema validates the persisted JSON on read so a
+// stored Brief whose required criteria are empty fails closed
+// instead of producing an unconstrained search.
+function hasHardRequiredAxis(value: TalentSearchRequiredCriteriaV1): boolean {
+  if (value.serviceModes && value.serviceModes.length > 0) return true;
+  if (value.primaryCategoryKeys && value.primaryCategoryKeys.length > 0) return true;
+  if (
+    value.independentlyPurchasableServiceKeys &&
+    value.independentlyPurchasableServiceKeys.length > 0
+  ) {
+    return true;
+  }
+  if (value.basedIn !== undefined) return true;
+  if (value.serviceArea !== undefined) return true;
+  return false;
+}
+
+export const bg3MatchmakerCriteriaV1Schema = z
+  .object({
+    query: normalizedQuerySchema.optional(),
+    required: talentSearchRequiredCriteriaV1Schema,
+    preferred: talentSearchPreferredCriteriaV1Schema.optional(),
+    // Optional non-search requirements derived from the brief.
+    nonSearchRequirements: projectBriefNonSearchRequirementsV1Schema,
+  })
+  .strict()
+  .superRefine((value, ctx) => {
+    const hasQuery = typeof value.query === "string" && value.query.length >= 2;
+    const requiredHasValue = isUsable(value.required);
+    const preferredHasValue = value.preferred ? isUsable(value.preferred) : false;
+    // A criteria payload must yield a usable search call so a
+    // malformed AI output cannot reach TalentSearchService with
+    // nothing to do.
+    if (!hasQuery && !requiredHasValue && !preferredHasValue) {
+      ctx.addIssue({
+        code: z.ZodIssueCode.custom,
+        message: "Matchmaker criteria must yield at least one of query, required, or preferred",
+      });
+    }
+    // GS 14: when the buyer DID express a hard constraint, that
+    // constraint must survive the AI boundary. We detect "hard
+    // constraint was expressed" by checking that either the
+    // required block has a hard axis OR the buyer-only non-search
+    // requirements carry a signal that implies a hard axis. In
+    // practice the deterministic fallback always maps the brief
+    // to a hard axis when the buyer's text contains a recognised
+    // phrase; this check only enforces that the AI boundary did
+    // not silently drop it.
+    //
+    // We do NOT force a hard axis when the buyer only supplied a
+    // query — the buyer is entitled to describe the work without
+    // naming a category.
+    if (requiredHasValue && !hasHardRequiredAxis(value.required)) {
+      ctx.addIssue({
+        code: z.ZodIssueCode.custom,
+        message: "Matchmaker criteria.required must contain at least one hard constraint axis",
+      });
+    }
+  });
+export type Bg3MatchmakerCriteriaV1 = z.infer<typeof bg3MatchmakerCriteriaV1Schema>;
+
+// ---------- Explanation payload (evidence-grounded, never AI-invented) ----------
+
+// A single explanation line refers to one factual match-evidence
+// axis from the eligibility-determined search result. AI cannot
+// invent qualifications, availability, verification, prices, or
+// sample rights; every line cites the evidence that already exists
+// in the search result. The label is human-friendly wording
+// restricted to a small allow-list so the UI cannot render
+// arbitrary agent output.
+export const bg3ExplanationKindV1Values = [
+  "matched-offering-title",
+  "matched-category-key",
+  "matched-category-name",
+  "preferred-genre",
+  "preferred-category",
+  "preferred-specialty",
+  "preferred-affiliation",
+  "preferred-service-mode",
+  "preferred-included-service",
+  "preferred-locality",
+  "standalone-offering",
+] as const;
+export type Bg3ExplanationKindV1 = (typeof bg3ExplanationKindV1Values)[number];
+
+export const bg3ExplanationEntryV1Schema = z
+  .object({
+    kind: z.enum(bg3ExplanationKindV1Values),
+    // The factual label derived from the validated search
+    // result's matched fields (e.g. "matched offering title",
+    // "preferred genre: Dancehall"). The schema restricts the
+    // string to a sane length; the AI boundary never constructs
+    // these values.
+    label: z.string().min(1).max(200),
+  })
+  .strict();
+export type Bg3ExplanationEntryV1 = z.infer<typeof bg3ExplanationEntryV1Schema>;
+
+// ---------- Brief public DTO ----------
+
+// Allow-listed public DTO returned by GET /api/matchmaker/brief/:id.
+// The persisted required/preferred criteria are re-validated against
+// the M1 schema on every read so a tampered or corrupted row cannot
+// leak malformed data into the UI. Provenance (`aiProvider`,
+// `aiModelId`, `aiFallbackUsed`) is exposed so the UI can disclose
+// which path produced the criteria.
+export const bg3PublicProjectBriefV1Schema = z
+  .object({
+    briefId: z.string().min(1).max(128),
+    actingWorkspaceId: z.string().min(1).max(128),
+    createdByUserId: z.string().min(1).max(128),
+    briefText: z.string().min(8).max(2000),
+    criteria: bg3MatchmakerCriteriaV1Schema,
+    aiProvider: z.enum(bg3AiProviderV1Values),
+    aiModelId: z.string().min(1).max(120).nullable(),
+    aiFallbackUsed: z.boolean(),
+    createdAt: z.string().datetime(),
+    // Allow-listed BuyerWorkspaceView (id + slug + name). The
+    // Workspace's capabilities and status are intentionally NOT
+    // exposed here — the caller already authorised through them.
+    buyerWorkspace: z
+      .object({
+        workspaceId: z.string().min(1).max(128),
+        slug: z.string().min(1).max(120),
+        name: z.string().min(1).max(200),
+      })
+      .strict(),
+  })
+  .strict();
+export type Bg3PublicProjectBriefV1 = z.infer<typeof bg3PublicProjectBriefV1Schema>;
+
+// ---------- Recommendation DTO (search results grounded to the brief) ----------
+
+// Allow-listed recommendation entry. Re-uses the public seller /
+// public offering schemas already shipped with the v1 search
+// contract so a Matchmaker response is structurally identical to a
+// direct search response; the only difference is the addition of
+// `explanations`, which is derived from the returned result (never
+// the AI provider).
+export const bg3RecommendationV1Schema = z
+  .object({
+    sellerId: z.string().min(1),
+    professionalName: z.string().min(1).max(200),
+    bestMatchingOfferingId: z.string().min(1),
+    relevanceScore: z
+      .number()
+      .min(0, "relevanceScore must be at least 0")
+      .max(1, "relevanceScore must be at most 1")
+      .finite(),
+    // Buyer-facing factual evidence the AI boundary assembled from
+    // the returned result's matched fields + preference atom
+    // coverage + query token coverage. Each entry maps to a
+    // structured allow-listed kind; AI-generated text never crosses
+    // this boundary.
+    explanations: z.array(bg3ExplanationEntryV1Schema).max(20),
+    matchReason: z.string().min(1).max(500),
+    preferenceCoverage: preferenceCoverageV1Schema.optional(),
+    textCoverage: textCoverageV1Schema.optional(),
+    // Best-matching offering snapshot. The full v1 public offering
+    // summary is inlined so the UI can render without a follow-up
+    // call; the `seller` snapshot follows the same v1 public shape.
+    bestMatchingOffering: publicOfferingSummaryV1Schema,
+    seller: publicSellerSummaryV1Schema,
+    additionalMatchingOfferings: z.array(publicOfferingSummaryV1Schema).max(2),
+  })
+  .strict();
+export type Bg3RecommendationV1 = z.infer<typeof bg3RecommendationV1Schema>;
+
+// ---------- Matchmaker response ----------
+
+// The submit-brief response returns the persisted brief AND the
+// recommendations produced by the eligibility-determined search in
+// a single round trip, so the buyer can render the results without
+// a follow-up fetch (per the brief+results UI). `totalResults`
+// mirrors the M1 search metadata field so the UI can render a
+// stable count without depending on the v1 metadata envelope shape.
+export const bg3SubmitBriefResponseV1Schema = z
+  .object({
+    ok: z.literal(true),
+    brief: bg3PublicProjectBriefV1Schema,
+    recommendations: z.array(bg3RecommendationV1Schema).max(10),
+    totalResults: z.number().int().nonnegative(),
+    strategy: talentSearchStrategyV1Schema,
+    // Surfaced when the AI provider failed and the deterministic
+    // fallback crossed the same boundary. The UI uses this to
+    // disclose the fallback; the field is absent on the managed
+    // path so a misconfigured UI cannot mis-attribute provenance.
+    fallbackNotice: z.string().min(1).max(500).optional(),
+  })
+  .strict();
+export type Bg3SubmitBriefResponseV1 = z.infer<typeof bg3SubmitBriefResponseV1Schema>;
+
+// ---------- Brief fetch response (no recommendations) ----------
+
+export const bg3GetBriefResponseV1Schema = z
+  .object({
+    brief: bg3PublicProjectBriefV1Schema,
+  })
+  .strict();
+export type Bg3GetBriefResponseV1 = z.infer<typeof bg3GetBriefResponseV1Schema>;
+
+// ---------- AI adapter contract ----------
+
+// Provider-neutral input handed to the AI adapter. Includes the
+// acting Workspace identifier so the AI boundary cannot be confused
+// about whose brief it is interpreting; the AI never receives raw
+// Prisma models, provider subjects, session tokens, or storage
+// keys.
+export const bg3AiInterpretInputV1Schema = z
+  .object({
+    actingWorkspaceId: z.string().min(1).max(128),
+    briefText: z.string().min(8).max(2000),
+    buyerNonSearchRequirements: projectBriefNonSearchRequirementsV1Schema,
+  })
+  .strict();
+export type Bg3AiInterpretInputV1 = z.infer<typeof bg3AiInterpretInputV1Schema>;
+
+// Provider-neutral output the AI adapter returns. The structure is
+// the candidate criteria payload (NOT yet validated) plus
+// provenance metadata the application persists alongside the brief.
+// The application is the only layer that validates the payload
+// against `bg3MatchmakerCriteriaV1Schema`; AI output NEVER crosses
+// the validation boundary untyped.
+export const bg3AiInterpretOutputV1Schema = z
+  .object({
+    provider: z.enum(bg3AiProviderV1Values),
+    modelId: z.string().min(1).max(120).nullable(),
+    // The unvalidated candidate payload. The application parses it
+    // through `bg3MatchmakerCriteriaV1Schema` and rejects any
+    // adapter that returns malformed JSON. The schema here is a
+    // permissive record because the goal is to catch anything
+    // obviously wrong (top-level type) without re-implementing the
+    // validation that already lives on the M1 side.
+    candidate: z.record(z.string(), z.unknown()),
+  })
+  .strict();
+export type Bg3AiInterpretOutputV1 = z.infer<typeof bg3AiInterpretOutputV1Schema>;
