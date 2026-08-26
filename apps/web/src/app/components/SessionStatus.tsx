@@ -5,42 +5,21 @@
 // Background: BG1 requires the browser to never assert an arbitrary
 // UserAccount. The session cookie is the only authoritative identity
 // signal, and the only way the client learns the authenticated user
-// is by calling `GET /api/auth/me`. This widget revalidates on mount
-// and after sign-in / sign-out so the nav stays consistent with the
-// authoritative server state.
+// is by calling `GET /api/auth/me`. The widget reads from the
+// shared `SessionProvider` seam so the navigation re-renders in
+// lock-step with the dashboard: a successful magic-link
+// verification (managed or deterministic) refreshes the session
+// once, and every auth-aware client component sees the new user
+// from the same render pass. Sign-out re-pulls the (now-empty)
+// session so the navigation clears consistently without a full
+// page reload.
 
-import { useEffect, useState } from "react";
 import Link from "next/link";
-import { fetchSessionInfo, signOut } from "../lib/auth-client";
-import type { Bg1PublicUserV1 } from "@soundhub/types";
+import { useSession } from "./SessionProvider";
 
 export function SessionStatus() {
-  const [user, setUser] = useState<Bg1PublicUserV1 | null>(null);
-  const [loading, setLoading] = useState(true);
+  const { user, loading, signOutAndRefresh } = useSession();
 
-  useEffect(() => {
-    let cancelled = false;
-    void (async () => {
-      try {
-        const info = await fetchSessionInfo();
-        if (cancelled) return;
-        setUser(info.user);
-      } catch {
-        if (cancelled) return;
-        setUser(null);
-      } finally {
-        if (!cancelled) setLoading(false);
-      }
-    })();
-    return () => {
-      cancelled = true;
-    };
-  }, []);
-
-  // Re-check after sign-out events fired from other tabs would require
-  // a storage-event listener; BG1 keeps that out of scope. The
-  // in-component `onClick` handlers below revalidate by reloading the
-  // page so the server-rendered state is the source of truth.
   if (loading) {
     return <span className="text-sm text-gray-500">Loading…</span>;
   }
@@ -64,8 +43,7 @@ export function SessionStatus() {
         type="button"
         onClick={() => {
           void (async () => {
-            await signOut();
-            window.location.reload();
+            await signOutAndRefresh();
           })();
         }}
         className="text-sm font-medium text-gray-600 hover:text-gray-900"

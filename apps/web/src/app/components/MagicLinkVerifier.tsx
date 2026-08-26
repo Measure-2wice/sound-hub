@@ -15,10 +15,19 @@
 // Presenting the public correlation id to `/api/auth/verify-token`
 // is rejected as an unknown credential, so the component must
 // always read the private token from the URL query parameter.
+//
+// The verifier consumes the shared session seam
+// (`SessionProvider.verifyAndRefresh`) so a successful verification
+// immediately re-pulls the authoritative user and every other
+// auth-aware client component (the navigation's `SessionStatus`,
+// the dashboard) sees the new identity without a full page
+// reload. A failed verification throws from `verifyAndRefresh`
+// without touching session state, so the navigation cannot read
+// "signed in" for an unverified session.
 
 import { useEffect, type ReactNode } from "react";
 import { useRouter, useSearchParams } from "next/navigation";
-import { verifyToken } from "../lib/auth-client";
+import { useSession } from "./SessionProvider";
 
 export interface MagicLinkVerifierProps {
   readonly paramName: string;
@@ -28,6 +37,7 @@ export interface MagicLinkVerifierProps {
 export function MagicLinkVerifier({ paramName, children }: MagicLinkVerifierProps) {
   const router = useRouter();
   const searchParams = useSearchParams();
+  const { verifyAndRefresh } = useSession();
 
   useEffect(() => {
     const verificationToken = searchParams.get(paramName);
@@ -38,7 +48,7 @@ export function MagicLinkVerifier({ paramName, children }: MagicLinkVerifierProp
     let cancelled = false;
     void (async () => {
       try {
-        await verifyToken({ verificationToken });
+        await verifyAndRefresh({ verificationToken });
         if (!cancelled) router.replace("/dashboard");
       } catch {
         if (!cancelled) router.replace("/login");
@@ -47,7 +57,7 @@ export function MagicLinkVerifier({ paramName, children }: MagicLinkVerifierProp
     return () => {
       cancelled = true;
     };
-  }, [router, searchParams, paramName]);
+  }, [router, searchParams, paramName, verifyAndRefresh]);
 
   return <>{children}</>;
 }

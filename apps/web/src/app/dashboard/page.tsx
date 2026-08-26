@@ -9,43 +9,29 @@
 // The page is intentionally simple — later Golden Slice tickets
 // will add ProjectRequest, Deal, TermsVersion, and approval flows
 // on top of this same foundation.
+//
+// The dashboard reads the authenticated user from the shared
+// `SessionProvider` seam so a successful magic-link verification
+// (managed or deterministic) renders the dashboard signed in
+// immediately, without depending on a re-fetch on mount. Sign-out
+// uses the same seam so the navigation and dashboard clear
+// consistently without a full page reload.
 
-import { useEffect, useState, type FormEvent } from "react";
+import { useState, type FormEvent } from "react";
 import Link from "next/link";
-import { fetchSessionInfo, signOut } from "../lib/auth-client";
-import type {
-  Bg1ActingWorkspaceResponseV1,
-  Bg1PublicUserV1,
-  Bg1PublicWorkspaceV1,
-} from "@soundhub/types";
+import { useRouter } from "next/navigation";
+import { useSession } from "../components/SessionProvider";
+import type { Bg1ActingWorkspaceResponseV1, Bg1PublicWorkspaceV1 } from "@soundhub/types";
 import { bg1ActingWorkspaceResponseV1Schema } from "@soundhub/types";
 import { Card } from "../components/ui/Card";
 
 export default function DashboardPage() {
-  const [user, setUser] = useState<Bg1PublicUserV1 | null>(null);
-  const [loading, setLoading] = useState(true);
+  const { user, loading, signOutAndRefresh } = useSession();
+  const router = useRouter();
   const [actingWorkspaceId, setActingWorkspaceId] = useState<string>("");
   const [actingResult, setActingResult] = useState<Bg1ActingWorkspaceResponseV1 | null>(null);
   const [actingError, setActingError] = useState<string | null>(null);
   const [commandResult, setCommandResult] = useState<string | null>(null);
-
-  useEffect(() => {
-    let cancelled = false;
-    void (async () => {
-      try {
-        const info = await fetchSessionInfo();
-        if (cancelled) return;
-        setUser(info.user);
-      } catch {
-        if (!cancelled) setUser(null);
-      } finally {
-        if (!cancelled) setLoading(false);
-      }
-    })();
-    return () => {
-      cancelled = true;
-    };
-  }, []);
 
   if (loading) {
     return (
@@ -148,8 +134,8 @@ export default function DashboardPage() {
             type="button"
             onClick={() => {
               void (async () => {
-                await signOut();
-                window.location.href = "/";
+                await signOutAndRefresh();
+                router.push("/");
               })();
             }}
             className="mt-3 text-sm font-medium text-gray-600 hover:text-gray-900"

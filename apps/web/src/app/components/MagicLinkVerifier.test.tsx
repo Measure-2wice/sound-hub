@@ -73,11 +73,53 @@ describe("BG1 magic-link callback pages (P0-001 producer/consumer alignment)", (
     // Per P0-001 the verifier posts the captured credential
     // under the documented `verificationToken` field; the public
     // correlation id `requestId` is NEVER used as the credential.
-    assert.ok(/verifyToken\(\s*\{\s*verificationToken/.test(source));
+    // The verifier routes through the shared `verifyAndRefresh`
+    // helper from `SessionProvider` so the navigation's
+    // `SessionStatus` re-renders on a successful verify.
+    assert.ok(/verifyAndRefresh\(\s*\{\s*verificationToken/.test(source));
     assert.ok(/searchParams\.get\(paramName\)/.test(source));
     assert.ok(
       !/verifyToken\(\s*\{\s*requestId/.test(source),
       "MagicLinkVerifier MUST NOT submit a public requestId as the credential",
+    );
+  });
+
+  // BG1 QA finding (stale navigation after verification): the
+  // verifier must refresh the shared session seam, NOT call the
+  // auth-client helper directly — a direct call leaves the
+  // navigation's SessionStatus stale until a full page reload.
+  test("the verifier calls the shared session seam (verifyAndRefresh) so the navigation reflects the new identity", () => {
+    const source = readPage("components/MagicLinkVerifier.tsx");
+    assert.ok(
+      /useSession\(\)/.test(source),
+      "MagicLinkVerifier MUST consume the shared session seam via useSession() so a successful verification refreshes the navigation",
+    );
+    assert.ok(
+      /verifyAndRefresh\(/.test(source),
+      "MagicLinkVerifier MUST call verifyAndRefresh from the seam, not verifyToken directly",
+    );
+  });
+
+  // The catch branch is what stops a failed verification from
+  // marking the user signed in: it redirects to /login, never to
+  // /dashboard, and never touches the session state. The verifier
+  // already routes through the shared seam so a successful run
+  // refreshes the navigation; this pin guards the failure path.
+  test("the verifier's failure branch never lands on /dashboard or mutates session state", () => {
+    const source = readPage("components/MagicLinkVerifier.tsx");
+    const catchBranch = source.match(/catch\s*\{[\s\S]*?\}\s*\)/);
+    assert.ok(catchBranch, "MagicLinkVerifier MUST have a catch branch for failed verification");
+    assert.ok(
+      /router\.replace\(\s*"\/login"\s*\)/.test(catchBranch[0]),
+      "the catch branch MUST redirect to /login",
+    );
+    assert.ok(
+      !/router\.replace\(\s*"\/dashboard"\s*\)/.test(catchBranch[0]),
+      "the catch branch MUST NOT redirect to /dashboard — a failed verification cannot sign the user in",
+    );
+    assert.ok(
+      !/setUser\(/.test(catchBranch[0]),
+      "the catch branch MUST NOT mutate the session state directly",
     );
   });
 });

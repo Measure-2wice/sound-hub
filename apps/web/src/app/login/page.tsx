@@ -15,11 +15,13 @@
 
 import { useState, type FormEvent } from "react";
 import { useRouter } from "next/navigation";
-import { requestMagicLink, verifyToken } from "../lib/auth-client";
+import { requestMagicLink } from "../lib/auth-client";
+import { useSession } from "../components/SessionProvider";
 import { Card } from "../components/ui/Card";
 
 export default function LoginPage() {
   const router = useRouter();
+  const { verifyAndRefresh } = useSession();
   const [email, setEmail] = useState("");
   const [submitting, setSubmitting] = useState(false);
   const [status, setStatus] = useState<"idle" | "sent" | "error">("idle");
@@ -62,7 +64,7 @@ export default function LoginPage() {
       return;
     }
     try {
-      await verifyToken({ verificationToken });
+      await verifyAndRefresh({ verificationToken });
       router.push("/dashboard");
     } catch (err) {
       setStatus("error");

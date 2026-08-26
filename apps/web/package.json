@@ -10,7 +10,7 @@
     "lint": "eslint .",
     "type-check": "tsc --noEmit",
     "test:e2e": "playwright test",
-    "test": "TSX_TSCONFIG_PATH=tsconfig.test.json node --import tsx --test src/app/lib/talent-search-request-builder.test.ts src/app/lib/field-error-paths.test.ts src/app/hooks/useSearch.test.ts src/app/components/SearchPage.test.ts src/app/components/MagicLinkVerifier.test.tsx"
+    "test": "TSX_TSCONFIG_PATH=tsconfig.test.json node --import tsx --test src/app/lib/talent-search-request-builder.test.ts src/app/lib/field-error-paths.test.ts src/app/hooks/useSearch.test.ts src/app/components/SearchPage.test.ts src/app/components/MagicLinkVerifier.test.tsx src/app/components/SessionProvider.test.tsx"
   },
   "dependencies": {
     "@soundhub/types": "workspace:*",
