@@ -225,5 +225,16 @@ export async function buildAppWithSmoke(
       console.log(`[bg1] ${message}`);
     },
   });
-  return buildApp({ ...options, identityAdapters: bundle, authRepository });
+  // Per review nitpick: forward the Prisma client we created (and
+  // bound `authRepository` to) into `buildApp`. Without this,
+  // `buildApp` would call `options.prismaClient ?? createPrismaClient()`
+  // and create a SECOND, unrelated client — the served repository
+  // graph would split across two pools and only one of them would
+  // ever be disconnected on shutdown.
+  return buildApp({
+    ...options,
+    prismaClient: prisma,
+    identityAdapters: bundle,
+    authRepository,
+  });
 }

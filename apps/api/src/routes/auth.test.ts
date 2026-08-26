@@ -343,6 +343,178 @@ describe("BG1 auth routes (in-memory, deterministic adapter)", () => {
     const meAfter = await request(app).get("/api/auth/me").set("Cookie", cookie);
     assert.equal(meAfter.body.user, null);
   });
+
+  // ---------- Regression suite for Tenki's PR #68 review ----------
+  //
+  // These tests pin the BG1 contract invariants the review
+  // surfaced. They run against the in-memory harness so they
+  // exercise the SAME `createAuthRouter` + `buildApp` wiring the
+  // deployed entry point uses; they do NOT depend on Supabase or
+  // PostgreSQL, so they fail closed if any one of the four fixes
+  // regresses.
+
+  test("regression: invalid JSON on /magic-link returns ONE safe envelope (no double-write) and the API stays responsive", async () => {
+    // Before the fix: `readJsonBodyOrRespond` returned `null` on
+    // BodyReadError, the handler's `if (rawBody === undefined) return;`
+    // missed it, the Zod parse threw, and the catch re-entered
+    // `writeSafeError` on an already-ended response — producing an
+    // unhandled ERR_HTTP_HEADERS_SENT and crashing the process.
+    // After the fix: the body reader returns `undefined` and the
+    // handler stops cleanly, leaving exactly one envelope on the
+    // wire.
+    const bad = await request(app)
+      .post("/api/auth/magic-link")
+      .set("Content-Type", "application/json")
+      .send("{not json");
+    assert.equal(bad.status, 400);
+    assert.equal(bad.body.error.code, "INVALID_AUTH_REQUEST");
+    assert.ok(bad.body.error.requestId);
+    // The follow-up good request must still succeed — proving the
+    // API process stayed alive after the bad request reached the
+    // rejection path.
+    const ok = await request(app)
+      .post("/api/auth/magic-link")
+      .send({ email: "buyer-route@example.com" })
+      .set("Content-Type", "application/json");
+    assert.equal(ok.status, 200);
+    assert.equal(ok.body.ok, true);
+    assert.ok(ok.body.requestId);
+  });
+
+  test("regression: oversized body on /magic-link returns ONE safe envelope and the API stays responsive", async () => {
+    // The body reader limit is 8 KB. A 9 KB payload triggers the
+    // `payload-too-large` branch which writes a safe envelope
+    // before throwing BodyReadError. The handler must stop here
+    // and NOT call `schema.parse` on the sentinel.
+    const oversized = "x".repeat(9 * 1024);
+    const bad = await request(app)
+      .post("/api/auth/magic-link")
+      .set("Content-Type", "application/json")
+      .send(`{ "email": "${oversized}" }`);
+    assert.equal(bad.status, 400);
+    assert.equal(bad.body.error.code, "INVALID_AUTH_REQUEST");
+    // Same responsiveness check as the invalid-JSON regression.
+    const ok = await request(app)
+      .post("/api/auth/magic-link")
+      .send({ email: "buyer-route@example.com" })
+      .set("Content-Type", "application/json");
+    assert.equal(ok.status, 200);
+    assert.equal(ok.body.ok, true);
+  });
+
+  test("regression: literal null body on /magic-link reaches schema validation (stop-signal change does not silence legitimate payloads)", async () => {
+    // The body-reader stop signal returns `undefined` on
+    // BodyReadError. Returning `null` would have collided with
+    // a legitimate `JSON.parse('null')` payload — a client that
+    // sends a literal `null` body MUST still reach
+    // `schema.parse(null)` so Zod returns its normal
+    // INVALID_AUTH_REQUEST field-error envelope instead of being
+    // silenced by the stop signal.
+    const literalNull = await request(app)
+      .post("/api/auth/magic-link")
+      .set("Content-Type", "application/json")
+      .send("null");
+    assert.equal(literalNull.status, 400);
+    assert.equal(literalNull.body.error.code, "INVALID_AUTH_REQUEST");
+    assert.ok(Array.isArray(literalNull.body.error.fields));
+    assert.ok(
+      literalNull.body.error.fields.some(
+        (f: { code: string }) => f.code === "invalid_type",
+      ),
+      "schema.parse(null) must produce Zod invalid_type field errors",
+    );
+  });
+
+  test("regression: malformed percent-encoded session cookie does not crash /me (treated as no session)", async () => {
+    // `soundhub_session=%zz` throws URIError from
+    // `decodeURIComponent`. Before the fix the throw escaped the
+    // route via `void handleMe(...)` and crashed the process.
+    // After the fix, the cookie decoder swallows the failure and
+    // returns `undefined`, so /me resolves an anonymous session.
+    const me = await request(app)
+      .get("/api/auth/me")
+      .set("Cookie", "soundhub_session=%zz");
+    assert.equal(me.status, 200);
+    assert.equal(me.body.user, null);
+    // The follow-up good request must still work — confirming the
+    // request after the malformed-cookie request still resolves
+    // cleanly.
+    const meGood = await request(app).get("/api/auth/me");
+    assert.equal(meGood.status, 200);
+    assert.equal(meGood.body.user, null);
+  });
+
+  test("regression: malformed cookie on /sign-out clears state without crashing", async () => {
+    const signOut = await request(app)
+      .post("/api/auth/sign-out")
+      .set("Cookie", "soundhub_session=%zz");
+    assert.equal(signOut.status, 200);
+    assert.equal(signOut.body.ok, true);
+    // Sign-out is idempotent — a second call still succeeds.
+    const second = await request(app).post("/api/auth/sign-out");
+    assert.equal(second.status, 200);
+    assert.equal(second.body.ok, true);
+  });
+
+  test("regression: malformed cookie on /acting-workspace returns SESSION_INVALID without crashing", async () => {
+    const response = await request(app)
+      .post("/api/auth/acting-workspace")
+      .send({ actingWorkspaceId: BUYER_WORKSPACE_ID })
+      .set("Content-Type", "application/json")
+      .set("Cookie", "soundhub_session=%zz");
+    assert.equal(response.status, 401);
+    assert.equal(response.body.error.code, "SESSION_INVALID");
+  });
+
+  test("regression: unexpected async auth-handler failures reach the Express error middleware without crashing the API", async () => {
+    // Build an isolated app whose AuthenticationService throws a
+    // non-recognised Error from `resolveSession`. The handler
+    // doesn't catch this — the failure must reach the Express
+    // error middleware via the wrapper the route mounts, NOT be
+    // swallowed by `void handleX(...)`. The wrapper logs only
+    // when the response was already sent; in this case the
+    // response was not yet sent, so the middleware runs and
+    // produces a schema-valid safe envelope.
+    class ExplodingAuthenticationService extends AuthenticationService {
+      override resolveSession(): Promise<null> {
+        // A rejection that none of the handler's targeted catches
+        // recognise — simulates a service-layer regression. We use
+        // `Promise.reject` so the lint rule that flags async
+        // methods without `await` still accepts the test override.
+        return Promise.reject(new Error("kaboom"));
+      }
+    }
+    const explodingAuthService = new ExplodingAuthenticationService({
+      identityAdapter: adapter,
+      authRepository: authRepo,
+    });
+    const { app: explodingApp } = buildApp({
+      authenticationService: explodingAuthService,
+      workspaceAuthorizationService,
+      authRepository: authRepo,
+      identityAdapter: adapter,
+      prismaClient: stubPrisma,
+    });
+    const me = await request(explodingApp).get("/api/auth/me");
+    // The Express error middleware writes a generic safe
+    // envelope (status 500, code SEARCH_FAILED — the global
+    // middleware intentionally uses a coarse code for any
+    // non-recognised error). The contract here is the safe
+    // envelope, not the specific code.
+    assert.equal(me.status, 500);
+    assert.ok(me.body.error);
+    assert.ok(me.body.error.requestId);
+    assert.equal(typeof me.body.error.message, "string");
+    // The error's internal text must never cross the wire.
+    assert.equal(JSON.stringify(me.body).includes("kaboom"), false);
+    assert.equal("stack" in me.body.error, false);
+    // The API must STILL be responsive on the surviving app
+    // instance — the wrapper forwarded the rejection, it did not
+    // let it become an unhandled process-level rejection.
+    const stillAlive = await request(explodingApp).get("/api/auth/me");
+    assert.equal(stillAlive.status, 500);
+    assert.ok(stillAlive.body.error);
+  });
 });
 
 async function signIn(
@@ -416,13 +588,33 @@ describe("BG1 auth routes (Prisma, disposable PostgreSQL)", () => {
     );
 
     const identityMappings = await prisma.identityProvider.findMany();
-    assert.ok(
-      identityMappings.some((m) => m.provider === "deterministic" && m.subject === "demo-buyer"),
-      "demo-buyer identity provider mapping must be persisted",
+    // The seed persists IdentityProvider rows under the HASHED
+    // subjects the deterministic adapter derives at sign-in time
+    // (seed.ts:1072-1073). Literal `demo-buyer` / `demo-seller`
+    // strings never appear in the row's `subject` column — only
+    // the derivation round-trips through
+    // `deriveDeterministicSubject(email, sha256)`.
+    const { deriveDeterministicSubject } = await import("@soundhub/types");
+    const sha256 = (input: string) => createHash("sha256").update(input).digest("hex");
+    const demoBuyerSubject = deriveDeterministicSubject(
+      "demo.buyer@soundhub.example",
+      sha256,
+    );
+    const demoSellerSubject = deriveDeterministicSubject(
+      "marc.andre@creolebeats.example",
+      sha256,
     );
     assert.ok(
-      identityMappings.some((m) => m.provider === "deterministic" && m.subject === "demo-seller"),
-      "demo-seller identity provider mapping must be persisted",
+      identityMappings.some(
+        (m) => m.provider === "deterministic" && m.subject === demoBuyerSubject,
+      ),
+      "demo buyer identity provider mapping must be persisted under its hashed subject",
+    );
+    assert.ok(
+      identityMappings.some(
+        (m) => m.provider === "deterministic" && m.subject === demoSellerSubject,
+      ),
+      "demo seller identity provider mapping must be persisted under its hashed subject",
     );
     await prisma.$disconnect();
   });

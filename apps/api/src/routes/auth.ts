@@ -39,7 +39,7 @@
 //     every request and rejects a user without it, regardless of any
 //     legacy ownerUserId match.
 
-import { Router, type Request, type Response } from "express";
+import { Router, type NextFunction, type Request, type Response } from "express";
 import {
   bg1MagicLinkRequestV1Schema,
   bg1MagicLinkResponseV1Schema,
@@ -77,23 +77,63 @@ export interface AuthRouteDeps {
 export function createAuthRouter(deps: AuthRouteDeps): Router {
   const router = Router();
 
-  router.post("/magic-link", (req, res) => {
-    void handleMagicLink(req, res, deps);
+  // BG1 contract: route handlers MUST NOT leave promise rejections
+  // unhandled. The handlers only translate recognised errors into
+  // safe-envelope responses; any unexpected throw escapes the
+  // service/route boundary. The wrapper forwards those rejections to
+  // Express's error middleware so a synchronous-looking failure
+  // cannot crash the process under Node's default
+  // unhandled-rejection policy.
+  //
+  // If the handler already wrote (or partially wrote) the response,
+  // the wrapper logs and returns instead of calling `next(err)` —
+  // the error middleware would attempt to set headers on a sent
+  // response and produce ERR_HTTP_HEADERS_SENT.
+  router.post("/magic-link", (req, res, next) => {
+    handleMagicLink(req, res, deps).catch((err) =>
+      forwardUnhandledRejection(req, res, next, err),
+    );
   });
-  router.post("/verify-token", (req, res) => {
-    void handleVerifyToken(req, res, deps);
+  router.post("/verify-token", (req, res, next) => {
+    handleVerifyToken(req, res, deps).catch((err) =>
+      forwardUnhandledRejection(req, res, next, err),
+    );
   });
-  router.get("/me", (req, res) => {
-    void handleMe(req, res, deps);
+  router.get("/me", (req, res, next) => {
+    handleMe(req, res, deps).catch((err) =>
+      forwardUnhandledRejection(req, res, next, err),
+    );
   });
-  router.post("/sign-out", (req, res) => {
-    void handleSignOut(req, res, deps);
+  router.post("/sign-out", (req, res, next) => {
+    handleSignOut(req, res, deps).catch((err) =>
+      forwardUnhandledRejection(req, res, next, err),
+    );
   });
-  router.post("/acting-workspace", (req, res) => {
-    void handleActingWorkspace(req, res, deps);
+  router.post("/acting-workspace", (req, res, next) => {
+    handleActingWorkspace(req, res, deps).catch((err) =>
+      forwardUnhandledRejection(req, res, next, err),
+    );
   });
 
   return router;
+}
+
+function forwardUnhandledRejection(
+  req: Request,
+  res: Response,
+  next: NextFunction,
+  err: unknown,
+): void {
+  if (res.headersSent) {
+    // The handler already wrote (or partially wrote) the response.
+    // We cannot recover by handing the error to the error
+    // middleware — it would attempt to set headers / write JSON on a
+    // sent response. Log so the failure is auditable and let the
+    // request close so the process stays responsive.
+    console.error(`[auth] requestId=${resolveRequestId(req)} handler-rejection-after-write:`, err);
+    return;
+  }
+  next(err);
 }
 
 // ---------- POST /api/auth/magic-link ----------
@@ -285,7 +325,19 @@ function readSessionCookie(req: Request): string | undefined {
   for (const part of header.split(";")) {
     const trimmed = part.trim();
     if (trimmed.startsWith(`${SESSION_COOKIE}=`)) {
-      return decodeURIComponent(trimmed.slice(SESSION_COOKIE.length + 1));
+      // BG1 contract: malformed percent-encoding on the cookie value
+      // (e.g. `soundhub_session=%zz`) is treated as "no session", NOT
+      // a thrown URIError. Without this guard, an attacker-controlled
+      // Cookie header would crash the auth routes via unhandled
+      // promise rejection — the routes fire handlers via
+      // `void handleX(...)` and a thrown URIError would never reach
+      // the Express error middleware.
+      const raw = trimmed.slice(SESSION_COOKIE.length + 1);
+      try {
+        return decodeURIComponent(raw);
+      } catch {
+        return undefined;
+      }
     }
   }
   return undefined;
@@ -361,8 +413,19 @@ async function readJsonBodyOrRespond(
   } catch (err) {
     if (err instanceof BodyReadError) {
       // The body reader already wrote a safe envelope for the
-      // recognised failure modes; the handler should stop here.
-      return null;
+      // recognised failure modes (payload-too-large, invalid-json).
+      // Returning `undefined` is the unique "stop signal" the
+      // handlers look for — `null` is a legitimate JSON value
+      // (e.g. a literal `null` body) that must reach
+      // `schema.parse(null)` so the Zod validator returns its
+      // normal `INVALID_AUTH_REQUEST` envelope instead of being
+      // silenced by the body-reader guard. A previous version of
+      // this function returned `null`, which collided with that
+      // legitimate payload and produced a second
+      // `writeSafeError` call on an already-ended response
+      // (`ERR_HTTP_HEADERS_SENT`) that escaped the handler as an
+      // unhandled promise rejection.
+      return undefined;
     }
     throw err;
   }

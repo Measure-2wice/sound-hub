@@ -34,13 +34,24 @@ describe("PrismaAuthRepository", () => {
       t.skip();
       return;
     }
+    // The seed persists the demo buyer `IdentityProvider` row under
+    // the HASHED subject the deterministic adapter derives at
+    // sign-in time (seed.ts:1072). A literal `"demo-buyer"` lookup
+    // would never resolve — only the derivation round-trips.
+    const { createHash } = await import("node:crypto");
+    const { deriveDeterministicSubject } = await import("@soundhub/types");
+    const sha256 = (input: string) => createHash("sha256").update(input).digest("hex");
+    const demoBuyerSubject = deriveDeterministicSubject(
+      "demo.buyer@soundhub.example",
+      sha256,
+    );
     const mapping = await repo.findUserByIdentity({
       provider: "deterministic",
-      subject: "demo-buyer",
+      subject: demoBuyerSubject,
     });
     assert.ok(mapping);
     assert.equal(mapping.provider, "deterministic");
-    assert.equal(mapping.subject, "demo-buyer");
+    assert.equal(mapping.subject, demoBuyerSubject);
     assert.equal(mapping.providerEmail, "demo.buyer@soundhub.example");
   });
 
