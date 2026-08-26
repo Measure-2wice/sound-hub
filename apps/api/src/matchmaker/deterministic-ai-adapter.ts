@@ -22,14 +22,14 @@
 //   - Required constraints appear only when the buyer's text names
 //     them; absent signals do not invent constraints.
 //   - The candidate payload ALWAYS validates against
-//     `bg3MatchmakerCriteriaV1Schema` so the application boundary
+//     `matchmakerCriteriaV1Schema` so the application boundary
 //     accepts it without falling back further.
 //
 // The adapter has no dependency on Prisma, on storage, or on the
 // authentication boundary. It can be unit-tested in isolation.
 
-import { bg3MatchmakerCriteriaV1Schema } from "@soundhub/types";
-import type { Bg3AiInterpretInputV1, Bg3AiInterpretOutputV1 } from "@soundhub/types";
+import { matchmakerCriteriaV1Schema } from "@soundhub/types";
+import type { AiInterpretBriefInputV1, AiInterpretBriefOutputV1 } from "@soundhub/types";
 import { AiInvalidOutputError, type AiAdapter } from "./ai-adapter.js";
 
 // A curated allow-list of phrases the deterministic fallback maps to
@@ -187,7 +187,7 @@ const AFFILIATION_PHRASES: ReadonlyArray<{
 const FUNDING_DEADLINE_PATTERN = /\b(?:by|before|on)\s+([a-z]+\s+\d{1,2}(?:,\s*\d{4})?)\b/i;
 
 export class DeterministicAiAdapter implements AiAdapter {
-  interpretBrief(input: Bg3AiInterpretInputV1): Promise<Bg3AiInterpretOutputV1> {
+  interpretBrief(input: AiInterpretBriefInputV1): Promise<AiInterpretBriefOutputV1> {
     const normalized = input.briefText.trim().toLowerCase();
     const required: {
       serviceModes?: ("Remote" | "InPerson" | "Hybrid")[];
@@ -325,7 +325,7 @@ export class DeterministicAiAdapter implements AiAdapter {
     // and let the application boundary translate it into the safe
     // MATCHMAKER_INVALID_REQUEST envelope. The deterministic
     // adapter never returns an unvalidated payload.
-    const result = bg3MatchmakerCriteriaV1Schema.safeParse(candidate);
+    const result = matchmakerCriteriaV1Schema.safeParse(candidate);
     if (!result.success) {
       throw new AiInvalidOutputError(
         "Deterministic fallback produced an invalid criteria payload.",

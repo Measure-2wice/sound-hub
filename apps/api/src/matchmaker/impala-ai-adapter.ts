@@ -17,7 +17,7 @@
 // SoundHub instructs the model to return only structured JSON that
 // matches the BG3 Matchmaker criteria shape. The adapter parses the
 // textual response, then validates it against
-// `bg3MatchmakerCriteriaV1Schema`. Only validated provider-neutral
+// `matchmakerCriteriaV1Schema`. Only validated provider-neutral
 // output crosses the adapter boundary. The adapter never queries
 // Prisma, never searches sellers, and never invents marketplace
 // facts — it interprets the buyer's brief and nothing else.
@@ -30,9 +30,9 @@
 // path picks up the deterministic adapter unchanged.
 
 import {
-  bg3MatchmakerCriteriaV1Schema,
-  type Bg3AiInterpretInputV1,
-  type Bg3AiInterpretOutputV1,
+  matchmakerCriteriaV1Schema,
+  type AiInterpretBriefInputV1,
+  type AiInterpretBriefOutputV1,
 } from "@soundhub/types";
 import { AiUnavailableError, type AiAdapter } from "./ai-adapter.js";
 import { FetchHttpTransport, HttpTransportError, type HttpTransport } from "./http-transport.js";
@@ -62,7 +62,7 @@ export interface ImpalaAdapterConfig {
 // OpenAI-compatible chat completion request shape. These types are
 // intentionally IMPALA-SPECIFIC and live ONLY inside this module;
 // the SoundHub domain never references them. SoundHub sees only
-// `Bg3AiInterpretInputV1` and `Bg3AiInterpretOutputV1`.
+// `AiInterpretBriefInputV1` and `AiInterpretBriefOutputV1`.
 interface ImpalaChatMessage {
   readonly role: "system" | "user";
   readonly content: string;
@@ -126,7 +126,7 @@ export class ImpalaAiAdapter implements AiAdapter {
    *     case and fall back, but failing fast at the adapter
    *     boundary keeps the failure mode obvious.
    */
-  async interpretBrief(input: Bg3AiInterpretInputV1): Promise<Bg3AiInterpretOutputV1> {
+  async interpretBrief(input: AiInterpretBriefInputV1): Promise<AiInterpretBriefOutputV1> {
     if (!this.apiKey || this.apiKey.trim().length === 0) {
       throw new AiUnavailableError("Managed AI provider is not configured.");
     }
@@ -191,7 +191,7 @@ export class ImpalaAiAdapter implements AiAdapter {
     // unavailable error so the application layer's fallback path
     // activates. We never pass unvalidated output to
     // TalentSearchService.
-    const validated = bg3MatchmakerCriteriaV1Schema.safeParse(parsedCandidate);
+    const validated = matchmakerCriteriaV1Schema.safeParse(parsedCandidate);
     if (!validated.success) {
       throw new AiUnavailableError(
         "Managed AI provider returned output that did not pass runtime validation.",
@@ -202,7 +202,7 @@ export class ImpalaAiAdapter implements AiAdapter {
       provider: "managed",
       modelId: parsedPayload.model ?? this.model,
       // The application service re-parses the candidate through
-      // bg3MatchmakerCriteriaV1Schema; the adapter hands back the
+      // matchmakerCriteriaV1Schema; the adapter hands back the
       // raw validated JSON so the schema is the single authority.
       candidate: validated.data as unknown as Record<string, unknown>,
     };
@@ -275,7 +275,7 @@ const SYSTEM_PROMPT = [
   "- Country codes are ISO 3166-1 alpha-2 uppercase. Caribbean affiliations are limited to the listed codes.",
 ].join("\n");
 
-function buildSystemMessage(_input: Bg3AiInterpretInputV1): ImpalaChatMessage {
+function buildSystemMessage(_input: AiInterpretBriefInputV1): ImpalaChatMessage {
   // The acting Workspace identifier is NOT included in the
   // system message; it is buyer-side context that must not
   // leak into the prompt as a free-form instruction. Only the
@@ -284,7 +284,7 @@ function buildSystemMessage(_input: Bg3AiInterpretInputV1): ImpalaChatMessage {
   return { role: "system", content: SYSTEM_PROMPT };
 }
 
-function buildUserMessage(input: Bg3AiInterpretInputV1): ImpalaChatMessage {
+function buildUserMessage(input: AiInterpretBriefInputV1): ImpalaChatMessage {
   return {
     role: "user",
     content: JSON.stringify({

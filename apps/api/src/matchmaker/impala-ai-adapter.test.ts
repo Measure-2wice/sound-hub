@@ -10,7 +10,7 @@
 
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { bg3MatchmakerCriteriaV1Schema, type Bg3AiInterpretInputV1 } from "@soundhub/types";
+import { matchmakerCriteriaV1Schema, type AiInterpretBriefInputV1 } from "@soundhub/types";
 import {
   FetchHttpTransport,
   HttpTransportError,
@@ -21,7 +21,7 @@ import {
 import { AiUnavailableError } from "./ai-adapter.js";
 import { ImpalaAiAdapter } from "./impala-ai-adapter.js";
 
-const VALID_INPUT: Bg3AiInterpretInputV1 = {
+const VALID_INPUT: AiInterpretBriefInputV1 = {
   actingWorkspaceId: "ws-buyer-1",
   briefText: "Need a producer in Brooklyn for a remote Haitian dancehall single.",
   buyerNonSearchRequirements: undefined,
@@ -165,7 +165,7 @@ test("ImpalaAiAdapter builds the documented gateway request", async () => {
     "system prompt must instruct the model to return structured JSON",
   );
   // The system prompt must NOT instruct the model to omit
-  // `required` for query-only briefs. bg3MatchmakerCriteriaV1Schema
+  // `required` for query-only briefs. matchmakerCriteriaV1Schema
   // declares `required` as a mandatory key, so a prompt that says
   // "omit required when query applies" produces output that fails
   // runtime validation. The mandatory-required invariant must be
@@ -227,7 +227,7 @@ test("ImpalaAiAdapter parses a valid assistant content payload", async () => {
     transport,
   );
   const output = await adapter.interpretBrief(VALID_INPUT);
-  const validated = bg3MatchmakerCriteriaV1Schema.parse(output.candidate);
+  const validated = matchmakerCriteriaV1Schema.parse(output.candidate);
   assert.deepEqual(validated.required.primaryCategoryKeys, ["music-production"]);
   assert.deepEqual(validated.required.serviceModes, ["Remote"]);
   assert.deepEqual(validated.preferred?.genreTags, ["dancehall"]);
@@ -246,7 +246,7 @@ test("ImpalaAiAdapter strips a single pair of surrounding code fences from assis
     transport,
   );
   const output = await adapter.interpretBrief(VALID_INPUT);
-  const validated = bg3MatchmakerCriteriaV1Schema.parse(output.candidate);
+  const validated = matchmakerCriteriaV1Schema.parse(output.candidate);
   assert.deepEqual(validated.required.primaryCategoryKeys, ["mixing"]);
 });
 
@@ -330,7 +330,7 @@ test("ImpalaAiAdapter throws when assistant content is a JSON array (not an obje
   );
 });
 
-test("ImpalaAiAdapter throws when the candidate fails bg3MatchmakerCriteriaV1Schema", async () => {
+test("ImpalaAiAdapter throws when the candidate fails matchmakerCriteriaV1Schema", async () => {
   const transport = new FakeHttpTransport();
   // Required block is present but missing any hard constraint axis.
   transport.enqueueResponse(

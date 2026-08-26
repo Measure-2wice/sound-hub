@@ -36,7 +36,7 @@
 
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import type { Bg3MatchmakerCriteriaV1 } from "@soundhub/types";
+import type { MatchmakerCriteriaV1 } from "@soundhub/types";
 import {
   InMemoryTalentSearchRepository,
   type InMemoryFixture,
@@ -180,7 +180,7 @@ test("Matchmaker → real TalentSearchService filters out non-Brooklyn sellers",
   // produced these from the buyer's natural-language brief; the
   // service hands them to the existing TalentSearchService
   // untouched (no second search path).
-  const persisted: Bg3MatchmakerCriteriaV1 = result.brief.criteria;
+  const persisted: MatchmakerCriteriaV1 = result.brief.criteria;
   assert.equal(persisted.required.basedIn?.city, "Brooklyn");
   assert.equal(persisted.required.basedIn?.countryCode, "US");
   assert.ok(persisted.required.serviceModes?.includes("Remote"));

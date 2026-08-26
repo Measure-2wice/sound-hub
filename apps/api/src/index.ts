@@ -143,7 +143,7 @@ export function buildApp(options: AppOptions = {}): BuiltApp {
     buildAiAdapters({
       managedConfig: readImpalaConfigFromEnv() ?? undefined,
       log: (message) => {
-        console.log(`[bg3] ${message}`);
+        console.log(`[matchmaker] ${message}`);
       },
     });
   const aiAdapter = options.aiAdapter ?? aiAdapters.active;

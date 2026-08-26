@@ -14,14 +14,14 @@
 // may inject a `submit` override to assert the payload contract
 // without exercising the network.
 
-import type { Bg3SubmitBriefResponseV1 } from "@soundhub/types";
+import type { SubmitBriefResponseV1 } from "@soundhub/types";
 import { submitBrief } from "../lib/matchmaker-client";
 
 export interface SubmitBriefFromFormInput {
   readonly actingWorkspaceId: string;
   readonly briefText: string;
   readonly setError: (message: string | null) => void;
-  readonly setResponse: (response: Bg3SubmitBriefResponseV1 | null) => void;
+  readonly setResponse: (response: SubmitBriefResponseV1 | null) => void;
   readonly setSubmitting: (value: boolean) => void;
   /**
    * Optional injection for tests. Defaults to the page's own

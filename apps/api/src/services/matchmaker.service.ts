@@ -7,7 +7,7 @@
 //   - Workspace authorization (current Buyer-capable membership).
 //   - AI boundary invocations (managed OR deterministic fallback).
 //   - Runtime validation of the AI output through the shared
-//     `bg3MatchmakerCriteriaV1Schema` (no unvalidated value ever
+//     `matchmakerCriteriaV1Schema` (no unvalidated value ever
 //     reaches the search service).
 //   - Persistence of the Brief + search results.
 //   - Evidence-grounded explanation assembly from the returned
@@ -22,21 +22,21 @@
 // the search result.
 
 import type {
-  Bg3AiInterpretInputV1,
-  Bg3AiProviderV1,
-  Bg3AiInterpretOutputV1,
-  Bg3ExplanationEntryV1,
-  Bg3ExplanationKindV1,
-  Bg3MatchmakerCriteriaV1,
-  Bg3PublicProjectBriefV1,
-  Bg3RecommendationV1,
-  Bg3SubmitBriefResponseV1,
+  AiInterpretBriefInputV1,
+  AiProviderV1,
+  AiInterpretBriefOutputV1,
+  ExplanationEntryV1,
+  ExplanationKindV1,
+  MatchmakerCriteriaV1,
+  ProjectBriefPublicV1,
+  MatchmakerRecommendationV1,
+  SubmitBriefResponseV1,
   PublicOfferingSummaryV1,
   PublicSellerSummaryV1,
   TalentSearchRequestV1,
   TalentSearchResponseV1,
 } from "@soundhub/types";
-import { bg3MatchmakerCriteriaV1Schema, publicOfferingSummaryV1Schema } from "@soundhub/types";
+import { matchmakerCriteriaV1Schema, publicOfferingSummaryV1Schema } from "@soundhub/types";
 import type { AiAdapter } from "../matchmaker/ai-adapter.js";
 import { DeterministicAiAdapter } from "../matchmaker/deterministic-ai-adapter.js";
 import type {
@@ -97,8 +97,8 @@ export interface SubmitBriefInput {
 }
 
 export interface SubmitBriefResult {
-  readonly brief: Bg3PublicProjectBriefV1;
-  readonly recommendations: readonly Bg3RecommendationV1[];
+  readonly brief: ProjectBriefPublicV1;
+  readonly recommendations: readonly MatchmakerRecommendationV1[];
   readonly totalResults: number;
   readonly strategy: "postgres-text-v1";
   readonly fallbackNotice: string | undefined;
@@ -110,7 +110,7 @@ export interface GetBriefInput {
 }
 
 export interface GetBriefResult {
-  readonly brief: Bg3PublicProjectBriefV1;
+  readonly brief: ProjectBriefPublicV1;
 }
 
 export class MatchmakerService {
@@ -133,7 +133,7 @@ export class MatchmakerService {
    *
    *   1. Authorize the buyer (current Buyer-capable membership).
    *   2. Hand the brief to the primary AI adapter.
-   *   3. Parse the AI output through `bg3MatchmakerCriteriaV1Schema`.
+   *   3. Parse the AI output through `matchmakerCriteriaV1Schema`.
    *      On parse failure or `AiUnavailableError`, fall back to
    *      the deterministic adapter and re-parse.
    *   4. Invoke the existing `TalentSearchService` (no second
@@ -147,7 +147,7 @@ export class MatchmakerService {
   async submitBrief(input: SubmitBriefInput): Promise<SubmitBriefResult> {
     const membership = await this.requireBuyer(input.userAccountId, input.actingWorkspaceId);
 
-    const aiInput: Bg3AiInterpretInputV1 = {
+    const aiInput: AiInterpretBriefInputV1 = {
       actingWorkspaceId: membership.workspace.workspaceId,
       briefText: input.briefText,
       buyerNonSearchRequirements: input.buyerNonSearchRequirements,
@@ -157,9 +157,9 @@ export class MatchmakerService {
     // through to the deterministic adapter and re-parse. The
     // fallback never sees unvalidated AI output because every
     // candidate payload must round-trip through
-    // `bg3MatchmakerCriteriaV1Schema` before it reaches the search
+    // `matchmakerCriteriaV1Schema` before it reaches the search
     // service.
-    let aiOutput: Bg3AiInterpretOutputV1;
+    let aiOutput: AiInterpretBriefOutputV1;
     let usedFallback = false;
     try {
       aiOutput = await this.primaryAi.interpretBrief(aiInput);
@@ -194,9 +194,9 @@ export class MatchmakerService {
       }
     }
 
-    let criteria: Bg3MatchmakerCriteriaV1;
+    let criteria: MatchmakerCriteriaV1;
     try {
-      criteria = bg3MatchmakerCriteriaV1Schema.parse(aiOutput.candidate);
+      criteria = matchmakerCriteriaV1Schema.parse(aiOutput.candidate);
     } catch {
       if (!usedFallback) {
         // Primary adapter returned a malformed payload — fall
@@ -206,7 +206,7 @@ export class MatchmakerService {
         // always contains at least one hard axis.
         try {
           const fallbackOutput = await this.fallbackAi.interpretBrief(aiInput);
-          criteria = bg3MatchmakerCriteriaV1Schema.parse(fallbackOutput.candidate);
+          criteria = matchmakerCriteriaV1Schema.parse(fallbackOutput.candidate);
           // Reassign aiOutput so the provenance trail below
           // records the fallback adapter's provider + model rather
           // than the primary adapter's (which would otherwise be
@@ -244,7 +244,7 @@ export class MatchmakerService {
     // Provenance. The fallback flag is true if EITHER path was
     // the deterministic fallback; the provider key reflects the
     // adapter that produced the final payload.
-    const aiProvider: Bg3AiProviderV1 = usedFallback
+    const aiProvider: AiProviderV1 = usedFallback
       ? "deterministic-fallback"
       : this.normaliseProvider(aiOutput.provider);
     const aiModelId = aiOutput.modelId;
@@ -329,7 +329,7 @@ export class MatchmakerService {
     });
   }
 
-  private normaliseProvider(provider: string): Bg3AiProviderV1 {
+  private normaliseProvider(provider: string): AiProviderV1 {
     if (provider === "managed" || provider === "deterministic-fallback") {
       return provider;
     }
@@ -366,7 +366,7 @@ function isRecoverableAiError(err: unknown): boolean {
  * this function only emits the buyer-safe fields the BG3 contract
  * declares.
  */
-export function toPublicBrief(persisted: PersistedBrief): Bg3PublicProjectBriefV1 {
+export function toPublicBrief(persisted: PersistedBrief): ProjectBriefPublicV1 {
   return {
     briefId: persisted.id,
     actingWorkspaceId: persisted.buyerWorkspaceId,
@@ -385,7 +385,7 @@ export function toPublicBrief(persisted: PersistedBrief): Bg3PublicProjectBriefV
   };
 }
 
-function normaliseProviderLabel(provider: string): Bg3AiProviderV1 {
+function normaliseProviderLabel(provider: string): AiProviderV1 {
   if (provider === "managed" || provider === "deterministic-fallback") {
     return provider;
   }
@@ -401,9 +401,9 @@ function normaliseProviderLabel(provider: string): Bg3AiProviderV1 {
  * coverage) and nothing else.
  */
 export function buildRecommendation(
-  criteria: Bg3MatchmakerCriteriaV1,
+  criteria: MatchmakerCriteriaV1,
   result: PersistedBrief["results"][number],
-): Bg3RecommendationV1 {
+): MatchmakerRecommendationV1 {
   const seller = result.sellerSnapshotJson as PublicSellerSummaryV1;
   const best = result.bestOfferingSnapshotJson as PublicOfferingSummaryV1;
   // Restore up to two additional standalone matching offerings
@@ -436,13 +436,13 @@ export function buildRecommendation(
 }
 
 function collectExplanations(
-  criteria: Bg3MatchmakerCriteriaV1,
+  criteria: MatchmakerCriteriaV1,
   best: PublicOfferingSummaryV1,
   matchReason: string,
-): readonly Bg3ExplanationEntryV1[] {
-  const out: Bg3ExplanationEntryV1[] = [];
+): readonly ExplanationEntryV1[] {
+  const out: ExplanationEntryV1[] = [];
   const seen = new Set<string>();
-  const push = (kind: Bg3ExplanationKindV1, label: string) => {
+  const push = (kind: ExplanationKindV1, label: string) => {
     const key = `${kind}|${label}`;
     if (seen.has(key)) return;
     seen.add(key);
@@ -538,4 +538,4 @@ function collectExplanations(
 
 // Avoid a circular import at module load by re-exporting the
 // response shape for routes that need it.
-export type { Bg3SubmitBriefResponseV1 };
+export type { SubmitBriefResponseV1 };

@@ -20,9 +20,9 @@
 import { useState, type FormEvent } from "react";
 import Link from "next/link";
 import type {
-  Bg3PublicProjectBriefV1,
-  Bg3RecommendationV1,
-  Bg3SubmitBriefResponseV1,
+  ProjectBriefPublicV1,
+  MatchmakerRecommendationV1,
+  SubmitBriefResponseV1,
 } from "@soundhub/types";
 import { useSession } from "../components/SessionProvider";
 import { submitBriefFromForm } from "./submit-brief-from-form";
@@ -37,7 +37,7 @@ export default function MatchmakerPage() {
   const [briefText, setBriefText] = useState<string>(DEFAULT_BRIEF);
   const [submitting, setSubmitting] = useState<boolean>(false);
   const [error, setError] = useState<string | null>(null);
-  const [response, setResponse] = useState<Bg3SubmitBriefResponseV1 | null>(null);
+  const [response, setResponse] = useState<SubmitBriefResponseV1 | null>(null);
 
   if (loading) {
     return (
@@ -181,7 +181,7 @@ export default function MatchmakerPage() {
   );
 }
 
-function BriefResults({ response }: { readonly response: Bg3SubmitBriefResponseV1 }) {
+function BriefResults({ response }: { readonly response: SubmitBriefResponseV1 }) {
   return (
     <>
       <Card data-testid="matchmaker-brief-summary">
@@ -235,7 +235,7 @@ function BriefResults({ response }: { readonly response: Bg3SubmitBriefResponseV
   );
 }
 
-function BriefSummary({ brief }: { readonly brief: Bg3PublicProjectBriefV1 }) {
+function BriefSummary({ brief }: { readonly brief: ProjectBriefPublicV1 }) {
   return (
     <dl className="grid grid-cols-1 gap-y-2 text-sm" data-testid="matchmaker-brief-summary-list">
       <div>
@@ -287,7 +287,7 @@ function RecommendationItem({
   recommendation,
   index,
 }: {
-  readonly recommendation: Bg3RecommendationV1;
+  readonly recommendation: MatchmakerRecommendationV1;
   readonly index: number;
 }) {
   return (

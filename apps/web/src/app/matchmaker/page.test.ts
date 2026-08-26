@@ -28,8 +28,8 @@
 import assert from "node:assert/strict";
 import { readFileSync } from "node:fs";
 import { afterEach, beforeEach, describe, test } from "node:test";
-import type { Bg3SubmitBriefRequestV1, Bg3SubmitBriefResponseV1 } from "@soundhub/types";
-import { bg3SubmitBriefResponseV1Schema } from "@soundhub/types";
+import type { SubmitBriefRequestV1, SubmitBriefResponseV1 } from "@soundhub/types";
+import { submitBriefResponseV1Schema } from "@soundhub/types";
 import type { submitBrief as submitBriefFn } from "../lib/matchmaker-client";
 import { submitBriefFromForm } from "./submit-brief-from-form.js";
 
@@ -41,7 +41,7 @@ function readMatchmakerPage(): string {
 
 // ---------- Runtime tests (controlled fetch) ----------
 
-function buildResponse(override: Partial<Bg3SubmitBriefResponseV1> = {}): Bg3SubmitBriefResponseV1 {
+function buildResponse(override: Partial<SubmitBriefResponseV1> = {}): SubmitBriefResponseV1 {
   return {
     ok: true,
     brief: {
@@ -101,7 +101,7 @@ function buildResponse(override: Partial<Bg3SubmitBriefResponseV1> = {}): Bg3Sub
 
 interface RecordedSubmission {
   readonly url: string;
-  readonly body: Bg3SubmitBriefRequestV1;
+  readonly body: SubmitBriefRequestV1;
 }
 
 let originalFetch: typeof fetch;
@@ -121,7 +121,7 @@ function installFetchStub(): void {
     if (typeof rawBody === "string" && rawBody.length > 0) {
       body = JSON.parse(rawBody);
     }
-    recordedSubmissions.push({ url, body: body as Bg3SubmitBriefRequestV1 });
+    recordedSubmissions.push({ url, body: body as SubmitBriefRequestV1 });
     if (queuedResponse instanceof Error) {
       throw queuedResponse;
     }
@@ -148,7 +148,7 @@ describe("BG3 Matchmaker page runtime submit path", () => {
       headers: { "Content-Type": "application/json" },
     });
     const setErrorCalls: (string | null)[] = [];
-    const setResponseCalls: (Bg3SubmitBriefResponseV1 | null)[] = [];
+    const setResponseCalls: (SubmitBriefResponseV1 | null)[] = [];
     const setSubmittingCalls: boolean[] = [];
 
     await submitBriefFromForm({
@@ -189,7 +189,7 @@ describe("BG3 Matchmaker page runtime submit path", () => {
     // recorded response. The recorded value is the last entry.
     assert.equal(setResponseCalls.length, 2);
     const recordedResponse = setResponseCalls[1]!;
-    bg3SubmitBriefResponseV1Schema.parse(recordedResponse);
+    submitBriefResponseV1Schema.parse(recordedResponse);
     assert.equal(recordedResponse.totalResults, 1);
     assert.equal(recordedResponse.recommendations.length, 1);
     assert.equal(recordedResponse.recommendations[0]?.sellerId, "seller-runtime-1");
@@ -212,7 +212,7 @@ describe("BG3 Matchmaker page runtime submit path", () => {
       { status: 400, headers: { "Content-Type": "application/json" } },
     );
     const setErrorCalls: (string | null)[] = [];
-    const setResponseCalls: (Bg3SubmitBriefResponseV1 | null)[] = [];
+    const setResponseCalls: (SubmitBriefResponseV1 | null)[] = [];
     const setSubmittingCalls: boolean[] = [];
 
     await submitBriefFromForm({
@@ -243,7 +243,7 @@ describe("BG3 Matchmaker page runtime submit path", () => {
   test("a network failure surfaces the error and resets submitting", async () => {
     queuedResponse = new Error("network unreachable");
     const setErrorCalls: (string | null)[] = [];
-    const setResponseCalls: (Bg3SubmitBriefResponseV1 | null)[] = [];
+    const setResponseCalls: (SubmitBriefResponseV1 | null)[] = [];
     const setSubmittingCalls: boolean[] = [];
 
     await submitBriefFromForm({
@@ -269,7 +269,7 @@ describe("BG3 Matchmaker page runtime submit path", () => {
 
   test("missing workspace selection short-circuits with a validation error and no fetch", async () => {
     const setErrorCalls: (string | null)[] = [];
-    const setResponseCalls: (Bg3SubmitBriefResponseV1 | null)[] = [];
+    const setResponseCalls: (SubmitBriefResponseV1 | null)[] = [];
     const setSubmittingCalls: boolean[] = [];
 
     await submitBriefFromForm({
@@ -307,14 +307,14 @@ describe("BG3 Matchmaker page runtime submit path", () => {
     // exercising the network. A refactor that drops the acting
     // workspace id or fails to trim the brief text would fail
     // this assertion.
-    const captured: Bg3SubmitBriefRequestV1[] = [];
+    const captured: SubmitBriefRequestV1[] = [];
     /* eslint-disable @typescript-eslint/require-await */
     const fakeSubmit: typeof submitBriefFn = async (input) => {
       captured.push(input);
       return buildResponse();
     };
     /* eslint-enable @typescript-eslint/require-await */
-    const setResponseCalls: (Bg3SubmitBriefResponseV1 | null)[] = [];
+    const setResponseCalls: (SubmitBriefResponseV1 | null)[] = [];
 
     await submitBriefFromForm({
       actingWorkspaceId: "ws-buyer-injected",
@@ -334,7 +334,7 @@ describe("BG3 Matchmaker page runtime submit path", () => {
     );
     assert.equal(setResponseCalls.length, 2);
     const recordedResponse = setResponseCalls[1]!;
-    bg3SubmitBriefResponseV1Schema.parse(recordedResponse);
+    submitBriefResponseV1Schema.parse(recordedResponse);
   });
 });
 

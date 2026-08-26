@@ -29,7 +29,7 @@ import { DeterministicAiAdapter } from "./deterministic-ai-adapter.js";
 import { ImpalaAiAdapter, type ImpalaAdapterConfig } from "./impala-ai-adapter.js";
 import type { HttpTransport } from "./http-transport.js";
 
-export type Bg3AiProviderSelection = "managed" | "deterministic-fallback";
+export type AiProviderSelection = "managed" | "deterministic-fallback";
 
 export interface AiAdapterFactoryOptions {
   /**
@@ -37,7 +37,7 @@ export interface AiAdapterFactoryOptions {
    * pass `"deterministic-fallback"` to skip the managed adapter
    * entirely.
    */
-  readonly override?: Bg3AiProviderSelection;
+  readonly override?: AiProviderSelection;
   /**
    * Explicit managed-adapter configuration. When unset, the
    * factory attempts to construct the managed adapter from
@@ -71,7 +71,7 @@ export interface BuiltAiAdapters {
    */
   readonly managed: ImpalaAiAdapter | null;
   readonly deterministic: DeterministicAiAdapter;
-  readonly selection: Bg3AiProviderSelection;
+  readonly selection: AiProviderSelection;
 }
 
 /**
@@ -97,7 +97,7 @@ export function buildAiAdapters(options: AiAdapterFactoryOptions = {}): BuiltAiA
   const deterministic = new DeterministicAiAdapter();
 
   if (options.override === "deterministic-fallback") {
-    log("[bg3] Deterministic fallback selected via override.");
+    log("[matchmaker] Deterministic fallback selected via override.");
     return {
       active: deterministic,
       managed: null,
@@ -109,9 +109,11 @@ export function buildAiAdapters(options: AiAdapterFactoryOptions = {}): BuiltAiA
   const managedConfig = options.managedConfig;
   if (managedConfig && managedConfig.apiKey.trim().length > 0) {
     const managed = new ImpalaAiAdapter(managedConfig, options.transport);
-    log("[bg3] Managed AI adapter is configured; using managed adapter.");
+    log("[matchmaker] Managed AI adapter is configured; using managed adapter.");
     if (options.override === "managed") {
-      log("[bg3] Managed AI adapter selected via override; managed provider is authoritative.");
+      log(
+        "[matchmaker] Managed AI adapter selected via override; managed provider is authoritative.",
+      );
       return { active: managed, managed, deterministic, selection: "managed" };
     }
     return { active: managed, managed, deterministic, selection: "managed" };
@@ -122,7 +124,7 @@ export function buildAiAdapters(options: AiAdapterFactoryOptions = {}): BuiltAiA
   }
 
   log(
-    "[bg3] Managed AI adapter is not configured; using deterministic fallback " +
+    "[matchmaker] Managed AI adapter is not configured; using deterministic fallback " +
       "(the approved BG3 buildathon path).",
   );
   return {

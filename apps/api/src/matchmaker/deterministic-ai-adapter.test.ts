@@ -3,7 +3,7 @@
 //
 // Background: the BG3 ticket requires that the deterministic
 // fallback produces a candidate criteria payload that ALWAYS
-// validates against `bg3MatchmakerCriteriaV1Schema`. The tests
+// validates against `matchmakerCriteriaV1Schema`. The tests
 // cover every documented GS 14 invariant: required constraints
 // are never silently relaxed, the fallback respects the buyer's
 // expressed hard axes, and identical inputs produce identical
@@ -11,7 +11,7 @@
 
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { bg3MatchmakerCriteriaV1Schema } from "@soundhub/types";
+import { matchmakerCriteriaV1Schema } from "@soundhub/types";
 import { DeterministicAiAdapter } from "./deterministic-ai-adapter.js";
 
 const adapter = new DeterministicAiAdapter();
@@ -21,7 +21,7 @@ async function interpret(briefText: string) {
     actingWorkspaceId: "ws-buyer-1",
     briefText,
   });
-  return bg3MatchmakerCriteriaV1Schema.parse(out.candidate);
+  return matchmakerCriteriaV1Schema.parse(out.candidate);
 }
 
 test("deterministic fallback recognises a remote dancehall brief", async () => {
@@ -122,7 +122,7 @@ test("deterministic fallback always produces a candidate that passes the M1+BG3 
       briefText: text,
     });
     assert.doesNotThrow(() => {
-      bg3MatchmakerCriteriaV1Schema.parse(out.candidate);
+      matchmakerCriteriaV1Schema.parse(out.candidate);
     }, `candidate for "${text}" must validate`);
   }
 });

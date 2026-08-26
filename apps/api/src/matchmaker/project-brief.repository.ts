@@ -13,7 +13,7 @@
 // against the M1 search schema on every read). The route NEVER
 // imports a Prisma model.
 
-import type { Bg3MatchmakerCriteriaV1, TalentSearchResponseV1 } from "@soundhub/types";
+import type { MatchmakerCriteriaV1, TalentSearchResponseV1 } from "@soundhub/types";
 
 export interface PersistedSearchResult {
   readonly resultPosition: number;
@@ -44,7 +44,7 @@ export interface PersistedBrief {
   readonly buyerWorkspaceId: string;
   readonly createdByUserId: string;
   readonly briefText: string;
-  readonly criteria: Bg3MatchmakerCriteriaV1;
+  readonly criteria: MatchmakerCriteriaV1;
   readonly aiProvider: string;
   readonly aiModelId: string | null;
   readonly aiFallbackUsed: boolean;
@@ -61,7 +61,7 @@ export interface CreateBriefInput {
   readonly buyerWorkspaceId: string;
   readonly createdByUserId: string;
   readonly briefText: string;
-  readonly criteria: Bg3MatchmakerCriteriaV1;
+  readonly criteria: MatchmakerCriteriaV1;
   readonly searchResponse: TalentSearchResponseV1;
   readonly aiProvider: string;
   readonly aiModelId: string | null;

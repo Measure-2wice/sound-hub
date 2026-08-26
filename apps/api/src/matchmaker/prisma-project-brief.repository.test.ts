@@ -12,8 +12,8 @@
 import assert from "node:assert/strict";
 import { after, before, describe, test } from "node:test";
 import { createPrismaClient } from "@soundhub/db";
-import type { Bg3MatchmakerCriteriaV1, TalentSearchResponseV1 } from "@soundhub/types";
-import { bg3MatchmakerCriteriaV1Schema } from "@soundhub/types";
+import type { MatchmakerCriteriaV1, TalentSearchResponseV1 } from "@soundhub/types";
+import { matchmakerCriteriaV1Schema } from "@soundhub/types";
 import { PrismaProjectBriefRepository } from "./prisma-project-brief.repository.js";
 
 const TEST_DATABASE_URL = process.env.TEST_DATABASE_URL;
@@ -35,7 +35,7 @@ describe("PrismaProjectBriefRepository", () => {
 
   // Criteria shape with the query axis present so a focused test can
   // assert the round-trip preserves it.
-  const queryOnlyCriteria: Bg3MatchmakerCriteriaV1 = {
+  const queryOnlyCriteria: MatchmakerCriteriaV1 = {
     required: { primaryCategoryKeys: ["music-production"] },
     query: "dancehall",
   };
@@ -57,7 +57,7 @@ describe("PrismaProjectBriefRepository", () => {
     });
     assert.ok(workspace, "BG1 demo buyer Workspace must be seeded");
 
-    const criteria: Bg3MatchmakerCriteriaV1 = {
+    const criteria: MatchmakerCriteriaV1 = {
       required: { primaryCategoryKeys: ["music-production"] },
       preferred: { genreTags: ["dancehall"] },
     };
@@ -171,7 +171,7 @@ describe("PrismaProjectBriefRepository", () => {
     // runtime schema; the repository's toPersistedBrief re-validates
     // it as a single unit, so a tampered query column would throw
     // before the route layer ever saw it.
-    bg3MatchmakerCriteriaV1Schema.parse(roundTrip.criteria);
+    matchmakerCriteriaV1Schema.parse(roundTrip.criteria);
 
     await prisma.projectBrief.delete({ where: { id: created.id } });
   });

@@ -1,7 +1,7 @@
 // Matchmaker route tests.
 //
 // Background: BG3 requires the route to:
-//   - Validate the request body through bg3SubmitBriefRequestV1Schema.
+//   - Validate the request body through submitBriefRequestV1Schema.
 //   - Reject unauthenticated requests with SESSION_INVALID.
 //   - Reject non-Buyer actors with BRIEF_FORBIDDEN.
 //   - Forward the request to the MatchmakerService.
@@ -17,14 +17,14 @@ import assert from "node:assert/strict";
 import { before, describe, test } from "node:test";
 import express from "express";
 import request from "supertest";
-import { bg3GetBriefResponseV1Schema, bg3SubmitBriefResponseV1Schema } from "@soundhub/types";
+import { briefResponseV1Schema, submitBriefResponseV1Schema } from "@soundhub/types";
 import { createMatchmakerRouter } from "./matchmaker.js";
 import { MatchmakerError, type MatchmakerService } from "../services/matchmaker.service.js";
 import { AuthorizationError } from "../services/workspace-authorization.service.js";
 import type {
-  Bg3PublicProjectBriefV1,
-  Bg3RecommendationV1,
-  Bg3SubmitBriefResponseV1,
+  ProjectBriefPublicV1,
+  MatchmakerRecommendationV1,
+  SubmitBriefResponseV1,
 } from "@soundhub/types";
 import type { AuthenticationService } from "../services/authentication.service.js";
 import type { Express } from "express";
@@ -60,7 +60,7 @@ class FakeMatchmakerService {
   // unusable.
   static INVALID_REQUEST = false;
 
-  async submitBrief(input: unknown): Promise<Bg3SubmitBriefResponseV1> {
+  async submitBrief(input: unknown): Promise<SubmitBriefResponseV1> {
     if (FakeMatchmakerService.INVALID_REQUEST) {
       throw new MatchmakerError(
         "ProjectBrief cannot be interpreted into valid search criteria.",
@@ -79,7 +79,7 @@ class FakeMatchmakerService {
       // 500 MATCHMAKER_FAILED).
       throw new AuthorizationError("not a member", "NOT_A_MEMBER");
     }
-    const brief: Bg3PublicProjectBriefV1 = {
+    const brief: ProjectBriefPublicV1 = {
       briefId: "brief-test-1",
       actingWorkspaceId: BUYER_WORKSPACE_ID,
       createdByUserId: BUYER_USER_ID,
@@ -97,7 +97,7 @@ class FakeMatchmakerService {
         name: "BG1 Demo Buyer",
       },
     };
-    const recommendations: Bg3RecommendationV1[] = [];
+    const recommendations: MatchmakerRecommendationV1[] = [];
     return {
       ok: true,
       brief,
@@ -202,7 +202,7 @@ describe("Matchmaker route contract", () => {
       briefText: "Need a Brooklyn producer for a remote Haitian dancehall single.",
     });
     assert.equal(response.status, 200);
-    const parsed = bg3SubmitBriefResponseV1Schema.safeParse(response.body);
+    const parsed = submitBriefResponseV1Schema.safeParse(response.body);
     assert.equal(parsed.success, true);
     assert.ok(mm.submitCalls.length >= 1);
   });
@@ -219,7 +219,7 @@ describe("Matchmaker route contract", () => {
   test("GET /api/matchmaker/brief/:briefId returns the brief when authorised", async () => {
     const response = await request(app).get("/api/matchmaker/brief/brief-test-1");
     assert.equal(response.status, 200);
-    const parsed = bg3GetBriefResponseV1Schema.safeParse(response.body);
+    const parsed = briefResponseV1Schema.safeParse(response.body);
     assert.equal(parsed.success, true);
     assert.ok(mm.getCalls.length >= 1);
   });

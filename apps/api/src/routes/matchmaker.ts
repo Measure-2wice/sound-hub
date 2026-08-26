@@ -29,9 +29,9 @@
 
 import { Router, type NextFunction, type Request, type Response } from "express";
 import {
-  bg3GetBriefResponseV1Schema,
-  bg3SubmitBriefRequestV1Schema,
-  bg3SubmitBriefResponseV1Schema,
+  briefResponseV1Schema,
+  submitBriefRequestV1Schema,
+  submitBriefResponseV1Schema,
   type ApiErrorCodeV1,
 } from "@soundhub/types";
 import { ZodError } from "zod";
@@ -115,7 +115,7 @@ async function handleSubmitBrief(
 
   let parsed;
   try {
-    parsed = bg3SubmitBriefRequestV1Schema.parse(rawBody);
+    parsed = submitBriefRequestV1Schema.parse(rawBody);
   } catch (err) {
     if (err instanceof ZodError) {
       writeSafeError(
@@ -168,7 +168,7 @@ async function handleSubmitBrief(
     return;
   }
 
-  const validated = bg3SubmitBriefResponseV1Schema.safeParse({
+  const validated = submitBriefResponseV1Schema.safeParse({
     ok: true,
     brief: result.brief,
     recommendations: result.recommendations,
@@ -259,7 +259,7 @@ async function handleGetBrief(
     return;
   }
 
-  const validated = bg3GetBriefResponseV1Schema.safeParse({
+  const validated = briefResponseV1Schema.safeParse({
     brief: result.brief,
   });
   if (!validated.success) {

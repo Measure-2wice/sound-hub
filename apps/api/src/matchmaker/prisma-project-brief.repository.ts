@@ -14,10 +14,10 @@
 
 import type { PrismaClient } from "@soundhub/db";
 import {
-  bg3MatchmakerCriteriaV1Schema,
+  matchmakerCriteriaV1Schema,
   talentSearchPreferredCriteriaV1Schema,
   talentSearchRequiredCriteriaV1Schema,
-  type Bg3MatchmakerCriteriaV1,
+  type MatchmakerCriteriaV1,
 } from "@soundhub/types";
 import type {
   CreateBriefInput,
@@ -44,7 +44,7 @@ export class PrismaProjectBriefRepository implements ProjectBriefRepository {
           // location / mode) round-trips through the BG3 schema
           // without dropping the axis. Without this column the
           // toPersistedBrief reconstruction produces an object
-          // that fails bg3MatchmakerCriteriaV1Schema's usability
+          // that fails matchmakerCriteriaV1Schema's usability
           // superRefine and POST / GET /api/matchmaker/brief return
           // MATCHMAKER_FAILED for query-only briefs.
           criteriaQueryJson: input.criteria.query ?? undefined,
@@ -151,10 +151,10 @@ export class PrismaProjectBriefRepository implements ProjectBriefRepository {
       row.preferredCriteriaJson === null || row.preferredCriteriaJson === undefined
         ? undefined
         : talentSearchPreferredCriteriaV1Schema.parse(row.preferredCriteriaJson);
-    const criteria: Bg3MatchmakerCriteriaV1 = {
+    const criteria: MatchmakerCriteriaV1 = {
       required,
       // Restore the query axis so a query-only brief still validates
-      // against bg3MatchmakerCriteriaV1Schema. The persisted value is
+      // against matchmakerCriteriaV1Schema. The persisted value is
       // already normalised by the time it lands here (the schema was
       // applied at write time), but we still re-validate the
       // reconstructed criteria below to fail closed on drift.
@@ -169,7 +169,7 @@ export class PrismaProjectBriefRepository implements ProjectBriefRepository {
     // Re-validate the reconstructed criteria as a single unit so a
     // tampered or drifted row fails closed before the application
     // layer hands it to the route DTO mapper.
-    bg3MatchmakerCriteriaV1Schema.parse(criteria);
+    matchmakerCriteriaV1Schema.parse(criteria);
     const results: PersistedSearchResult[] = row.searchResults.map((r) => ({
       resultPosition: r.resultPosition,
       sellerId: r.sellerId,

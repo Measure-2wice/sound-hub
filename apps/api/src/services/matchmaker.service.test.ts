@@ -6,7 +6,7 @@
 // Background: BG3 requires the service to:
 //   - Authorize the buyer (current Buyer-capable membership).
 //   - Hand the brief to the AI boundary.
-//   - Validate AI output through bg3MatchmakerCriteriaV1Schema.
+//   - Validate AI output through matchmakerCriteriaV1Schema.
 //   - Fall back to the deterministic adapter on parse failure or
 //     AiUnavailableError.
 //   - Invoke the existing TalentSearchService (NO second search
@@ -23,8 +23,8 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
 import type {
-  Bg3AiInterpretInputV1,
-  Bg3AiInterpretOutputV1,
+  AiInterpretBriefInputV1,
+  AiInterpretBriefOutputV1,
   TalentSearchRequestV1,
   TalentSearchResponseV1,
 } from "@soundhub/types";
@@ -161,7 +161,7 @@ class FakeTalentSearchService {
 // A managed adapter that produces a malformed payload so the
 // service exercises its fallback path.
 class MalformedManagedAdapter implements AiAdapter {
-  async interpretBrief(_input: Bg3AiInterpretInputV1): Promise<Bg3AiInterpretOutputV1> {
+  async interpretBrief(_input: AiInterpretBriefInputV1): Promise<AiInterpretBriefOutputV1> {
     return {
       provider: "managed",
       modelId: "fake-model",
@@ -172,7 +172,7 @@ class MalformedManagedAdapter implements AiAdapter {
 
 // A managed adapter that throws AiUnavailableError.
 class UnavailableManagedAdapter implements AiAdapter {
-  async interpretBrief(_input: Bg3AiInterpretInputV1): Promise<Bg3AiInterpretOutputV1> {
+  async interpretBrief(_input: AiInterpretBriefInputV1): Promise<AiInterpretBriefOutputV1> {
     throw new AiUnavailableError("managed provider offline");
   }
 }
@@ -184,7 +184,7 @@ class UnavailableManagedAdapter implements AiAdapter {
 // MATCHMAKER_FAILED (HTTP 500) that the prior code path produced
 // when deterministic was the primary adapter.
 class InvalidOutputManagedAdapter implements AiAdapter {
-  async interpretBrief(_input: Bg3AiInterpretInputV1): Promise<Bg3AiInterpretOutputV1> {
+  async interpretBrief(_input: AiInterpretBriefInputV1): Promise<AiInterpretBriefOutputV1> {
     throw new AiInvalidOutputError("managed adapter produced invalid output");
   }
 }

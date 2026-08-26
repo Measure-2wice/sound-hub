@@ -758,7 +758,8 @@ export function deriveDeterministicSubject(email: string, sha256Hex: Sha256HexFn
 }
 
 // ===========================================================================
-// Buildathon Golden Slice 3 (BG3) shared runtime contracts.
+// Matchmaker shared runtime contracts (introduced by ticket #60
+// / BG3 of the Buildathon Golden Slice).
 //
 // These schemas cover the Matchmaker slice: natural-language
 // ProjectBrief submission, validated search criteria, evidence-
@@ -791,8 +792,8 @@ export function deriveDeterministicSubject(email: string, sha256Hex: Sha256HexFn
 // owns these keys; provider SDKs never read them. Adding a new
 // provider requires editing this enum and the adapter factory
 // together.
-export const bg3AiProviderV1Values = ["managed", "deterministic-fallback"] as const;
-export type Bg3AiProviderV1 = (typeof bg3AiProviderV1Values)[number];
+export const aiProviderV1Values = ["managed", "deterministic-fallback"] as const;
+export type AiProviderV1 = (typeof aiProviderV1Values)[number];
 
 // ---------- Brief submission ----------
 
@@ -841,7 +842,7 @@ export type ProjectBriefNonSearchRequirementsV1 = z.infer<
 // override. Required + preferred criteria are NOT supplied by the
 // buyer; they are produced by the AI boundary (or its deterministic
 // fallback) and persisted alongside the brief.
-export const bg3SubmitBriefRequestV1Schema = z
+export const submitBriefRequestV1Schema = z
   .object({
     actingWorkspaceId: z.string().min(1).max(128),
     briefText: projectBriefTextV1Schema,
@@ -850,7 +851,7 @@ export const bg3SubmitBriefRequestV1Schema = z
     nonSearchRequirements: projectBriefNonSearchRequirementsV1Schema,
   })
   .strict();
-export type Bg3SubmitBriefRequestV1 = z.infer<typeof bg3SubmitBriefRequestV1Schema>;
+export type SubmitBriefRequestV1 = z.infer<typeof submitBriefRequestV1Schema>;
 
 // ---------- Matchmaker criteria (AI output, validated) ----------
 
@@ -877,7 +878,7 @@ function hasHardRequiredAxis(value: TalentSearchRequiredCriteriaV1): boolean {
   return false;
 }
 
-export const bg3MatchmakerCriteriaV1Schema = z
+export const matchmakerCriteriaV1Schema = z
   .object({
     query: normalizedQuerySchema.optional(),
     required: talentSearchRequiredCriteriaV1Schema,
@@ -919,7 +920,7 @@ export const bg3MatchmakerCriteriaV1Schema = z
       });
     }
   });
-export type Bg3MatchmakerCriteriaV1 = z.infer<typeof bg3MatchmakerCriteriaV1Schema>;
+export type MatchmakerCriteriaV1 = z.infer<typeof matchmakerCriteriaV1Schema>;
 
 // ---------- Explanation payload (evidence-grounded, never AI-invented) ----------
 
@@ -930,7 +931,7 @@ export type Bg3MatchmakerCriteriaV1 = z.infer<typeof bg3MatchmakerCriteriaV1Sche
 // in the search result. The label is human-friendly wording
 // restricted to a small allow-list so the UI cannot render
 // arbitrary agent output.
-export const bg3ExplanationKindV1Values = [
+export const explanationKindV1Values = [
   "matched-offering-title",
   "matched-category-key",
   "matched-category-name",
@@ -943,11 +944,11 @@ export const bg3ExplanationKindV1Values = [
   "preferred-locality",
   "standalone-offering",
 ] as const;
-export type Bg3ExplanationKindV1 = (typeof bg3ExplanationKindV1Values)[number];
+export type ExplanationKindV1 = (typeof explanationKindV1Values)[number];
 
-export const bg3ExplanationEntryV1Schema = z
+export const explanationEntryV1Schema = z
   .object({
-    kind: z.enum(bg3ExplanationKindV1Values),
+    kind: z.enum(explanationKindV1Values),
     // The factual label derived from the validated search
     // result's matched fields (e.g. "matched offering title",
     // "preferred genre: Dancehall"). The schema restricts the
@@ -956,7 +957,7 @@ export const bg3ExplanationEntryV1Schema = z
     label: z.string().min(1).max(200),
   })
   .strict();
-export type Bg3ExplanationEntryV1 = z.infer<typeof bg3ExplanationEntryV1Schema>;
+export type ExplanationEntryV1 = z.infer<typeof explanationEntryV1Schema>;
 
 // ---------- Brief public DTO ----------
 
@@ -966,14 +967,14 @@ export type Bg3ExplanationEntryV1 = z.infer<typeof bg3ExplanationEntryV1Schema>;
 // leak malformed data into the UI. Provenance (`aiProvider`,
 // `aiModelId`, `aiFallbackUsed`) is exposed so the UI can disclose
 // which path produced the criteria.
-export const bg3PublicProjectBriefV1Schema = z
+export const projectBriefPublicV1Schema = z
   .object({
     briefId: z.string().min(1).max(128),
     actingWorkspaceId: z.string().min(1).max(128),
     createdByUserId: z.string().min(1).max(128),
     briefText: z.string().min(8).max(2000),
-    criteria: bg3MatchmakerCriteriaV1Schema,
-    aiProvider: z.enum(bg3AiProviderV1Values),
+    criteria: matchmakerCriteriaV1Schema,
+    aiProvider: z.enum(aiProviderV1Values),
     aiModelId: z.string().min(1).max(120).nullable(),
     aiFallbackUsed: z.boolean(),
     createdAt: z.string().datetime(),
@@ -989,7 +990,7 @@ export const bg3PublicProjectBriefV1Schema = z
       .strict(),
   })
   .strict();
-export type Bg3PublicProjectBriefV1 = z.infer<typeof bg3PublicProjectBriefV1Schema>;
+export type ProjectBriefPublicV1 = z.infer<typeof projectBriefPublicV1Schema>;
 
 // ---------- Recommendation DTO (search results grounded to the brief) ----------
 
@@ -999,7 +1000,7 @@ export type Bg3PublicProjectBriefV1 = z.infer<typeof bg3PublicProjectBriefV1Sche
 // direct search response; the only difference is the addition of
 // `explanations`, which is derived from the returned result (never
 // the AI provider).
-export const bg3RecommendationV1Schema = z
+export const matchmakerRecommendationV1Schema = z
   .object({
     sellerId: z.string().min(1),
     professionalName: z.string().min(1).max(200),
@@ -1014,7 +1015,7 @@ export const bg3RecommendationV1Schema = z
     // coverage + query token coverage. Each entry maps to a
     // structured allow-listed kind; AI-generated text never crosses
     // this boundary.
-    explanations: z.array(bg3ExplanationEntryV1Schema).max(20),
+    explanations: z.array(explanationEntryV1Schema).max(20),
     matchReason: z.string().min(1).max(500),
     preferenceCoverage: preferenceCoverageV1Schema.optional(),
     textCoverage: textCoverageV1Schema.optional(),
@@ -1026,7 +1027,7 @@ export const bg3RecommendationV1Schema = z
     additionalMatchingOfferings: z.array(publicOfferingSummaryV1Schema).max(2),
   })
   .strict();
-export type Bg3RecommendationV1 = z.infer<typeof bg3RecommendationV1Schema>;
+export type MatchmakerRecommendationV1 = z.infer<typeof matchmakerRecommendationV1Schema>;
 
 // ---------- Matchmaker response ----------
 
@@ -1036,11 +1037,11 @@ export type Bg3RecommendationV1 = z.infer<typeof bg3RecommendationV1Schema>;
 // a follow-up fetch (per the brief+results UI). `totalResults`
 // mirrors the M1 search metadata field so the UI can render a
 // stable count without depending on the v1 metadata envelope shape.
-export const bg3SubmitBriefResponseV1Schema = z
+export const submitBriefResponseV1Schema = z
   .object({
     ok: z.literal(true),
-    brief: bg3PublicProjectBriefV1Schema,
-    recommendations: z.array(bg3RecommendationV1Schema).max(10),
+    brief: projectBriefPublicV1Schema,
+    recommendations: z.array(matchmakerRecommendationV1Schema).max(10),
     totalResults: z.number().int().nonnegative(),
     strategy: talentSearchStrategyV1Schema,
     // Surfaced when the AI provider failed and the deterministic
@@ -1050,16 +1051,16 @@ export const bg3SubmitBriefResponseV1Schema = z
     fallbackNotice: z.string().min(1).max(500).optional(),
   })
   .strict();
-export type Bg3SubmitBriefResponseV1 = z.infer<typeof bg3SubmitBriefResponseV1Schema>;
+export type SubmitBriefResponseV1 = z.infer<typeof submitBriefResponseV1Schema>;
 
 // ---------- Brief fetch response (no recommendations) ----------
 
-export const bg3GetBriefResponseV1Schema = z
+export const briefResponseV1Schema = z
   .object({
-    brief: bg3PublicProjectBriefV1Schema,
+    brief: projectBriefPublicV1Schema,
   })
   .strict();
-export type Bg3GetBriefResponseV1 = z.infer<typeof bg3GetBriefResponseV1Schema>;
+export type BriefResponseV1 = z.infer<typeof briefResponseV1Schema>;
 
 // ---------- AI adapter contract ----------
 
@@ -1068,27 +1069,27 @@ export type Bg3GetBriefResponseV1 = z.infer<typeof bg3GetBriefResponseV1Schema>;
 // about whose brief it is interpreting; the AI never receives raw
 // Prisma models, provider subjects, session tokens, or storage
 // keys.
-export const bg3AiInterpretInputV1Schema = z
+export const aiInterpretBriefInputV1Schema = z
   .object({
     actingWorkspaceId: z.string().min(1).max(128),
     briefText: z.string().min(8).max(2000),
     buyerNonSearchRequirements: projectBriefNonSearchRequirementsV1Schema,
   })
   .strict();
-export type Bg3AiInterpretInputV1 = z.infer<typeof bg3AiInterpretInputV1Schema>;
+export type AiInterpretBriefInputV1 = z.infer<typeof aiInterpretBriefInputV1Schema>;
 
 // Provider-neutral output the AI adapter returns. The structure is
 // the candidate criteria payload (NOT yet validated) plus
 // provenance metadata the application persists alongside the brief.
 // The application is the only layer that validates the payload
-// against `bg3MatchmakerCriteriaV1Schema`; AI output NEVER crosses
+// against `matchmakerCriteriaV1Schema`; AI output NEVER crosses
 // the validation boundary untyped.
-export const bg3AiInterpretOutputV1Schema = z
+export const aiInterpretBriefOutputV1Schema = z
   .object({
-    provider: z.enum(bg3AiProviderV1Values),
+    provider: z.enum(aiProviderV1Values),
     modelId: z.string().min(1).max(120).nullable(),
     // The unvalidated candidate payload. The application parses it
-    // through `bg3MatchmakerCriteriaV1Schema` and rejects any
+    // through `matchmakerCriteriaV1Schema` and rejects any
     // adapter that returns malformed JSON. The schema here is a
     // permissive record because the goal is to catch anything
     // obviously wrong (top-level type) without re-implementing the
@@ -1096,4 +1097,4 @@ export const bg3AiInterpretOutputV1Schema = z
     candidate: z.record(z.string(), z.unknown()),
   })
   .strict();
-export type Bg3AiInterpretOutputV1 = z.infer<typeof bg3AiInterpretOutputV1Schema>;
+export type AiInterpretBriefOutputV1 = z.infer<typeof aiInterpretBriefOutputV1Schema>;

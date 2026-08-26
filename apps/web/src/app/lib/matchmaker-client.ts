@@ -7,12 +7,8 @@
 // from `@soundhub/types` so the browser cannot drift from the
 // contract.
 
-import type {
-  Bg3SubmitBriefRequestV1,
-  Bg3SubmitBriefResponseV1,
-  Bg3GetBriefResponseV1,
-} from "@soundhub/types";
-import { bg3GetBriefResponseV1Schema, bg3SubmitBriefResponseV1Schema } from "@soundhub/types";
+import type { SubmitBriefRequestV1, SubmitBriefResponseV1, BriefResponseV1 } from "@soundhub/types";
+import { briefResponseV1Schema, submitBriefResponseV1Schema } from "@soundhub/types";
 
 export interface MatchmakerClientError {
   readonly status: number;
@@ -52,9 +48,7 @@ function ensureError(value: unknown, fallback: MatchmakerClientError): Error {
   return err;
 }
 
-export async function submitBrief(
-  input: Bg3SubmitBriefRequestV1,
-): Promise<Bg3SubmitBriefResponseV1> {
+export async function submitBrief(input: SubmitBriefRequestV1): Promise<SubmitBriefResponseV1> {
   const response = await fetch("/api/matchmaker/brief", {
     method: "POST",
     headers: { "Content-Type": "application/json" },
@@ -65,10 +59,10 @@ export async function submitBrief(
     throw ensureError(null, await parseErrorResponse(response));
   }
   const raw: unknown = await response.json();
-  return bg3SubmitBriefResponseV1Schema.parse(raw);
+  return submitBriefResponseV1Schema.parse(raw);
 }
 
-export async function fetchBrief(briefId: string): Promise<Bg3GetBriefResponseV1> {
+export async function fetchBrief(briefId: string): Promise<BriefResponseV1> {
   const response = await fetch(`/api/matchmaker/brief/${encodeURIComponent(briefId)}`, {
     method: "GET",
     credentials: "include",
@@ -78,5 +72,5 @@ export async function fetchBrief(briefId: string): Promise<Bg3GetBriefResponseV1
     throw ensureError(null, await parseErrorResponse(response));
   }
   const raw: unknown = await response.json();
-  return bg3GetBriefResponseV1Schema.parse(raw);
+  return briefResponseV1Schema.parse(raw);
 }
