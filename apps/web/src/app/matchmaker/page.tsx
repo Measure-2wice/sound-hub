@@ -25,7 +25,7 @@ import type {
   Bg3SubmitBriefResponseV1,
 } from "@soundhub/types";
 import { useSession } from "../components/SessionProvider";
-import { submitBrief } from "../lib/matchmaker-client";
+import { submitBriefFromForm } from "./submit-brief-from-form";
 import { Card } from "../components/ui/Card";
 
 const DEFAULT_BRIEF =
@@ -71,30 +71,19 @@ export default function MatchmakerPage() {
 
   const buyerWorkspaces = user.workspaces.filter((w) => w.capabilities.includes("Buyer"));
 
+  // The page's onSubmit delegates to the extracted test seam so
+  // the focused UI test can exercise the runtime wiring
+  // (workspace + brief payload + response state + error
+  // rendering + submitting flag) with a controlled fetch.
   const handleSubmit = async (e: FormEvent) => {
     e.preventDefault();
-    setError(null);
-    setResponse(null);
-    if (!actingWorkspaceId) {
-      setError("Pick an acting Workspace before submitting a brief.");
-      return;
-    }
-    if (briefText.trim().length < 8) {
-      setError("Brief text must be at least 8 characters after trimming.");
-      return;
-    }
-    setSubmitting(true);
-    try {
-      const result = await submitBrief({
-        actingWorkspaceId,
-        briefText: briefText.trim(),
-      });
-      setResponse(result);
-    } catch (err) {
-      setError(err instanceof Error ? err.message : "Could not submit the brief.");
-    } finally {
-      setSubmitting(false);
-    }
+    await submitBriefFromForm({
+      actingWorkspaceId,
+      briefText,
+      setError,
+      setResponse,
+      setSubmitting,
+    });
   };
 
   return (
