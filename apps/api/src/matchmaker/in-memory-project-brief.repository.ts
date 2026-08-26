@@ -26,6 +26,7 @@ export class InMemoryProjectBriefRepository implements ProjectBriefRepository {
       bestOfferingId: result.bestMatchingOffering.offeringId,
       sellerSnapshotJson: result.seller,
       bestOfferingSnapshotJson: result.bestMatchingOffering,
+      additionalOfferingsJson: [...result.additionalMatchingOfferings],
       relevanceScore: result.relevanceScore,
       matchReason: result.matchReason,
       preferenceCoverageJson: result.preferenceCoverage ?? null,

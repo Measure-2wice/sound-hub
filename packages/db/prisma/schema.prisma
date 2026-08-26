@@ -368,6 +368,12 @@ model ProjectBrief {
   // TalentSearchRequiredCriteriaV1 schema. Required constraints may
   // never be silently relaxed by AI or fallback behaviour.
   requiredCriteriaJson Json
+  // Normalised buyer query (per normalizedQuerySchema). Persisted
+  // alongside the required/preferred axes so a brief whose criteria
+  // surface only a query (e.g. the deterministic fallback when the
+  // buyer named no recognised category / location / mode) round-
+  // trips through the schema without dropping the axis.
+  criteriaQueryJson Json?
   // Validated preferred criteria (may be absent when the buyer did
   // not express any preference signal).
   preferredCriteriaJson Json?
@@ -426,6 +432,13 @@ model BriefSearchResult {
   // The selected best-matching offering's id and snapshot.
   bestOfferingId           String
   bestOfferingSnapshotJson Json
+  // Up to two additional standalone matching offerings that
+  // surfaced alongside the best match. Persisted as a JSON array
+  // (empty when the seller only had one eligible offering) so the
+  // buyer can see the full eligibility evidence without a
+  // follow-up search and so the later ProjectRequest step can
+  // revalidate against the same context.
+  additionalOfferingsJson   Json
   relevanceScore           Float
   matchReason              String
   preferenceCoverageJson   Json?

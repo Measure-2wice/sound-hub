@@ -126,3 +126,19 @@ test("deterministic fallback always produces a candidate that passes the M1+BG3 
     }, `candidate for "${text}" must validate`);
   }
 });
+
+test("deterministic fallback refuses to emit an unvalidated criteria payload (punctuation-only brief)", async () => {
+  // Punctuation-only briefs have no recognised axis and produce a
+  // query value that normalizedQuerySchema rejects. The adapter
+  // self-validates before returning and surfaces AiInvalidOutputError
+  // so the application boundary maps it to MATCHMAKER_INVALID_REQUEST
+  // rather than handing the unvalidated payload to TalentSearchService.
+  let caught: unknown;
+  try {
+    await adapter.interpretBrief({ actingWorkspaceId: "ws-buyer-1", briefText: "---" });
+  } catch (err) {
+    caught = err;
+  }
+  assert.ok(caught instanceof Error);
+  assert.equal(caught.name, "AiInvalidOutputError");
+});

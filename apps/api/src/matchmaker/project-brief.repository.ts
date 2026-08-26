@@ -27,6 +27,10 @@ export interface PersistedSearchResult {
   // `null` here is documentation that the JSON value may be absent.
   readonly sellerSnapshotJson: unknown;
   readonly bestOfferingSnapshotJson: unknown;
+  // Up to two additional standalone matching offerings that
+  // surfaced alongside the best match. The empty array is a
+  // valid value when the seller only had one eligible offering.
+  readonly additionalOfferingsJson: readonly unknown[];
   readonly relevanceScore: number;
   readonly matchReason: string;
   // eslint-disable-next-line @typescript-eslint/no-redundant-type-constituents

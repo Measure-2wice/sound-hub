@@ -28,8 +28,9 @@
 // The adapter has no dependency on Prisma, on storage, or on the
 // authentication boundary. It can be unit-tested in isolation.
 
+import { bg3MatchmakerCriteriaV1Schema } from "@soundhub/types";
 import type { Bg3AiInterpretInputV1, Bg3AiInterpretOutputV1 } from "@soundhub/types";
-import type { AiAdapter } from "./ai-adapter.js";
+import { AiInvalidOutputError, type AiAdapter } from "./ai-adapter.js";
 
 // A curated allow-list of phrases the deterministic fallback maps to
 // the M1 `serviceModes` enum. Each value is a normalised lowercase
@@ -302,6 +303,22 @@ export class DeterministicAiAdapter implements AiAdapter {
       (preferred.caribbeanAffiliationCodes && preferred.caribbeanAffiliationCodes.length > 0);
     if (!hasHardAxis && !hasPreference) {
       candidate.query = input.briefText;
+    }
+
+    // Self-validate the candidate against the BG3 runtime schema
+    // before returning. The schema's usability superRefine requires
+    // at least one of query / required / preferred, and the query
+    // axis is subject to normalizedQuerySchema's letter/digit +
+    // length rules. A punctuation-only brief (e.g. "---") would
+    // fail validation here, so surface an AiInvalidOutputError
+    // and let the application boundary translate it into the safe
+    // MATCHMAKER_INVALID_REQUEST envelope. The deterministic
+    // adapter never returns an unvalidated payload.
+    const result = bg3MatchmakerCriteriaV1Schema.safeParse(candidate);
+    if (!result.success) {
+      throw new AiInvalidOutputError(
+        "Deterministic fallback produced an invalid criteria payload.",
+      );
     }
 
     return Promise.resolve({

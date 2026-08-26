@@ -20,6 +20,7 @@ import request from "supertest";
 import { bg3GetBriefResponseV1Schema, bg3SubmitBriefResponseV1Schema } from "@soundhub/types";
 import { createMatchmakerRouter } from "./matchmaker.js";
 import { MatchmakerError, type MatchmakerService } from "../services/matchmaker.service.js";
+import { AuthorizationError } from "../services/workspace-authorization.service.js";
 import type {
   Bg3PublicProjectBriefV1,
   Bg3RecommendationV1,
@@ -60,7 +61,10 @@ class FakeMatchmakerService {
       "actingWorkspaceId" in input &&
       (input as { actingWorkspaceId: string }).actingWorkspaceId === NON_BUYER_WORKSPACE_ID
     ) {
-      throw new MatchmakerError("not a member", "BRIEF_FORBIDDEN");
+      // The real service throws AuthorizationError; the route must
+      // map it to a 403 BRIEF_FORBIDDEN envelope (not a generic
+      // 500 MATCHMAKER_FAILED).
+      throw new AuthorizationError("not a member", "NOT_A_MEMBER");
     }
     const brief: Bg3PublicProjectBriefV1 = {
       briefId: "brief-test-1",
@@ -99,6 +103,14 @@ class FakeMatchmakerService {
       (input as { briefId: string }).briefId === "brief-missing"
     ) {
       throw new MatchmakerError("Brief not found", "BRIEF_NOT_FOUND");
+    }
+    if (
+      typeof input === "object" &&
+      input !== null &&
+      "briefId" in input &&
+      (input as { briefId: string }).briefId === "brief-forbidden"
+    ) {
+      throw new AuthorizationError("missing capability", "MISSING_CAPABILITY");
     }
     return {
       brief: {
@@ -203,5 +215,11 @@ describe("Matchmaker route contract", () => {
     const response = await request(app).get("/api/matchmaker/brief/brief-missing");
     assert.equal(response.status, 404);
     assert.equal((response.body as { error: { code: string } }).error.code, "BRIEF_NOT_FOUND");
+  });
+
+  test("GET /api/matchmaker/brief/:briefId maps AuthorizationError to 403", async () => {
+    const response = await request(app).get("/api/matchmaker/brief/brief-forbidden");
+    assert.equal(response.status, 403);
+    assert.equal((response.body as { error: { code: string } }).error.code, "BRIEF_FORBIDDEN");
   });
 });

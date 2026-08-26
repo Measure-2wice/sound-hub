@@ -120,10 +120,20 @@ class FakeTalentSearchService {
       serviceMode: "Remote",
       serviceAreas: [{ city: "Brooklyn", region: "NY", countryCode: "US" }],
     };
+    const additionalOffering: PublicOfferingSummaryV1 = {
+      offeringId: "of-marc-mixing",
+      title: "Dancehall mixing — remote",
+      description: "Mixdown for a single.",
+      primaryCategory: { key: "mixing", name: "Mixing" },
+      includedServices: [],
+      genreTags: ["Dancehall"],
+      serviceMode: "Remote",
+      serviceAreas: [{ city: "Brooklyn", region: "NY", countryCode: "US" }],
+    };
     const result: TalentSearchResultV1 = {
       seller,
       bestMatchingOffering: offering,
-      additionalMatchingOfferings: [],
+      additionalMatchingOfferings: [additionalOffering],
       relevanceScore: 0.9,
       matchReason:
         "matched offering title; preferred genre: Dancehall; preferred Caribbean affiliation: HT",
@@ -353,4 +363,22 @@ test("MatchmakerService preserves required constraints end-to-end (GS 14)", asyn
   assert.ok(required.serviceModes?.includes("Remote"));
   assert.ok(required.primaryCategoryKeys?.some((k) => k === "music-production"));
   assert.equal(required.basedIn?.countryCode, "US");
+});
+
+test("MatchmakerService surfaces additional matching offerings end-to-end", async () => {
+  const { service } = buildService({});
+  const result = await service.submitBrief({
+    userAccountId: BUYER_USER_ID,
+    actingWorkspaceId: BUYER_WORKSPACE_ID,
+    briefText: "I need a remote dancehall producer in Brooklyn.",
+  });
+  // The recommendation carries the additional matching offering
+  // the search service returned alongside the best match. The
+  // repository persists the array and buildRecommendation
+  // validates each entry against publicOfferingSummaryV1Schema.
+  assert.equal(result.recommendations.length, 1);
+  const rec = result.recommendations[0]!;
+  assert.equal(rec.bestMatchingOfferingId, "of-marc-dancehall");
+  assert.equal(rec.additionalMatchingOfferings.length, 1);
+  assert.equal(rec.additionalMatchingOfferings[0]?.offeringId, "of-marc-mixing");
 });

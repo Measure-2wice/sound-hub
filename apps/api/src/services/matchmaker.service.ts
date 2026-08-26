@@ -36,7 +36,7 @@ import type {
   TalentSearchRequestV1,
   TalentSearchResponseV1,
 } from "@soundhub/types";
-import { bg3MatchmakerCriteriaV1Schema } from "@soundhub/types";
+import { bg3MatchmakerCriteriaV1Schema, publicOfferingSummaryV1Schema } from "@soundhub/types";
 import type { AiAdapter, AiUnavailableError } from "../matchmaker/ai-adapter.js";
 import { DeterministicAiAdapter } from "../matchmaker/deterministic-ai-adapter.js";
 import type {
@@ -184,6 +184,11 @@ export class MatchmakerService {
         try {
           const fallbackOutput = await this.fallbackAi.interpretBrief(aiInput);
           criteria = bg3MatchmakerCriteriaV1Schema.parse(fallbackOutput.candidate);
+          // Reassign aiOutput so the provenance trail below
+          // records the fallback adapter's provider + model rather
+          // than the primary adapter's (which would otherwise be
+          // persisted alongside `aiFallbackUsed: true`).
+          aiOutput = fallbackOutput;
           usedFallback = true;
         } catch {
           throw new MatchmakerError(
@@ -353,7 +358,16 @@ export function buildRecommendation(
 ): Bg3RecommendationV1 {
   const seller = result.sellerSnapshotJson as PublicSellerSummaryV1;
   const best = result.bestOfferingSnapshotJson as PublicOfferingSummaryV1;
+  // Restore up to two additional standalone matching offerings
+  // from the persisted snapshot. The repository stores them as
+  // JSON so the application layer validates the shape against
+  // publicOfferingSummaryV1Schema on read — drift fails closed
+  // (the route handler surfaces a safe envelope rather than a
+  // half-built DTO).
   const additional: PublicOfferingSummaryV1[] = [];
+  for (const entry of result.additionalOfferingsJson) {
+    additional.push(publicOfferingSummaryV1Schema.parse(entry));
+  }
   const explanations = collectExplanations(criteria, best, result.matchReason);
 
   return {

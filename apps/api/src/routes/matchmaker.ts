@@ -44,6 +44,7 @@ import {
 } from "../lib/errors.js";
 import { SESSION_COOKIE } from "../lib/session-cookie.js";
 import type { AuthenticationService } from "../services/authentication.service.js";
+import { AuthorizationError } from "../services/workspace-authorization.service.js";
 import { MatchmakerError, type MatchmakerService } from "../services/matchmaker.service.js";
 
 export interface MatchmakerRouteDeps {
@@ -144,6 +145,16 @@ async function handleSubmitBrief(
       writeMatchmakerError(res, err, requestId);
       return;
     }
+    if (err instanceof AuthorizationError) {
+      // Map the authorization rejection to the documented 403 envelope
+      // (routes/auth.ts:297 does the same). The application service
+      // throws AuthorizationError with NOT_A_MEMBER /
+      // MISSING_CAPABILITY / WORKSPACE_INELIGIBLE codes; we project
+      // them onto the BG3 BRIEF_FORBIDDEN code so the safe envelope
+      // carries a 403 status (see errors.ts mapStatus).
+      writeSafeError(res, buildSafeError("BRIEF_FORBIDDEN", err.message, undefined, requestId));
+      return;
+    }
     console.error(`[matchmaker] requestId=${requestId} unhandled:`, err);
     writeSafeError(
       res,
@@ -229,6 +240,10 @@ async function handleGetBrief(
   } catch (err) {
     if (err instanceof MatchmakerError) {
       writeMatchmakerError(res, err, requestId);
+      return;
+    }
+    if (err instanceof AuthorizationError) {
+      writeSafeError(res, buildSafeError("BRIEF_FORBIDDEN", err.message, undefined, requestId));
       return;
     }
     console.error(`[matchmaker] requestId=${requestId} unhandled:`, err);

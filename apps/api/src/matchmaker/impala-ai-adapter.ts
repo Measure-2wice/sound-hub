@@ -267,10 +267,11 @@ const SYSTEM_PROMPT = [
   "}",
   "",
   "Rules:",
+  "- Always emit a `required` object. It is mandatory in the SoundHub schema; never omit it.",
+  "- Populate `required` with the buyer's hard axes when the brief names them. If the buyer named no hard axis, emit `required` as `{}` and put the brief text in `query`.",
   "- Only include a field when the buyer's brief explicitly expressed that signal.",
   "- Do not invent sellers, prices, availability, verification, ratings, or sample rights.",
   "- Do not authorise, rank, or shortlist. Ranking is performed by SoundHub after you return.",
-  "- If the buyer expressed no hard axis at all, omit `required` and put the brief text in `query`.",
   "- Country codes are ISO 3166-1 alpha-2 uppercase. Caribbean affiliations are limited to the listed codes.",
 ].join("\n");
 

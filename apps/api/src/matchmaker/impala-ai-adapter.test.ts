@@ -164,6 +164,21 @@ test("ImpalaAiAdapter builds the documented gateway request", async () => {
       body.messages[0].content.includes("structured JSON"),
     "system prompt must instruct the model to return structured JSON",
   );
+  // The system prompt must NOT instruct the model to omit
+  // `required` for query-only briefs. bg3MatchmakerCriteriaV1Schema
+  // declares `required` as a mandatory key, so a prompt that says
+  // "omit required when query applies" produces output that fails
+  // runtime validation. The mandatory-required invariant must be
+  // explicit in the prompt.
+  const systemPrompt = body.messages[0]?.content ?? "";
+  assert.ok(
+    systemPrompt.includes("Always emit a `required` object"),
+    "system prompt must instruct the model to always emit `required`",
+  );
+  assert.ok(
+    !systemPrompt.includes("omit `required`") && !systemPrompt.includes('omit "required"'),
+    "system prompt must not instruct the model to omit `required`",
+  );
   assert.equal(body.messages[1]?.role, "user");
   const userMessage = body.messages[1];
   assert.ok(userMessage);
