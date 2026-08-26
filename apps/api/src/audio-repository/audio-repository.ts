@@ -60,10 +60,11 @@ export interface AudioRepository {
   /**
    * Persist a new sample row inside a database transaction that
    * ALSO enforces the 3-sample cap at the persistence boundary
-   * (P1-004). Two concurrent uploads starting with two existing
-   * samples both observe a free slot via a non-transactional count;
-   * the transactional create with a `WHERE NOT EXISTS` guard
-   * makes one of them fail atomically.
+   * (P1-002). The repository acquires a per-offering advisory lock
+   * for the duration of the transaction so concurrent writers
+   * serialize; the count + display-order allocation + insert run
+   * atomically against that lock. The repository owns display-
+   * order allocation; callers do not pass it in.
    *
    * Returns `null` when the cap is hit (the row was NOT inserted).
    * Throws for other persistence failures.
@@ -73,7 +74,6 @@ export interface AudioRepository {
     readonly label: string;
     readonly contentType: "audio/mpeg";
     readonly byteSize: number;
-    readonly displayOrder: number;
     readonly storageRef: string;
   }): Promise<AudioSampleRecord | null>;
 
@@ -88,22 +88,25 @@ export interface AudioRepository {
   }): Promise<AudioSampleRecord | null>;
 
   /**
-   * Mark a sample as `Removed` and delete its row inside a single
-   * transaction. Idempotent: deleting an already-removed row is a
-   * no-op. The repository never throws for a missing row.
+   * Mark a sample as `PendingCleanup` and increment
+   * `cleanupAttempts`. Per P1-003 the row is preserved (NOT
+   * deleted) so the bounded retry can drive a follow-up provider
+   * delete + row sweep. Only Live rows are updated; a sample
+   * that is already PendingCleanup or Removed is left alone so
+   * concurrent retries converge.
    */
-  markRemovedAndDelete(input: {
+  markPendingCleanup(input: {
     readonly offeringId: string;
     readonly sampleId: string;
   }): Promise<void>;
 
   /**
-   * Mark a sample as `PendingCleanup` and increment
-   * `cleanupAttempts`. Idempotent: the row count is updated only
-   * when the sample is currently `Live`. The bounded retry path
-   * uses this when storage removal fails on the first attempt.
+   * Delete a row whose provider-side cleanup has been confirmed
+   * (success or already-absent). Called by the bounded retry
+   * sweep and the immediate removal command after the provider
+   * delete resolves.
    */
-  markPendingCleanup(input: {
+  finalizePendingCleanup(input: {
     readonly offeringId: string;
     readonly sampleId: string;
   }): Promise<void>;

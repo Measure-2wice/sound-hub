@@ -321,4 +321,83 @@ describe("SupabaseStorageAdapter", () => {
     await adapter.removeSample(ref);
     await adapter.removeSample(ref);
   });
+
+  test("P1-001: getPlaybackBytes resolves the signed URL against the /storage/v1 base", async () => {
+    // The sign endpoint returns a path-only signedURL like
+    // /object/sign/...; the subsequent GET must target the
+    // Storage API at `${SUPABASE_URL}/storage/v1/object/sign/...`,
+    // not the project root. Without this prefix managed playback
+    // fails even though upload succeeds.
+    const uploadBytes = new Uint8Array([
+      0x49, 0x44, 0x33, 0x04, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 1, 2, 3, 4,
+    ]);
+    const recordedCalls: FetchCall[] = [];
+    let capturedObjectPath = "";
+    const { fetchImpl } = makeFetchStub((call) => {
+      recordedCalls.push(call);
+      const uploadPrefix = `${SUPABASE_URL}/storage/v1/object/offering-audio/samples/of-1/`;
+      if (call.init.method === "POST" && call.url.startsWith(uploadPrefix)) {
+        capturedObjectPath = call.url.slice(uploadPrefix.length);
+        return new Response(null, { status: 200 });
+      }
+      const signUrl = `${SUPABASE_URL}/storage/v1/object/sign/offering-audio/samples/of-1/${capturedObjectPath}`;
+      if (call.init.method === "POST" && call.url === signUrl) {
+        return jsonResponse({
+          signedURL: `/object/sign/offering-audio/samples/of-1/${capturedObjectPath}?token=abc`,
+        });
+      }
+      // The subsequent GET against the resolved signed URL.
+      const resolvedSignedUrl = `${SUPABASE_URL}/storage/v1/object/sign/offering-audio/samples/of-1/${capturedObjectPath}?token=abc`;
+      if (call.init.method === "GET" && call.url === resolvedSignedUrl) {
+        return new Response(uploadBytes, { status: 200 });
+      }
+      return new Response(null, { status: 404 });
+    });
+    const adapter = new SupabaseStorageAdapter({
+      supabaseUrl: SUPABASE_URL,
+      supabaseServiceRoleKey: SUPABASE_KEY,
+      bucket: "offering-audio",
+      pathPrefix: "samples",
+      fetchImpl,
+    });
+    const ref = (
+      await adapter.uploadSample({
+        label: "S",
+        contentType: "audio/mpeg",
+        byteSize: uploadBytes.byteLength,
+        offeringId: "of-1",
+        bytes: uploadBytes,
+      })
+    ).storageRef;
+    // Simulate a fresh adapter — resolve the persisted ref.
+    const freshAdapter = new SupabaseStorageAdapter({
+      supabaseUrl: SUPABASE_URL,
+      supabaseServiceRoleKey: SUPABASE_KEY,
+      bucket: "offering-audio",
+      pathPrefix: "samples",
+      fetchImpl,
+    });
+    const bytes = await freshAdapter.getPlaybackBytes(ref);
+    assert.ok(bytes);
+    assert.equal(bytes.byteLength, uploadBytes.byteLength);
+    // The sign request must hit /storage/v1/object/sign/...
+    const signCall = recordedCalls.find((c) => c.url.includes("/storage/v1/object/sign/"));
+    assert.ok(signCall, "sign request targets the Storage API base");
+    // The subsequent GET must hit the /storage/v1-prefixed URL,
+    // NOT the project root.
+    const downloadCall = recordedCalls.find(
+      (c) =>
+        c.init.method === "GET" &&
+        !c.url.endsWith("/object/sign/offering-audio/samples/of-1/test.mp3"),
+    );
+    assert.ok(downloadCall);
+    assert.ok(
+      downloadCall.url.startsWith(`${SUPABASE_URL}/storage/v1/object/sign/`),
+      `GET must target the Storage API base, got ${downloadCall.url}`,
+    );
+    assert.ok(
+      !downloadCall.url.startsWith(`${SUPABASE_URL}/object/sign/`),
+      `GET must NOT target the project root, got ${downloadCall.url}`,
+    );
+  });
 });

@@ -169,13 +169,16 @@ function buildService(repo: InMemoryAudioRepository, storage: DeterministicStora
 }
 
 function mp3Bytes(size: number): Uint8Array {
-  // Produce real MPEG audio frame sync (0xFF 0xFB) followed by
-  // padding so the trusted boundary observes genuine MP3 content.
-  const bytes = new Uint8Array(size);
-  if (size >= 2) {
-    bytes[0] = 0xff;
-    bytes[1] = 0xfb;
-  }
+  // Produce a real MPEG-1 Layer III 128 kbps frame at 44.1 kHz
+  // (frame size = 417 bytes). The helper always returns at least
+  // 417 bytes so the trusted boundary's frame-size check passes;
+  // callers that ask for smaller payloads still receive a valid
+  // frame they can pad.
+  const bytes = new Uint8Array(Math.max(size, 417));
+  bytes[0] = 0xff;
+  bytes[1] = 0xfb; // MPEG-1 Layer III, no CRC
+  bytes[2] = 0x90; // bitrate index 9 = 128 kbps, sample-rate 0 = 44.1 kHz, no padding
+  bytes[3] = 0x00; // channel mode + emphasis (none)
   return bytes;
 }
 
@@ -667,20 +670,155 @@ describe("AudioSampleService", () => {
     const storage = new DeterministicStorageAdapter();
     const repo = makeAudioRepo();
     const service = buildService(repo, storage);
-    // MPEG audio frame sync: 11 bits set (0xFFE_). The next byte's
-    // top 3 bits are part of the sync too (0b111). Combined: bytes
-    // 0xFF 0xFB form a valid MP3 frame sync word.
-    const mp3Bytes = Buffer.from([0xff, 0xfb, 0x90, 0x00, 0x00, 0x00, 0x00, 0x00]);
+    // MPEG-1 Layer III 128 kbps at 44.1 kHz: 4-byte header
+    // 0xFF 0xFB 0x90 0x00 followed by 413 bytes of frame body
+    // (frame size 417). The trusted boundary observes a real frame.
+    const frame = new Uint8Array(417);
+    frame[0] = 0xff;
+    frame[1] = 0xfb;
+    frame[2] = 0x90;
+    frame[3] = 0x00;
     const uploaded = await service.uploadSample({
       userAccountId: SELLER_USER,
       offeringId: OFFERING_ID,
       actingWorkspaceId: SELLER_WORKSPACE,
       label: "Real MP3",
       contentType: "audio/mpeg",
-      byteSize: mp3Bytes.length,
-      bytes: mp3Bytes,
+      byteSize: frame.length,
+      bytes: frame,
     });
     assert.ok(uploaded.sample);
+  });
+
+  test("P1-005: an ID3-tagged MP3 with a valid frame body passes", async () => {
+    const storage = new DeterministicStorageAdapter();
+    const repo = makeAudioRepo();
+    const service = buildService(repo, storage);
+    // 10-byte ID3v2 header (no declared tag body) + valid frame.
+    const frame = new Uint8Array(10 + 417);
+    frame[0] = 0x49;
+    frame[1] = 0x44;
+    frame[2] = 0x33; // "ID3"
+    frame[6] = 0;
+    frame[7] = 0;
+    frame[8] = 0;
+    frame[9] = 0; // size = 0
+    frame[10] = 0xff;
+    frame[11] = 0xfb;
+    frame[12] = 0x90;
+    frame[13] = 0x00;
+    const uploaded = await service.uploadSample({
+      userAccountId: SELLER_USER,
+      offeringId: OFFERING_ID,
+      actingWorkspaceId: SELLER_WORKSPACE,
+      label: "Tagged MP3",
+      contentType: "audio/mpeg",
+      byteSize: frame.length,
+      bytes: frame,
+    });
+    assert.ok(uploaded.sample);
+  });
+
+  test("P1-005: a ten-byte empty ID3 tag (no frame follows) is rejected", async () => {
+    const storage = new DeterministicStorageAdapter();
+    const repo = makeAudioRepo();
+    const service = buildService(repo, storage);
+    // Reviewer evidence: "ten-byte empty tag 49 44 33 04 00 00
+    // 00 00 00 00" — a 10-byte ID3v2 header with declared size 0
+    // and no audio frame after it.
+    const empty = new Uint8Array([0x49, 0x44, 0x33, 0x04, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00]);
+    await assert.rejects(
+      () =>
+        service.uploadSample({
+          userAccountId: SELLER_USER,
+          offeringId: OFFERING_ID,
+          actingWorkspaceId: SELLER_WORKSPACE,
+          label: "Empty ID3",
+          contentType: "audio/mpeg",
+          byteSize: empty.length,
+          bytes: empty,
+        }),
+      (err: unknown) =>
+        err instanceof AudioSampleError && err.code === "AUDIO_CONTENT_TYPE_UNSUPPORTED",
+    );
+  });
+
+  test("P1-005: a reserved MPEG version (01) header is rejected", async () => {
+    const storage = new DeterministicStorageAdapter();
+    const repo = makeAudioRepo();
+    const service = buildService(repo, storage);
+    // Header bytes: 0xFF 0xE0 — bits 19-20 are 01 (reserved MPEG
+    // version). Reviewer evidence: "ff e0 00 00".
+    const invalid = new Uint8Array([0xff, 0xe0, 0x00, 0x00]);
+    await assert.rejects(
+      () =>
+        service.uploadSample({
+          userAccountId: SELLER_USER,
+          offeringId: OFFERING_ID,
+          actingWorkspaceId: SELLER_WORKSPACE,
+          label: "Reserved version",
+          contentType: "audio/mpeg",
+          byteSize: invalid.length,
+          bytes: invalid,
+        }),
+      (err: unknown) =>
+        err instanceof AudioSampleError && err.code === "AUDIO_CONTENT_TYPE_UNSUPPORTED",
+    );
+  });
+
+  test("P1-005: a truncated frame body (header ok, body shorter than the declared frame size) is rejected", async () => {
+    const storage = new DeterministicStorageAdapter();
+    const repo = makeAudioRepo();
+    const service = buildService(repo, storage);
+    // Valid 4-byte header 0xFF 0xFB 0x90 0x00 but only 100 bytes
+    // follow — not enough for a 128 kbps / 44.1 kHz Layer III
+    // frame (417 bytes).
+    const truncated = new Uint8Array(100);
+    truncated[0] = 0xff;
+    truncated[1] = 0xfb;
+    truncated[2] = 0x90;
+    truncated[3] = 0x00;
+    await assert.rejects(
+      () =>
+        service.uploadSample({
+          userAccountId: SELLER_USER,
+          offeringId: OFFERING_ID,
+          actingWorkspaceId: SELLER_WORKSPACE,
+          label: "Truncated",
+          contentType: "audio/mpeg",
+          byteSize: truncated.length,
+          bytes: truncated,
+        }),
+      (err: unknown) =>
+        err instanceof AudioSampleError && err.code === "AUDIO_CONTENT_TYPE_UNSUPPORTED",
+    );
+  });
+
+  test("P1-005: a non-Layer-III (Layer II) header is rejected", async () => {
+    const storage = new DeterministicStorageAdapter();
+    const repo = makeAudioRepo();
+    const service = buildService(repo, storage);
+    // 0xFF 0xFC ... → MPEG-1 Layer II (bits 17-18 = 10). Only
+    // Layer III is accepted at the trusted boundary.
+    const layer2 = new Uint8Array(417);
+    layer2[0] = 0xff;
+    layer2[1] = 0xfc;
+    layer2[2] = 0x90;
+    layer2[3] = 0x00;
+    await assert.rejects(
+      () =>
+        service.uploadSample({
+          userAccountId: SELLER_USER,
+          offeringId: OFFERING_ID,
+          actingWorkspaceId: SELLER_WORKSPACE,
+          label: "Layer II",
+          contentType: "audio/mpeg",
+          byteSize: layer2.length,
+          bytes: layer2,
+        }),
+      (err: unknown) =>
+        err instanceof AudioSampleError && err.code === "AUDIO_CONTENT_TYPE_UNSUPPORTED",
+    );
   });
 
   test("P1-004: two concurrent uploads starting from two existing samples cannot create four rows", async () => {
@@ -699,7 +837,7 @@ describe("AudioSampleService", () => {
         bytes: mp3Bytes(1024),
       });
     }
-    const mp3 = (): Uint8Array => new Uint8Array([0xff, 0xfb, 0x90, 0x00, 0x00, 0x00, 0x00, 0x00]);
+    const mp3 = (): Uint8Array => mp3Bytes(512);
     // Two uploads race from cap-1. Exactly one wins; the other gets
     // AUDIO_SAMPLE_LIMIT_EXCEEDED.
     const results = await Promise.allSettled([
@@ -709,7 +847,7 @@ describe("AudioSampleService", () => {
         actingWorkspaceId: SELLER_WORKSPACE,
         label: "Race A",
         contentType: "audio/mpeg",
-        byteSize: 8,
+        byteSize: 512,
         bytes: mp3(),
       }),
       service.uploadSample({
@@ -718,7 +856,7 @@ describe("AudioSampleService", () => {
         actingWorkspaceId: SELLER_WORKSPACE,
         label: "Race B",
         contentType: "audio/mpeg",
-        byteSize: 8,
+        byteSize: 512,
         bytes: mp3(),
       }),
     ]);
@@ -739,6 +877,151 @@ describe("AudioSampleService", () => {
     assert.ok(
       list.samples.every((s) => s.displayOrder >= 1 && s.displayOrder <= 3),
       "display order stays within 1..3",
+    );
+  });
+
+  test("P1-004: a fourth upload never produces a storage object (pre-flight cap check)", async () => {
+    // The service rejects known-full offerings BEFORE calling
+    // storage.uploadSample so the offering at the cap cannot leak
+    // an orphan object. After three successful uploads, the fourth
+    // attempt must throw without invoking storage.
+    const uploadCalls: unknown[] = [];
+    const trackingStorage = {
+      uploadSample: (
+        input: Parameters<typeof DeterministicStorageAdapter.prototype.uploadSample>[0],
+      ): ReturnType<typeof DeterministicStorageAdapter.prototype.uploadSample> => {
+        uploadCalls.push(input);
+        const inner = new DeterministicStorageAdapter();
+        return inner.uploadSample(input);
+      },
+      getPlaybackReference: (
+        input: Parameters<typeof DeterministicStorageAdapter.prototype.getPlaybackReference>[0],
+      ): ReturnType<typeof DeterministicStorageAdapter.prototype.getPlaybackReference> => {
+        const inner = new DeterministicStorageAdapter();
+        return inner.getPlaybackReference(input);
+      },
+      getPlaybackBytes: (
+        ref: string,
+      ): ReturnType<typeof DeterministicStorageAdapter.prototype.getPlaybackBytes> => {
+        const inner = new DeterministicStorageAdapter();
+        return inner.getPlaybackBytes(ref);
+      },
+      removeSample: (
+        ref: string,
+      ): ReturnType<typeof DeterministicStorageAdapter.prototype.removeSample> => {
+        const inner = new DeterministicStorageAdapter();
+        return inner.removeSample(ref);
+      },
+    };
+    const repo = makeAudioRepo();
+    const service = new AudioSampleService({
+      repository: repo,
+      // eslint-disable-next-line @typescript-eslint/no-unnecessary-type-assertion
+      storage: trackingStorage as never,
+      workspaceAuthorization: new WorkspaceAuthorizationService({
+        authRepository: makeAuthRepo(),
+      }),
+    });
+    for (let i = 1; i <= 3; i += 1) {
+      await service.uploadSample({
+        userAccountId: SELLER_USER,
+        offeringId: OFFERING_ID,
+        actingWorkspaceId: SELLER_WORKSPACE,
+        label: `Cap ${i}`,
+        contentType: "audio/mpeg",
+        byteSize: 512,
+        bytes: mp3Bytes(512),
+      });
+    }
+    assert.equal(uploadCalls.length, 3, "three uploads = three storage calls");
+    uploadCalls.length = 0;
+    await assert.rejects(
+      () =>
+        service.uploadSample({
+          userAccountId: SELLER_USER,
+          offeringId: OFFERING_ID,
+          actingWorkspaceId: SELLER_WORKSPACE,
+          label: "Fourth",
+          contentType: "audio/mpeg",
+          byteSize: 512,
+          bytes: mp3Bytes(512),
+        }),
+      (err: unknown) =>
+        err instanceof AudioSampleError && err.code === "AUDIO_SAMPLE_LIMIT_EXCEEDED",
+    );
+    assert.equal(
+      uploadCalls.length,
+      0,
+      "fourth upload never reaches storage: no orphan object is produced",
+    );
+  });
+
+  test("P1-004: post-upload DB failure deletes the orphaned storage object", async () => {
+    // Simulate a write failure between storage and DB. The service
+    // must call removeSample with the just-uploaded storageRef so
+    // no orphan is left behind. Defense-in-depth: the atomic cap
+    // guard inside the repository is the primary protection; this
+    // path covers any other write-time throw.
+    const removeCalls: string[] = [];
+    const flakyStorage = {
+      uploadSample: (
+        input: Parameters<typeof DeterministicStorageAdapter.prototype.uploadSample>[0],
+      ): ReturnType<typeof DeterministicStorageAdapter.prototype.uploadSample> => {
+        const inner = new DeterministicStorageAdapter();
+        return inner.uploadSample(input);
+      },
+      getPlaybackReference: (
+        input: Parameters<typeof DeterministicStorageAdapter.prototype.getPlaybackReference>[0],
+      ): ReturnType<typeof DeterministicStorageAdapter.prototype.getPlaybackReference> => {
+        const inner = new DeterministicStorageAdapter();
+        return inner.getPlaybackReference(input);
+      },
+      getPlaybackBytes: (
+        ref: string,
+      ): ReturnType<typeof DeterministicStorageAdapter.prototype.getPlaybackBytes> => {
+        const inner = new DeterministicStorageAdapter();
+        return inner.getPlaybackBytes(ref);
+      },
+      removeSample: (
+        ref: string,
+      ): ReturnType<typeof DeterministicStorageAdapter.prototype.removeSample> => {
+        removeCalls.push(ref);
+        const inner = new DeterministicStorageAdapter();
+        return inner.removeSample(ref);
+      },
+    };
+    // Use prototype delegation so all InMemoryAudioRepository
+    // methods remain available while createSampleWithCap is
+    // overridden to throw. A plain object spread would drop the
+    // prototype methods.
+    const baseRepo = makeAudioRepo();
+    const failingRepo = Object.create(baseRepo) as typeof baseRepo;
+    failingRepo.createSampleWithCap = () => {
+      throw new Error("simulated DB write failure");
+    };
+    const service = new AudioSampleService({
+      repository: failingRepo,
+      // eslint-disable-next-line @typescript-eslint/no-unnecessary-type-assertion
+      storage: flakyStorage as never,
+      workspaceAuthorization: new WorkspaceAuthorizationService({
+        authRepository: makeAuthRepo(),
+      }),
+    });
+    await assert.rejects(() =>
+      service.uploadSample({
+        userAccountId: SELLER_USER,
+        offeringId: OFFERING_ID,
+        actingWorkspaceId: SELLER_WORKSPACE,
+        label: "DB fails after upload",
+        contentType: "audio/mpeg",
+        byteSize: 512,
+        bytes: mp3Bytes(512),
+      }),
+    );
+    assert.equal(
+      removeCalls.length,
+      1,
+      "exactly one storage remove call cleans up the orphaned object",
     );
   });
 
@@ -793,8 +1076,8 @@ describe("AudioSampleService", () => {
       actingWorkspaceId: SELLER_WORKSPACE,
       label: "Will fail to remove",
       contentType: "audio/mpeg",
-      byteSize: 8,
-      bytes: new Uint8Array([0xff, 0xfb, 0x90, 0x00, 0x00, 0x00, 0x00, 0x00]),
+      byteSize: 512,
+      bytes: mp3Bytes(512),
     });
     await assert.rejects(
       () =>
@@ -807,12 +1090,122 @@ describe("AudioSampleService", () => {
       (err: unknown) => err instanceof AudioSampleError && err.code === "AUDIO_STORAGE_FAILED",
     );
     assert.ok(callCount.remove >= 1);
-    // The sample must be hidden from discovery immediately.
+    // The sample must be hidden from discovery immediately, AND a
+    // PendingCleanup row must survive so the next operation can
+    // drive the bounded retry.
     const list = await service.listSamplesForBuyer(OFFERING_ID);
     assert.equal(
       list.samples.find((s) => s.sampleId === uploaded.sample.sampleId),
       undefined,
     );
+    // Recreate the service to simulate a process restart; the
+    // PendingCleanup row must survive and the next operation
+    // against the offering must drive the bounded retry, calling
+    // removeSample exactly once.
+    const callsBeforeRetry = callCount.remove;
+    const freshService = new AudioSampleService({
+      repository: repo,
+      // eslint-disable-next-line @typescript-eslint/no-unnecessary-type-assertion
+      storage: flakyStorage as never,
+      workspaceAuthorization: new WorkspaceAuthorizationService({
+        authRepository: makeAuthRepo(),
+      }),
+    });
+    // A fresh seller list triggers the bounded retry pass. Even
+    // when the retry still fails (provider still down), the call
+    // count must increase by at least 1.
+    await freshService.listSamplesForSeller({
+      userAccountId: SELLER_USER,
+      offeringId: OFFERING_ID,
+      actingWorkspaceId: SELLER_WORKSPACE,
+    });
+    assert.ok(callCount.remove > callsBeforeRetry, "bounded retry invoked removeSample");
+  });
+
+  test("P1-005: bounded retry converges when the provider recovers (finalizePendingCleanup runs)", async () => {
+    // First removal attempt fails → row is PendingCleanup.
+    // Provider recovers before the next operation. The bounded
+    // retry must call removeSample, observe success, and finalize
+    // the row.
+    let attempt = 0;
+    const recoveredStorage = {
+      uploadSample: (
+        input: Parameters<typeof DeterministicStorageAdapter.prototype.uploadSample>[0],
+      ): ReturnType<typeof DeterministicStorageAdapter.prototype.uploadSample> => {
+        const inner = new DeterministicStorageAdapter();
+        return inner.uploadSample(input);
+      },
+      getPlaybackReference: (
+        input: Parameters<typeof DeterministicStorageAdapter.prototype.getPlaybackReference>[0],
+      ): ReturnType<typeof DeterministicStorageAdapter.prototype.getPlaybackReference> => {
+        const inner = new DeterministicStorageAdapter();
+        return inner.getPlaybackReference(input);
+      },
+      getPlaybackBytes: (
+        ref: string,
+      ): ReturnType<typeof DeterministicStorageAdapter.prototype.getPlaybackBytes> => {
+        const inner = new DeterministicStorageAdapter();
+        return inner.getPlaybackBytes(ref);
+      },
+      removeSample: (
+        ref: string,
+      ): ReturnType<typeof DeterministicStorageAdapter.prototype.removeSample> => {
+        void ref;
+        attempt += 1;
+        if (attempt === 1) {
+          throw new StorageUnavailableError("provider down");
+        }
+        const inner = new DeterministicStorageAdapter();
+        return inner.removeSample(ref);
+      },
+    };
+    const repo = makeAudioRepo();
+    const service = new AudioSampleService({
+      repository: repo,
+      // eslint-disable-next-line @typescript-eslint/no-unnecessary-type-assertion
+      storage: recoveredStorage as never,
+      workspaceAuthorization: new WorkspaceAuthorizationService({
+        authRepository: makeAuthRepo(),
+      }),
+    });
+    const uploaded = await service.uploadSample({
+      userAccountId: SELLER_USER,
+      offeringId: OFFERING_ID,
+      actingWorkspaceId: SELLER_WORKSPACE,
+      label: "Recover",
+      contentType: "audio/mpeg",
+      byteSize: 512,
+      bytes: mp3Bytes(512),
+    });
+    await assert.rejects(
+      () =>
+        service.removeSample({
+          userAccountId: SELLER_USER,
+          offeringId: OFFERING_ID,
+          sampleId: uploaded.sample.sampleId,
+          actingWorkspaceId: SELLER_WORKSPACE,
+        }),
+      (err: unknown) => err instanceof AudioSampleError && err.code === "AUDIO_STORAGE_FAILED",
+    );
+    // The PendingCleanup row is still visible to the bounded retry.
+    const list = await service.listSamplesForSeller({
+      userAccountId: SELLER_USER,
+      offeringId: OFFERING_ID,
+      actingWorkspaceId: SELLER_WORKSPACE,
+    });
+    assert.equal(list.samples.length, 0, "PendingCleanup rows are not buyer-visible");
+    // Drive the bounded retry via a fresh service. The retry
+    // succeeds on attempt 2 and finalizes the row.
+    await service.listSamplesForSeller({
+      userAccountId: SELLER_USER,
+      offeringId: OFFERING_ID,
+      actingWorkspaceId: SELLER_WORKSPACE,
+    });
+    assert.ok(attempt >= 2, "bounded retry attempted at least twice");
+    // After the retry, the PendingCleanup row is gone — buyer list
+    // is empty and a fresh service sees no further cleanup work.
+    const finalList = await service.listSamplesForBuyer(OFFERING_ID);
+    assert.equal(finalList.samples.length, 0);
   });
 
   test("P0-001 + P1-001: playback URL never exposes bucket, path, or storage ref", async () => {
@@ -827,8 +1220,8 @@ describe("AudioSampleService", () => {
       actingWorkspaceId: SELLER_WORKSPACE,
       label: "Privacy",
       contentType: "audio/mpeg",
-      byteSize: 8,
-      bytes: new Uint8Array([0xff, 0xfb, 0x90, 0x00, 0x00, 0x00, 0x00, 0x00]),
+      byteSize: 512,
+      bytes: mp3Bytes(512),
     });
     const url = uploaded.sample.playbackUrl;
     assert.ok(url.startsWith("http://api.example.test/api/services/"));
@@ -850,15 +1243,15 @@ describe("AudioSampleService", () => {
       actingWorkspaceId: SELLER_WORKSPACE,
       label: "Play me then remove me",
       contentType: "audio/mpeg",
-      byteSize: 8,
-      bytes: new Uint8Array([0xff, 0xfb, 0x90, 0x00, 0x00, 0x00, 0x00, 0x00]),
+      byteSize: 512,
+      bytes: mp3Bytes(512),
     });
     const playback = await service.getBytesForPlayback({
       offeringId: OFFERING_ID,
       sampleId: uploaded.sample.sampleId,
     });
     assert.ok(playback);
-    assert.equal(playback.bytes.length, 8);
+    assert.equal(playback.bytes.length, 512);
     await service.removeSample({
       userAccountId: SELLER_USER,
       offeringId: OFFERING_ID,

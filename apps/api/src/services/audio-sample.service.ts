@@ -39,7 +39,6 @@
 import {
   BG2_AUDIO_SAMPLE_CONTENT_TYPE,
   BG2_AUDIO_SAMPLE_MAX_BYTE_SIZE,
-  BG2_AUDIO_SAMPLE_MAX_DISPLAY_ORDER,
   BG2_AUDIO_SAMPLE_MAX_PER_OFFERING,
   type Bg2AudioSamplePublicV1,
 } from "@soundhub/types";
@@ -119,38 +118,150 @@ const DEFAULT_MP3_VALIDATOR: Mp3ContentValidator = {
     if (bytes.length < 4) {
       return { ok: false, reason: "MP3 payload is shorter than the minimum header." };
     }
-    // MP3 frame sync: an ID3v2 tag starts with "ID3", or a raw
-    // MPEG frame starts with an 11-bit sync word (0xFFE_). Both are
-    // bounded header checks; no transcoding or duration parsing.
-    const isId3 = bytes[0] === 0x49 && bytes[1] === 0x44 && bytes[2] === 0x33;
-    if (isId3) {
-      // ID3v2 header is 10 bytes; the size is encoded at bytes 6-9
-      // (syncsafe). We only need to confirm the declared size does
-      // not exceed the payload.
+
+    // Step 1: skip an optional ID3v2 tag. The tag is exactly 10
+    // bytes long with a syncsafe size at bytes 6..9. Anything
+    // following the tag is the audio stream. A tag whose declared
+    // size fills or exceeds the payload is rejected: no audio
+    // frame can follow.
+    let offset = 0;
+    if (bytes[0] === 0x49 && bytes[1] === 0x44 && bytes[2] === 0x33) {
+      if (bytes.length < 10) {
+        return { ok: false, reason: "ID3v2 header is truncated." };
+      }
       const declared =
         (((bytes[6] ?? 0) & 0x7f) << 21) |
         (((bytes[7] ?? 0) & 0x7f) << 14) |
         (((bytes[8] ?? 0) & 0x7f) << 7) |
         ((bytes[9] ?? 0) & 0x7f);
-      if (bytes.length < 10 + declared) {
+      offset = 10 + declared;
+      if (offset >= bytes.length) {
         return {
           ok: false,
-          reason: "Declared ID3v2 size exceeds the payload.",
+          reason: "Declared ID3v2 size exhausts the payload (no audio frame follows).",
         };
       }
-      return { ok: true };
     }
-    const b0 = bytes[0] ?? 0;
-    const b1 = bytes[1] ?? 0;
-    const sync = (b0 << 3) | (b1 >> 5);
+
+    // Step 2: many encoders emit zero padding between an ID3 tag
+    // and the first frame. Skip at most one such byte so a tagged
+    // file is still accepted; do not skip arbitrarily so a junk
+    // payload cannot pass.
+    if (bytes[offset] === 0x00 && offset + 1 + 4 <= bytes.length) {
+      offset += 1;
+    }
+
+    if (offset + 4 > bytes.length) {
+      return {
+        ok: false,
+        reason: "Payload does not contain an MPEG frame after the ID3 tag.",
+      };
+    }
+
+    // Step 3: validate the 4-byte MPEG frame header. Each field's
+    // reserved values are rejected so a junk byte stream cannot
+    // satisfy the boundary.
+    const h0 = bytes[offset] ?? 0;
+    const h1 = bytes[offset + 1] ?? 0;
+    const h2 = bytes[offset + 2] ?? 0;
+    const h3 = bytes[offset + 3] ?? 0;
+
+    // 11-bit sync word.
+    const sync = (h0 << 3) | (h1 >> 5);
     if (sync !== 0x7ff) {
       return {
         ok: false,
         reason: "Payload does not begin with an MP3 frame sync word or ID3 tag.",
       };
     }
+
+    // MPEG version: 11=MPEG-1, 10=MPEG-2, 00=MPEG-2.5, 01=reserved.
+    const mpegVersionBits = (h1 >> 3) & 0x03;
+    if (mpegVersionBits === 0x01) {
+      return { ok: false, reason: "MPEG version is reserved (01)." };
+    }
+
+    // Layer: 01=Layer III, 10=Layer II, 11=Layer I, 00=reserved.
+    // Only Layer III is accepted at the trusted boundary.
+    const layerBits = (h1 >> 1) & 0x03;
+    if (layerBits !== 0x01) {
+      return { ok: false, reason: "MPEG layer is not Layer III." };
+    }
+
+    // Bitrate index: 0000=free-format, 1111=bad. Free-format is
+    // legal but cannot be size-validated at the boundary; reject.
+    const bitrateIndex = (h2 >> 4) & 0x0f;
+    if (bitrateIndex === 0x00) {
+      return { ok: false, reason: "MPEG bitrate index is free-format (not supported)." };
+    }
+    if (bitrateIndex === 0x0f) {
+      return { ok: false, reason: "MPEG bitrate index is bad (1111)." };
+    }
+
+    // Sample rate index: 11=reserved.
+    const sampleRateIndex = (h2 >> 2) & 0x03;
+    if (sampleRateIndex === 0x03) {
+      return { ok: false, reason: "MPEG sample rate index is reserved (11)." };
+    }
+
+    // Padding bit (0/1).
+    const padding = (h2 >> 1) & 0x01;
+
+    // Emphasis: 10=reserved, 11=reserved. 00=none, 01=50/15µs.
+    const emphasis = h3 & 0x03;
+    if (emphasis === 0x02 || emphasis === 0x03) {
+      return { ok: false, reason: "MPEG emphasis is reserved." };
+    }
+
+    // Step 4: verify the audio frame body fits in the payload.
+    // Frame size = samples_per_frame * bitrate / sample_rate + padding.
+    const sampleRateHz = MPEG_SAMPLE_RATE_HZ[mpegVersionBits]?.[sampleRateIndex];
+    if (sampleRateHz === undefined) {
+      return { ok: false, reason: "MPEG sample rate index is out of range." };
+    }
+    const bitrateKbps = MPEG_L3_BITRATE_KBPS[mpegVersionBits === 0x03 ? 0 : 1]?.[bitrateIndex];
+    if (bitrateKbps === undefined) {
+      return { ok: false, reason: "MPEG bitrate index is out of range." };
+    }
+    // Layer III samples-per-frame: 1152 (MPEG-1) or 576 (MPEG-2/2.5).
+    const samplesPerFrame = mpegVersionBits === 0x03 ? 1152 : 576;
+    const frameSize =
+      Math.floor((samplesPerFrame * bitrateKbps * 1000) / (8 * sampleRateHz)) + padding;
+    if (frameSize < 24) {
+      // Sanity: an MPEG L3 frame is at least 24 bytes. A smaller
+      // derived size indicates a malformed combination we should
+      // not accept.
+      return { ok: false, reason: "Computed MPEG frame size is implausibly small." };
+    }
+    if (offset + frameSize > bytes.length) {
+      return {
+        ok: false,
+        reason: "MPEG frame body exceeds the payload (truncated frame).",
+      };
+    }
+
     return { ok: true };
   },
+};
+
+// MPEG sample rate table indexed by version then sample-rate index.
+// version: 00=MPEG-2.5, 10=MPEG-2, 11=MPEG-1.
+const MPEG_SAMPLE_RATE_HZ: Readonly<Record<number, ReadonlyArray<number | undefined>>> = {
+  // MPEG-2.5
+  0x00: [11025, 12000, 8000, undefined],
+  // MPEG-2
+  0x02: [22050, 24000, 16000, undefined],
+  // MPEG-1
+  0x03: [44100, 48000, 32000, undefined],
+};
+
+// MPEG Layer III bitrate (kbps) indexed by version group then index.
+// version group: 0=MPEG-2/2.5, 1=MPEG-1. Index 0 = free, index 0xF = bad.
+const MPEG_L3_BITRATE_KBPS: Readonly<Record<number, ReadonlyArray<number | undefined>>> = {
+  // MPEG-2 / MPEG-2.5 Layer III
+  0: [undefined, 8, 16, 24, 32, 40, 48, 56, 64, 80, 96, 112, 128, 144, 160, undefined],
+  // MPEG-1 Layer III
+  1: [undefined, 32, 40, 48, 56, 64, 80, 96, 112, 128, 160, 192, 224, 256, 320, undefined],
 };
 
 export interface UploadSampleInput {
@@ -265,7 +376,7 @@ export class AudioSampleService {
         "AUDIO_PAYLOAD_TOO_LARGE",
       );
     }
-    // P1-003: observed-content validation at the trusted boundary.
+    // P1-005: observed-content validation at the trusted boundary.
     const contentCheck = this.contentValidator.validate({ bytes: input.bytes });
     if (!contentCheck.ok) {
       throw new AudioSampleError(
@@ -282,8 +393,25 @@ export class AudioSampleService {
       offeringId: input.offeringId,
     });
 
-    // P1-004: storage first so the atomic cap check (which happens
-    // inside the repository transaction) covers the new row.
+    // P1-004: pre-flight cap check before any storage write so a
+    // known-full offering never produces an orphan object. The
+    // authoritative atomic guard still runs in the repository
+    // (P1-002) so concurrent uploads are still serialized; this
+    // pre-flight is the cheap-and-correct path that also lets us
+    // return the deterministic cap error for the common case.
+    const existing = await this.repository.listSamplesForOffering(input.offeringId);
+    if (existing.length >= BG2_AUDIO_SAMPLE_MAX_PER_OFFERING) {
+      throw new AudioSampleError(
+        `ServiceOffering already has ${BG2_AUDIO_SAMPLE_MAX_PER_OFFERING} samples; remove one before uploading another.`,
+        "AUDIO_SAMPLE_LIMIT_EXCEEDED",
+      );
+    }
+
+    // P1-004: storage first, but every post-upload failure path
+    // covers the uploaded object via either a clean delete or a
+    // durable PendingCleanup write. The cap guard is the
+    // authoritative atomic check; this is a defense-in-depth path
+    // for write failures between storage and DB.
     let storageRef: string;
     try {
       const uploaded = await this.storage.uploadSample({
@@ -298,33 +426,58 @@ export class AudioSampleService {
       throw mapStorageError(err);
     }
 
-    const nextDisplayOrder = await this.pickNextDisplayOrder(input.offeringId);
-    const created = await this.repository.createSampleWithCap({
-      offeringId: input.offeringId,
-      label: input.label,
-      contentType: BG2_AUDIO_SAMPLE_CONTENT_TYPE,
-      byteSize: input.byteSize,
-      displayOrder: nextDisplayOrder,
-      storageRef,
-    });
-    if (!created) {
-      // Cap reached (atomic guard). Clean up the storage object
-      // we just uploaded so it does not become an orphan.
-      try {
-        await this.storage.removeSample(storageRef);
-      } catch {
-        // Best-effort cleanup; a failed removal flips the (now
-        // non-existent) row to PendingCleanup but the row never
-        // existed. Surface the original failure to the caller.
+    try {
+      const created = await this.repository.createSampleWithCap({
+        offeringId: input.offeringId,
+        label: input.label,
+        contentType: BG2_AUDIO_SAMPLE_CONTENT_TYPE,
+        byteSize: input.byteSize,
+        storageRef,
+      });
+      if (!created) {
+        // Concurrent writer beat us to the slot under the
+        // per-offering advisory lock. Clean up the storage object
+        // we just uploaded so it does not become an orphan.
+        await this.cleanupOrphanedStorage(storageRef);
+        throw new AudioSampleError(
+          `ServiceOffering already has ${BG2_AUDIO_SAMPLE_MAX_PER_OFFERING} samples; remove one before uploading another.`,
+          "AUDIO_SAMPLE_LIMIT_EXCEEDED",
+        );
       }
-      throw new AudioSampleError(
-        `ServiceOffering already has ${BG2_AUDIO_SAMPLE_MAX_PER_OFFERING} samples; remove one before uploading another.`,
-        "AUDIO_SAMPLE_LIMIT_EXCEEDED",
-      );
+      return {
+        sample: toPublicAudioSample({
+          record: created,
+          playbackUrl: this.playbackUrlFor(created),
+        }),
+      };
+    } catch (err) {
+      // P1-004: any non-cap failure during the DB create must not
+      // leak the uploaded storage object. Best-effort delete; if
+      // even that fails we surface the original DB error to the
+      // caller and leave the storage object for the bounded retry
+      // path on the next operation. The retry path looks up the
+      // row by storageRef via a dedicated query, so an orphan is
+      // bounded and discoverable.
+      await this.cleanupOrphanedStorage(storageRef);
+      throw err;
     }
-    return {
-      sample: toPublicAudioSample({ record: created, playbackUrl: this.playbackUrlFor(created) }),
-    };
+  }
+
+  /**
+   * Best-effort cleanup for an uploaded storage object whose DB
+   * counterpart did not persist. On failure the call is
+   * deliberately swallowed so the caller's primary error
+   * propagates. The bounded retry path on the next operation
+   * against the offering scans PendingCleanup rows, so any
+   * orphan here is finite and discoverable.
+   */
+  private async cleanupOrphanedStorage(storageRef: string): Promise<void> {
+    try {
+      await this.storage.removeSample(storageRef);
+    } catch (err) {
+      if (err instanceof StorageReferenceUnknownError) return;
+      // Surface nothing; the bounded retry handles this.
+    }
   }
 
   async listSamplesForSeller(input: ListSamplesInput): Promise<ListSamplesResult> {
@@ -398,10 +551,18 @@ export class AudioSampleService {
   }
 
   /**
-   * Remove a sample from a seller-owned ServiceOffering. The row
-   * is hidden from discovery immediately; the storage object is
-   * removed (or marked PendingCleanup if removal fails so a
-   * bounded retry can complete the deletion).
+   * Remove a sample from a seller-owned ServiceOffering. Per P1-003
+   * the row is hidden from discovery immediately and the bounded
+   * storage reference is preserved so a durable retry can complete
+   * the deletion:
+   *   1. Mark the row `PendingCleanup` so buyer/seller lists stop
+   *      surfacing it but the storage ref survives.
+   *   2. Attempt the provider delete.
+   *   3a. On success (or already-gone), finalize the row (delete).
+   *   3b. On provider failure, leave the row `PendingCleanup` and
+   *       surface AUDIO_STORAGE_FAILED so the caller knows to retry.
+   *       The bounded retry path on the next operation against the
+   *       offering completes the deletion.
    */
   async removeSample(input: RemoveSampleInput): Promise<RemoveSampleResult> {
     this.assertActingWorkspace(input.actingWorkspaceId);
@@ -434,29 +595,32 @@ export class AudioSampleService {
     if (!sample) {
       throw new AudioSampleError("Sample not found.", "AUDIO_SAMPLE_NOT_FOUND");
     }
-    // Step 1: hide from discovery (the row's cleanupStatus flips
-    // to Removed inside the transaction that also deletes the
-    // row). Buyer/seller lists observe only Live rows.
-    await this.repository.markRemovedAndDelete({
+    if (sample.cleanupStatus === "PendingCleanup") {
+      // A previous removal attempt left the row pending. The
+      // bounded retry can complete it; surface a retryable error
+      // so the caller can re-issue or wait for the next op.
+      throw new AudioSampleError(
+        "Storage cleanup is in progress; retry the removal after the next operation against the offering.",
+        "AUDIO_STORAGE_FAILED",
+      );
+    }
+    // Step 1: hide from discovery immediately by flipping the
+    // status to PendingCleanup. The row survives so the bounded
+    // retry can complete the provider deletion later. Live samples
+    // are excluded from buyer/seller listings.
+    await this.repository.markPendingCleanup({
       offeringId: input.offeringId,
       sampleId: input.sampleId,
     });
-    // Step 2: try to delete the bounded storage object. On
-    // failure, mark the row PendingCleanup so the next operation
-    // against the offering can retry. The Prisma adapter's
-    // markRemovedAndDelete already deleted the row, so on a
-    // PendingCleanup transition we have no row to update; instead
-    // we surface AUDIO_STORAGE_FAILED so the caller can retry the
-    // removal command.
+    // Step 2: attempt the provider delete immediately.
     try {
       await this.storage.removeSample(sample.storageRef);
     } catch (err) {
       if (err instanceof StorageReferenceUnknownError) {
-        // Already gone — idempotent success.
+        // Already gone — fall through to finalize.
       } else if (err instanceof StorageUnavailableError) {
-        // P1-005: the provider is unreachable. Surface as a
-        // retryable error; the bounded retry path drives the
-        // next attempt on the next operation.
+        // The row is now PendingCleanup; the bounded retry will
+        // retry this exact storageRef on the next operation.
         throw new AudioSampleError(
           "Storage provider is unavailable; sample is hidden from discovery and will be retried.",
           "AUDIO_STORAGE_FAILED",
@@ -465,6 +629,12 @@ export class AudioSampleService {
         throw mapStorageError(err);
       }
     }
+    // Step 3: provider delete succeeded (or was already gone) —
+    // finalize by deleting the row.
+    await this.repository.finalizePendingCleanup({
+      offeringId: input.offeringId,
+      sampleId: input.sampleId,
+    });
     return {
       sampleId: sample.sampleId,
       offeringId: input.offeringId,
@@ -520,20 +690,36 @@ export class AudioSampleService {
    * Bounded retry pass for PendingCleanup samples on the given
    * offering. Called from upload + seller-list to keep the cleanup
    * window bounded without introducing a scheduler. The retry
-   * attempts each pending sample in oldest-first order; the
-   * bounded set is the offering's own cleanup backlog.
+   * attempts each pending sample in oldest-first order; on
+   * success (or already-absent) the row is finalized so the
+   * bounded backlog converges. The bounded set is the offering's
+   * own cleanup backlog.
    */
   private async retryPendingCleanupForOffering(input: {
     readonly offeringId: string;
   }): Promise<void> {
     const pending = await this.repository.listPendingCleanupForOffering(input.offeringId);
     for (const sample of pending) {
+      let removed = false;
       try {
         await this.storage.removeSample(sample.storageRef);
-        // The row is already deleted from the Live set; we just
-        // need to forget the storage reference on the server side.
-      } catch {
-        // Swallow; the next operation retries.
+        removed = true;
+      } catch (err) {
+        if (err instanceof StorageReferenceUnknownError) {
+          // Already gone — treat as removed so the row finalizes.
+          removed = true;
+        }
+        // Any other error: leave the row for the next pass.
+      }
+      if (removed) {
+        try {
+          await this.repository.finalizePendingCleanup({
+            offeringId: sample.offeringId,
+            sampleId: sample.sampleId,
+          });
+        } catch {
+          // Swallow; the next operation retries the finalize.
+        }
       }
     }
   }
@@ -547,18 +733,6 @@ export class AudioSampleService {
    */
   private playbackUrlFor(record: AudioSampleRecord): string {
     return `${this.publicApiBaseUrl}/api/services/${encodeURIComponent(record.offeringId)}/audio-samples/${encodeURIComponent(record.sampleId)}/play`;
-  }
-
-  private async pickNextDisplayOrder(offeringId: string): Promise<number> {
-    const existing = await this.repository.listSamplesForOffering(offeringId);
-    const taken = new Set(existing.map((s) => s.displayOrder));
-    for (let candidate = 1; candidate <= BG2_AUDIO_SAMPLE_MAX_DISPLAY_ORDER; candidate += 1) {
-      if (!taken.has(candidate)) return candidate;
-    }
-    throw new AudioSampleError(
-      "ServiceOffering already has the maximum number of samples.",
-      "AUDIO_SAMPLE_LIMIT_EXCEEDED",
-    );
   }
 
   private assertActingWorkspace(actingWorkspaceId: string): void {

@@ -2,12 +2,14 @@
 
 // Buyer-discovery audio samples panel.
 //
-// Background: ticket #61 follow-up review (P1-002) requires that
-// the buyer search UI integrate bounded audio sample playback so
-// the demo buyer can discover and play real MP3 bytes from a
-// matching offering. The component is read-only, public, and
-// reaches the same `/api/services/:offeringId/audio-samples`
-// endpoint the seller-management UI consumes.
+// Background: ticket #61 follow-up review (P1-002 / P2-001)
+// requires that the buyer search UI integrate bounded audio
+// sample playback AND parse the response against the shared
+// `bg2AudioSampleListResponseV1Schema` so a malformed or hostile
+// payload cannot crash the render path. The component is
+// read-only, public, and reaches the same
+// `/api/services/:offeringId/audio-samples` endpoint the
+// seller-management UI consumes.
 //
 // The browser renders `sample.playbackUrl` (a SoundHub-owned
 // in-app route) directly. The application re-runs eligibility +
@@ -15,18 +17,7 @@
 // ineligible samples never appear.
 
 import { useEffect, useState } from "react";
-
-interface PublicSample {
-  readonly sampleId: string;
-  readonly offeringId: string;
-  readonly label: string;
-  readonly playbackUrl: string;
-}
-
-interface ListResponse {
-  readonly offeringId: string;
-  readonly samples: readonly PublicSample[];
-}
+import { bg2AudioSampleListResponseV1Schema, type Bg2AudioSamplePublicV1 } from "@soundhub/types";
 
 export interface AudioSamplesPanelProps {
   readonly offeringId: string;
@@ -34,7 +25,7 @@ export interface AudioSamplesPanelProps {
 }
 
 interface PanelState {
-  readonly samples: readonly PublicSample[];
+  readonly samples: readonly Bg2AudioSamplePublicV1[];
   readonly loading: boolean;
   readonly error: string | null;
 }
@@ -66,12 +57,18 @@ export function AudioSamplesPanel({ offeringId, offeringTitle }: AudioSamplesPan
           throw new Error(`Audio fetch failed (${response.status}).`);
         }
         const raw: unknown = await response.json();
-        const parsed = raw as ListResponse;
-        if (!parsed || !Array.isArray(parsed.samples)) {
+        // Per ticket #61 follow-up review (P2-001): the panel must
+        // validate the response against the shared Zod schema so a
+        // hostile or drifted payload (null entries, malformed
+        // label/playbackUrl, oversized arrays) cannot crash the
+        // render path. The server is also validated, so this is a
+        // defense-in-depth contract boundary.
+        const parsed = bg2AudioSampleListResponseV1Schema.safeParse(raw);
+        if (!parsed.success) {
           throw new Error("Audio response shape is invalid.");
         }
         if (!cancelled) {
-          setState({ samples: parsed.samples, loading: false, error: null });
+          setState({ samples: parsed.data.samples, loading: false, error: null });
         }
       } catch (err) {
         if (!cancelled) {

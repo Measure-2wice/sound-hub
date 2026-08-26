@@ -91,21 +91,30 @@ export class InMemoryAudioRepository implements AudioRepository {
 
   /**
    * Atomic guarded insert mirroring the Prisma adapter's
-   * transaction. Two concurrent calls in the same state observe
-   * the same count; both can't succeed when the cap is hit.
+   * transaction. JavaScript is single-threaded so the count +
+   * insert pair is implicitly serialized; the cap is enforced
+   * before display-order allocation.
    */
   createSampleWithCap(input: {
     offeringId: string;
     label: string;
     contentType: "audio/mpeg";
     byteSize: number;
-    displayOrder: number;
     storageRef: string;
   }): Promise<AudioSampleRecord | null> {
-    const liveCount = [...this.samples.values()].filter(
+    const liveRows = [...this.samples.values()].filter(
       (s) => s.offeringId === input.offeringId && s.cleanupStatus === "Live",
-    ).length;
-    if (liveCount >= 3) return Promise.resolve(null);
+    );
+    if (liveRows.length >= 3) return Promise.resolve(null);
+    const taken = new Set(liveRows.map((r) => r.displayOrder));
+    let displayOrder: number | null = null;
+    for (let candidate = 1; candidate <= 1024; candidate += 1) {
+      if (!taken.has(candidate)) {
+        displayOrder = candidate;
+        break;
+      }
+    }
+    if (displayOrder === null) return Promise.resolve(null);
     const id = `smp-${randomUUID().slice(0, 12)}`;
     const now = new Date();
     const record: AudioSampleRecord = {
@@ -114,7 +123,7 @@ export class InMemoryAudioRepository implements AudioRepository {
       label: input.label,
       contentType: input.contentType,
       byteSize: input.byteSize,
-      displayOrder: input.displayOrder,
+      displayOrder,
       storageRef: input.storageRef,
       cleanupStatus: "Live",
       cleanupAttempts: 0,
@@ -135,14 +144,6 @@ export class InMemoryAudioRepository implements AudioRepository {
     return Promise.resolve(sample);
   }
 
-  markRemovedAndDelete(input: { offeringId: string; sampleId: string }): Promise<void> {
-    const sample = this.samples.get(input.sampleId);
-    if (!sample) return Promise.resolve();
-    if (sample.offeringId !== input.offeringId) return Promise.resolve();
-    this.samples.delete(input.sampleId);
-    return Promise.resolve();
-  }
-
   markPendingCleanup(input: { offeringId: string; sampleId: string }): Promise<void> {
     const sample = this.samples.get(input.sampleId);
     if (!sample) return Promise.resolve();
@@ -155,6 +156,17 @@ export class InMemoryAudioRepository implements AudioRepository {
       cleanupAttempts: sample.cleanupAttempts + 1,
       updatedAt: now,
     });
+    return Promise.resolve();
+  }
+
+  finalizePendingCleanup(input: { offeringId: string; sampleId: string }): Promise<void> {
+    const sample = this.samples.get(input.sampleId);
+    if (!sample) return Promise.resolve();
+    if (sample.offeringId !== input.offeringId) return Promise.resolve();
+    if (sample.cleanupStatus !== "PendingCleanup" && sample.cleanupStatus !== "Live") {
+      return Promise.resolve();
+    }
+    this.samples.delete(input.sampleId);
     return Promise.resolve();
   }
 

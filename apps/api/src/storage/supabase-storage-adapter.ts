@@ -328,7 +328,16 @@ export class SupabaseStorageAdapter implements StorageAdapter {
         "Supabase Storage sign response did not match the expected schema.",
       );
     }
-    return `${this.supabaseUrl}${parsed.signedURL}`;
+    // Per ticket #61 follow-up review (P1-001): Supabase Storage's
+    // /object/sign endpoint returns a path-only `signedURL` like
+    // `/object/sign/<bucket>/<path>?token=...`. The application must
+    // resolve it against the Storage API base `${SUPABASE_URL}/storage/v1`
+    // (NOT the project root). Without this prefix the subsequent
+    // fetch targets `${SUPABASE_URL}/object/sign/...` and the GET
+    // fails, so managed playback is broken even though upload
+    // succeeded. The Storage SDK and supabase-js both compose the
+    // same base; see SupabaseClient and StorageFileApi.
+    return resolveSupabaseStorageUrl(this.supabaseUrl ?? "", parsed.signedURL);
   }
 
   private makeCuid(): string {
@@ -348,4 +357,31 @@ function parseSignSuccessBody(raw: unknown): SignSuccessBody | null {
   if (typeof candidate.signedURL !== "string") return null;
   if (candidate.signedURL.length === 0 || candidate.signedURL.length > 4096) return null;
   return { signedURL: candidate.signedURL };
+}
+
+/**
+ * Resolve a Supabase Storage signed-URL path against the Storage
+ * API base. The Storage REST endpoint
+ * `POST /storage/v1/object/sign/<bucket>/<path>` returns a path-only
+ * `signedURL` (e.g. `/object/sign/<bucket>/<path>?token=...`). The
+ * resolved URL must live under `${SUPABASE_URL}/storage/v1`, NOT
+ * the project root, so the subsequent GET actually targets the
+ * Storage API. Accepts both already-absolute URLs (defensive) and
+ * path-only responses.
+ *
+ * Exported for unit testing the URL composition independently of
+ * the network stack.
+ */
+export function resolveSupabaseStorageUrl(supabaseUrl: string, signedPath: string): string {
+  const base = supabaseUrl.replace(/\/+$/, "");
+  // Already absolute — trust the storage API to have composed a
+  // full URL; do not re-prefix.
+  if (/^https?:\/\//i.test(signedPath)) {
+    return signedPath;
+  }
+  // Path-only responses always start with `/`. Supabase Storage
+  // returns paths under the `/storage/v1` prefix; join them so a
+  // relative path resolves correctly.
+  const path = signedPath.startsWith("/") ? signedPath : `/${signedPath}`;
+  return `${base}/storage/v1${path}`;
 }
