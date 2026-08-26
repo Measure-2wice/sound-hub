@@ -97,7 +97,13 @@ function mapStatus(code: ApiErrorCodeV1): number {
       return 400;
     case "AUDIO_CONTENT_TYPE_UNSUPPORTED":
       return 400;
+    // AUDIO_PAYLOAD_MISSING is a malformed-request rejection, not
+    // a size-cap rejection. The boundary distinguished the two at
+    // the trusted multipart parser; the safe envelope maps them to
+    // distinct statuses so a buyer who omitted the file part sees
+    // 400 Bad Request, not 413 Payload Too Large.
     case "AUDIO_PAYLOAD_MISSING":
+      return 400;
     case "AUDIO_PAYLOAD_TOO_LARGE":
       return 413;
     case "AUDIO_PROVIDER_UNAVAILABLE":

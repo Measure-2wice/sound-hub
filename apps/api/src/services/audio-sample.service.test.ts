@@ -12,6 +12,8 @@
 //     (GS 11).
 //   - Storage-first / row-after ordering (GS 9).
 //   - Removal ordering: row first, then storage object (GS 10).
+//   - Explicit actingWorkspaceId on every consequential command
+//     (ticket #61 follow-up review).
 //
 // Tests assert observable contract outcomes (return shape, error
 // codes, persisted record count, storage adapter calls) rather than
@@ -32,7 +34,11 @@ const SELLER_USER = "user-buyer-seller";
 const SELLER_WORKSPACE = "ws-buyer-seller";
 const BUYER_USER = "user-buyer-other";
 const BUYER_WORKSPACE = "ws-buyer-other";
+const DUAL_USER = "user-dual-member";
+const DUAL_SELLER_WORKSPACE = "ws-dual-seller";
+const DUAL_BUYER_WORKSPACE = "ws-dual-buyer";
 const OFFERING_ID = "of-active";
+const DUAL_OFFERING_ID = "of-dual-seller";
 const DRAFT_OFFERING_ID = "of-draft";
 const SUSPENDED_OFFERING_ID = "of-suspended";
 
@@ -74,6 +80,36 @@ function makeAuthRepo() {
         },
       ],
     },
+    // A user who belongs to both a Seller-capable Workspace and a
+    // Buyer-only Workspace. Used to assert that membership in both
+    // Workspaces cannot bypass the actingWorkspaceId ownership check
+    // (ticket #61 P0-001 follow-up).
+    {
+      userAccountId: DUAL_USER,
+      email: "dual@example.com",
+      identityProvider: "deterministic",
+      identitySubject: "dual-subject",
+      memberships: [
+        {
+          workspaceId: DUAL_SELLER_WORKSPACE,
+          slug: "dual-seller",
+          name: "Dual Seller Workspace",
+          workspaceType: "Personal",
+          workspaceStatus: "Active",
+          role: "Owner",
+          capabilities: ["Seller"],
+        },
+        {
+          workspaceId: DUAL_BUYER_WORKSPACE,
+          slug: "dual-buyer",
+          name: "Dual Buyer Workspace",
+          workspaceType: "Personal",
+          workspaceStatus: "Active",
+          role: "Owner",
+          capabilities: ["Buyer"],
+        },
+      ],
+    },
   ]);
 }
 
@@ -88,6 +124,15 @@ function makeAudioRepo() {
         sellerWorkspaceStatus: "Active",
         hasSellerCapability: true,
         title: "Active offering",
+      },
+      {
+        offeringId: DUAL_OFFERING_ID,
+        offeringStatus: "Active",
+        sellerProfileStatus: "Published",
+        sellerWorkspaceId: DUAL_SELLER_WORKSPACE,
+        sellerWorkspaceStatus: "Active",
+        hasSellerCapability: true,
+        title: "Dual member's offering",
       },
       {
         offeringId: DRAFT_OFFERING_ID,
@@ -135,6 +180,7 @@ describe("AudioSampleService", () => {
     const uploaded = await service.uploadSample({
       userAccountId: SELLER_USER,
       offeringId: OFFERING_ID,
+      actingWorkspaceId: SELLER_WORKSPACE,
       label: "Sample 1",
       contentType: "audio/mpeg",
       byteSize: 1024,
@@ -144,10 +190,19 @@ describe("AudioSampleService", () => {
     assert.equal(uploaded.sample.byteSize, 1024);
     assert.equal(uploaded.sample.displayOrder, 1);
     assert.equal(uploaded.sample.contentType, "audio/mpeg");
+    // The public DTO carries a playbackUrl but never a storageRef.
+    assert.ok(uploaded.sample.playbackUrl);
+    assert.equal(
+      "storageRef" in uploaded.sample,
+      false,
+      "storageRef must not appear in the public DTO",
+    );
+    assert.ok(uploaded.sample.playbackUrl.includes(OFFERING_ID));
 
     const list = await service.listSamplesForSeller({
       userAccountId: SELLER_USER,
       offeringId: OFFERING_ID,
+      actingWorkspaceId: SELLER_WORKSPACE,
     });
     assert.equal(list.samples.length, 1);
     assert.equal(list.samples[0]?.sampleId, uploaded.sample.sampleId);
@@ -156,12 +211,14 @@ describe("AudioSampleService", () => {
       userAccountId: SELLER_USER,
       offeringId: OFFERING_ID,
       sampleId: uploaded.sample.sampleId,
+      actingWorkspaceId: SELLER_WORKSPACE,
     });
     assert.equal(removed.sampleId, uploaded.sample.sampleId);
 
     const after = await service.listSamplesForSeller({
       userAccountId: SELLER_USER,
       offeringId: OFFERING_ID,
+      actingWorkspaceId: SELLER_WORKSPACE,
     });
     assert.equal(after.samples.length, 0);
   });
@@ -175,6 +232,9 @@ describe("AudioSampleService", () => {
         service.uploadSample({
           userAccountId: BUYER_USER,
           offeringId: OFFERING_ID,
+          // BUYER_USER's acting workspace is BUYER_WORKSPACE, which
+          // does not own OFFERING_ID. The server rejects.
+          actingWorkspaceId: BUYER_WORKSPACE,
           label: "Foreign",
           contentType: "audio/mpeg",
           byteSize: 1024,
@@ -182,6 +242,47 @@ describe("AudioSampleService", () => {
         }),
       (err: unknown) => err instanceof AudioSampleError && err.code === "AUDIO_OFFERING_INELIGIBLE",
     );
+  });
+
+  test("a dual-Workspace member cannot modify a stale offering under the wrong acting Workspace", async () => {
+    // DUAL_USER belongs to both DUAL_SELLER_WORKSPACE and
+    // DUAL_BUYER_WORKSPACE. They can only modify offerings owned
+    // by the workspace they are currently acting for. Picking
+    // the wrong acting workspace is rejected by the server even
+    // though the user has the right membership role on both
+    // workspaces.
+    const storage = new DeterministicStorageAdapter();
+    const repo = makeAudioRepo();
+    const service = buildService(repo, storage);
+    await assert.rejects(
+      () =>
+        service.uploadSample({
+          userAccountId: DUAL_USER,
+          offeringId: DUAL_OFFERING_ID,
+          // Acting as the BUYER workspace, which does not own the
+          // offering. The server rejects with
+          // AUDIO_OFFERING_INELIGIBLE even though the user IS a
+          // member of the BUYER workspace.
+          actingWorkspaceId: DUAL_BUYER_WORKSPACE,
+          label: "Cross-workspace attempt",
+          contentType: "audio/mpeg",
+          byteSize: 1024,
+          bytes: mp3Bytes(1024),
+        }),
+      (err: unknown) => err instanceof AudioSampleError && err.code === "AUDIO_OFFERING_INELIGIBLE",
+    );
+    // Confirm the dual user CAN upload when acting as the correct
+    // workspace (the seller workspace that owns DUAL_OFFERING_ID).
+    const ok = await service.uploadSample({
+      userAccountId: DUAL_USER,
+      offeringId: DUAL_OFFERING_ID,
+      actingWorkspaceId: DUAL_SELLER_WORKSPACE,
+      label: "Correctly acting",
+      contentType: "audio/mpeg",
+      byteSize: 1024,
+      bytes: mp3Bytes(1024),
+    });
+    assert.ok(ok.sample.playbackUrl);
   });
 
   test("a member without Seller capability cannot upload (GS 8)", async () => {
@@ -200,15 +301,12 @@ describe("AudioSampleService", () => {
       ],
     });
     const service = buildService(repo, storage);
-    // BUYER_USER is a Buyer-only member. The Workspace owns the
-    // offering (impossible state in production — buyer workspaces
-    // cannot own seller offerings — but it proves the capability
-    // check still fires regardless of ownership).
     await assert.rejects(
       () =>
         service.uploadSample({
           userAccountId: BUYER_USER,
           offeringId: OFFERING_ID,
+          actingWorkspaceId: BUYER_WORKSPACE,
           label: "Buyer attempt",
           contentType: "audio/mpeg",
           byteSize: 1024,
@@ -226,6 +324,7 @@ describe("AudioSampleService", () => {
       await service.uploadSample({
         userAccountId: SELLER_USER,
         offeringId: OFFERING_ID,
+        actingWorkspaceId: SELLER_WORKSPACE,
         label: `Sample ${i}`,
         contentType: "audio/mpeg",
         byteSize: 1024,
@@ -237,6 +336,7 @@ describe("AudioSampleService", () => {
         service.uploadSample({
           userAccountId: SELLER_USER,
           offeringId: OFFERING_ID,
+          actingWorkspaceId: SELLER_WORKSPACE,
           label: "Sample 4",
           contentType: "audio/mpeg",
           byteSize: 1024,
@@ -256,6 +356,7 @@ describe("AudioSampleService", () => {
         service.uploadSample({
           userAccountId: SELLER_USER,
           offeringId: OFFERING_ID,
+          actingWorkspaceId: SELLER_WORKSPACE,
           label: "Bad",
           contentType: "audio/wav",
           byteSize: 1024,
@@ -276,6 +377,7 @@ describe("AudioSampleService", () => {
         service.uploadSample({
           userAccountId: SELLER_USER,
           offeringId: OFFERING_ID,
+          actingWorkspaceId: SELLER_WORKSPACE,
           label: "Big",
           contentType: "audio/mpeg",
           byteSize: oversize,
@@ -294,6 +396,7 @@ describe("AudioSampleService", () => {
         service.uploadSample({
           userAccountId: SELLER_USER,
           offeringId: DRAFT_OFFERING_ID,
+          actingWorkspaceId: SELLER_WORKSPACE,
           label: "Draft",
           contentType: "audio/mpeg",
           byteSize: 1024,
@@ -312,6 +415,7 @@ describe("AudioSampleService", () => {
         service.uploadSample({
           userAccountId: SELLER_USER,
           offeringId: SUSPENDED_OFFERING_ID,
+          actingWorkspaceId: SELLER_WORKSPACE,
           label: "Suspended",
           contentType: "audio/mpeg",
           byteSize: 1024,
@@ -328,6 +432,7 @@ describe("AudioSampleService", () => {
     const uploaded = await service.uploadSample({
       userAccountId: SELLER_USER,
       offeringId: OFFERING_ID,
+      actingWorkspaceId: SELLER_WORKSPACE,
       label: "Sample",
       contentType: "audio/mpeg",
       byteSize: 1024,
@@ -339,6 +444,7 @@ describe("AudioSampleService", () => {
       userAccountId: SELLER_USER,
       offeringId: OFFERING_ID,
       sampleId: uploaded.sample.sampleId,
+      actingWorkspaceId: SELLER_WORKSPACE,
     });
     const after = await service.listSamplesForBuyer(OFFERING_ID);
     assert.equal(after.samples.length, 0);
@@ -354,6 +460,7 @@ describe("AudioSampleService", () => {
           userAccountId: SELLER_USER,
           offeringId: OFFERING_ID,
           sampleId: "smp-missing",
+          actingWorkspaceId: SELLER_WORKSPACE,
         }),
       (err: unknown) => err instanceof AudioSampleError && err.code === "AUDIO_SAMPLE_NOT_FOUND",
     );
@@ -380,6 +487,7 @@ describe("AudioSampleService", () => {
         service.uploadSample({
           userAccountId: SELLER_USER,
           offeringId: OFFERING_ID,
+          actingWorkspaceId: SELLER_WORKSPACE,
           label: "Failing",
           contentType: "audio/mpeg",
           byteSize: 1024,
@@ -391,6 +499,7 @@ describe("AudioSampleService", () => {
     const list = await service.listSamplesForSeller({
       userAccountId: SELLER_USER,
       offeringId: OFFERING_ID,
+      actingWorkspaceId: SELLER_WORKSPACE,
     });
     assert.equal(list.samples.length, 0, "no row should be persisted on storage failure");
   });
@@ -416,6 +525,7 @@ describe("AudioSampleService", () => {
         service.uploadSample({
           userAccountId: SELLER_USER,
           offeringId: OFFERING_ID,
+          actingWorkspaceId: SELLER_WORKSPACE,
           label: "Bad",
           contentType: "audio/mpeg",
           byteSize: 1024,
@@ -433,6 +543,7 @@ describe("AudioSampleService", () => {
     const a = await service.uploadSample({
       userAccountId: SELLER_USER,
       offeringId: OFFERING_ID,
+      actingWorkspaceId: SELLER_WORKSPACE,
       label: "A",
       contentType: "audio/mpeg",
       byteSize: 1024,
@@ -442,6 +553,7 @@ describe("AudioSampleService", () => {
     const b = await service.uploadSample({
       userAccountId: SELLER_USER,
       offeringId: OFFERING_ID,
+      actingWorkspaceId: SELLER_WORKSPACE,
       label: "B",
       contentType: "audio/mpeg",
       byteSize: 1024,
@@ -452,18 +564,61 @@ describe("AudioSampleService", () => {
       userAccountId: SELLER_USER,
       offeringId: OFFERING_ID,
       sampleId: a.sample.sampleId,
+      actingWorkspaceId: SELLER_WORKSPACE,
     });
     const c = await service.uploadSample({
       userAccountId: SELLER_USER,
       offeringId: OFFERING_ID,
+      actingWorkspaceId: SELLER_WORKSPACE,
       label: "C",
       contentType: "audio/mpeg",
       byteSize: 1024,
       bytes: mp3Bytes(1024),
     });
-    // Slot 1 is free again after removing `a`; the seller assigns
-    // the next free slot rather than appending at the end so the
-    // listing stays compact.
     assert.equal(c.sample.displayOrder, 1);
+  });
+
+  test("buyer list exposes a playback URL but never a storageRef", async () => {
+    const storage = new DeterministicStorageAdapter({
+      playbackBaseUrl: "http://api.test",
+    });
+    const repo = makeAudioRepo();
+    const service = buildService(repo, storage);
+    await service.uploadSample({
+      userAccountId: SELLER_USER,
+      offeringId: OFFERING_ID,
+      actingWorkspaceId: SELLER_WORKSPACE,
+      label: "Privacy",
+      contentType: "audio/mpeg",
+      byteSize: 1024,
+      bytes: mp3Bytes(1024),
+    });
+    const list = await service.listSamplesForBuyer(OFFERING_ID);
+    assert.equal(list.samples.length, 1);
+    const publicSample = list.samples[0]!;
+    assert.ok(publicSample.playbackUrl);
+    assert.equal("storageRef" in publicSample, false, "storageRef must never cross the public DTO");
+    // Playback URL points to the in-app route — no Supabase URL or
+    // bucket name leaks.
+    assert.ok(publicSample.playbackUrl.startsWith("http://api.test/"));
+  });
+
+  test("missing or empty actingWorkspaceId is rejected at the trusted boundary", async () => {
+    const storage = new DeterministicStorageAdapter();
+    const repo = makeAudioRepo();
+    const service = buildService(repo, storage);
+    await assert.rejects(
+      () =>
+        service.uploadSample({
+          userAccountId: SELLER_USER,
+          offeringId: OFFERING_ID,
+          actingWorkspaceId: "",
+          label: "Bad",
+          contentType: "audio/mpeg",
+          byteSize: 1024,
+          bytes: mp3Bytes(1024),
+        }),
+      (err: unknown) => err instanceof AudioSampleError && err.code === "INVALID_AUTH_REQUEST",
+    );
   });
 });

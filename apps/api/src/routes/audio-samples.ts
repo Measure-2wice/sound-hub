@@ -6,6 +6,11 @@
 //
 //   - resolves the authenticated user via the HttpOnly session
 //     cookie (the same cookie the BG1 /api/auth/me route reads);
+//   - carries the explicit acting Workspace in the body so the
+//     server revalidates current membership + Seller capability +
+//     offering ownership against it (a user belonging to two
+//     Workspaces cannot modify a stale offering under the wrong
+//     one);
 //   - delegates to the AudioSampleService, which owns the
 //     authorization, content-type, size, and 3-sample-cap rules;
 //   - emits the shared safe envelope on rejection so a future
@@ -15,28 +20,28 @@
 // Endpoints:
 //
 //   POST   /api/services/:offeringId/audio-samples
-//     multipart/form-data with `label`, `file` (audio/mpeg, ≤ 25 MB).
-//     Requires authentication + Seller capability + offering ownership.
-//     Returns { ok: true, sample } on success.
+//     multipart/form-data with `actingWorkspaceId`, `label`, `file`
+//     (audio/mpeg, ≤ 25 MB). Requires Seller capability + offering
+//     ownership + actingWorkspaceId match. Returns
+//     { ok: true, sample } on success.
 //
 //   GET    /api/services/:offeringId/audio-samples
 //     Buyer-facing read of the bounded samples for an Active
 //     offering. No authentication required: the samples are public
 //     discovery evidence. Returns the same allow-listed DTO the
-//     seller management UI consumes, so the UI can rely on a single
-//     list endpoint.
+//     seller management UI consumes.
 //
 //   DELETE /api/services/:offeringId/audio-samples/:sampleId
-//     Requires authentication + Seller capability + offering ownership.
-//     Removes a sample. Idempotent: a missing sample returns the
-//     safe envelope code AUDIO_SAMPLE_NOT_FOUND.
-//
-// Buyer-facing playback:
+//     Requires authentication + Seller capability + offering
+//     ownership + actingWorkspaceId match. Removes a sample.
+//     Idempotent: a missing sample returns the safe envelope code
+//     AUDIO_SAMPLE_NOT_FOUND.
 //
 //   GET    /api/services/:offeringId/audio-samples/:sampleId/play
 //     Read-only stream of an Active offering's sample bytes for the
-//     deterministic adapter. The Supabase path returns a signed URL
-//     in the public DTO instead.
+//     deterministic adapter. The Supabase path returns a signed
+//     URL in the public DTO instead, so this route never streams
+//     bytes for the deployed backend.
 
 import { Router, type NextFunction, type Request, type Response } from "express";
 import {
@@ -46,9 +51,8 @@ import {
   BG2_AUDIO_SAMPLE_CONTENT_TYPE,
   BG2_AUDIO_SAMPLE_MAX_BYTE_SIZE,
   BG2_AUDIO_SAMPLE_MAX_LABEL_LENGTH,
-  type Bg2AudioSamplePublicV1,
 } from "@soundhub/types";
-import { ZodError } from "zod";
+import { z, ZodError } from "zod";
 import type { AudioSampleService } from "../services/audio-sample.service.js";
 import { AudioSampleError } from "../services/audio-sample.service.js";
 import {
@@ -60,22 +64,14 @@ import {
 } from "../lib/errors.js";
 import { SESSION_COOKIE } from "../lib/session-cookie.js";
 import type { AuthenticationService } from "../services/authentication.service.js";
-import type { StorageAdapter } from "../storage/storage-adapter.js";
 
 export interface AudioSamplesRouteDeps {
   readonly service: AudioSampleService;
   readonly authenticationService: AuthenticationService;
-  /**
-   * The same storage adapter the service uses, exposed here so the
-   * deterministic playback route can read bytes for the in-process
-   * adapter. Supabase Storage streams via signed URLs returned in
-   * the public DTO instead.
-   */
-  readonly storage: StorageAdapter;
 }
 
 const MAX_REQUEST_BODY_BYTES = 30 * 1024 * 1024; // 30 MB; 25 MB sample + multipart overhead
-const MAX_LABEL_BYTES = BG2_AUDIO_SAMPLE_MAX_LABEL_LENGTH * 4; // upper bound on UTF-8 expansion
+const MAX_LABEL_CHARS = BG2_AUDIO_SAMPLE_MAX_LABEL_LENGTH; // 120 characters
 
 export function createAudioSamplesRouter(deps: AudioSamplesRouteDeps): Router {
   const router = Router({ mergeParams: true });
@@ -136,9 +132,6 @@ async function handleUpload(
     return;
   }
 
-  // Multipart parse. The request boundary is the trusted point for
-  // content-type and size enforcement; the service runs the same
-  // checks defensively.
   const mediaType = parseMultipartMediaType(req.headers["content-type"]);
   if (!mediaType.ok) {
     writeSafeError(
@@ -167,7 +160,7 @@ async function handleUpload(
     parsed = await readMultipartWithLimits(req, {
       maxBodyBytes: MAX_REQUEST_BODY_BYTES,
       maxBytes: BG2_AUDIO_SAMPLE_MAX_BYTE_SIZE,
-      maxLabelBytes: MAX_LABEL_BYTES,
+      maxLabelChars: MAX_LABEL_CHARS,
     });
   } catch (err) {
     if (err instanceof MultipartError) {
@@ -189,6 +182,7 @@ async function handleUpload(
     const result = await deps.service.uploadSample({
       userAccountId: view.userAccountId,
       offeringId,
+      actingWorkspaceId: parsed.actingWorkspaceId,
       label: parsed.label,
       contentType: parsed.contentType,
       byteSize: parsed.byteSize,
@@ -220,10 +214,6 @@ async function handleList(req: Request, res: Response, deps: AudioSamplesRouteDe
   }
 
   try {
-    // The buyer-facing list is public for an Active offering. The
-    // service runs the eligibility check (Active offering, Published
-    // profile, Active Workspace, Seller capability) before returning
-    // any samples; the route does not authenticate the caller.
     const result = await deps.service.listSamplesForBuyer(offeringId);
     const body = bg2AudioSampleListResponseV1Schema.parse({
       offeringId: result.offeringId,
@@ -261,11 +251,35 @@ async function handleRemove(
     return;
   }
 
+  const rawBody = await readJsonBodyOrRespond(req, res, requestId);
+  if (rawBody === undefined) return;
+
+  let actingWorkspaceId: string;
+  try {
+    const parsed = removeRequestSchema.parse(rawBody);
+    actingWorkspaceId = parsed.actingWorkspaceId;
+  } catch (err) {
+    if (err instanceof ZodError) {
+      writeSafeError(
+        res,
+        buildSafeError(
+          "INVALID_AUTH_REQUEST",
+          "Remove request failed schema validation.",
+          buildFieldErrors(err.issues),
+          requestId,
+        ),
+      );
+      return;
+    }
+    throw err;
+  }
+
   try {
     const result = await deps.service.removeSample({
       userAccountId: view.userAccountId,
       offeringId,
       sampleId,
+      actingWorkspaceId,
     });
     const body = bg2AudioSampleRemoveResponseV1Schema.parse({
       ok: true,
@@ -352,12 +366,17 @@ function writeAudioError(res: Response, err: unknown, requestId: string): void {
     return;
   }
   if (err instanceof ZodError) {
+    // Response-schema validation failures are server-side response
+    // generation bugs (the route returned a body that does not match
+    // the shared Zod schema). Surface as a 500; never as 400 (the
+    // public DTO contract failure is not a client request defect).
+    console.error(`[audio-samples] requestId=${requestId} response-schema-failure:`, err);
     writeSafeError(
       res,
       buildSafeError(
-        "INVALID_AUTH_REQUEST",
-        "Audio sample response failed schema validation.",
-        buildFieldErrors(err.issues),
+        "SEARCH_FAILED",
+        "An unexpected error occurred while building the response.",
+        undefined,
         requestId,
       ),
     );
@@ -466,6 +485,7 @@ function mapMultipartErrorCode(
 }
 
 interface ParsedMultipart {
+  readonly actingWorkspaceId: string;
   readonly label: string;
   readonly contentType: string;
   readonly byteSize: number;
@@ -475,21 +495,23 @@ interface ParsedMultipart {
 // Minimal multipart/form-data parser for the seller-audio slice.
 //
 // Scope: this parser accepts the exact shape the seller management
-// UI produces — a `label` text field and a `file` part carrying the
-// MP3 bytes. It rejects oversize or missing payloads at the trusted
-// boundary. It is NOT a general-purpose multipart parser.
+// UI produces — an `actingWorkspaceId` text field, a `label` text
+// field, and a `file` part carrying the MP3 bytes. It rejects
+// oversize or missing payloads at the trusted boundary. It is NOT
+// a general-purpose multipart parser.
 //
-// Why hand-rolled: pulling in busboy/multer just for two fields adds
-// a dependency for a bounded upload surface. The parser below
-// handles one file part and one label part, the exact shape the
-// BG2 UI emits. Every byte-count check is the application-layer
-// policy, not the parser's responsibility.
+// Why hand-rolled: pulling in busboy/multer just for three fields
+// adds a dependency for a bounded upload surface. The parser below
+// handles three parts — `actingWorkspaceId`, `label`, `file` —
+// the exact shape the BG2 UI emits. Every byte-count and label-
+// char check is the application-layer policy, not the parser's
+// responsibility.
 async function readMultipartWithLimits(
   req: Request,
   limits: {
     readonly maxBodyBytes: number;
     readonly maxBytes: number;
-    readonly maxLabelBytes: number;
+    readonly maxLabelChars: number;
   },
 ): Promise<ParsedMultipart | null> {
   const header = req.headers["content-type"];
@@ -564,7 +586,7 @@ function parseMultipartBuffer(
   limits: {
     readonly maxBodyBytes: number;
     readonly maxBytes: number;
-    readonly maxLabelBytes: number;
+    readonly maxLabelChars: number;
   },
 ): ParsedMultipart | null {
   // Locate parts. The multipart/form-data format per RFC 7578 is:
@@ -576,11 +598,11 @@ function parseMultipartBuffer(
   //   ...
   //   --{boundary}--\r\n         (closing boundary)
   let cursor = 0;
+  let actingWorkspaceId: string | null = null;
   let label: string | null = null;
   let file: { contentType: string; bytes: Buffer } | null = null;
 
-  // First boundary has no leading CRLF. Compute its offset directly.
-  const openingBoundary = crlfBoundary.slice(2); // strip the leading \r\n
+  const openingBoundary = crlfBoundary.slice(2);
   const partStart = buffer.indexOf(openingBoundary, cursor);
   if (partStart !== 0) {
     throw new MultipartError(
@@ -588,16 +610,14 @@ function parseMultipartBuffer(
       "INVALID_AUTH_REQUEST",
     );
   }
-  // Skip past `--{boundary}\r\n` to reach the part headers.
-  cursor = partStart + openingBoundary.length + 2; // +2 for \r\n
+  cursor = partStart + openingBoundary.length + 2;
 
   while (cursor < buffer.length) {
-    // Find the next boundary. The boundary is whichever of the
-    // intermediate or closing forms appears FIRST in the buffer; the
-    // closing form shares a prefix with the intermediate form, so a
-    // naive `indexOf(trailingBoundary)` would always match the
-    // closing form at the end of the body and the parser would treat
-    // every part as one. Pick the nearer occurrence.
+    // Find the next boundary. The closing form shares a prefix with
+    // the intermediate form, so the parser picks whichever appears
+    // first in the buffer; otherwise it would always match the
+    // closing form at the end of the body and treat every part as
+    // one.
     const intermediateIdx = buffer.indexOf(crlfBoundary, cursor);
     const closingIdx = buffer.indexOf(trailingBoundary, cursor);
     let partEnd: number;
@@ -612,11 +632,6 @@ function parseMultipartBuffer(
       partEnd = intermediateIdx;
       last = false;
     } else if (closingIdx <= intermediateIdx) {
-      // The closing form appears first. Two valid shapes are
-      // possible: a body whose only part ends at the closing form,
-      // or a body whose second part is the closing form. The latter
-      // is the only valid RFC 7578 shape for any body with more
-      // than one part.
       partEnd = closingIdx;
       last = true;
     } else {
@@ -629,11 +644,28 @@ function parseMultipartBuffer(
       const disposition = headers["content-disposition"] ?? "";
       const nameMatch = /name="([^"]+)"/i.exec(disposition);
       const name = nameMatch?.[1] ?? "";
-      if (name === "label") {
+      if (name === "actingWorkspaceId") {
         const text = body.toString("utf8").trim();
-        if (text.length === 0 || text.length > limits.maxLabelBytes) {
+        if (text.length === 0 || text.length > 128) {
           throw new MultipartError(
-            "Label is required and must fit within the byte limit.",
+            "actingWorkspaceId is required and must be at most 128 characters.",
+            "INVALID_AUTH_REQUEST",
+          );
+        }
+        actingWorkspaceId = text;
+      } else if (name === "label") {
+        const text = body.toString("utf8").trim();
+        if (text.length === 0) {
+          throw new MultipartError("Label is required.", "INVALID_AUTH_REQUEST");
+        }
+        // The label char limit aligns with the shared schema
+        // (BG2_AUDIO_SAMPLE_MAX_LABEL_LENGTH = 120). Compare against
+        // the character count, not the byte count, so a UTF-8 label
+        // shorter than 120 chars but heavier than 120 bytes is not
+        // a false-positive rejection.
+        if (text.length > limits.maxLabelChars) {
+          throw new MultipartError(
+            `Label exceeds the ${limits.maxLabelChars}-character limit.`,
             "INVALID_AUTH_REQUEST",
           );
         }
@@ -661,18 +693,37 @@ function parseMultipartBuffer(
       }
     }
     if (last) break;
-    // Skip past `\r\n--{boundary}\r\n` to reach the next part's headers.
-    cursor = partEnd + crlfBoundary.length + 2; // +2 for \r\n after boundary
+    cursor = partEnd + crlfBoundary.length + 2;
   }
 
-  if (!label || !file) {
-    if (!label && !file) return null;
+  if (!actingWorkspaceId || !label || !file) {
+    // Distinguish between authorization-contract violations and
+    // payload-shape violations so the safe envelope carries the
+    // most actionable code:
+    //   - actingWorkspaceId is the GS 4 authorization handle; a
+    //     missing value is INVALID_AUTH_REQUEST, not a payload
+    //     deficiency.
+    //   - label or file missing is a multipart payload deficiency.
+    //   - all three missing means the multipart body is genuinely
+    //     empty; return null so the route can answer with
+    //     AUDIO_PAYLOAD_MISSING (mapped to 400, not 413).
+    if (!actingWorkspaceId && !label && !file) return null;
+    if (!actingWorkspaceId) {
+      throw new MultipartError(
+        "actingWorkspaceId is required on every audio-sample command.",
+        "INVALID_AUTH_REQUEST",
+      );
+    }
+    const missing = [!label ? "label" : null, !file ? "file" : null].filter(
+      (x): x is string => x !== null,
+    );
     throw new MultipartError(
-      `Multipart payload is missing ${!label ? "label" : "file"} part.`,
+      `Multipart payload is missing ${missing.join(", ")} part(s).`,
       "AUDIO_PAYLOAD_MISSING",
     );
   }
   return {
+    actingWorkspaceId,
     label,
     contentType: file.contentType,
     byteSize: file.bytes.length,
@@ -686,7 +737,6 @@ interface PartSplit {
 }
 
 function splitPart(partBytes: Buffer): PartSplit {
-  // Headers are separated from the body by a blank CRLF.
   const separator = partBytes.indexOf("\r\n\r\n");
   if (separator === -1) {
     throw new MultipartError("Multipart part is malformed.", "INVALID_AUTH_REQUEST");
@@ -704,6 +754,59 @@ function splitPart(partBytes: Buffer): PartSplit {
   return { headers, body };
 }
 
-// Suppress unused-import warning on Bg2AudioSamplePublicV1: the
-// runtime return value uses the inferred type from bg2AudioSampleListResponseV1Schema.
-void (null as unknown as Bg2AudioSamplePublicV1);
+const removeRequestSchema = z.object({ actingWorkspaceId: z.string().min(1).max(128) }).strict();
+
+async function readJsonBodyOrRespond(
+  req: Request,
+  res: Response,
+  requestId: string,
+): Promise<unknown> {
+  // The body reader for the remove endpoint. Reused from the BG1
+  // pattern (see routes/auth.ts): small JSON body, returns
+  // `undefined` to signal "stop" on recognised failure modes.
+  const chunks: Buffer[] = [];
+  let total = 0;
+  const limit = 8 * 1024;
+  let settled = false;
+  const fail = (code: string, message: string) => {
+    if (settled) return;
+    settled = true;
+    writeSafeError(res, buildSafeError(code as never, message, undefined, requestId));
+  };
+  try {
+    await new Promise<void>((resolve, reject) => {
+      req.on("data", (chunk: Buffer) => {
+        if (settled) return;
+        total += chunk.length;
+        if (total > limit) {
+          req.pause();
+          fail("INVALID_AUTH_REQUEST", "Request body exceeds the limit.");
+          reject(new Error("payload-too-large"));
+          return;
+        }
+        chunks.push(chunk);
+      });
+      req.on("end", () => resolve());
+      req.on("error", (err: Error) => reject(err));
+    });
+  } catch (err) {
+    if (err instanceof Error && err.message === "payload-too-large") return undefined;
+    throw err;
+  }
+  if (res.writableEnded) return undefined;
+  if (chunks.length === 0) return {};
+  try {
+    return JSON.parse(Buffer.concat(chunks).toString("utf8"));
+  } catch {
+    writeSafeError(
+      res,
+      buildSafeError(
+        "INVALID_AUTH_REQUEST",
+        "Request body is not valid JSON.",
+        undefined,
+        requestId,
+      ),
+    );
+    return undefined;
+  }
+}

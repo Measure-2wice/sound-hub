@@ -1149,10 +1149,15 @@ export type AiInterpretBriefOutputV1 = z.infer<typeof aiInterpretBriefOutputV1Sc
 // ---------- Audio sample DTOs ----------
 
 // The only audio sample shape that ever crosses the public HTTP
-// boundary. `storageRef` is opaque: the application treats it as an
-// opaque string; only the storage adapter that produced it can
-// resolve it back to a playable reference. Storage credentials,
-// bucket names, and provider subjects never enter this schema.
+// boundary. The buyer-facing `<audio>` tag renders `playbackUrl`
+// directly; the application server uses the persisted storage ref
+// for upload/remove operations but never serializes it. Storage
+// credentials, bucket names, object keys, and provider subjects
+// never enter this schema. `playbackUrl` resolves to either a
+// narrowly scoped Supabase signed URL or the in-app buyer-safe
+// playback route, depending on which adapter the server wires.
+// Both adapters produce a URL that resolves to actual playable
+// audio without further resolution on the client.
 export const bg2AudioSamplePublicV1Schema = z
   .object({
     sampleId: z.string().min(1).max(128),
@@ -1165,13 +1170,15 @@ export const bg2AudioSamplePublicV1Schema = z
       .nonnegative()
       .max(25 * 1024 * 1024),
     displayOrder: z.number().int().min(1).max(3),
-    // `storageRef` is opaque to the public DTO; it is the handoff
-    // between PostgreSQL and the storage adapter. Its presence on the
-    // wire does not expose provider internals: the contract is the
-    // same for live Supabase Storage and the deterministic fixture
-    // adapter (both produce an opaque handle that the adapter alone
-    // resolves).
-    storageRef: z.string().min(1).max(512),
+    // Fully-formed URL the browser attaches to the `<audio>` `src`
+    // attribute without inspecting the internals. For Supabase
+    // Storage this is a narrowly scoped signed URL; for the
+    // deterministic adapter this is the in-app
+    // `/api/services/:offeringId/audio-samples/:sampleId/play`
+    // route. Eligibility and removal checks are applied before the
+    // URL is emitted, so an ineligible or removed sample never
+    // appears with a playable handle.
+    playbackUrl: z.string().url(),
     createdAt: z.string().datetime(),
   })
   .strict();

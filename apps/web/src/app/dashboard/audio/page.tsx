@@ -170,8 +170,24 @@ export default function SellerAudioPage() {
             <select
               value={selectedWorkspaceId}
               onChange={(e) => {
-                setSelectedWorkspaceId(e.currentTarget.value);
+                // Clearing the dependent offering selection here is
+                // critical: a user belonging to multiple Workspaces
+                // (e.g. a Seller Workspace AND a Buyer Workspace that
+                // also owns a separate ServiceOffering) must not see
+                // a stale offering carry over when they switch the
+                // acting Workspace. The audio panel passes the
+                // selected offering + acting workspace id to the
+                // server on every upload/remove call; the server
+                // revalidates that the acting workspace actually owns
+                // the offering, so a stale offering id would
+                // surface as an authorization failure rather than a
+                // silent data leak.
+                const next = e.currentTarget.value;
+                setSelectedWorkspaceId(next);
+                setSelectedOfferingId("");
+                setSelectedOfferingTitle("");
                 setActingVerified(false);
+                setSelectedWorkspaceName("");
               }}
               className="mt-1 w-full border border-gray-300 rounded-md px-2 py-1 text-sm"
               data-testid="seller-audio-workspace-select"

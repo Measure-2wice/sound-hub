@@ -84,19 +84,27 @@ export interface AudioRepository {
 
 /**
  * Public mapper. The repository returns internal `AudioSampleRecord`
- * views; the service maps them to the allow-listed public DTO. Lives
- * here so every call site goes through the same boundary and Prisma
- * models never cross the contract.
+ * views; the service maps them to the allow-listed public DTO.
+ *
+ * The mapper does NOT carry `storageRef` or any provider-internal
+ * shape across the public boundary. The service populates
+ * `playbackUrl` after consulting the storage adapter so the
+ * serialized DTO only carries buyer-safe fields. Storage
+ * credentials, bucket names, object keys, and provider subjects
+ * never appear here.
  */
-export function toPublicAudioSample(record: AudioSampleRecord): Bg2AudioSamplePublicV1 {
+export function toPublicAudioSample(input: {
+  readonly record: AudioSampleRecord;
+  readonly playbackUrl: string;
+}): Bg2AudioSamplePublicV1 {
   return {
-    sampleId: record.sampleId,
-    offeringId: record.offeringId,
-    label: record.label,
-    contentType: record.contentType,
-    byteSize: record.byteSize,
-    displayOrder: record.displayOrder,
-    storageRef: record.storageRef,
-    createdAt: record.createdAt.toISOString(),
+    sampleId: input.record.sampleId,
+    offeringId: input.record.offeringId,
+    label: input.record.label,
+    contentType: input.record.contentType,
+    byteSize: input.record.byteSize,
+    displayOrder: input.record.displayOrder,
+    playbackUrl: input.playbackUrl,
+    createdAt: input.record.createdAt.toISOString(),
   };
 }

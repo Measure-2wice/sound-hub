@@ -8,32 +8,34 @@
 // adapter directly — the service is the single owner of the
 // authorization and lifecycle rules.
 //
+// Per ticket #61 P0-001 the acting Workspace is named explicitly
+// on every consequential command. The route body carries
+// `actingWorkspaceId`; the service revalidates:
+//
+//   1. (user, actingWorkspaceId) has current WorkspaceMembership AND
+//      the Seller capability (via WorkspaceAuthorizationService).
+//   2. The actingWorkspaceId matches the offering's owning
+//      Workspace. A user who belongs to two Workspaces cannot
+//      modify a stale offering under the wrong acting workspace;
+//      the server rejects the command with AUDIO_OFFERING_INELIGIBLE.
+//
 // Order of operations for `uploadSample`:
 //
-//   1. Resolve the authenticated userAccountId via the session
-//      (the route supplies it from the session cookie).
-//   2. Resolve the bounded ServiceOffering context (ownership +
+//   1. Resolve the bounded ServiceOffering context (ownership +
 //      profile + workspace + capability + status).
-//   3. Require current WorkspaceMembership in the offering's owning
-//      Workspace AND the Seller capability. Reuses
-//      WorkspaceAuthorizationService so the GS 4 / GS 5 / GS 6
-//      invariant lives in exactly one place.
-//   4. Enforce offering eligibility (GS 10): the seller can manage
-//      samples for an Active offering only. The repository's
-//      context exposes status; the service narrows the transition.
-//   5. Enforce the 3-sample cap and the MP3 / 25 MB limits at the
-//      trusted boundary (GS 11). The repository does not enforce
-//      these; the service is the source of truth.
-//   6. Call the storage adapter FIRST. Only after the storage
-//      operation succeeds does the service persist the row; a
-//      storage failure removes the row's only durable handle (GS 9).
-//   7. Return the buyer-safe public DTO mapped from the persisted
-//      row.
-//
-// Removal flow is symmetric: ownership + membership + capability +
-// offering status, then delete the row, then remove the storage
-// object. The storage removal runs AFTER the row delete so a retried
-// command cannot surface a sample whose storage object is gone.
+//   2. Require current WorkspaceMembership in the supplied acting
+//      Workspace AND the Seller capability, AND that the supplied
+//      acting Workspace matches the offering's owning Workspace.
+//   3. Enforce offering eligibility (GS 10): only Active offerings
+//      with a Published profile under an Active Workspace with the
+//      Seller capability may carry samples.
+//   4. Enforce the 3-sample cap, the MP3 content type, and the
+//      25 MB size cap at the trusted boundary (GS 11).
+//   5. Call the storage adapter FIRST. Only after the storage
+//      operation succeeds does the service persist the row (GS 9).
+//   6. Resolve the playback URL via the storage adapter and
+//      return the buyer-safe public DTO with `playbackUrl`
+//      populated. Storage ref never crosses the public DTO.
 
 import {
   BG2_AUDIO_SAMPLE_CONTENT_TYPE,
@@ -46,7 +48,7 @@ import {
   AuthorizationError,
   type WorkspaceAuthorizationService,
 } from "./workspace-authorization.service.js";
-import { toPublicAudioSample, type AudioRepository } from "../audio-repository/audio-repository.js";
+import type { AudioRepository, AudioSampleRecord } from "../audio-repository/audio-repository.js";
 import {
   StorageRejectedError,
   StorageUnavailableError,
@@ -65,7 +67,8 @@ export class AudioSampleError extends Error {
       | "AUDIO_PAYLOAD_TOO_LARGE"
       | "AUDIO_PAYLOAD_MISSING"
       | "AUDIO_PROVIDER_UNAVAILABLE"
-      | "AUDIO_STORAGE_FAILED",
+      | "AUDIO_STORAGE_FAILED"
+      | "INVALID_AUTH_REQUEST",
   ) {
     super(message);
     this.name = "AudioSampleError";
@@ -86,6 +89,7 @@ export interface AudioSampleServiceDeps {
 export interface UploadSampleInput {
   readonly userAccountId: string;
   readonly offeringId: string;
+  readonly actingWorkspaceId: string;
   readonly label: string;
   readonly contentType: string;
   readonly byteSize: number;
@@ -95,6 +99,7 @@ export interface UploadSampleInput {
 export interface ListSamplesInput {
   readonly userAccountId: string;
   readonly offeringId: string;
+  readonly actingWorkspaceId: string;
 }
 
 export interface ListSamplesResult {
@@ -106,6 +111,7 @@ export interface RemoveSampleInput {
   readonly userAccountId: string;
   readonly offeringId: string;
   readonly sampleId: string;
+  readonly actingWorkspaceId: string;
 }
 
 export interface RemoveSampleResult {
@@ -133,24 +139,25 @@ export class AudioSampleService {
 
   /**
    * Upload a bounded MP3 sample to a seller-owned ServiceOffering.
-   * The application boundary enforces content type and byte size
-   * BEFORE invoking this method; this service runs the same checks
-   * defensively.
+   * The application boundary enforces content type, byte size, and
+   * the 120-character label cap BEFORE invoking this method; this
+   * service runs the same checks defensively.
    */
   async uploadSample(input: UploadSampleInput): Promise<UploadSampleResult> {
+    this.assertActingWorkspace(input.actingWorkspaceId);
     const context = await this.repository.getOfferingContext(input.offeringId);
     if (!context) {
       throw new AudioSampleError("ServiceOffering not found.", "AUDIO_OFFERING_NOT_FOUND");
     }
     // GS 8 + GS 4: require current WorkspaceMembership in the
-    // owning Workspace AND the Seller capability. The authorization
-    // service throws AuthorizationError for non-members, suspended
-    // workspaces, and missing capabilities; we translate those into
-    // the BG2 safe-envelope codes below.
+    // supplied acting Workspace AND the Seller capability. The
+    // authorization service throws AuthorizationError for
+    // non-members, suspended workspaces, and missing capabilities;
+    // we translate those into the BG2 safe-envelope codes below.
     try {
       await this.workspaceAuthorization.requireCapability({
         userAccountId: input.userAccountId,
-        workspaceId: context.sellerWorkspaceId,
+        workspaceId: input.actingWorkspaceId,
         requiredCapability: "Seller",
       });
     } catch (err) {
@@ -158,6 +165,17 @@ export class AudioSampleService {
         throw mapAuthorizationError(err, context);
       }
       throw err;
+    }
+    // GS 8 / dual-Workspace defense: a user belonging to both the
+    // seller Workspace and a buyer Workspace cannot modify a stale
+    // offering under the wrong acting Workspace. The server
+    // rejects commands whose actingWorkspaceId does not match the
+    // offering's owning Workspace.
+    if (context.sellerWorkspaceId !== input.actingWorkspaceId) {
+      throw new AudioSampleError(
+        "Acting Workspace is not the owner of this ServiceOffering.",
+        "AUDIO_OFFERING_INELIGIBLE",
+      );
     }
     // GS 10: only an Active offering may carry discovery samples.
     // A Draft / Paused / Archived offering is ineligible — the
@@ -234,17 +252,28 @@ export class AudioSampleService {
       displayOrder: nextDisplayOrder,
       storageRef,
     });
-    return { sample: toPublicAudioSample(created) };
+    const playbackUrl = await this.resolvePlaybackUrl(created);
+    if (!playbackUrl) {
+      // Storage returned a ref but cannot resolve a playback URL;
+      // surface as a provider error so the caller can retry without
+      // believing the upload succeeded.
+      throw new AudioSampleError(
+        "Storage provider did not produce a playback URL.",
+        "AUDIO_PROVIDER_UNAVAILABLE",
+      );
+    }
+    return { sample: toPublic({ record: created, playbackUrl }) };
   }
 
   /**
    * List the bounded samples for a seller-owned ServiceOffering.
    * Authorization is identical to upload (GS 4 + GS 7 + GS 8): the
    * seller acting through the owning Workspace can list; everyone
-   * else cannot. The buyer-facing discovery surface uses a
-   * separate read-only path that does not require Seller authority.
+   * else cannot. The actingWorkspaceId must match the offering's
+   * owning Workspace.
    */
   async listSamplesForSeller(input: ListSamplesInput): Promise<ListSamplesResult> {
+    this.assertActingWorkspace(input.actingWorkspaceId);
     const context = await this.repository.getOfferingContext(input.offeringId);
     if (!context) {
       throw new AudioSampleError("ServiceOffering not found.", "AUDIO_OFFERING_NOT_FOUND");
@@ -252,7 +281,7 @@ export class AudioSampleService {
     try {
       await this.workspaceAuthorization.requireCapability({
         userAccountId: input.userAccountId,
-        workspaceId: context.sellerWorkspaceId,
+        workspaceId: input.actingWorkspaceId,
         requiredCapability: "Seller",
       });
     } catch (err) {
@@ -261,11 +290,20 @@ export class AudioSampleService {
       }
       throw err;
     }
+    if (context.sellerWorkspaceId !== input.actingWorkspaceId) {
+      throw new AudioSampleError(
+        "Acting Workspace is not the owner of this ServiceOffering.",
+        "AUDIO_OFFERING_INELIGIBLE",
+      );
+    }
     const samples = await this.repository.listSamplesForOffering(input.offeringId);
-    return {
-      offeringId: input.offeringId,
-      samples: samples.map(toPublicAudioSample),
-    };
+    const mapped: Bg2AudioSamplePublicV1[] = [];
+    for (const record of samples) {
+      const playbackUrl = await this.resolvePlaybackUrl(record);
+      if (!playbackUrl) continue;
+      mapped.push(toPublic({ record, playbackUrl }));
+    }
+    return { offeringId: input.offeringId, samples: mapped };
   }
 
   /**
@@ -278,9 +316,7 @@ export class AudioSampleService {
    *
    * No WorkspaceMembership check: the buyer may view any Active
    * offering's samples (the search results path already establishes
-   * eligibility). The opaque `storageRef` is included so the
-   * buyer-facing renderer's playback URL can be derived server-side
-   * without exposing provider internals.
+   * eligibility).
    */
   async listSamplesForBuyer(offeringId: string): Promise<ListSamplesResult> {
     const context = await this.repository.getOfferingContext(offeringId);
@@ -301,9 +337,13 @@ export class AudioSampleService {
     const samples = await this.repository.listSamplesForOffering(offeringId);
     const playable: Bg2AudioSamplePublicV1[] = [];
     for (const record of samples) {
-      const ref = await this.storage.getPlaybackReference(record.storageRef);
+      const ref = await this.storage.getPlaybackReference({
+        storageRef: record.storageRef,
+        offeringId: record.offeringId,
+        sampleId: record.sampleId,
+      });
       if (!ref) continue;
-      playable.push(toPublicAudioSample(record));
+      playable.push(toPublic({ record, playbackUrl: ref.url }));
     }
     return { offeringId, samples: playable };
   }
@@ -316,6 +356,7 @@ export class AudioSampleService {
    * because the row has already been deleted.
    */
   async removeSample(input: RemoveSampleInput): Promise<RemoveSampleResult> {
+    this.assertActingWorkspace(input.actingWorkspaceId);
     const context = await this.repository.getOfferingContext(input.offeringId);
     if (!context) {
       throw new AudioSampleError("ServiceOffering not found.", "AUDIO_OFFERING_NOT_FOUND");
@@ -323,7 +364,7 @@ export class AudioSampleService {
     try {
       await this.workspaceAuthorization.requireCapability({
         userAccountId: input.userAccountId,
-        workspaceId: context.sellerWorkspaceId,
+        workspaceId: input.actingWorkspaceId,
         requiredCapability: "Seller",
       });
     } catch (err) {
@@ -331,6 +372,12 @@ export class AudioSampleService {
         throw mapAuthorizationError(err, context);
       }
       throw err;
+    }
+    if (context.sellerWorkspaceId !== input.actingWorkspaceId) {
+      throw new AudioSampleError(
+        "Acting Workspace is not the owner of this ServiceOffering.",
+        "AUDIO_OFFERING_INELIGIBLE",
+      );
     }
     const sample = await this.repository.findSampleById({
       offeringId: input.offeringId,
@@ -343,7 +390,7 @@ export class AudioSampleService {
     // call returns "sample not found" cleanly. The storage removal
     // is best-effort because the row is already gone — a storage
     // failure surfaces as AUDIO_STORAGE_FAILED but the buyer-facing
-    // surface no longer exposes the sample (GS 10).
+    // surface already hides the sample (GS 10).
     await this.repository.deleteSample({
       offeringId: input.offeringId,
       sampleId: input.sampleId,
@@ -404,6 +451,47 @@ export class AudioSampleService {
     if (!bytes) return null;
     return { bytes, storageRef: sample.storageRef };
   }
+
+  /**
+   * Resolve the buyer-safe playback URL via the storage adapter.
+   * Returns `null` when the adapter cannot resolve the reference
+   * (object removed, unknown). The caller treats `null` as "hide
+   * this sample from buyer-facing discovery".
+   */
+  private async resolvePlaybackUrl(record: AudioSampleRecord): Promise<string | null> {
+    const ref = await this.storage.getPlaybackReference({
+      storageRef: record.storageRef,
+      offeringId: record.offeringId,
+      sampleId: record.sampleId,
+    });
+    return ref?.url ?? null;
+  }
+
+  private assertActingWorkspace(actingWorkspaceId: string): void {
+    if (
+      typeof actingWorkspaceId !== "string" ||
+      actingWorkspaceId.length === 0 ||
+      actingWorkspaceId.length > 128
+    ) {
+      throw new AudioSampleError("Acting Workspace id is required.", "INVALID_AUTH_REQUEST");
+    }
+  }
+}
+
+function toPublic(input: {
+  readonly record: AudioSampleRecord;
+  readonly playbackUrl: string;
+}): Bg2AudioSamplePublicV1 {
+  return {
+    sampleId: input.record.sampleId,
+    offeringId: input.record.offeringId,
+    label: input.record.label,
+    contentType: input.record.contentType,
+    byteSize: input.record.byteSize,
+    displayOrder: input.record.displayOrder,
+    playbackUrl: input.playbackUrl,
+    createdAt: input.record.createdAt.toISOString(),
+  };
 }
 
 function pickNextDisplayOrder(existing: ReadonlyArray<{ readonly displayOrder: number }>): number {
@@ -427,14 +515,6 @@ function mapAuthorizationError(
   err: AuthorizationError,
   context: { readonly sellerWorkspaceId: string },
 ): AudioSampleError {
-  // The workspace authorization service rejects with one of
-  // NOT_A_MEMBER / WORKSPACE_INELIGIBLE / MISSING_CAPABILITY. Map
-  // the first two to AUDIO_OFFERING_INELIGIBLE because the buyer's
-  // perspective treats every authorization failure of an authorized
-  // seller command the same way (the seller cannot manage this
-  // offering's samples). WORKSPACE_NOT_FOUND is not produced by
-  // requireCapability (it always requires a workspaceId), but if it
-  // were, it would map to AUDIO_OFFERING_NOT_FOUND for symmetry.
   if (err.code === "WORKSPACE_NOT_FOUND") {
     return new AudioSampleError("ServiceOffering not found.", "AUDIO_OFFERING_NOT_FOUND");
   }

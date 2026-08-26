@@ -72,18 +72,42 @@ export interface StorageUploadResult {
    * Opaque storage reference. The application persists this value
    * in PostgreSQL as the `storageRef` column and passes it back to
    * `getPlaybackReference` and `removeSample`. The adapter that
-   * produced it is the only component that can parse it.
+   * produced it is the only component that can parse it. This
+   * reference is intentionally NEVER serialized to public DTOs;
+   * the buyer-facing surface uses the public `playbackUrl` instead.
    */
   readonly storageRef: string;
 }
 
+/**
+ * Inputs to `getPlaybackReference`. Both adapters need the offering
+ * and sample identifiers to compose a playable URL that the
+ * application can hand to the buyer-facing UI without further
+ * resolution:
+ *
+ *   - Supabase Storage uses the persisted `storageRef` to resolve a
+ *     signed URL; the offering/sample ids are returned to the
+ *     application for logging only.
+ *   - The deterministic adapter composes
+ *     `${apiOrigin}/api/services/${offeringId}/audio-samples/${sampleId}/play`
+ *     so the in-app route streams the persisted bytes after the
+ *     service runs its eligibility and removal checks.
+ */
+export interface StoragePlaybackInput {
+  readonly storageRef: string;
+  readonly offeringId: string;
+  readonly sampleId: string;
+}
+
 export interface StoragePlaybackReference {
   /**
-   * Player URL the buyer-facing UI may attach to an `<audio>` tag.
-   * For Supabase Storage this is a narrowly-scoped signed URL; for
-   * the deterministic adapter this is a server-issued opaque route
-   * (e.g. `/api/services/.../audio-samples/.../play`).
-   * The application renders the URL but never inspects its internals.
+   * Fully-formed URL the buyer-facing UI may attach to an `<audio>`
+   * tag. For Supabase Storage this is a narrowly scoped signed URL;
+   * for the deterministic adapter this is the in-app
+   * `/api/services/:offeringId/audio-samples/:sampleId/play` route
+   * which re-runs eligibility and removal checks on every request.
+   * The application renders the URL but never inspects its
+   * internals; the adapter alone owns the URL's semantics.
    */
   readonly url: string;
   /**
@@ -117,12 +141,11 @@ export class StorageRejectedError extends Error {
  *   depth so an adapter cannot be tricked into accepting non-MP3 or
  *   oversize objects by a malicious or buggy caller.
  * - Return an opaque `storageRef` from `uploadSample`. The reference
- *   MUST be unique per object and idempotent across retries that
- *   pass the same (offeringId, bytes, contentType) tuple? NO — the
- *   adapter MUST treat each `uploadSample` call as a NEW object even
- *   if the bytes happen to match. Repeated uploads create distinct
- *   storage references; the application owns the display order and
- *   metadata.
+ *   MUST be unique per object. The application persists the
+ *   reference in PostgreSQL and passes it back to `getPlaybackReference`
+ *   and `removeSample`. The application NEVER serializes the
+ *   reference to a public DTO; the buyer-facing surface receives
+ *   the fully-formed `playbackUrl` instead.
  * - Never expose bucket names, private object keys, provider subjects,
  *   or storage credentials through any return value or error message.
  */
@@ -139,13 +162,18 @@ export interface StorageAdapter {
   uploadSample(input: StorageUploadInput): Promise<StorageUploadResult>;
 
   /**
-   * Resolve an opaque storage reference back to a playable URL.
-   * Returns `null` when the reference is unknown or has been removed.
-   * Never throws for a missing reference — the application uses
+   * Resolve an opaque storage reference back to a fully-formed
+   * playable URL. Returns `null` when the reference is unknown or
+   * the underlying object has been removed. The application uses
    * `null` to hide the sample from buyer-facing discovery without
    * crashing.
+   *
+   * `offeringId` and `sampleId` let the deterministic adapter
+   * compose the in-app playback route (`/api/services/.../play`).
+   * The Supabase adapter ignores them and uses the persisted
+   * `storageRef` to mint a signed URL.
    */
-  getPlaybackReference(storageRef: string): Promise<StoragePlaybackReference | null>;
+  getPlaybackReference(input: StoragePlaybackInput): Promise<StoragePlaybackReference | null>;
 
   /**
    * Remove a previously uploaded sample. Idempotent: removing an

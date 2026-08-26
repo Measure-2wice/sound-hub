@@ -21,9 +21,13 @@
 //             that serve Supabase Storage and the deterministic
 //             fixture adapter.
 //
-// Buyer-facing playback renders via the same `/api/services/:offering
-// Id/audio-samples/:sampleId/play` endpoint the UI surfaces in the
-// `<audio>` `src` attribute.
+// The browser renders `sample.playbackUrl` as the `<audio>` `src`.
+// For Supabase Storage that is a narrowly scoped signed URL; for the
+// deterministic adapter it is the in-app
+// `/api/services/.../audio-samples/.../play` route. The server
+// re-runs eligibility and removal checks on every deterministic
+// playback request, so a stale or removed sample resolves to a 404
+// instead of an unbounded download.
 
 import { useCallback, useEffect, useMemo, useState, type FormEvent } from "react";
 import {
@@ -34,7 +38,6 @@ import {
 } from "@soundhub/types";
 import {
   listOfferingSamples,
-  playbackUrlFor,
   removeOfferingSample,
   uploadOfferingSample,
   type AudioSampleError,
@@ -43,7 +46,7 @@ import { Card } from "../components/ui/Card";
 
 const MAX_BYTES = BG2_AUDIO_SAMPLE_MAX_BYTE_SIZE;
 const MAX_PER_OFFERING = 3;
-const MAX_LABEL_LENGTH = BG2_AUDIO_SAMPLE_MAX_LABEL_LENGTH;
+const MAX_LABEL_CHARS = BG2_AUDIO_SAMPLE_MAX_LABEL_LENGTH;
 const ACCEPTED_CONTENT_TYPE = BG2_AUDIO_SAMPLE_CONTENT_TYPE;
 
 export interface AudioSamplesPanelProps {
@@ -109,10 +112,19 @@ export function AudioSamplesPanel({
         setError(`Sample must be ${ACCEPTED_CONTENT_TYPE} (got ${fileEntry.type || "unknown"}).`);
         return;
       }
+      if (trimmedLabel.length > MAX_LABEL_CHARS) {
+        setError(`Label must be at most ${MAX_LABEL_CHARS} characters.`);
+        return;
+      }
       setUploading(true);
       setError(null);
       try {
-        await uploadOfferingSample({ offeringId, label: trimmedLabel, file: fileEntry });
+        await uploadOfferingSample({
+          offeringId,
+          actingWorkspaceId,
+          label: trimmedLabel,
+          file: fileEntry,
+        });
         form.reset();
         await reload();
       } catch (err) {
@@ -121,7 +133,7 @@ export function AudioSamplesPanel({
         setUploading(false);
       }
     },
-    [offeringId, reload, uploading],
+    [actingWorkspaceId, offeringId, reload, uploading],
   );
 
   const handleRemove = useCallback(
@@ -130,7 +142,11 @@ export function AudioSamplesPanel({
       setRemovingId(sample.sampleId);
       setError(null);
       try {
-        await removeOfferingSample({ offeringId, sample });
+        await removeOfferingSample({
+          offeringId,
+          sample,
+          actingWorkspaceId,
+        });
         await reload();
       } catch (err) {
         setError(formatError(err));
@@ -138,7 +154,7 @@ export function AudioSamplesPanel({
         setRemovingId(null);
       }
     },
-    [offeringId, reload, removingId],
+    [actingWorkspaceId, offeringId, reload, removingId],
   );
 
   return (
@@ -196,11 +212,11 @@ export function AudioSamplesPanel({
           data-testid="audio-samples-upload-form"
         >
           <label className="block text-sm font-medium text-gray-800">
-            <span>Label</span>
+            <span>Label (max {MAX_LABEL_CHARS} characters)</span>
             <input
               name="label"
               type="text"
-              maxLength={MAX_LABEL_LENGTH}
+              maxLength={MAX_LABEL_CHARS}
               required
               className="mt-1 w-full border border-gray-300 rounded-md px-2 py-1 text-sm"
               data-testid="audio-samples-label-input"
@@ -217,7 +233,12 @@ export function AudioSamplesPanel({
               data-testid="audio-samples-file-input"
             />
           </label>
-          <input type="hidden" name="actingWorkspaceId" value={actingWorkspaceId} />
+          <input
+            type="hidden"
+            name="actingWorkspaceId"
+            value={actingWorkspaceId}
+            data-testid="audio-samples-acting-workspace-input"
+          />
           <button
             type="submit"
             disabled={uploading || remainingSlots === 0}
@@ -241,7 +262,6 @@ function SampleRow({
   readonly removing: boolean;
   readonly onRemove: () => void;
 }) {
-  const url = playbackUrlFor({ offeringId: sample.offeringId, sampleId: sample.sampleId });
   return (
     <li
       className="border border-gray-200 rounded-md p-3"
@@ -259,7 +279,7 @@ function SampleRow({
           <audio
             controls
             preload="none"
-            src={url}
+            src={sample.playbackUrl}
             className="mt-2 w-full"
             data-testid="audio-sample-player"
             aria-label={`${sample.label} sample player`}

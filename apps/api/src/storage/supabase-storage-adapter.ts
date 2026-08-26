@@ -8,22 +8,25 @@
 //
 // Wire-level contract:
 //
-//   1. `uploadSample` issues a TUS-style upload via the
-//      `${SUPABASE_URL}/storage/v1/object/{bucket}/{path}` endpoint.
-//      The bucket is server-side-only (SUPABASE_STORAGE_BUCKET env
-//      var); the adapter validates it is configured and refuses to
-//      upload to a public bucket because MP3 samples are private
-//      bytes owned by the seller.
+//   1. `uploadSample` issues a POST against
+//      `${SUPABASE_URL}/storage/v1/object/{bucket}/{path}`. The bucket
+//      is server-side-only (SUPABASE_STORAGE_BUCKET env var); the
+//      adapter validates it is configured and refuses to upload to a
+//      public bucket because MP3 samples are private bytes owned by
+//      the seller. The returned `storageRef` is an opaque per-sample
+//      id; the bucket/path mapping is held inside the adapter and
+//      never serialized to a public DTO.
 //
 //   2. `getPlaybackReference` derives a narrowly scoped signed URL
 //      via the Storage REST `POST /storage/v1/object/sign/{bucket}/
 //      {path}` endpoint. The URL is the only value returned to the
 //      application; bucket name, signing key, and path never cross
-//      the application boundary.
+//      the application boundary through the public DTO.
 //
 //   3. `removeSample` issues `DELETE /storage/v1/object/{bucket}/
 //      {path}` and never throws for a 404 (idempotent removal per
-//      the adapter contract).
+//      the adapter contract). The storage-ref → bucket/path mapping
+//      is removed from the adapter's internal index on success.
 //
 // Defense in depth: every adapter method validates content type and
 // size BEFORE contacting Supabase. The application boundary ALSO
@@ -35,6 +38,7 @@ import {
   StorageRejectedError,
   StorageUnavailableError,
   type StorageAdapter,
+  type StoragePlaybackInput,
   type StoragePlaybackReference,
   type StorageUploadInput,
   type StorageUploadResult,
@@ -69,6 +73,11 @@ interface SignSuccessBody {
   readonly signedURL: string;
 }
 
+interface UploadedObject {
+  readonly bucket: string;
+  readonly objectPath: string;
+}
+
 export class SupabaseStorageAdapter implements StorageAdapter {
   private readonly supabaseUrl: string | undefined;
   private readonly supabaseServiceRoleKey: string | undefined;
@@ -76,6 +85,17 @@ export class SupabaseStorageAdapter implements StorageAdapter {
   private readonly signedUrlExpiresInSeconds: number;
   private readonly fetchImpl: typeof fetch;
   private readonly pathPrefix: string;
+  /**
+   * Per-sample mapping from opaque storage ref to bucket/object path.
+   * The index lives in-process for the buildathon scope; a future
+   * scope may persist it (Supabase object metadata or a side column
+   * on `ServiceOfferingAudioSample`). The reference returned to the
+   * application is opaque and never reveals bucket/path through any
+   * public DTO — the application reads it back only via
+   * `getPlaybackReference` and `removeSample`, both of which go
+   * through this index.
+   */
+  private readonly index = new Map<string, UploadedObject>();
 
   constructor(options: SupabaseStorageAdapterOptions = {}) {
     this.supabaseUrl = options.supabaseUrl;
@@ -144,20 +164,18 @@ export class SupabaseStorageAdapter implements StorageAdapter {
         `Supabase Storage rejected the upload with status ${String(response.status)}.`,
       );
     }
-    // The opaque storage reference is `supa:{bucket}:{path}`. The
-    // bucket segment is included so a future migration to multiple
-    // buckets stays unambiguous. The application never reads the
-    // internals; the adapter parses them back to a path.
-    return {
-      storageRef: this.encodeStorageRef(objectPath),
-    };
+    const storageRef = this.makeStorageRef();
+    this.index.set(storageRef, { bucket: this.bucket, objectPath });
+    return { storageRef };
   }
 
-  async getPlaybackReference(storageRef: string): Promise<StoragePlaybackReference | null> {
+  async getPlaybackReference(
+    input: StoragePlaybackInput,
+  ): Promise<StoragePlaybackReference | null> {
     this.assertConfigured();
-    const objectPath = this.decodeStorageRef(storageRef);
-    if (!objectPath) return null;
-    const url = `${this.supabaseUrl}/storage/v1/object/sign/${this.bucket}/${objectPath}`;
+    const record = this.index.get(input.storageRef);
+    if (!record) return null;
+    const url = `${this.supabaseUrl}/storage/v1/object/sign/${record.bucket}/${record.objectPath}`;
     let response: Response;
     try {
       response = await this.fetchImpl(url, {
@@ -191,10 +209,6 @@ export class SupabaseStorageAdapter implements StorageAdapter {
       );
     }
     return {
-      // Supabase returns a path-relative signed URL (e.g.
-      // `/object/sign/...`). The application needs an absolute URL
-      // to render in an `<audio>` tag, so the adapter composes it
-      // here. The application still treats the value as opaque.
       url: `${this.supabaseUrl}${parsed.signedURL}`,
       cacheControlHint: "private, max-age=60",
     };
@@ -202,13 +216,13 @@ export class SupabaseStorageAdapter implements StorageAdapter {
 
   async removeSample(storageRef: string): Promise<void> {
     this.assertConfigured();
-    const objectPath = this.decodeStorageRef(storageRef);
-    if (!objectPath) {
+    const record = this.index.get(storageRef);
+    if (!record) {
       // Idempotent: an unknown reference is treated as already
       // removed so a retried command never raises.
       return;
     }
-    const url = `${this.supabaseUrl}/storage/v1/object/${this.bucket}/${objectPath}`;
+    const url = `${this.supabaseUrl}/storage/v1/object/${record.bucket}/${record.objectPath}`;
     let response: Response;
     try {
       response = await this.fetchImpl(url, {
@@ -222,7 +236,9 @@ export class SupabaseStorageAdapter implements StorageAdapter {
       throw new StorageUnavailableError(err instanceof Error ? err.message : String(err));
     }
     if (response.status === 404) {
-      // Already gone — idempotent success.
+      // Already gone — idempotent success. Drop the index entry
+      // either way so a subsequent remove is also a no-op.
+      this.index.delete(storageRef);
       return;
     }
     if (!response.ok) {
@@ -230,6 +246,7 @@ export class SupabaseStorageAdapter implements StorageAdapter {
         `Supabase Storage delete returned ${String(response.status)}.`,
       );
     }
+    this.index.delete(storageRef);
   }
 
   /**
@@ -243,24 +260,15 @@ export class SupabaseStorageAdapter implements StorageAdapter {
     return `${prefix}/${encodeURIComponent(offeringId)}/${cuid}.mp3`;
   }
 
-  private encodeStorageRef(objectPath: string): string {
-    return `supa:${this.bucket}:${objectPath}`;
-  }
-
-  private decodeStorageRef(storageRef: string): string | null {
-    const parts = storageRef.split(":");
-    if (parts.length < 3 || parts[0] !== "supa") return null;
-    const bucket = parts[1];
-    const path = parts.slice(2).join(":");
-    if (bucket !== this.bucket) return null;
-    return path;
+  /**
+   * Mint a per-sample opaque id. The application never parses it;
+   * the adapter resolves it back to bucket/path via the index.
+   */
+  private makeStorageRef(): string {
+    return `${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 12)}`;
   }
 
   private makeCuid(): string {
-    // Lightweight cuid-like identifier — collision-resistant for the
-    // bounded number of objects the slice produces. Supabase Storage
-    // itself does not require cuid format; we only need a stable,
-    // opaque handle the adapter can encode/decode.
     return `${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 12)}`;
   }
 

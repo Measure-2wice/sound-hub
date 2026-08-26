@@ -93,7 +93,12 @@ describe("SupabaseStorageAdapter", () => {
     assert.ok(captured.url.startsWith(`${SUPABASE_URL}/storage/v1/object/offering-audio/samples/`));
     assert.equal(captured.init.method, "POST");
     assert.equal(headersValue(captured.init.headers, "Content-Type"), "audio/mpeg");
-    assert.ok(result.storageRef.startsWith("supa:offering-audio:samples/"));
+    // Per ticket #61 follow-up review the storage reference is
+    // an opaque handle, NOT a `supa:{bucket}:{path}` value. The
+    // adapter resolves the handle back to bucket/path via an
+    // internal index.
+    assert.ok(result.storageRef.length > 0);
+    assert.equal(result.storageRef.includes("offering-audio"), false);
     assert.equal(calls.length, 1);
   });
 
@@ -174,7 +179,11 @@ describe("SupabaseStorageAdapter", () => {
       offeringId: "of-1",
       bytes: new Uint8Array(4),
     });
-    const ref = await adapter.getPlaybackReference(result.storageRef);
+    const ref = await adapter.getPlaybackReference({
+      storageRef: result.storageRef,
+      offeringId: "of-1",
+      sampleId: "smp-1",
+    });
     assert.ok(ref);
     assert.equal(ref.url, `${SUPABASE_URL}/object/sign/offering-audio/samples/x.mp3?token=abc`);
   });
@@ -186,7 +195,11 @@ describe("SupabaseStorageAdapter", () => {
       supabaseServiceRoleKey: SUPABASE_KEY,
       fetchImpl,
     });
-    const ref = await adapter.getPlaybackReference("supa:offering-audio:samples/missing.mp3");
+    const ref = await adapter.getPlaybackReference({
+      storageRef: "unknown-opaque-ref",
+      offeringId: "of-1",
+      sampleId: "smp-1",
+    });
     assert.equal(ref, null);
   });
 
@@ -197,9 +210,9 @@ describe("SupabaseStorageAdapter", () => {
       supabaseServiceRoleKey: SUPABASE_KEY,
       fetchImpl,
     });
-    // Truly unparseable reference: missing the `supa:` prefix.
-    await adapter.removeSample("not-a-valid-supabase-ref");
-    assert.equal(calls.length, 0, "no fetch call is made for an unparseable reference");
+    // Truly unknown reference (not in the adapter's index).
+    await adapter.removeSample("never-uploaded-ref");
+    assert.equal(calls.length, 0, "no fetch call is made for an unindexed reference");
   });
 
   test("removeSample issues a DELETE that returns 404 idempotently", async () => {
@@ -228,5 +241,61 @@ describe("SupabaseStorageAdapter", () => {
     const last = calls[calls.length - 1];
     assert.ok(last);
     assert.equal(last.init.method, "DELETE");
+  });
+
+  test("the storage reference never embeds bucket or object path", async () => {
+    const { fetchImpl } = makeFetchStub(() => new Response(null, { status: 200 }));
+    const adapter = new SupabaseStorageAdapter({
+      supabaseUrl: SUPABASE_URL,
+      supabaseServiceRoleKey: SUPABASE_KEY,
+      bucket: "offering-audio",
+      fetchImpl,
+    });
+    const result = await adapter.uploadSample({
+      label: "S",
+      contentType: "audio/mpeg",
+      byteSize: 4,
+      offeringId: "of-1",
+      bytes: new Uint8Array(4),
+    });
+    // Per ticket #61 follow-up review: storageRef is opaque and
+    // never reveals the bucket name or the object path. The adapter
+    // resolves it back to bucket/path via its internal index.
+    assert.equal(result.storageRef.includes("offering-audio"), false);
+    assert.equal(result.storageRef.includes("/samples/"), false);
+    assert.equal(result.storageRef.includes(".mp3"), false);
+  });
+
+  test("removal drops the storage reference from the internal index", async () => {
+    // Stub returns 200 for uploads (so the test can mint a ref)
+    // and 404 for sign/delete (so the adapter treats the object as
+    // gone). After removal the adapter must not re-resolve the
+    // storage reference — `getPlaybackReference` returns null.
+    const { fetchImpl } = makeFetchStub((call) => {
+      if (call.init.method === "DELETE") return new Response(null, { status: 200 });
+      if (call.init.method === "POST") return new Response(null, { status: 200 });
+      return new Response(null, { status: 404 });
+    });
+    const adapter = new SupabaseStorageAdapter({
+      supabaseUrl: SUPABASE_URL,
+      supabaseServiceRoleKey: SUPABASE_KEY,
+      fetchImpl,
+    });
+    const ref = (
+      await adapter.uploadSample({
+        label: "S",
+        contentType: "audio/mpeg",
+        byteSize: 4,
+        offeringId: "of-1",
+        bytes: new Uint8Array(4),
+      })
+    ).storageRef;
+    await adapter.removeSample(ref);
+    const playback = await adapter.getPlaybackReference({
+      storageRef: ref,
+      offeringId: "of-1",
+      sampleId: "smp-1",
+    });
+    assert.equal(playback, null);
   });
 });

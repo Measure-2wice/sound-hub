@@ -37,7 +37,6 @@ export interface StorageFactoryDeps {
   readonly signedUrlExpiresInSeconds?: number;
   readonly fetchImpl?: typeof fetch;
   readonly playbackBaseUrl?: string;
-  readonly playbackTtlMs?: number;
   readonly now?: () => number;
 }
 
@@ -58,7 +57,6 @@ export function buildStorageAdapters(deps: StorageFactoryDeps = {}): BuiltStorag
   });
   const deterministic = new DeterministicStorageAdapter({
     playbackBaseUrl: deps.playbackBaseUrl,
-    playbackTtlMs: deps.playbackTtlMs,
     now: deps.now,
   });
   const backend = selectBackend({ supabase, explicit: process.env.BG2_STORAGE_BACKEND });

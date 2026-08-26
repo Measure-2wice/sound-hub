@@ -8,10 +8,19 @@
 // contract.
 //
 // The list endpoint is unauthenticated; the upload and remove
-// endpoints require the seller session. The seller management UI
-// calls the list endpoint on mount and again after every successful
-// upload or remove, so a freshly-removed sample disappears from the
-// UI without an explicit optimistic update.
+// endpoints require the seller session AND the explicit acting
+// Workspace id (the GS 4 contract: every consequential command
+// names an acting Workspace). The seller management UI calls the
+// list endpoint on mount and again after every successful upload or
+// remove, so a freshly-removed sample disappears from the UI
+// without an explicit optimistic update.
+//
+// Playback: the server-provided `playbackUrl` is the only audio
+// handle the browser holds. For the deployed Supabase backend that
+// is a narrowly scoped signed URL; for the deterministic backend it
+// is the in-app `/api/services/.../audio-samples/.../play` route.
+// The browser renders the value as the `<audio>` tag's `src` and
+// never inspects its internals.
 
 import type {
   Bg2AudioSampleListResponseV1,
@@ -66,6 +75,7 @@ export async function listOfferingSamples(
 
 export interface UploadSampleInput {
   readonly offeringId: string;
+  readonly actingWorkspaceId: string;
   readonly label: string;
   readonly file: File;
 }
@@ -74,8 +84,10 @@ export async function uploadOfferingSample(
   input: UploadSampleInput,
 ): Promise<Bg2AudioSampleUploadResponseV1> {
   // Browser-driven multipart upload. The browser owns the boundary;
-  // the server validates it.
+  // the server validates it. `actingWorkspaceId` is required on
+  // every consequential command per the GS 4 contract.
   const body = new FormData();
+  body.append("actingWorkspaceId", input.actingWorkspaceId);
   body.append("label", input.label);
   body.append("file", input.file);
   const response = await fetch(
@@ -94,6 +106,7 @@ export async function uploadOfferingSample(
 export async function removeOfferingSample(input: {
   readonly offeringId: string;
   readonly sample: Bg2AudioSamplePublicV1;
+  readonly actingWorkspaceId: string;
 }): Promise<Bg2AudioSampleRemoveResponseV1> {
   const response = await fetch(
     `/api/services/${encodeURIComponent(input.offeringId)}/audio-samples/${encodeURIComponent(
@@ -102,26 +115,14 @@ export async function removeOfferingSample(input: {
     {
       method: "DELETE",
       credentials: "include",
-      headers: { Accept: "application/json" },
+      headers: {
+        Accept: "application/json",
+        "Content-Type": "application/json",
+      },
+      body: JSON.stringify({ actingWorkspaceId: input.actingWorkspaceId }),
     },
   );
   if (!response.ok) throw await parseErrorResponse(response);
   const raw: unknown = await response.json();
   return bg2AudioSampleRemoveResponseV1Schema.parse(raw);
-}
-
-/**
- * Resolve a buyer-safe playback URL for a sample. The deterministic
- * adapter returns the in-process `/api/services/.../audio-samples/
- * .../play` route; Supabase Storage returns a narrowly scoped signed
- * URL. The browser renders the value as the `<audio>` tag's `src`
- * without inspecting the internals.
- */
-export function playbackUrlFor(input: {
-  readonly offeringId: string;
-  readonly sampleId: string;
-}): string {
-  return `/api/services/${encodeURIComponent(input.offeringId)}/audio-samples/${encodeURIComponent(
-    input.sampleId,
-  )}/play`;
 }

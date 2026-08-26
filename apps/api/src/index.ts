@@ -264,7 +264,6 @@ export function buildApp(options: AppOptions = {}): BuiltApp {
     createAudioSamplesRouter({
       service: audioSampleService,
       authenticationService,
-      storage: storageAdapter,
     }),
   );
 
