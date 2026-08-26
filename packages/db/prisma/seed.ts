@@ -1048,6 +1048,139 @@ async function applySellerGraph(
   }
 }
 
+// BG1 demo buyer identity. A stable, deterministic identity subject is
+// required so the integrated browser journey and the authorization
+// service tests can sign in without touching managed email delivery.
+// The demo buyer Workspace has Buyer capability and the demo buyer
+// UserAccount is the Owner via a WorkspaceMembership row. The seed
+// restores this graph on every run so stale mutations cannot persist.
+//
+// The subject is derived from the email through the canonical
+// `deriveDeterministicSubject` helper in `@soundhub/types` so the
+// seeded (provider, subject) tuple is exactly the one the
+// deterministic adapter computes at sign-in. Without this, the
+// adapter would look up an unknown subject and create a second
+// UserAccount (violating ticket #59 GS 2 and the deterministic
+// mapping invariant).
+import { createHash } from "node:crypto";
+import { deriveDeterministicSubject } from "@soundhub/types";
+
+const DEMO_BUYER_EMAIL = "demo.buyer@soundhub.example";
+const DEMO_SELLER_EMAIL = "marc.andre@creolebeats.example";
+
+const sha256Hex = (input: string): string => createHash("sha256").update(input).digest("hex");
+const DEMO_BUYER_SUBJECT = deriveDeterministicSubject(DEMO_BUYER_EMAIL, sha256Hex);
+const DEMO_SELLER_SUBJECT = deriveDeterministicSubject(DEMO_SELLER_EMAIL, sha256Hex);
+const DEMO_BUYER_WORKSPACE_SLUG = "bg1-demo-buyer";
+const DEMO_BUYER_WORKSPACE_NAME = "BG1 Demo Buyer";
+const DEMO_BUYER_USER_ID = "user-bg1-demo-buyer";
+const DEMO_BUYER_WORKSPACE_ID = "ws-bg1-demo-buyer";
+
+// BG1 demo seller identity. The Buildathon journey signs in as the
+// existing canonical seller "Marc-André Pierre" (Creole Beats Brooklyn).
+// He already owns his Workspace and has the Seller capability; we only
+// add a deterministic identity provider mapping so the journey can
+// complete magic-link sign-in deterministically. The seller UserAccount
+// already exists from the canonical SELLERS loop above.
+
+async function applyDemoBuyerGraph(tx: Prisma.TransactionClient): Promise<void> {
+  const buyer = await tx.userAccount.upsert({
+    where: { id: DEMO_BUYER_USER_ID },
+    create: {
+      id: DEMO_BUYER_USER_ID,
+      email: DEMO_BUYER_EMAIL,
+    },
+    update: { email: DEMO_BUYER_EMAIL },
+  });
+
+  const workspace = await tx.workspace.upsert({
+    where: { slug: DEMO_BUYER_WORKSPACE_SLUG },
+    create: {
+      id: DEMO_BUYER_WORKSPACE_ID,
+      slug: DEMO_BUYER_WORKSPACE_SLUG,
+      name: DEMO_BUYER_WORKSPACE_NAME,
+      type: "Personal",
+      status: "Active",
+      ownerUserId: buyer.id,
+    },
+    update: {
+      name: DEMO_BUYER_WORKSPACE_NAME,
+      type: "Personal",
+      status: "Active",
+      ownerUserId: buyer.id,
+    },
+  });
+
+  await tx.workspaceMembership.upsert({
+    where: {
+      userId_workspaceId: { userId: buyer.id, workspaceId: workspace.id },
+    },
+    create: {
+      userId: buyer.id,
+      workspaceId: workspace.id,
+      role: "Owner",
+    },
+    update: { role: "Owner" },
+  });
+
+  // Replace the canonical capability set so a stale mutation cannot
+  // persist. The demo buyer is Buyer-capable only; Seller capability
+  // is intentionally absent so authorization-service negative tests
+  // can prove the buyer cannot sell.
+  await tx.workspaceCapability.deleteMany({ where: { workspaceId: workspace.id } });
+  await tx.workspaceCapability.create({
+    data: { workspaceId: workspace.id, capability: "Buyer" },
+  });
+}
+
+async function applyIdentityProviders(tx: Prisma.TransactionClient): Promise<void> {
+  // The BG1 deterministic identity adapter signs in by
+  // (provider="deterministic", subject). The demo buyer subject maps to
+  // the demo buyer UserAccount; the demo seller subject maps to the
+  // canonical Marc-André Pierre UserAccount (which already owns the
+  // Creole Beats Brooklyn Workspace).
+  const buyer = await tx.userAccount.findUnique({ where: { email: DEMO_BUYER_EMAIL } });
+  if (!buyer) {
+    throw new Error(`BG1 demo buyer ${DEMO_BUYER_EMAIL} missing before identity seeding`);
+  }
+  const seller = await tx.userAccount.findUnique({ where: { email: DEMO_SELLER_EMAIL } });
+  if (!seller) {
+    throw new Error(`BG1 demo seller ${DEMO_SELLER_EMAIL} missing before identity seeding`);
+  }
+
+  await tx.identityProvider.upsert({
+    where: {
+      provider_subject: { provider: "deterministic", subject: DEMO_BUYER_SUBJECT },
+    },
+    create: {
+      provider: "deterministic",
+      subject: DEMO_BUYER_SUBJECT,
+      providerEmail: DEMO_BUYER_EMAIL,
+      userAccountId: buyer.id,
+    },
+    update: {
+      providerEmail: DEMO_BUYER_EMAIL,
+      userAccountId: buyer.id,
+    },
+  });
+
+  await tx.identityProvider.upsert({
+    where: {
+      provider_subject: { provider: "deterministic", subject: DEMO_SELLER_SUBJECT },
+    },
+    create: {
+      provider: "deterministic",
+      subject: DEMO_SELLER_SUBJECT,
+      providerEmail: DEMO_SELLER_EMAIL,
+      userAccountId: seller.id,
+    },
+    update: {
+      providerEmail: DEMO_SELLER_EMAIL,
+      userAccountId: seller.id,
+    },
+  });
+}
+
 async function applySeed(): Promise<void> {
   await prisma.$transaction(async (tx) => {
     // Controlled records (categorical taxonomies).
@@ -1096,6 +1229,20 @@ async function applySeed(): Promise<void> {
     for (const fixture of NEGATIVE_FIXTURES) {
       await applySellerGraph(tx, fixture);
     }
+
+    // BG1 demo buyer and identity provider mappings. The Buildathon
+    // Golden Slice ticket requires the buyer and seller demo
+    // Workspaces, capabilities, and memberships to be persisted, and
+    // it requires the identity provider subjects for the demo buyer
+    // and demo seller(s) to be deterministic so the integrated browser
+    // journey and the authorization-service tests can sign in without
+    // touching managed email delivery. The demo buyer has its own
+    // Workspace + WorkspaceMembership(Owner) + Buyer capability; the
+    // seller identity mappings reuse the canonical seller UserAccounts
+    // (which already own the seller Workspaces and have the Seller
+    // capability).
+    await applyDemoBuyerGraph(tx);
+    await applyIdentityProviders(tx);
   });
 }
 
