@@ -377,6 +377,11 @@ describe("PrismaTalentSearchRepository", () => {
     // getControlledKeys returns it. This proves the application does
     // not need a hard-coded list of canonical keys; the database is
     // the source of truth.
+    //
+    // The test MUST delete the row it created in `finally` so the
+    // row cannot survive the test that created it. The seed's
+    // canonical-state convergence pass is a second-line guarantee,
+    // not the primary isolation boundary.
     const prisma = createTestPrismaClient();
     const newKey = `test-category-${Date.now()}`;
     try {
@@ -385,14 +390,25 @@ describe("PrismaTalentSearchRepository", () => {
         create: { key: newKey, name: "Test category", bundleOnly: false },
         update: {},
       });
+      const keys = await repository.getControlledKeys();
+      assert.ok(
+        keys.serviceCategoryKeys.has(newKey),
+        "newly inserted canonical category must be visible via getControlledKeys",
+      );
     } finally {
+      // Always remove the row this test inserted. Without this,
+      // repeated runs accumulate "Test category" entries in the
+      // disposable DB and leak them into the next reset cycle.
+      await prisma.serviceCategory.delete({ where: { key: newKey } }).catch((err: unknown) => {
+        // The deletion is best-effort; if the row vanished (e.g.
+        // a parallel test wiped it), do not fail the suite.
+        if (err instanceof Error && "code" in err && (err as { code?: string }).code === "P2025") {
+          return;
+        }
+        throw err;
+      });
       await prisma.$disconnect();
     }
-    const keys = await repository.getControlledKeys();
-    assert.ok(
-      keys.serviceCategoryKeys.has(newKey),
-      "newly inserted canonical category must be visible via getControlledKeys",
-    );
   });
 
   test("a mutating test that deletes a canonical row does not contaminate the next test (proves the beforeEach reset)", async () => {
