@@ -90,9 +90,7 @@ export function createAuthRouter(deps: AuthRouteDeps): Router {
   // the error middleware would attempt to set headers on a sent
   // response and produce ERR_HTTP_HEADERS_SENT.
   router.post("/magic-link", (req, res, next) => {
-    handleMagicLink(req, res, deps).catch((err) =>
-      forwardUnhandledRejection(req, res, next, err),
-    );
+    handleMagicLink(req, res, deps).catch((err) => forwardUnhandledRejection(req, res, next, err));
   });
   router.post("/verify-token", (req, res, next) => {
     handleVerifyToken(req, res, deps).catch((err) =>
@@ -100,14 +98,10 @@ export function createAuthRouter(deps: AuthRouteDeps): Router {
     );
   });
   router.get("/me", (req, res, next) => {
-    handleMe(req, res, deps).catch((err) =>
-      forwardUnhandledRejection(req, res, next, err),
-    );
+    handleMe(req, res, deps).catch((err) => forwardUnhandledRejection(req, res, next, err));
   });
   router.post("/sign-out", (req, res, next) => {
-    handleSignOut(req, res, deps).catch((err) =>
-      forwardUnhandledRejection(req, res, next, err),
-    );
+    handleSignOut(req, res, deps).catch((err) => forwardUnhandledRejection(req, res, next, err));
   });
   router.post("/acting-workspace", (req, res, next) => {
     handleActingWorkspace(req, res, deps).catch((err) =>

@@ -41,10 +41,7 @@ describe("PrismaAuthRepository", () => {
     const { createHash } = await import("node:crypto");
     const { deriveDeterministicSubject } = await import("@soundhub/types");
     const sha256 = (input: string) => createHash("sha256").update(input).digest("hex");
-    const demoBuyerSubject = deriveDeterministicSubject(
-      "demo.buyer@soundhub.example",
-      sha256,
-    );
+    const demoBuyerSubject = deriveDeterministicSubject("demo.buyer@soundhub.example", sha256);
     const mapping = await repo.findUserByIdentity({
       provider: "deterministic",
       subject: demoBuyerSubject,

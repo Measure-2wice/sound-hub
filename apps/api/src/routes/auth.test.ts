@@ -418,9 +418,7 @@ describe("BG1 auth routes (in-memory, deterministic adapter)", () => {
     assert.equal(literalNull.body.error.code, "INVALID_AUTH_REQUEST");
     assert.ok(Array.isArray(literalNull.body.error.fields));
     assert.ok(
-      literalNull.body.error.fields.some(
-        (f: { code: string }) => f.code === "invalid_type",
-      ),
+      literalNull.body.error.fields.some((f: { code: string }) => f.code === "invalid_type"),
       "schema.parse(null) must produce Zod invalid_type field errors",
     );
   });
@@ -431,9 +429,7 @@ describe("BG1 auth routes (in-memory, deterministic adapter)", () => {
     // route via `void handleMe(...)` and crashed the process.
     // After the fix, the cookie decoder swallows the failure and
     // returns `undefined`, so /me resolves an anonymous session.
-    const me = await request(app)
-      .get("/api/auth/me")
-      .set("Cookie", "soundhub_session=%zz");
+    const me = await request(app).get("/api/auth/me").set("Cookie", "soundhub_session=%zz");
     assert.equal(me.status, 200);
     assert.equal(me.body.user, null);
     // The follow-up good request must still work — confirming the
@@ -596,14 +592,8 @@ describe("BG1 auth routes (Prisma, disposable PostgreSQL)", () => {
     // `deriveDeterministicSubject(email, sha256)`.
     const { deriveDeterministicSubject } = await import("@soundhub/types");
     const sha256 = (input: string) => createHash("sha256").update(input).digest("hex");
-    const demoBuyerSubject = deriveDeterministicSubject(
-      "demo.buyer@soundhub.example",
-      sha256,
-    );
-    const demoSellerSubject = deriveDeterministicSubject(
-      "marc.andre@creolebeats.example",
-      sha256,
-    );
+    const demoBuyerSubject = deriveDeterministicSubject("demo.buyer@soundhub.example", sha256);
+    const demoSellerSubject = deriveDeterministicSubject("marc.andre@creolebeats.example", sha256);
     assert.ok(
       identityMappings.some(
         (m) => m.provider === "deterministic" && m.subject === demoBuyerSubject,
