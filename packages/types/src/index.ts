@@ -431,6 +431,19 @@ export const apiErrorCodeV1Schema = z.enum([
   "MATCHMAKER_FAILED",
   "BRIEF_NOT_FOUND",
   "BRIEF_FORBIDDEN",
+  // Buildathon Golden Slice 2 (BG2) error codes. Each code maps to a
+  // stable HTTP status via `mapStatus` and to a buyer-safe message.
+  // They cover the seller-audio slice only; existing codes are
+  // unchanged.
+  "AUDIO_OFFERING_NOT_FOUND",
+  "AUDIO_OFFERING_INELIGIBLE",
+  "AUDIO_SAMPLE_NOT_FOUND",
+  "AUDIO_SAMPLE_LIMIT_EXCEEDED",
+  "AUDIO_CONTENT_TYPE_UNSUPPORTED",
+  "AUDIO_PAYLOAD_TOO_LARGE",
+  "AUDIO_PAYLOAD_MISSING",
+  "AUDIO_PROVIDER_UNAVAILABLE",
+  "AUDIO_STORAGE_FAILED",
 ]);
 export type ApiErrorCodeV1 = z.infer<typeof apiErrorCodeV1Schema>;
 
@@ -1098,3 +1111,132 @@ export const aiInterpretBriefOutputV1Schema = z
   })
   .strict();
 export type AiInterpretBriefOutputV1 = z.infer<typeof aiInterpretBriefOutputV1Schema>;
+
+// ===========================================================================
+// Buildathon Golden Slice 2 (BG2) shared runtime contracts.
+//
+// These schemas cover the bounded MP3 discovery samples a seller may
+// attach to a ServiceOffering. The contracts follow the same patterns
+// as the v1 search and BG1 contracts: shared Zod is the executable
+// contract; TypeScript types are inferred from it; the same schema is
+// consumed by the Express route validator, the seller management UI,
+// the buyer-facing discovery renderer, and the deterministic browser
+// journey. No Prisma model, storage reference, bucket name, or
+// provider credential ever crosses a public DTO.
+//
+// Per ticket #61 the BG2 slice satisfies the Golden Slice GS 7–GS 12
+// acceptance criteria:
+//
+//   GS 7  — an authorized seller Workspace can upload an MP3 sample
+//           to its own ServiceOffering and list, play, and remove it.
+//   GS 8  — an unrelated Workspace, non-member, or insufficiently
+//           authorized member cannot upload or remove samples.
+//   GS 9  — a successful upload persists buyer-safe metadata and an
+//           opaque storage reference in PostgreSQL only after the
+//           storage operation succeeds.
+//   GS 10 — an Active ServiceOffering exposes zero to three playable
+//           MP3 discovery samples; removal stops a sample from
+//           appearing in buyer-facing discovery.
+//   GS 11 — a fourth sample, a non-MP3 object, or an object larger
+//           than 25 MB is rejected at a trusted boundary; duration
+//           is not an acceptance condition.
+//   GS 12 — Supabase Storage is exercised by a bounded deployed-
+//           provider smoke; deterministic storage fixtures satisfy
+//           the same application-facing contract in tests.
+//
+// ===========================================================================
+
+// ---------- Audio sample DTOs ----------
+
+// The only audio sample shape that ever crosses the public HTTP
+// boundary. `storageRef` is opaque: the application treats it as an
+// opaque string; only the storage adapter that produced it can
+// resolve it back to a playable reference. Storage credentials,
+// bucket names, and provider subjects never enter this schema.
+export const bg2AudioSamplePublicV1Schema = z
+  .object({
+    sampleId: z.string().min(1).max(128),
+    offeringId: z.string().min(1).max(128),
+    label: z.string().min(1).max(120),
+    contentType: z.literal("audio/mpeg"),
+    byteSize: z
+      .number()
+      .int()
+      .nonnegative()
+      .max(25 * 1024 * 1024),
+    displayOrder: z.number().int().min(1).max(3),
+    // `storageRef` is opaque to the public DTO; it is the handoff
+    // between PostgreSQL and the storage adapter. Its presence on the
+    // wire does not expose provider internals: the contract is the
+    // same for live Supabase Storage and the deterministic fixture
+    // adapter (both produce an opaque handle that the adapter alone
+    // resolves).
+    storageRef: z.string().min(1).max(512),
+    createdAt: z.string().datetime(),
+  })
+  .strict();
+export type Bg2AudioSamplePublicV1 = z.infer<typeof bg2AudioSamplePublicV1Schema>;
+
+// ---------- Seller list response (one offering's bounded samples) ----------
+
+export const bg2AudioSampleListResponseV1Schema = z
+  .object({
+    offeringId: z.string().min(1).max(128),
+    samples: z.array(bg2AudioSamplePublicV1Schema).max(3),
+  })
+  .strict();
+export type Bg2AudioSampleListResponseV1 = z.infer<typeof bg2AudioSampleListResponseV1Schema>;
+
+// ---------- Upload response ----------
+
+// The upload command returns the persisted buyer-safe sample. The
+// request body itself is multipart/form-data (Content-Disposition:
+// form-data), so the JSON schema is only for the RESPONSE side; the
+// request boundary enforces the file content type and size at the
+// trusted multipart parser.
+export const bg2AudioSampleUploadResponseV1Schema = z
+  .object({
+    ok: z.literal(true),
+    sample: bg2AudioSamplePublicV1Schema,
+  })
+  .strict();
+export type Bg2AudioSampleUploadResponseV1 = z.infer<typeof bg2AudioSampleUploadResponseV1Schema>;
+
+// ---------- Remove response ----------
+
+export const bg2AudioSampleRemoveResponseV1Schema = z
+  .object({
+    ok: z.literal(true),
+    sampleId: z.string().min(1).max(128),
+    offeringId: z.string().min(1).max(128),
+    removedAt: z.string().datetime(),
+  })
+  .strict();
+export type Bg2AudioSampleRemoveResponseV1 = z.infer<typeof bg2AudioSampleRemoveResponseV1Schema>;
+
+// ---------- Stable limits exposed for runtime validation ----------
+//
+// The application uses these constants to enforce the GS 11 / GS 12
+// limits at the trusted boundary. A future contract drift detector
+// can compare them against the values the application service
+// enforces.
+export const BG2_AUDIO_SAMPLE_MAX_PER_OFFERING = 3;
+export const BG2_AUDIO_SAMPLE_MAX_BYTE_SIZE = 25 * 1024 * 1024;
+export const BG2_AUDIO_SAMPLE_CONTENT_TYPE = "audio/mpeg" as const;
+export const BG2_AUDIO_SAMPLE_MAX_LABEL_LENGTH = 120;
+export const BG2_AUDIO_SAMPLE_MAX_DISPLAY_ORDER = 3;
+
+// ===========================================================================
+// BG2 error code additions to the shared safe envelope.
+//
+// Existing codes remain unchanged. The new BG2 codes cover the
+// rejection surfaces unique to the seller-audio slice and round-trip
+// through `mapStatus` in `apps/api/src/lib/errors.ts`. The codes
+// never expose provider subjects, raw tokens, session ids, storage
+// credentials, bucket names, or membership internals.
+// ===========================================================================
+
+// The new codes are appended to the existing enum so a contract-drift
+// detector can compare this list against the runtime error builder.
+// The drift test (`apps/api/src/lib/enum-drift.test.ts`) is the only
+// place that consults this list outside the route layer.

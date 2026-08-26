@@ -7,20 +7,27 @@ import { healthRoutes } from "./routes/health.js";
 import { createSearchRouter } from "./routes/search.js";
 import { createMetadataRouter } from "./routes/metadata.js";
 import { createAuthRouter } from "./routes/auth.js";
+import { createAudioSamplesRouter } from "./routes/audio-samples.js";
+import { createOfferingCatalogRouter } from "./routes/offering-catalog.js";
 import { createMatchmakerRouter } from "./routes/matchmaker.js";
 import { TalentSearchService } from "./services/talent-search.service.js";
 import { AuthenticationService } from "./services/authentication.service.js";
 import { WorkspaceAuthorizationService } from "./services/workspace-authorization.service.js";
+import { AudioSampleService } from "./services/audio-sample.service.js";
 import { MatchmakerService } from "./services/matchmaker.service.js";
 import { PrismaTalentSearchRepository } from "./repositories/prisma-talent-search.repository.js";
 import { PrismaMetadataRepository } from "./repositories/prisma-metadata.repository.js";
 import { PrismaAuthRepository } from "./auth-repository/prisma-auth-repository.js";
+import { PrismaAudioRepository } from "./audio-repository/prisma-audio-repository.js";
 import { PrismaProjectBriefRepository } from "./matchmaker/prisma-project-brief.repository.js";
 import type { ProjectBriefRepository } from "./matchmaker/project-brief.repository.js";
 import type { MetadataRepository } from "./repositories/metadata.repository.js";
 import type { AuthRepository } from "./auth-repository/auth-repository.js";
+import type { AudioRepository } from "./audio-repository/audio-repository.js";
 import type { IdentityAdapter } from "./identity/identity-adapter.js";
 import type { AiAdapter } from "./matchmaker/ai-adapter.js";
+import type { StorageAdapter } from "./storage/storage-adapter.js";
+import { buildStorageAdapters, type BuiltStorageAdapters } from "./storage/storage-factory.js";
 import {
   buildIdentityAdapters,
   buildIdentityAdaptersAsync,
@@ -78,6 +85,31 @@ export interface AppOptions {
   readonly projectBriefRepository?: ProjectBriefRepository;
   readonly matchmakerService?: MatchmakerService;
   readonly aiAdapter?: AiAdapter;
+  /**
+   * Override for the audio repository. When supplied, the composition
+   * root does NOT construct the Prisma adapter; the override is
+   * served directly. Tests pass the in-memory adapter.
+   */
+  readonly audioRepository?: AudioRepository;
+  /**
+   * Pre-built storage adapter bundle. When supplied, the composition
+   * root uses the same instance the served factory built so tests
+   * can assert object identity. The factory's default selection is
+   * driven by `BG2_STORAGE_BACKEND` and the Supabase configuration.
+   */
+  readonly storageAdapters?: BuiltStorageAdapters;
+  /**
+   * Override for the active storage adapter. When supplied, the
+   * composition root uses this adapter instead of the bundle's
+   * `active`. Tests inject a deterministic adapter.
+   */
+  readonly storageAdapterOverride?: StorageAdapter;
+  /**
+   * Override for the audio sample service. When supplied, the
+   * composition root uses this service instead of constructing one
+   * from the repository and storage adapter.
+   */
+  readonly audioSampleService?: AudioSampleService;
 }
 
 export interface BuiltApp {
@@ -90,6 +122,9 @@ export interface BuiltApp {
   readonly identityAdapter: IdentityAdapter;
   readonly matchmakerService: MatchmakerService;
   readonly aiAdapter: AiAdapter;
+  readonly audioSampleService: AudioSampleService;
+  readonly storageAdapter: StorageAdapter;
+  readonly storageBackend: "supabase" | "deterministic";
 }
 
 export function buildApp(options: AppOptions = {}): BuiltApp {
@@ -159,6 +194,31 @@ export function buildApp(options: AppOptions = {}): BuiltApp {
       fallbackAiAdapter: aiAdapters.deterministic,
     });
 
+  // BG2: storage adapter bundle. The factory owns the
+  // Supabase-vs-deterministic selection so the same env-var set
+  // drives the identity adapter and the storage backend.
+  const storageBundle =
+    options.storageAdapters ??
+    buildStorageAdapters({
+      supabaseUrl: process.env.SUPABASE_URL,
+      supabaseServiceRoleKey: process.env.SUPABASE_SERVICE_ROLE_KEY,
+      bucket: process.env.SUPABASE_STORAGE_BUCKET,
+      signedUrlExpiresInSeconds: process.env.SUPABASE_STORAGE_SIGNED_URL_TTL_SECONDS
+        ? Number(process.env.SUPABASE_STORAGE_SIGNED_URL_TTL_SECONDS)
+        : undefined,
+      playbackBaseUrl: process.env.SUPABASE_STORAGE_PLAYBACK_BASE_URL,
+    });
+  const storageAdapter: StorageAdapter = options.storageAdapterOverride ?? storageBundle.active;
+
+  const audioRepository = options.audioRepository ?? new PrismaAudioRepository(prisma);
+  const audioSampleService =
+    options.audioSampleService ??
+    new AudioSampleService({
+      repository: audioRepository,
+      storage: storageAdapter,
+      workspaceAuthorization: workspaceAuthorizationService,
+    });
+
   const app: Application = express();
   app.disable("x-powered-by");
   app.use(helmet());
@@ -183,6 +243,7 @@ export function buildApp(options: AppOptions = {}): BuiltApp {
   app.use("/api/health", healthRoutes);
   app.use("/api/search", createSearchRouter({ service }));
   app.use("/api/metadata", createMetadataRouter({ repository: metadataRepository }));
+  app.use("/api/metadata", createOfferingCatalogRouter({ prisma }));
   app.use(
     "/api/auth",
     createAuthRouter({
@@ -196,6 +257,14 @@ export function buildApp(options: AppOptions = {}): BuiltApp {
     createMatchmakerRouter({
       authenticationService,
       matchmakerService,
+    }),
+  );
+  app.use(
+    "/api",
+    createAudioSamplesRouter({
+      service: audioSampleService,
+      authenticationService,
+      storage: storageAdapter,
     }),
   );
 
@@ -235,6 +304,9 @@ export function buildApp(options: AppOptions = {}): BuiltApp {
     identityAdapter,
     matchmakerService,
     aiAdapter,
+    audioSampleService,
+    storageAdapter,
+    storageBackend: storageBundle.backend,
   };
 }
 
@@ -293,10 +365,27 @@ export async function buildAppWithSmoke(
   // and create a SECOND, unrelated client — the served repository
   // graph would split across two pools and only one of them would
   // ever be disconnected on shutdown.
+  //
+  // BG2: build the storage adapter bundle using the same Supabase
+  // configuration the BG1 smoke probed, so the served routes use
+  // the configured Supabase bucket (or the deterministic fallback)
+  // without a second selection round.
+  const storageBundle =
+    options.storageAdapters ??
+    buildStorageAdapters({
+      supabaseUrl: process.env.SUPABASE_URL,
+      supabaseServiceRoleKey: process.env.SUPABASE_SERVICE_ROLE_KEY,
+      bucket: process.env.SUPABASE_STORAGE_BUCKET,
+      signedUrlExpiresInSeconds: process.env.SUPABASE_STORAGE_SIGNED_URL_TTL_SECONDS
+        ? Number(process.env.SUPABASE_STORAGE_SIGNED_URL_TTL_SECONDS)
+        : undefined,
+      playbackBaseUrl: process.env.SUPABASE_STORAGE_PLAYBACK_BASE_URL,
+    });
   return buildApp({
     ...options,
     prismaClient: prisma,
     identityAdapters: bundle,
     authRepository,
+    storageAdapters: storageBundle,
   });
 }

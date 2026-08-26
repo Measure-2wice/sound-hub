@@ -85,6 +85,27 @@ function mapStatus(code: ApiErrorCodeV1): number {
     case "MISSING_CAPABILITY":
     case "BRIEF_FORBIDDEN":
       return 403;
+    // Buildathon Golden Slice 2 (BG2) seller-audio rejection
+    // surfaces. Each code maps to a stable HTTP status that respects
+    // the spirit of the HTTP semantic while preserving the shared
+    // envelope contract.
+    case "AUDIO_OFFERING_NOT_FOUND":
+      return 404;
+    case "AUDIO_OFFERING_INELIGIBLE":
+      return 403;
+    case "AUDIO_SAMPLE_LIMIT_EXCEEDED":
+      return 400;
+    case "AUDIO_CONTENT_TYPE_UNSUPPORTED":
+      return 400;
+    case "AUDIO_PAYLOAD_MISSING":
+    case "AUDIO_PAYLOAD_TOO_LARGE":
+      return 413;
+    case "AUDIO_PROVIDER_UNAVAILABLE":
+      return 503;
+    case "AUDIO_STORAGE_FAILED":
+      return 500;
+    case "AUDIO_SAMPLE_NOT_FOUND":
+      return 404;
   }
 }
 
