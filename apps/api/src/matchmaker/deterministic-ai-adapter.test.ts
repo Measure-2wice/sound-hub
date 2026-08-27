@@ -577,3 +577,60 @@ test("deterministic fallback does not fail closed when a non-geographic in-objec
   );
   assert.equal(criteria.required.basedIn?.city, "Brooklyn");
 });
+
+// --- P1-001 regression coverage (Codex re-review): St. George's ----
+//
+// The previous location-candidate grammar treated the period in the
+// canonical `St.` abbreviation as a clause boundary, so the
+// supported briefs below all failed with `AiInvalidOutputError`
+// claiming `St` was unsupported. The detector now absorbs the
+// abbreviation period when it is immediately followed by another
+// proper noun and continues through the apostrophe-s in the
+// canonical city name. These tests pin all three supported cues
+// and the trailing-punctuation edge cases.
+
+test("deterministic fallback honours 'in St. George's' (canonical supported city)", async () => {
+  const criteria = await interpret("I need a producer in St. George's.");
+  assert.equal(criteria.required.basedIn?.countryCode, "GD");
+  assert.equal(criteria.required.basedIn?.city, "St. George's");
+});
+
+test("deterministic fallback honours 'based in St. George's' (canonical supported city)", async () => {
+  const criteria = await interpret("I need a producer based in St. George's for a remote single.");
+  assert.equal(criteria.required.basedIn?.countryCode, "GD");
+  assert.equal(criteria.required.basedIn?.city, "St. George's");
+  assert.ok(criteria.required.serviceModes?.includes("Remote"));
+});
+
+test("deterministic fallback honours 'from St. George's' (canonical supported city)", async () => {
+  const criteria = await interpret("I need a producer from St. George's for a single.");
+  assert.equal(criteria.required.basedIn?.countryCode, "GD");
+  assert.equal(criteria.required.basedIn?.city, "St. George's");
+});
+
+test("deterministic fallback honours lowercase 'in st. george's' (case-insensitive)", async () => {
+  // Belt-and-suspenders: the case-insensitive detector must still
+  // capture "st. george's" so the canonical supported city is
+  // preserved when the buyer types the abbreviation in lowercase.
+  const criteria = await interpret("I need a producer in st. george's.");
+  assert.equal(criteria.required.basedIn?.countryCode, "GD");
+  assert.equal(criteria.required.basedIn?.city, "St. George's");
+});
+
+test("deterministic fallback still fails closed on an unsupported 'St.' location", async () => {
+  // Belt-and-suspenders: the abbreviation period must only be
+  // absorbed when it is followed by another proper noun. A
+  // sentence-final "St." (no following capitalised word) must
+  // still fail closed if the location is unsupported.
+  let caught: unknown;
+  try {
+    await adapter.interpretBrief({
+      actingWorkspaceId: "ws-buyer-1",
+      briefText: "I need a producer in St.",
+    });
+  } catch (err) {
+    caught = err;
+  }
+  assert.ok(caught instanceof Error);
+  assert.equal(caught.name, "AiInvalidOutputError");
+});

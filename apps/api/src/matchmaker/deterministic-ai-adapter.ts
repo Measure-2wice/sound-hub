@@ -488,7 +488,23 @@ const LOCATION_CLAUSE_BOUNDARY = new RegExp(`\\s+(?:${BOUNDARY_WORDS_SOURCE})\\b
 // project-clause / temporal boundary words above. The negative
 // lookahead sits at the start of the word so the engine never
 // begins matching a known boundary word.
-const LOCATION_WORD = String.raw`(?!(?:${BOUNDARY_WORDS_SOURCE})\b)[A-Z][a-z]+`;
+//
+// The first alternative `St\.(?=\s+[A-Z])` absorbs the canonical
+// `St.` abbreviation when it is immediately followed by another
+// proper noun (e.g. "St. George"). The lookahead is what makes
+// this safe: a sentence-final period after "St" cannot be matched
+// because the next non-whitespace character would not be a
+// capitalised word. This preserves the canonical `St. George's`
+// location (Grenada) so briefs like "in St. George's" honour the
+// location rather than being rejected as unsupported.
+const LOCATION_WORD = String.raw`(?!(?:${BOUNDARY_WORDS_SOURCE})\b)(?:St\.(?=\s+[A-Z])|[A-Z][a-z]+)`;
+
+// A location-word possessive: a capitalised word followed by an
+// apostrophe and a lowercase suffix (e.g. "George's"). Required
+// for canonical names like "St. George's" where the trailing
+// apostrophe-s must remain part of the captured token so the
+// canonical-phrase matcher can identify it.
+const POSSESSIVE_WORD = String.raw`[A-Z][a-z]+[''][a-z]+`;
 
 // Bounded allow-list of `in <X>` objects that are unambiguously
 // non-geographic. The list covers audio formats, languages, and DAW
@@ -560,7 +576,7 @@ function detectUnsupportedLocation(original: string): string | null {
   // on tiny tokens. Case-insensitive so lowercase phrasing
   // ("based in antarctica") triggers the same fail-closed path.
   const basedInMatch = new RegExp(
-    `\\b(?:based|located)\\s+in\\s+([^.,;]+?)(?=${LOCATION_CLAUSE_BOUNDARY.source})`,
+    `\\b(?:based|located)\\s+in\\s+(${LOCATION_WORD}(?:\\s+(?:of|${LOCATION_WORD}|${POSSESSIVE_WORD}))*(?:\\s+(?:de|la|el|los|las|du|le|von|van|di|del))?)(?=${LOCATION_CLAUSE_BOUNDARY.source})`,
     "i",
   ).exec(original);
   if (basedInMatch) {
@@ -578,7 +594,7 @@ function detectUnsupportedLocation(original: string): string | null {
   // as a potential location cue: a canonical LOCATION_PHRASES entry
   // is honoured, and anything else fails closed.
   const inRegex = new RegExp(
-    `\\bin\\s+(${LOCATION_WORD}(?:\\s+(?:of|${LOCATION_WORD}|St\\.))*(?:\\s+(?:de|la|el|los|las|du|le|von|van|di|del))?)(?=${LOCATION_CLAUSE_BOUNDARY.source})`,
+    `\\bin\\s+(${LOCATION_WORD}(?:\\s+(?:of|${LOCATION_WORD}|${POSSESSIVE_WORD}))*(?:\\s+(?:de|la|el|los|las|du|le|von|van|di|del))?)(?=${LOCATION_CLAUSE_BOUNDARY.source})`,
     "gi",
   );
   let inMatch: RegExpExecArray | null;
@@ -591,7 +607,7 @@ function detectUnsupportedLocation(original: string): string | null {
   }
   // "from <Location>" — case-insensitive.
   const fromRegex = new RegExp(
-    `\\bfrom\\s+(${LOCATION_WORD}(?:\\s+(?:of|${LOCATION_WORD}|St\\.))*(?:\\s+(?:de|la|el|los|las|du|le|von|van|di|del))?)(?=${LOCATION_CLAUSE_BOUNDARY.source})`,
+    `\\bfrom\\s+(${LOCATION_WORD}(?:\\s+(?:of|${LOCATION_WORD}|${POSSESSIVE_WORD}))*(?:\\s+(?:de|la|el|los|las|du|le|von|van|di|del))?)(?=${LOCATION_CLAUSE_BOUNDARY.source})`,
     "gi",
   );
   let fromMatch: RegExpExecArray | null;
@@ -609,7 +625,7 @@ function detectUnsupportedLocation(original: string): string | null {
   // "reykjavik-based" (lowercase) reaches the same path as
   // "Reykjavik-based".
   const xBasedRegex = new RegExp(
-    `\\b(${LOCATION_WORD}(?:\\s+(?:of|${LOCATION_WORD}|St\\.|George's))*)-based\\b`,
+    `\\b(${LOCATION_WORD}(?:\\s+(?:of|${LOCATION_WORD}|${POSSESSIVE_WORD}))*)-based\\b`,
     "gi",
   );
   let xBasedMatch: RegExpExecArray | null;
