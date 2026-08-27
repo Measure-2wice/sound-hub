@@ -487,7 +487,15 @@ const BOUNDARY_WORDS = [
 ] as const;
 const BOUNDARY_WORDS_SOURCE = BOUNDARY_WORDS.join("|");
 
-const LOCATION_CLAUSE_BOUNDARY = new RegExp(`\\s+(?:${BOUNDARY_WORDS_SOURCE})\\b|[.,;]|$`, "i");
+// Comma is intentionally excluded from the punctuation class. The
+// capture treats `,` as a location-word separator so a
+// comma-qualified candidate like `London, Ontario` is preserved as
+// a single location token for exact-match canonical validation,
+// rather than being silently narrowed to the city prefix at the
+// comma. Semicolons and periods remain terminators since they
+// always follow the canonical location name in the supported buyer
+// phrasing.
+const LOCATION_CLAUSE_BOUNDARY = new RegExp(`\\s+(?:${BOUNDARY_WORDS_SOURCE})\\b|[.;]|$`, "i");
 
 // A single location word. Case-insensitive (`/i` flag is set on
 // every regex that uses this token) but explicitly NOT one of the
@@ -601,8 +609,12 @@ function detectUnsupportedLocation(original: string): string | null {
   // location must be at least 2 characters to avoid false positives
   // on tiny tokens. Case-insensitive so lowercase phrasing
   // ("based in antarctica") triggers the same fail-closed path.
+  // The non-capturing separator accepts whitespace OR a comma so a
+  // comma-qualified candidate (e.g. "London, Ontario") is preserved
+  // as a single token for exact-match canonical validation rather
+  // than being truncated at the comma.
   const basedInMatch = new RegExp(
-    `\\b(?:based|located)\\s+in\\s+(${LOCATION_WORD}(?:\\s+(?:of|${LOCATION_WORD}|${POSSESSIVE_WORD}))*(?:\\s+(?:de|la|el|los|las|du|le|von|van|di|del))?)(?=${LOCATION_CLAUSE_BOUNDARY.source})`,
+    `\\b(?:based|located)\\s+in\\s+(${LOCATION_WORD}(?:[\\s,]+(?:of|${LOCATION_WORD}|${POSSESSIVE_WORD}))*(?:\\s+(?:de|la|el|los|las|du|le|von|van|di|del))?)(?=${LOCATION_CLAUSE_BOUNDARY.source})`,
     "i",
   ).exec(original);
   if (basedInMatch) {
@@ -618,9 +630,11 @@ function detectUnsupportedLocation(original: string): string | null {
   // is checked against `CREATIVE_OBJECT_PHRASES`; only objects in
   // that bounded allow-list are skipped. Any other object is treated
   // as a potential location cue: a canonical LOCATION_PHRASES entry
-  // is honoured, and anything else fails closed.
+  // is honoured, and anything else fails closed. The non-capturing
+  // separator accepts whitespace OR a comma so comma-qualified
+  // candidates are preserved.
   const inRegex = new RegExp(
-    `\\bin\\s+(${LOCATION_WORD}(?:\\s+(?:of|${LOCATION_WORD}|${POSSESSIVE_WORD}))*(?:\\s+(?:de|la|el|los|las|du|le|von|van|di|del))?)(?=${LOCATION_CLAUSE_BOUNDARY.source})`,
+    `\\bin\\s+(${LOCATION_WORD}(?:[\\s,]+(?:of|${LOCATION_WORD}|${POSSESSIVE_WORD}))*(?:\\s+(?:de|la|el|los|las|du|le|von|van|di|del))?)(?=${LOCATION_CLAUSE_BOUNDARY.source})`,
     "gi",
   );
   let inMatch: RegExpExecArray | null;
@@ -633,7 +647,7 @@ function detectUnsupportedLocation(original: string): string | null {
   }
   // "from <Location>" — case-insensitive.
   const fromRegex = new RegExp(
-    `\\bfrom\\s+(${LOCATION_WORD}(?:\\s+(?:of|${LOCATION_WORD}|${POSSESSIVE_WORD}))*(?:\\s+(?:de|la|el|los|las|du|le|von|van|di|del))?)(?=${LOCATION_CLAUSE_BOUNDARY.source})`,
+    `\\bfrom\\s+(${LOCATION_WORD}(?:[\\s,]+(?:of|${LOCATION_WORD}|${POSSESSIVE_WORD}))*(?:\\s+(?:de|la|el|los|las|du|le|von|van|di|del))?)(?=${LOCATION_CLAUSE_BOUNDARY.source})`,
     "gi",
   );
   let fromMatch: RegExpExecArray | null;
@@ -649,9 +663,11 @@ function detectUnsupportedLocation(original: string): string | null {
   // triggering fail-closed; service-mode keywords are excluded by
   // `matchesKnownLocation`. Case-insensitive flag means
   // "reykjavik-based" (lowercase) reaches the same path as
-  // "Reykjavik-based".
+  // "Reykjavik-based". The separator accepts whitespace OR a
+  // comma so a comma-qualified prefix (e.g. "Brooklyn, NY-based")
+  // is preserved as a single token.
   const xBasedRegex = new RegExp(
-    `\\b(${LOCATION_WORD}(?:\\s+(?:of|${LOCATION_WORD}|${POSSESSIVE_WORD}))*)-based\\b`,
+    `\\b(${LOCATION_WORD}(?:[\\s,]+(?:of|${LOCATION_WORD}|${POSSESSIVE_WORD}))*)-based\\b`,
     "gi",
   );
   let xBasedMatch: RegExpExecArray | null;

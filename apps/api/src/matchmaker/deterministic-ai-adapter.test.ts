@@ -727,3 +727,106 @@ test("deterministic fallback fails closed on 'Brooklyn Heights-based' (no substr
   assert.equal(caught.name, "AiInvalidOutputError");
   assert.match(caught.message, /Brooklyn Heights/);
 });
+
+// --- P1-001 regression coverage (Codex re-review): comma-qualified ---
+//
+// The location grammar previously treated a comma as the end of
+// the candidate, validating only the canonical city prefix and
+// discarding the qualifier after the comma. That silently narrowed
+// longer unsupported locations:
+//   in London, Ontario              → London, GB
+//   based in Brooklyn, Connecticut  → Brooklyn, NY
+//   in Kingston, Ontario            → Kingston, Jamaica
+// The capture now treats `,` as a location-word separator so the
+// full comma-qualified token is preserved and exact-match
+// validation rejects unsupported candidates.
+
+test("deterministic fallback resolves 'in London' (canonical supported city)", async () => {
+  const criteria = await interpret("I need a music producer in London for a single.");
+  assert.equal(criteria.required.basedIn?.countryCode, "GB");
+  assert.equal(criteria.required.basedIn?.city, "London");
+});
+
+test("deterministic fallback fails closed on 'in London, Ontario' (no narrowing to London GB)", async () => {
+  let caught: unknown;
+  try {
+    await adapter.interpretBrief({
+      actingWorkspaceId: "ws-buyer-1",
+      briefText: "I need a music producer in London, Ontario for a single.",
+    });
+  } catch (err) {
+    caught = err;
+  }
+  assert.ok(caught instanceof Error);
+  assert.equal(caught.name, "AiInvalidOutputError");
+  assert.match(caught.message, /London, Ontario/);
+});
+
+test("deterministic fallback resolves 'in Brooklyn' (canonical supported city)", async () => {
+  const criteria = await interpret("I need a music producer in Brooklyn for a single.");
+  assert.equal(criteria.required.basedIn?.countryCode, "US");
+  assert.equal(criteria.required.basedIn?.city, "Brooklyn");
+  assert.equal(criteria.required.basedIn?.region, "NY");
+});
+
+test("deterministic fallback fails closed on 'based in Brooklyn, Connecticut' (no narrowing to Brooklyn NY)", async () => {
+  let caught: unknown;
+  try {
+    await adapter.interpretBrief({
+      actingWorkspaceId: "ws-buyer-1",
+      briefText: "I need a producer based in Brooklyn, Connecticut for a single.",
+    });
+  } catch (err) {
+    caught = err;
+  }
+  assert.ok(caught instanceof Error);
+  assert.equal(caught.name, "AiInvalidOutputError");
+  assert.match(caught.message, /Brooklyn, Connecticut/);
+});
+
+test("deterministic fallback resolves 'in Kingston' (canonical supported city)", async () => {
+  const criteria = await interpret("I need a music producer in Kingston for a single.");
+  assert.equal(criteria.required.basedIn?.countryCode, "JM");
+  assert.equal(criteria.required.basedIn?.city, "Kingston");
+});
+
+test("deterministic fallback fails closed on 'in Kingston, Ontario' (no narrowing to Kingston JM)", async () => {
+  let caught: unknown;
+  try {
+    await adapter.interpretBrief({
+      actingWorkspaceId: "ws-buyer-1",
+      briefText: "I need a music producer in Kingston, Ontario for a single.",
+    });
+  } catch (err) {
+    caught = err;
+  }
+  assert.ok(caught instanceof Error);
+  assert.equal(caught.name, "AiInvalidOutputError");
+  assert.match(caught.message, /Kingston, Ontario/);
+});
+
+test("deterministic fallback resolves 'in St. George's' (canonical supported city with apostrophe)", async () => {
+  const criteria = await interpret("I need a music producer in St. George's for a single.");
+  assert.equal(criteria.required.basedIn?.countryCode, "GD");
+  assert.equal(criteria.required.basedIn?.city, "St. George's");
+});
+
+test("deterministic fallback fails closed on 'in Brooklyn, NY' (no new-alias narrowing)", async () => {
+  // Belt-and-suspenders: a buyer who adds a state qualifier must
+  // not be silently mapped to the bare canonical city. Per the
+  // review's no-new-aliases rule, the only non-semantic
+  // normalisation permitted is case / spacing / apostrophe style,
+  // so "Brooklyn, NY" cannot become "Brooklyn".
+  let caught: unknown;
+  try {
+    await adapter.interpretBrief({
+      actingWorkspaceId: "ws-buyer-1",
+      briefText: "I need a music producer in Brooklyn, NY for a single.",
+    });
+  } catch (err) {
+    caught = err;
+  }
+  assert.ok(caught instanceof Error);
+  assert.equal(caught.name, "AiInvalidOutputError");
+  assert.match(caught.message, /Brooklyn, NY/);
+});
