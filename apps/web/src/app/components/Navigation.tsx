@@ -28,6 +28,13 @@ export function Navigation() {
             <SessionAwareMatchmakerLink />
           </div>
           <div className="flex items-center gap-4">
+            <Link
+              href="/dashboard/audio"
+              className="text-sm font-medium text-gray-600 hover:text-gray-900"
+              data-testid="nav-audio-samples"
+            >
+              Audio samples
+            </Link>
             <SessionStatus />
           </div>
         </div>

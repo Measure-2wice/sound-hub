@@ -68,6 +68,22 @@ enum PurchaseMode {
   BundleOnly
 }
 
+// Audio sample cleanup lifecycle.
+//
+//   - `Live`           — visible in buyer-facing discovery; default.
+//   - `PendingCleanup` — the seller removed the sample but the
+//     storage object could not be deleted (e.g. provider outage).
+//     The row is preserved so a bounded retry can complete the
+//     bounded object cleanup later. Hidden from buyer-facing
+//     discovery immediately.
+//   - `Removed`        — the storage object has been removed; the
+//     row will be deleted at the next transactional sweep.
+enum AudioSampleCleanupStatus {
+  Live
+  PendingCleanup
+  Removed
+}
+
 // ---------- Identity and authority ----------
 
 model UserAccount {
@@ -293,6 +309,8 @@ model ServiceOffering {
   includedServices IncludedService[]
   serviceAreas     ServiceOfferingServiceArea[]
   pricing          ServiceOfferingPricing?
+  audioSamples     ServiceOfferingAudioSample[]
+  orphanedAudioStorage AudioSampleOrphanedStorage[]
 
   @@index([sellerProfileId])
   @@index([primaryCategoryId])
@@ -450,4 +468,101 @@ model BriefSearchResult {
   @@index([briefId])
   @@index([sellerId])
   @@map("brief_search_results")
+}
+
+// ---------- Buildathon Golden Slice 2 (BG2): audio discovery samples ----------
+//
+// Per ticket #61 a ServiceOffering owns zero through three
+// `ServiceOfferingAudioSample` records. Each sample is a bounded MP3
+// discovery attachment; this is NOT a PortfolioItem, playlist, catalog
+// asset, licensed work, or DealDeliverable. PostgreSQL is canonical
+// for the metadata (id, owning offering, buyer-facing label, declared
+// MIME type, byte size, deterministic display order, opaque storage
+// reference). The bounded object bytes live in replaceable external
+// storage (Supabase Storage in production; deterministic fixtures in
+// tests). Storage credentials, bucket names, and private object keys
+// never cross public DTOs.
+//
+// The display order is owned by the seller (no drag-and-drop, no
+// reordering UI), the MIME type is "audio/mpeg" only, and the size is
+// capped at 25 MB. The opaque storage reference is the single
+// handoff between PostgreSQL and the provider-neutral storage adapter;
+// the storage adapter alone can resolve it back to a playable
+// reference.
+model ServiceOfferingAudioSample {
+  id            String   @id @default(cuid())
+  offeringId    String
+  // Buyer-facing title or label rendered in the discovery UI. Allowed
+  // length is bounded; the storage adapter never sees this value.
+  label         String
+  // Declared MIME type. The application enforces audio/mpeg at the
+  // trusted boundary; the column captures the value the seller
+  // declared at upload time.
+  contentType   String
+  // Observed byte size. The application enforces the 25 MB cap at
+  // the trusted boundary so a seller cannot smuggle a larger file by
+  // declaring a smaller content type.
+  byteSize      Int
+  // Deterministic seller-owned display order. The seller assigns this
+  // value at upload time (e.g. "1, 2, 3") so removal + re-upload does
+  // not silently re-order the buyer-facing discovery list.
+  displayOrder  Int
+  // Opaque storage reference handed back by the StorageAdapter. The
+  // application treats it as an opaque string; only the adapter that
+  // produced it can resolve it back to a playable reference.
+  storageRef    String
+  // Cleanup lifecycle (ticket #61 follow-up review P1-005). Default
+  // `Live`. `PendingCleanup` means the seller removed the sample but
+  // the bounded object could not be deleted at provider removal time;
+  // the row is preserved so a bounded retry can complete the
+  // cleanup. `Removed` is a transient state during the row delete.
+  cleanupStatus AudioSampleCleanupStatus @default(Live)
+  // Number of storage-removal attempts that have failed for this
+  // row while it is in `PendingCleanup`. Bounded by the application
+  // (no generalized retry infrastructure).
+  cleanupAttempts Int @default(0)
+  // Last cleanup failure timestamp (UTC). Used to surface the most
+  // recent provider failure without logging the provider error
+  // message.
+  cleanupLastFailureAt DateTime?
+  createdAt     DateTime @default(now())
+  updatedAt     DateTime @updatedAt
+
+  offering ServiceOffering @relation(fields: [offeringId], references: [id], onDelete: Cascade)
+
+  @@index([offeringId])
+  @@index([cleanupStatus])
+  @@map("offering_audio_samples")
+}
+
+// Audio sample orphaned storage locator.
+//
+// Per ticket #61 follow-up review (P1-002): when an upload succeeds
+// in storage but the DB counterpart never persists (DB write fails or
+// the cap guard rejects the row), and the immediate storage-delete
+// also fails, the storage reference would otherwise be lost. This
+// table is the durable recovery record: a row keyed by `storageRef`
+// carries the offering id and a bounded retry counter so the next
+// operation against the offering can discover and complete the
+// storage-side cleanup. Rows are deleted when the storage-side
+// delete confirms success or the storage object is reported
+// already-gone.
+model AudioSampleOrphanedStorage {
+  storageRef           String   @id
+  // Owning offering. Used to scope the bounded retry pass and to
+  // cascade when the offering is removed.
+  offeringId           String
+  // Number of storage-removal attempts that have failed for this
+  // orphan. Bounded by the application (no generalized retry
+  // infrastructure).
+  cleanupAttempts      Int      @default(0)
+  // Last cleanup failure timestamp (UTC).
+  cleanupLastFailureAt DateTime?
+  createdAt            DateTime @default(now())
+  updatedAt            DateTime @updatedAt
+
+  offering ServiceOffering @relation(fields: [offeringId], references: [id], onDelete: Cascade)
+
+  @@index([offeringId])
+  @@map("audio_sample_orphaned_storage")
 }
