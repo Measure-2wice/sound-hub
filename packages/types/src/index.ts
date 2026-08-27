@@ -1295,11 +1295,15 @@ export const BG2_AUDIO_SAMPLE_MAX_DISPLAY_ORDER = 3;
 
 // ---------- ProjectRequest public DTO ----------
 
-// Allow-listed ProjectRequest shape. Mirrors the persisted columns
-// with one exception: `sellerConsentAt` is the canonical
-// "explicit seller consent" evidence referenced by GS 18 / future
-// activation invariants. It is null for Pending and Declined
-// requests and the timestamp of the accept call for Accepted ones.
+// Allow-listed ProjectRequest shape. The counterparty-visible surface
+// does NOT include private human-actor identifiers (`createdByUserId`,
+// `sellerDecisionByUserId`): those are persisted as audit evidence
+// only and are never serialized into responses (CLAUDE.md: "Do not
+// expose account identity... publicly"). `sellerConsentAt` is the
+// canonical "explicit seller consent" evidence referenced by GS 18
+// / future activation invariants. It is null for Pending and
+// Declined requests and the timestamp of the accept call for
+// Accepted ones.
 export const projectRequestPublicV1Schema = z
   .object({
     projectRequestId: z.string().min(1).max(128),
@@ -1307,10 +1311,8 @@ export const projectRequestPublicV1Schema = z
     sellerWorkspaceId: z.string().min(1).max(128),
     serviceOfferingId: z.string().min(1).max(128),
     projectBriefId: z.string().min(1).max(128),
-    createdByUserId: z.string().min(1).max(128),
     status: z.enum(projectRequestStatusValuesV1),
     sellerDecisionAt: z.string().datetime().nullable(),
-    sellerDecisionByUserId: z.string().min(1).max(128).nullable(),
     sellerConsentAt: z.string().datetime().nullable(),
     createdAt: z.string().datetime(),
   })

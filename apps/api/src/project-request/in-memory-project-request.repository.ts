@@ -6,17 +6,28 @@
 // Prisma adapter is the canonical implementation; this is for unit
 // tests only.
 //
-// The adapter enforces the same semantic guards as the Prisma adapter
-// (a Pending duplicate for the same tuple is rejected; an accept or
-// decline on a non-Pending row returns ALREADY_RESPONDED) so the
-// service-level tests can prove the GS 26 contract without a
-// database.
+// The adapter enforces the same semantic guards as the Prisma adapter:
+//
+//   - createProjectRequestWithRevalidation enforces brief-ownership,
+//     brief-recommendation (P1-001), and offering-eligibility
+//     boundaries in one logical operation. Test fixtures seed
+//     `seedBriefRecommendations` so the adapter can answer
+//     "is offering X in brief Y's persisted results?" without a
+//     database.
+//   - acceptProjectRequest / declineProjectRequest atomically
+//     transition Pending→Accepted/Declined via guarded semantics; a
+//     Pending duplicate for the same tuple is rejected via the same
+//     `PendingDuplicateError` type as the Prisma adapter's
+//     pre-atomic contract (still thrown here so test fixtures that
+//     call the older helper catch the same exception type the
+//     service historically translated).
 
 import { randomUUID } from "node:crypto";
 import type {
   AcceptProjectRequestInput,
   AcceptProjectRequestResult,
-  CreateProjectRequestInput,
+  CreateProjectRequestResult,
+  CreateProjectRequestRevalidatedInput,
   DeclineProjectRequestInput,
   DecideResult,
   PersistedDeal,
@@ -26,11 +37,121 @@ import type {
 import type { ProjectRequestStatusV1 } from "@soundhub/types";
 import { PendingDuplicateError } from "./prisma-project-request.repository.js";
 
+export interface OfferingEligibilityInput {
+  readonly id: string;
+  readonly status: "Active" | "Draft" | "Paused" | "Archived";
+  readonly sellerWorkspaceId: string;
+  readonly workspaceStatus: "Active" | "Suspended";
+  readonly workspaceHasSellerCapability: boolean;
+  readonly profileStatus: "Draft" | "Published" | "Suspended";
+}
+
 export class InMemoryProjectRequestRepository implements ProjectRequestRepository {
   private readonly requests = new Map<string, PersistedProjectRequest>();
   private readonly deals = new Map<string, PersistedDeal>();
+  /** briefId → set of ServiceOffering ids that Matchmaker returned. */
+  private readonly briefRecommendations = new Map<string, Set<string>>();
+  /** briefId → buyerWorkspaceId ownership. */
+  private readonly briefOwnership = new Map<string, string>();
+  /** Offering id → eligibility snapshot. */
+  private readonly offeringEligibility = new Map<string, OfferingEligibilityInput>();
 
-  async createProjectRequest(input: CreateProjectRequestInput): Promise<PersistedProjectRequest> {
+  /** Test seam: register a brief's ownership + persisted recommendations. */
+  seedBrief(input: {
+    readonly briefId: string;
+    readonly buyerWorkspaceId: string;
+    readonly offeringIds: readonly string[];
+  }): void {
+    this.briefOwnership.set(input.briefId, input.buyerWorkspaceId);
+    this.briefRecommendations.set(input.briefId, new Set(input.offeringIds));
+  }
+
+  /** Test seam: register an offering's eligibility snapshot. */
+  seedOfferingEligibility(input: OfferingEligibilityInput): void {
+    this.offeringEligibility.set(input.id, input);
+  }
+
+  async createProjectRequestWithRevalidation(
+    input: CreateProjectRequestRevalidatedInput,
+  ): Promise<CreateProjectRequestResult> {
+    // Step 1: Brief existence + ownership.
+    const buyerWorkspaceId = this.briefOwnership.get(input.projectBriefId);
+    if (!buyerWorkspaceId) {
+      return { ok: false, reason: "BRIEF_NOT_FOUND" };
+    }
+    if (buyerWorkspaceId !== input.buyerWorkspaceId) {
+      return { ok: false, reason: "BRIEF_FORBIDDEN" };
+    }
+
+    // Step 2: Brief-recommendation boundary (P1-001).
+    const recommendations = this.briefRecommendations.get(input.projectBriefId);
+    if (!recommendations || !recommendations.has(input.serviceOfferingId)) {
+      return { ok: false, reason: "OFFERING_NOT_IN_BRIEF" };
+    }
+
+    // Step 3: Offering eligibility chain.
+    const offering = this.offeringEligibility.get(input.serviceOfferingId);
+    if (!offering) {
+      return { ok: false, reason: "OFFERING_INELIGIBLE" };
+    }
+    if (offering.status !== "Active") {
+      return { ok: false, reason: "OFFERING_INELIGIBLE" };
+    }
+    if (offering.workspaceStatus !== "Active") {
+      return { ok: false, reason: "OFFERING_INELIGIBLE" };
+    }
+    if (!offering.workspaceHasSellerCapability) {
+      return { ok: false, reason: "OFFERING_INELIGIBLE" };
+    }
+    if (offering.profileStatus !== "Published") {
+      return { ok: false, reason: "OFFERING_INELIGIBLE" };
+    }
+
+    // Step 4: Persist with Pending duplicate guard.
+    for (const existing of this.requests.values()) {
+      if (
+        existing.status === "Pending" &&
+        existing.buyerWorkspaceId === input.buyerWorkspaceId &&
+        existing.sellerWorkspaceId === offering.sellerWorkspaceId &&
+        existing.serviceOfferingId === input.serviceOfferingId &&
+        existing.projectBriefId === input.projectBriefId
+      ) {
+        return { ok: false, reason: "ALREADY_PENDING" };
+      }
+    }
+    const row: PersistedProjectRequest = {
+      id: `pr-${randomUUID()}`,
+      buyerWorkspaceId: input.buyerWorkspaceId,
+      sellerWorkspaceId: offering.sellerWorkspaceId,
+      serviceOfferingId: input.serviceOfferingId,
+      projectBriefId: input.projectBriefId,
+      createdByUserId: input.createdByUserId,
+      status: "Pending",
+      sellerDecisionAt: null,
+      sellerDecisionByUserId: null,
+      sellerConsentAt: null,
+      createdAt: new Date(),
+    };
+    this.requests.set(row.id, row);
+    return Promise.resolve({ ok: true, value: row });
+  }
+
+  /**
+   * Backwards-compatible escape hatch for tests that pre-date the
+   * atomic revalidation boundary. New tests MUST use
+   * {@link createProjectRequestWithRevalidation} so the boundary is
+   * actually exercised. Retained only to keep older fixtures
+   * compiling until they are migrated.
+   *
+   * @deprecated Use createProjectRequestWithRevalidation.
+   */
+  async createProjectRequest(input: {
+    readonly buyerWorkspaceId: string;
+    readonly sellerWorkspaceId: string;
+    readonly serviceOfferingId: string;
+    readonly projectBriefId: string;
+    readonly createdByUserId: string;
+  }): Promise<PersistedProjectRequest> {
     for (const existing of this.requests.values()) {
       if (
         existing.status === "Pending" &&
@@ -39,9 +160,6 @@ export class InMemoryProjectRequestRepository implements ProjectRequestRepositor
         existing.serviceOfferingId === input.serviceOfferingId &&
         existing.projectBriefId === input.projectBriefId
       ) {
-        // Mirror the Prisma adapter's behavior: throw the same
-        // PendingDuplicateError type so the service catches it
-        // and surfaces PROJECT_REQUEST_ALREADY_PENDING.
         throw new PendingDuplicateError();
       }
     }

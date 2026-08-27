@@ -29,6 +29,7 @@ export interface ProjectRequestFixture {
   };
   readonly sellerProfile: { readonly id: string };
   readonly offering: { readonly id: string; readonly slug: string };
+  readonly notRecommendedOffering: { readonly id: string; readonly slug: string };
   readonly brief: { readonly id: string };
 }
 
@@ -46,6 +47,9 @@ const SELLER_PROFILE_ID = "sp-bg4-test-seller";
 const OFFERING_ID = "of-bg4-test-seller";
 const OFFERING_SLUG = "bg4-test-seller-offering";
 const BRIEF_ID = "brief-bg4-test-1";
+const BRIEF_RESULT_ID = "bsr-bg4-test-1";
+const NOT_RECOMMENDED_OFFERING_ID = "of-bg4-test-not-recommended";
+const NOT_RECOMMENDED_OFFERING_SLUG = "bg4-test-not-recommended-offering";
 
 export async function loadOrCreateFixture(prisma: PrismaClient): Promise<ProjectRequestFixture> {
   // Ensure a single deterministic ProjectCategory exists so the
@@ -173,6 +177,29 @@ export async function loadOrCreateFixture(prisma: PrismaClient): Promise<Project
     update: { status: "Active", sellerProfileId: sellerProfile.id, primaryCategoryId: category.id },
   });
 
+  // A second Active offering that Matchmaker did NOT return for this
+  // brief. The P1-001 brief-recommendation boundary must reject any
+  // attempt to submit it.
+  const notRecommendedOffering = await prisma.serviceOffering.upsert({
+    where: { slug: NOT_RECOMMENDED_OFFERING_SLUG },
+    create: {
+      id: NOT_RECOMMENDED_OFFERING_ID,
+      slug: NOT_RECOMMENDED_OFFERING_SLUG,
+      sellerProfileId: sellerProfile.id,
+      title: "BG4 Test Offering (not recommended)",
+      description: "Active offering absent from this brief's results.",
+      status: "Active",
+      serviceMode: "Remote",
+      primaryCategoryId: category.id,
+      genreTags: [],
+    },
+    update: {
+      status: "Active",
+      sellerProfileId: sellerProfile.id,
+      primaryCategoryId: category.id,
+    },
+  });
+
   const brief = await prisma.projectBrief.upsert({
     where: { id: BRIEF_ID },
     create: {
@@ -186,6 +213,26 @@ export async function loadOrCreateFixture(prisma: PrismaClient): Promise<Project
       aiFallbackUsed: true,
     },
     update: {},
+  });
+
+  // Persisted BriefSearchResult so the P1-001 brief-recommendation
+  // boundary accepts OFFERING_ID. NOT_RECOMMENDED_OFFERING_ID is
+  // intentionally absent.
+  await prisma.briefSearchResult.upsert({
+    where: { id: BRIEF_RESULT_ID },
+    create: {
+      id: BRIEF_RESULT_ID,
+      briefId: brief.id,
+      resultPosition: 1,
+      sellerId: sellerProfile.id,
+      sellerSnapshotJson: { sellerId: sellerProfile.id, professionalName: "BG4 Test Seller" },
+      bestOfferingId: offering.id,
+      bestOfferingSnapshotJson: { offeringId: offering.id, title: offering.title },
+      additionalOfferingsJson: [],
+      relevanceScore: 1,
+      matchReason: "test",
+    },
+    update: { bestOfferingId: offering.id },
   });
 
   return {
@@ -203,6 +250,10 @@ export async function loadOrCreateFixture(prisma: PrismaClient): Promise<Project
     },
     sellerProfile: { id: sellerProfile.id },
     offering: { id: offering.id, slug: offering.slug },
+    notRecommendedOffering: {
+      id: notRecommendedOffering.id,
+      slug: notRecommendedOffering.slug,
+    },
     brief: { id: brief.id },
   };
 }

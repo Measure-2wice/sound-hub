@@ -10,6 +10,14 @@
 // accepts cannot both succeed; the unique index on
 // `deals.projectRequestId` is the second defense against retries
 // creating duplicate Deals (ticket #62 GS 26).
+//
+// `createProjectRequestWithRevalidation` runs every revalidation
+// read (Brief ownership + persisted BriefSearchResult matching +
+// ServiceOffering eligibility chain) AND the INSERT inside one
+// `$transaction` so a concurrent mutation cannot bypass the
+// boundary (P1-002). The Prisma adapter is the only layer that
+// knows the SQL/Prisma boundary; the service has no Prisma
+// dependency (P1-003).
 
 import type { PrismaClient } from "@soundhub/db";
 import { PrismaClientKnownRequestError } from "@soundhub/db/dist/generated/internal/prismaNamespace.js";
@@ -17,7 +25,9 @@ import type { ProjectRequestStatusV1, DealStatusV1 } from "@soundhub/types";
 import type {
   AcceptProjectRequestInput,
   AcceptProjectRequestResult,
-  CreateProjectRequestInput,
+  CreateProjectRequestFailureReason,
+  CreateProjectRequestResult,
+  CreateProjectRequestRevalidatedInput,
   DeclineProjectRequestInput,
   DecideResult,
   PersistedDeal,
@@ -37,29 +47,164 @@ function toDealStatus(value: DbDealStatus): DealStatusV1 {
   return value;
 }
 
+/**
+ * Thrown when the partial unique index rejects a Pending duplicate
+ * inside an in-memory adapter that does not own the partial-index
+ * SQL. The Prisma adapter never throws this exception — its
+ * `createProjectRequestWithRevalidation` translates the P2002
+ * violation into the `ALREADY_PENDING` discriminated-union reason.
+ * The export remains so the in-memory adapter can mirror the same
+ * surface for service-level tests.
+ */
+export class PendingDuplicateError extends Error {
+  constructor() {
+    super("A Pending ProjectRequest already exists for this tuple.");
+    this.name = "PendingDuplicateError";
+  }
+}
+
 export class PrismaProjectRequestRepository implements ProjectRequestRepository {
   constructor(private readonly prisma: PrismaClient) {}
 
-  async createProjectRequest(input: CreateProjectRequestInput): Promise<PersistedProjectRequest> {
+  async createProjectRequestWithRevalidation(
+    input: CreateProjectRequestRevalidatedInput,
+  ): Promise<CreateProjectRequestResult> {
+    const buyerWorkspaceId = input.buyerWorkspaceId;
+    const projectBriefId = input.projectBriefId;
+    const serviceOfferingId = input.serviceOfferingId;
+    const createdByUserId = input.createdByUserId;
+
     try {
-      const row = await this.prisma.projectRequest.create({
-        data: {
-          buyerWorkspaceId: input.buyerWorkspaceId,
-          sellerWorkspaceId: input.sellerWorkspaceId,
-          serviceOfferingId: input.serviceOfferingId,
-          projectBriefId: input.projectBriefId,
-          createdByUserId: input.createdByUserId,
-        },
+      const result = await this.prisma.$transaction(async (tx) => {
+        // Step 1: Brief existence + ownership. The brief is the
+        // buyer's anchor; without it the buyer has no persisted
+        // search criteria to anchor on.
+        const brief = await tx.projectBrief.findUnique({
+          where: { id: projectBriefId },
+          select: { id: true, buyerWorkspaceId: true },
+        });
+        if (!brief) {
+          return { ok: false as const, reason: "BRIEF_NOT_FOUND" as const };
+        }
+        if (brief.buyerWorkspaceId !== buyerWorkspaceId) {
+          return { ok: false as const, reason: "BRIEF_FORBIDDEN" as const };
+        }
+
+        // Step 2: Brief-recommendation boundary (P1-001). The
+        // selected offering MUST be a persisted recommendation
+        // (bestOfferingId) OR appear in the additionalOfferingsJson
+        // of any BriefSearchResult for this brief. A buyer cannot
+        // submit an arbitrary eligible offering that Matchmaker
+        // never returned for this brief.
+        const briefResults = await tx.briefSearchResult.findMany({
+          where: { briefId: projectBriefId },
+          select: { bestOfferingId: true, additionalOfferingsJson: true },
+        });
+        const offeringIsInBrief = briefResults.some((row) => {
+          if (row.bestOfferingId === serviceOfferingId) return true;
+          const additional = row.additionalOfferingsJson;
+          if (!Array.isArray(additional)) return false;
+          // Each entry may carry its own `offeringId`; we accept
+          // either a bare string id (legacy shape) or an object
+          // carrying { offeringId } / { id }.
+          for (const entry of additional) {
+            if (typeof entry === "string" && entry === serviceOfferingId) return true;
+            if (
+              entry &&
+              typeof entry === "object" &&
+              "offeringId" in entry &&
+              (entry as { offeringId: unknown }).offeringId === serviceOfferingId
+            ) {
+              return true;
+            }
+            if (
+              entry &&
+              typeof entry === "object" &&
+              "id" in entry &&
+              (entry as { id: unknown }).id === serviceOfferingId
+            ) {
+              return true;
+            }
+          }
+          return false;
+        });
+        if (!offeringIsInBrief) {
+          return { ok: false as const, reason: "OFFERING_NOT_IN_BRIEF" as const };
+        }
+
+        // Step 3: Eligibility chain (workspace active + Seller
+        // capability + SellerProfile Published + ServiceOffering
+        // Active). Same shape as the previous service-level
+        // eligibility check, now under transaction control so a
+        // concurrent mutation that flips one of these conditions
+        // between the read and the INSERT would still be caught by
+        // the re-read after the eligibility check, OR by the FK
+        // constraint when the buyer/seller workspace is removed.
+        const offering = await tx.serviceOffering.findUnique({
+          where: { id: serviceOfferingId },
+          include: {
+            sellerProfile: {
+              include: {
+                workspace: {
+                  include: { capabilities: true },
+                },
+              },
+            },
+          },
+        });
+        if (!offering) {
+          return { ok: false as const, reason: "OFFERING_INELIGIBLE" as const };
+        }
+        if (offering.status !== "Active") {
+          return { ok: false as const, reason: "OFFERING_INELIGIBLE" as const };
+        }
+        if (offering.sellerProfile.status !== "Published") {
+          return { ok: false as const, reason: "OFFERING_INELIGIBLE" as const };
+        }
+        if (offering.sellerProfile.workspace.status !== "Active") {
+          return { ok: false as const, reason: "OFFERING_INELIGIBLE" as const };
+        }
+        const hasSeller = offering.sellerProfile.workspace.capabilities.some(
+          (c) => c.capability === "Seller",
+        );
+        if (!hasSeller) {
+          return { ok: false as const, reason: "OFFERING_INELIGIBLE" as const };
+        }
+
+        // Step 4: Persist. The partial unique index
+        // `project_requests_pending_unique_idx` rejects a duplicate
+        // Pending row for the same tuple; we translate the P2002
+        // violation into ALREADY_PENDING so the service fails closed
+        // (covered by GS 26).
+        const sellerWorkspaceId = offering.sellerProfile.workspace.id;
+        try {
+          const row = await tx.projectRequest.create({
+            data: {
+              buyerWorkspaceId,
+              sellerWorkspaceId,
+              serviceOfferingId,
+              projectBriefId,
+              createdByUserId,
+            },
+          });
+          return { ok: true as const, value: toPersisted(row) };
+        } catch (err) {
+          if (err instanceof PrismaClientKnownRequestError && err.code === "P2002") {
+            return {
+              ok: false as const,
+              reason: "ALREADY_PENDING" as CreateProjectRequestFailureReason,
+            };
+          }
+          throw err;
+        }
       });
-      return toPersisted(row);
+      return result;
     } catch (err) {
-      // The partial unique index `project_requests_pending_unique_idx`
-      // rejects a duplicate Pending row for the same tuple. Surface
-      // the violation as a domain-meaningful error so the service
-      // can fail closed with PROJECT_REQUEST_ALREADY_PENDING
-      // (covered by GS 26).
+      // Same defense in the rare case the partial unique index
+      // violation escapes the inner catch (e.g. transaction rollback
+      // races).
       if (err instanceof PrismaClientKnownRequestError && err.code === "P2002") {
-        throw new PendingDuplicateError();
+        return { ok: false, reason: "ALREADY_PENDING" };
       }
       throw err;
     }
@@ -238,17 +383,4 @@ function toPersistedDeal(row: {
     activatedAt: row.activatedAt,
     createdAt: row.createdAt,
   };
-}
-
-/**
- * Thrown when the partial unique index rejects a Pending duplicate.
- * The service catches this and translates it to
- * PROJECT_REQUEST_ALREADY_PENDING so the route can fail closed with
- * a buyer-safe 409 envelope.
- */
-export class PendingDuplicateError extends Error {
-  constructor() {
-    super("A Pending ProjectRequest already exists for this tuple.");
-    this.name = "PendingDuplicateError";
-  }
 }

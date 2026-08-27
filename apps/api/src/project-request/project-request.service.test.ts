@@ -3,8 +3,12 @@
 //
 // Background: ticket #62 acceptance criteria require the service to:
 //   - revalidate Buyer membership + acting Workspace identity
-//   - revalidate ProjectBrief ownership + ServiceOffering eligibility
-//   - persist a Pending ProjectRequest
+//   - enforce the brief-ownership + brief-recommendation boundary (P1-001)
+//   - revalidate ServiceOffering eligibility (workspace active +
+//     Seller capability + SellerProfile Published + ServiceOffering
+//     Active) atomically with the INSERT (P1-002)
+//   - persist a Pending ProjectRequest through the repository, with
+//     NO Prisma dependency in the service (P1-003)
 //   - revalidate seller membership before accept/decline
 //   - atomically transition Pending -> Accepted + create exactly one Deal
 //   - atomically transition Pending -> Declined + create NO Deal
@@ -16,7 +20,6 @@
 
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import type { PrismaClient } from "@soundhub/db";
 import type { MatchmakerCriteriaV1, ProjectBriefPublicV1 } from "@soundhub/types";
 import {
   InMemoryAuthRepository,
@@ -40,17 +43,20 @@ const SELLER_WORKSPACE_ID = "ws-seller";
 const OFFERING_ID = "of-eligible";
 const OFFERING_INELIGIBLE_ID = "of-ineligible";
 const OFFERING_OTHER_SELLER_ID = "of-other-seller";
+const OFFERING_NOT_IN_BRIEF_ID = "of-not-recommended";
 const BRIEF_ID = "brief-1";
 const OTHER_BRIEF_ID = "brief-other";
 
-function buildFixture(): {
+interface Fixture {
   projectRequestService: ProjectRequestService;
   projectRequestRepo: InMemoryProjectRequestRepository;
   briefRepo: ProjectBriefRepository;
   buildBrief: (id: string, buyerWorkspaceId: string) => PersistedBrief;
   now: () => Date;
   clock: { current: Date };
-} {
+}
+
+function buildFixture(): Fixture {
   const buyerSeed: InMemoryUserSeed = {
     userAccountId: BUYER_USER_ID,
     email: "buyer@example.com",
@@ -106,6 +112,55 @@ function buildFixture(): {
   const authz = new WorkspaceAuthorizationService({ authRepository: authRepo });
 
   const projectRequestRepo = new InMemoryProjectRequestRepository();
+  // Seed the brief → recommendation mapping for P1-001 enforcement.
+  // BRIEF_ID surfaces OFFERING_ID, OFFERING_OTHER_SELLER_ID,
+  // OFFERING_INELIGIBLE_ID; OFFERING_NOT_IN_BRIEF_ID is NOT a
+  // recommendation, so submitting it must fail with
+  // OFFERING_NOT_IN_BRIEF.
+  projectRequestRepo.seedBrief({
+    briefId: BRIEF_ID,
+    buyerWorkspaceId: BUYER_WORKSPACE_ID,
+    offeringIds: [OFFERING_ID, OFFERING_OTHER_SELLER_ID, OFFERING_INELIGIBLE_ID],
+  });
+  projectRequestRepo.seedBrief({
+    briefId: OTHER_BRIEF_ID,
+    buyerWorkspaceId: OTHER_BUYER_WORKSPACE_ID,
+    offeringIds: [OFFERING_ID],
+  });
+  // Seed eligibility snapshots. The repository's P1-002 transaction
+  // applies the same chain as the previous Prisma `loadOfferingEligibility`.
+  projectRequestRepo.seedOfferingEligibility({
+    id: OFFERING_ID,
+    status: "Active",
+    sellerWorkspaceId: SELLER_WORKSPACE_ID,
+    workspaceStatus: "Active",
+    workspaceHasSellerCapability: true,
+    profileStatus: "Published",
+  });
+  projectRequestRepo.seedOfferingEligibility({
+    id: OFFERING_OTHER_SELLER_ID,
+    status: "Active",
+    sellerWorkspaceId: "ws-different-seller",
+    workspaceStatus: "Active",
+    workspaceHasSellerCapability: true,
+    profileStatus: "Published",
+  });
+  projectRequestRepo.seedOfferingEligibility({
+    id: OFFERING_INELIGIBLE_ID,
+    status: "Paused", // ineligible — Paused, not Active
+    sellerWorkspaceId: SELLER_WORKSPACE_ID,
+    workspaceStatus: "Active",
+    workspaceHasSellerCapability: true,
+    profileStatus: "Published",
+  });
+  projectRequestRepo.seedOfferingEligibility({
+    id: OFFERING_NOT_IN_BRIEF_ID,
+    status: "Active",
+    sellerWorkspaceId: SELLER_WORKSPACE_ID,
+    workspaceStatus: "Active",
+    workspaceHasSellerCapability: true,
+    profileStatus: "Published",
+  });
 
   const buildBrief = (id: string, buyerWorkspaceId: string): PersistedBrief => {
     const criteria: MatchmakerCriteriaV1 = {
@@ -138,54 +193,12 @@ function buildFixture(): {
   const clock = { current: new Date("2026-08-27T00:00:00Z") };
   const now = () => clock.current;
 
-  // Fake Prisma client stub — only the eligibility-revalidation
-  // method is used in this test set. We hand-construct a minimal
-  // cast so the tests don't depend on a live database.
-  const prismaStub = {} as unknown as PrismaClient;
-  // Provide the eligibility query the service uses. The service
-  // accesses `prisma.serviceOffering.findUnique(...)`. We use a
-  // Proxy that returns the canned eligibility for our known
-  // offering ids.
-  const eligibilityMap: Record<string, { ok: true; sellerWorkspaceId: string } | { ok: false }> = {
-    [OFFERING_ID]: { ok: true, sellerWorkspaceId: SELLER_WORKSPACE_ID },
-    [OFFERING_OTHER_SELLER_ID]: {
-      ok: true,
-      sellerWorkspaceId: "ws-different-seller",
-    },
-    [OFFERING_INELIGIBLE_ID]: { ok: false },
-  };
-  const proxied = new Proxy(prismaStub, {
-    get(target, prop) {
-      if (prop === "serviceOffering") {
-        return {
-          findUnique: async (args: { where: { id: string } }) => {
-            await Promise.resolve();
-            const entry = eligibilityMap[args.where.id];
-            if (!entry || !entry.ok) return null;
-            return {
-              id: args.where.id,
-              status: "Active",
-              sellerProfile: {
-                status: "Published",
-                workspace: {
-                  id: entry.sellerWorkspaceId,
-                  status: "Active",
-                  capabilities: [{ capability: "Seller" }],
-                },
-              },
-            };
-          },
-        };
-      }
-      return (target as unknown as Record<string | symbol, unknown>)[prop];
-    },
-  });
-
+  // P1-003: the service has NO Prisma dependency. The fixture wires
+  // the in-memory repository directly.
   const service = new ProjectRequestService({
     projectRequestRepository: projectRequestRepo,
     projectBriefRepository: briefRepo,
     workspaceAuthorizationService: authz,
-    prisma: proxied,
     now,
   });
 
@@ -212,7 +225,6 @@ test("createProjectRequest persists a Pending request owned by the buyer Workspa
   assert.equal(result.projectRequest.sellerWorkspaceId, SELLER_WORKSPACE_ID);
   assert.equal(result.projectRequest.serviceOfferingId, OFFERING_ID);
   assert.equal(result.projectRequest.projectBriefId, BRIEF_ID);
-  assert.equal(result.projectRequest.createdByUserId, BUYER_USER_ID);
   assert.equal(result.projectRequest.sellerDecisionAt, null);
   assert.equal(result.projectRequest.sellerConsentAt, null);
 });
@@ -221,7 +233,7 @@ test("createProjectRequest rejects a non-Buyer actor with PROJECT_REQUEST_FORBID
   const { projectRequestService } = buildFixture();
   // The seller user is not a member of the buyer workspace, so the
   // workspace authorization service must reject them with
-  // NOT_A_MEMBER. The route maps that to PROJECT_REQUEST_FORBIDDEN.
+  // NOT_A_MEMBER. The route collapses it to a safe envelope.
   await assert.rejects(
     projectRequestService.createProjectRequest({
       userAccountId: SELLER_USER_ID,
@@ -275,20 +287,37 @@ test("createProjectRequest rejects a stale or ineligible offering", async () => 
   );
 });
 
-test("createProjectRequest rejects an offering whose seller Workspace does not match the offering owner", async () => {
+// P1-001 verification: the selected offering MUST be a persisted
+// recommendation for the brief. An otherwise-eligible offering that
+// Matchmaker never returned for this brief must fail closed with
+// PROJECT_REQUEST_OFFERING_INELIGIBLE.
+test("createProjectRequest rejects an offering not surfaced by the brief's Matchmaker", async () => {
+  const { projectRequestService } = buildFixture();
+  await assert.rejects(
+    projectRequestService.createProjectRequest({
+      userAccountId: BUYER_USER_ID,
+      actingWorkspaceId: BUYER_WORKSPACE_ID,
+      projectBriefId: BRIEF_ID,
+      serviceOfferingId: OFFERING_NOT_IN_BRIEF_ID,
+    }),
+    (err: unknown) => {
+      return (
+        err instanceof Error &&
+        err.name === "ProjectRequestError" &&
+        (err as { code?: string }).code === "PROJECT_REQUEST_OFFERING_INELIGIBLE"
+      );
+    },
+  );
+});
+
+test("createProjectRequest persists the offering's owning Workspace as the seller", async () => {
   const { projectRequestService } = buildFixture();
   // The buyer is addressing the buyer Workspace, but the offering
   // is owned by a different seller Workspace. The eligibility
-  // revalidation returns the offering (Active etc.) but the
-  // sellerWorkspaceId returned from eligibility is NOT the one the
-  // buyer intends. Today the service trusts the eligibility return
-  // value, which is the source of truth for ownership; this test
-  // pins the surface so a future regression that hard-codes the
-  // acting Workspace would be detected.
-  // The current implementation persists with the eligibility's
-  // sellerWorkspaceId. We assert that the result references the
-  // sellerWorkspaceId from the eligibility lookup, NOT the buyer's
-  // actingWorkspaceId.
+  // revalidation returns the offering (Active etc.) and the
+  // sellerWorkspaceId from the lookup is the source of truth for
+  // ownership. This test pins the surface so a future regression
+  // that hard-codes the acting Workspace would be detected.
   const result = await projectRequestService.createProjectRequest({
     userAccountId: BUYER_USER_ID,
     actingWorkspaceId: BUYER_WORKSPACE_ID,
@@ -338,7 +367,6 @@ test("acceptProjectRequest atomically transitions Pending and creates exactly on
     projectRequestId: created.projectRequest.projectRequestId,
   });
   assert.equal(result.projectRequest.status, "Accepted");
-  assert.equal(result.projectRequest.sellerDecisionByUserId, SELLER_USER_ID);
   assert.notEqual(result.projectRequest.sellerConsentAt, null);
   assert.equal(result.deal.status, "Negotiating");
   assert.equal(result.deal.projectRequestId, created.projectRequest.projectRequestId);
@@ -565,6 +593,24 @@ test("getProjectRequest rejects a non-member of either side", async () => {
       );
     },
   );
+});
+
+// P1-003 verification: the service MUST NOT depend on Prisma. This
+// test pins the type-level contract so a future regression that
+// re-introduces `prisma` into the constructor would fail to compile.
+test("ProjectRequestService has no Prisma dependency at the type level", () => {
+  // Constructor signature: { projectRequestRepository,
+  // projectBriefRepository, workspaceAuthorizationService, now? }.
+  // No `prisma` field. The next line would NOT compile if `prisma`
+  // were reintroduced.
+  type _AssertNoPrisma = ProjectRequestService extends {
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    readonly prisma: any;
+  }
+    ? true
+    : false;
+  const assertFalse: _AssertNoPrisma = false;
+  void assertFalse;
 });
 
 // Make the typed import survive the strict TS settings.

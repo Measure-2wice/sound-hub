@@ -636,6 +636,13 @@ model AudioSampleOrphanedStorage {
 // projectBriefId) WHERE status = 'Pending'` prevents inappropriate
 // duplicate Pending ProjectRequests while still allowing the buyer
 // to send a follow-up request after a Decline or a closed Deal.
+//
+// Every consequential reference (buyer / seller Workspace, deciding
+// UserAccount, owning ProjectBrief, owning ServiceOffering) uses
+// `onDelete: Restrict` so deleting a Workspace, deciding user, or
+// referenced record fails closed rather than erasing consent and
+// audit evidence. Workspace removal in the buildathon is
+// out-of-scope; archival semantics will land in a later ticket.
 model ProjectRequest {
   id                  String               @id @default(cuid())
   buyerWorkspaceId    String
@@ -662,12 +669,12 @@ model ProjectRequest {
   sellerConsentAt    DateTime?
   createdAt           DateTime              @default(now())
 
-  buyerWorkspace    Workspace      @relation("BuyerWorkspaceProjectRequests",   fields: [buyerWorkspaceId],   references: [id], onDelete: Cascade)
-  sellerWorkspace   Workspace      @relation("SellerWorkspaceProjectRequests",   fields: [sellerWorkspaceId],  references: [id], onDelete: Cascade)
+  buyerWorkspace    Workspace      @relation("BuyerWorkspaceProjectRequests",   fields: [buyerWorkspaceId],   references: [id], onDelete: Restrict)
+  sellerWorkspace   Workspace      @relation("SellerWorkspaceProjectRequests",   fields: [sellerWorkspaceId],  references: [id], onDelete: Restrict)
   serviceOffering   ServiceOffering @relation(fields: [serviceOfferingId], references: [id], onDelete: Restrict)
   projectBrief      ProjectBrief   @relation(fields: [projectBriefId],    references: [id], onDelete: Restrict)
   createdByUser     UserAccount    @relation("ProjectRequestCreatedBy",  fields: [createdByUserId],    references: [id], onDelete: Restrict)
-  sellerDecisionBy  UserAccount?   @relation("ProjectRequestDecidedBy", fields: [sellerDecisionByUserId], references: [id], onDelete: SetNull)
+  sellerDecisionBy  UserAccount?   @relation("ProjectRequestDecidedBy", fields: [sellerDecisionByUserId], references: [id], onDelete: Restrict)
 
   deal              Deal?
 
@@ -689,6 +696,12 @@ model ProjectRequest {
 // retries from creating a second Deal (GS 26). Transitions to Active
 // are owned by a later ticket (Deal/TermsVersion/approvals) and never
 // happen in BG4.
+//
+// Every consequential reference uses `onDelete: Restrict` so
+// deleting the buyer / seller Workspace, the originating
+// ProjectRequest, the referenced ProjectBrief, or the referenced
+// ServiceOffering fails closed rather than erasing the accepted
+// engagement and its audit evidence.
 model Deal {
   id                String     @id @default(cuid())
   buyerWorkspaceId  String
@@ -708,11 +721,11 @@ model Deal {
   activatedAt       DateTime?
   createdAt         DateTime   @default(now())
 
-  buyerWorkspace    Workspace      @relation("BuyerWorkspaceDeals",  fields: [buyerWorkspaceId],  references: [id], onDelete: Cascade)
-  sellerWorkspace   Workspace      @relation("SellerWorkspaceDeals",  fields: [sellerWorkspaceId], references: [id], onDelete: Cascade)
+  buyerWorkspace    Workspace      @relation("BuyerWorkspaceDeals",  fields: [buyerWorkspaceId],  references: [id], onDelete: Restrict)
+  sellerWorkspace   Workspace      @relation("SellerWorkspaceDeals",  fields: [sellerWorkspaceId], references: [id], onDelete: Restrict)
   serviceOffering   ServiceOffering @relation(fields: [serviceOfferingId], references: [id], onDelete: Restrict)
   projectBrief      ProjectBrief   @relation(fields: [projectBriefId],    references: [id], onDelete: Restrict)
-  projectRequest    ProjectRequest  @relation(fields: [projectRequestId],  references: [id], onDelete: Cascade)
+  projectRequest    ProjectRequest  @relation(fields: [projectRequestId],  references: [id], onDelete: Restrict)
 
   @@index([buyerWorkspaceId, status, createdAt])
   @@index([sellerWorkspaceId, status, createdAt])

@@ -11,7 +11,13 @@
 // The contract deliberately exposes the operations the application
 // service needs without leaking Prisma types:
 //
-//   - createProjectRequest persists a Pending request.
+//   - createProjectRequestWithRevalidation persists a Pending
+//     request. The brief lookup, brief-ownership check, brief-
+//     recommendation check (P1-001), offering eligibility check,
+//     and the INSERT all run inside a single PostgreSQL
+//     transaction (P1-002). The repository owns every direct
+//     SQL/Prisma read and write — the service does NOT touch
+//     Prisma (P1-003).
 //   - findProjectRequestById loads one (used by view + decide).
 //   - listProjectRequests lists Pending requests for the seller
 //     inbox (and accepted/declined views for audit, though BG4 ships
@@ -53,11 +59,10 @@ export interface PersistedDeal {
   readonly createdAt: Date;
 }
 
-export interface CreateProjectRequestInput {
+export interface CreateProjectRequestRevalidatedInput {
   readonly buyerWorkspaceId: string;
-  readonly sellerWorkspaceId: string;
-  readonly serviceOfferingId: string;
   readonly projectBriefId: string;
+  readonly serviceOfferingId: string;
   readonly createdByUserId: string;
 }
 
@@ -84,13 +89,55 @@ export type DecideResult<T> =
   | { readonly ok: true; readonly value: T }
   | { readonly ok: false; readonly reason: DecideFailureReason };
 
+/**
+ * Failure reasons for {@link ProjectRequestRepository.createProjectRequestWithRevalidation}.
+ * The repository runs every revalidation step + the INSERT inside one
+ * transaction; a stale or ineligible state at any step fails closed
+ * without leaving a partial ProjectRequest row.
+ */
+export type CreateProjectRequestFailureReason =
+  | "BRIEF_NOT_FOUND"
+  | "BRIEF_FORBIDDEN"
+  | "OFFERING_NOT_IN_BRIEF"
+  | "OFFERING_INELIGIBLE"
+  | "ALREADY_PENDING";
+
+export type CreateProjectRequestResult =
+  | { readonly ok: true; readonly value: PersistedProjectRequest }
+  | { readonly ok: false; readonly reason: CreateProjectRequestFailureReason };
+
 export interface ProjectRequestRepository {
   /**
-   * Persist a new Pending ProjectRequest. Throws when a Pending row
-   * already exists for the same (buyer, seller, offering, brief)
-   * tuple — the partial unique index in PostgreSQL enforces this.
+   * Atomically revalidate the brief-ownership / brief-recommendation
+   * boundary and the offering-eligibility chain, then persist a
+   * Pending ProjectRequest. The entire operation runs inside a
+   * single Prisma `$transaction` so a concurrent mutation between
+   * the read of the BriefSearchResult, the eligibility lookup,
+   * and the INSERT cannot produce an ineligible Pending request
+   * (P1-002). Returns `{ok:false,...}` for any revalidation
+   * failure without leaving a partial ProjectRequest row.
+   *
+   * Failure reasons:
+   *   - `BRIEF_NOT_FOUND` — the ProjectBrief id does not exist.
+   *   - `BRIEF_FORBIDDEN` — the ProjectBrief is owned by a
+   *      different buyer Workspace than the one the caller is
+   *      acting through.
+   *   - `OFFERING_NOT_IN_BRIEF` — the selected ServiceOffering
+   *      was not returned by the brief's persisted Matchmaker
+   *      recommendations (P1-001). A buyer cannot submit an
+   *      arbitrary eligible offering that the buyer never saw.
+   *   - `OFFERING_INELIGIBLE` — the selected offering (or its
+   *      owning Workspace / SellerProfile) is no longer in the
+   *      eligibility chain (Active workspace + Seller capability
+   *      + Published profile + Active offering).
+   *   - `ALREADY_PENDING` — a Pending ProjectRequest already
+   *      exists for the same tuple. The partial unique index
+   *      enforces this; retries return this reason instead of
+   *      creating a duplicate.
    */
-  createProjectRequest(input: CreateProjectRequestInput): Promise<PersistedProjectRequest>;
+  createProjectRequestWithRevalidation(
+    input: CreateProjectRequestRevalidatedInput,
+  ): Promise<CreateProjectRequestResult>;
 
   findProjectRequestById(projectRequestId: string): Promise<PersistedProjectRequest | null>;
 

@@ -242,7 +242,6 @@ export function buildApp(options: AppOptions = {}): BuiltApp {
       projectRequestRepository,
       projectBriefRepository,
       workspaceAuthorizationService,
-      prisma,
     });
 
   const app: Application = express();

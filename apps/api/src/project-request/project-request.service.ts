@@ -5,7 +5,7 @@
 // accept/decline, and the eligibility revalidation that protects
 // against stale selections (GS 16). The service threads:
 //   - authenticated human + acting Workspace authorization
-//   - persisted ProjectBrief ownership / current membership
+//   - the brief-recommendation boundary check (P1-001)
 //   - eligibility revalidation of the selected ServiceOffering
 //     (workspace active + Seller capability + SellerProfile Published
 //     + ServiceOffering Active + ownership — i.e. the offering
@@ -16,9 +16,13 @@
 //
 // The service is the only layer that knows the domain rules. The
 // route layer translates the typed errors into the safe envelope;
-// the repository layer owns the SQL boundary.
+// the repository layer owns the SQL boundary. The service has NO
+// Prisma dependency — every read and write is delegated to the
+// repository contract (P1-003). The repository runs the brief-ownership,
+// brief-recommendation, offering-eligibility, and INSERT inside a
+// single `$transaction` (P1-002) so a concurrent mutation cannot
+// produce an ineligible Pending row.
 
-import type { PrismaClient } from "@soundhub/db";
 import type {
   CreateProjectRequestRequestV1,
   ProjectRequestPublicV1,
@@ -34,10 +38,10 @@ import {
 } from "../services/workspace-authorization.service.js";
 import type {
   ProjectRequestRepository,
+  CreateProjectRequestFailureReason,
   PersistedProjectRequest,
   PersistedDeal,
 } from "./project-request.repository.js";
-import { PendingDuplicateError } from "./prisma-project-request.repository.js";
 
 export class ProjectRequestError extends Error {
   constructor(
@@ -61,13 +65,6 @@ export interface ProjectRequestServiceDeps {
   readonly projectRequestRepository: ProjectRequestRepository;
   readonly projectBriefRepository: ProjectBriefRepository;
   readonly workspaceAuthorizationService: WorkspaceAuthorizationService;
-  /**
-   * Prisma is passed only so the eligibility-revalidation step can
-   * look up current Workspace / SellerProfile / ServiceOffering rows
-   * in a single transaction. The service never exposes Prisma models
-   * to the route layer.
-   */
-  readonly prisma: PrismaClient;
   /**
    * Optional clock injection for tests. Defaults to `new Date()`.
    */
@@ -109,14 +106,12 @@ export class ProjectRequestService {
   private readonly repository: ProjectRequestRepository;
   private readonly briefs: ProjectBriefRepository;
   private readonly authz: WorkspaceAuthorizationService;
-  private readonly prisma: PrismaClient;
   private readonly now: () => Date;
 
   constructor(deps: ProjectRequestServiceDeps) {
     this.repository = deps.projectRequestRepository;
     this.briefs = deps.projectBriefRepository;
     this.authz = deps.workspaceAuthorizationService;
-    this.prisma = deps.prisma;
     this.now = deps.now ?? (() => new Date());
   }
 
@@ -127,16 +122,15 @@ export class ProjectRequestService {
    * Sequence (ticket #62 acceptance criteria):
    *   1. Revalidate the acting Workspace has current Buyer-capable
    *      membership (GS 4 / GS 5 / GS 6).
-   *   2. Load the persisted ProjectBrief; revalidate the buyer
-   *      Workspace owns it (i.e. the brief was created by a current
-   *      member of the same Workspace).
-   *   3. Revalidate the selected ServiceOffering against current
-   *      eligibility (Workspace active + Seller capability +
-   *      SellerProfile Published + ServiceOffering Active +
-   *      offering-owned-by-seller-Workspace).
-   *   4. Persist a Pending ProjectRequest; the partial unique
-   *      index catches inappropriate retries.
-   *   5. Return the public DTO.
+   *   2. Delegate the brief-ownership / brief-recommendation (P1-001)
+   *      / offering-eligibility revalidation AND the INSERT to the
+   *      repository, which runs the entire operation inside one
+   *      `$transaction` (P1-002). The service has no Prisma
+   *      dependency (P1-003).
+   *   3. Map the repository's discriminated-union failure reasons to
+   *      typed ProjectRequestError values so the route layer can map
+   *      them to the buyer-safe envelope.
+   *   4. Return the public DTO.
    */
   async createProjectRequest(input: CreateProjectRequestInput): Promise<{
     readonly projectRequest: ProjectRequestPublicV1;
@@ -148,66 +142,17 @@ export class ProjectRequestService {
       requiredCapability: "Buyer",
     });
 
-    // Step 2: Brief ownership and current Buyer-membership
-    // revalidation (membership was already revalidated in
-    // requireCapability; we still need to prove the brief belongs
-    // to the buyer Workspace so a buyer cannot address another
-    // Workspace's brief).
-    const brief = await this.briefs.findBriefById(input.projectBriefId);
-    if (!brief) {
-      throw new ProjectRequestError("ProjectBrief not found.", "PROJECT_REQUEST_BRIEF_NOT_FOUND");
+    // Step 2: Atomic revalidation + INSERT (P1-001 / P1-002 / P1-003).
+    const result = await this.repository.createProjectRequestWithRevalidation({
+      buyerWorkspaceId: membership.workspace.workspaceId,
+      projectBriefId: input.projectBriefId,
+      serviceOfferingId: input.serviceOfferingId,
+      createdByUserId: input.userAccountId,
+    });
+    if (!result.ok) {
+      throw this.createFailureToServiceError(result.reason);
     }
-    if (brief.buyerWorkspaceId !== membership.workspace.workspaceId) {
-      throw new ProjectRequestError(
-        "ProjectBrief does not belong to this Workspace.",
-        "PROJECT_REQUEST_BRIEF_FORBIDDEN",
-      );
-    }
-
-    // Step 3: Eligibility revalidation of the selected offering.
-    const offering = await this.loadOfferingEligibility(input.serviceOfferingId);
-    if (!offering) {
-      // Either the offering no longer exists OR it is not Active.
-      // Both surface as OFFERING_INELIGIBLE so the buyer is told
-      // the selection is stale without leaking whether the row
-      // exists.
-      throw new ProjectRequestError(
-        "The selected ServiceOffering is no longer eligible.",
-        "PROJECT_REQUEST_OFFERING_INELIGIBLE",
-      );
-    }
-
-    // Cross-check: the buyer is addressing the seller Workspace
-    // that owns the offering. A buyer cannot address an offering
-    // owned by a different Workspace even if all other eligibility
-    // conditions hold. This is already implicit in the
-    // loadOfferingEligibility lookup (we resolve the offering's
-    // owning workspace from the database row), so this block is a
-    // no-op gate today; the comment documents intent so future
-    // revalidation logic does not introduce a regression.
-    void offering;
-
-    // Step 4: Persist.
-    let persisted: PersistedProjectRequest;
-    try {
-      persisted = await this.repository.createProjectRequest({
-        buyerWorkspaceId: membership.workspace.workspaceId,
-        sellerWorkspaceId: offering.sellerWorkspaceId,
-        serviceOfferingId: offering.id,
-        projectBriefId: brief.id,
-        createdByUserId: input.userAccountId,
-      });
-    } catch (err) {
-      if (err instanceof PendingDuplicateError) {
-        throw new ProjectRequestError(
-          "A Pending ProjectRequest already exists for this selection.",
-          "PROJECT_REQUEST_ALREADY_PENDING",
-        );
-      }
-      throw err;
-    }
-
-    return { projectRequest: toPublicProjectRequest(persisted) };
+    return { projectRequest: toPublicProjectRequest(result.value) };
   }
 
   /**
@@ -337,48 +282,32 @@ export class ProjectRequestService {
     return { membership, userAccountId: input.userAccountId };
   }
 
-  /**
-   * Single-row eligibility revalidation. The service loads the
-   * Workspace, SellerProfile, and ServiceOffering in one round-trip
-   * and applies the M1 eligibility filter (Active workspace +
-   * Seller capability + Published profile + Active offering).
-   */
-  private async loadOfferingEligibility(serviceOfferingId: string): Promise<{
-    readonly id: string;
-    readonly status: string;
-    readonly sellerWorkspaceId: string;
-    readonly workspaceStatus: string;
-    readonly workspaceHasSellerCapability: boolean;
-    readonly profileStatus: string;
-  } | null> {
-    const row = await this.prisma.serviceOffering.findUnique({
-      where: { id: serviceOfferingId },
-      include: {
-        sellerProfile: {
-          include: {
-            workspace: {
-              include: { capabilities: true },
-            },
-          },
-        },
-      },
-    });
-    if (!row) return null;
-    if (row.status !== "Active") return null;
-    if (row.sellerProfile.status !== "Published") return null;
-    if (row.sellerProfile.workspace.status !== "Active") return null;
-    const hasSeller = row.sellerProfile.workspace.capabilities.some(
-      (c) => c.capability === "Seller",
-    );
-    if (!hasSeller) return null;
-    return {
-      id: row.id,
-      status: row.status,
-      sellerWorkspaceId: row.sellerProfile.workspace.id,
-      workspaceStatus: row.sellerProfile.workspace.status,
-      workspaceHasSellerCapability: hasSeller,
-      profileStatus: row.sellerProfile.status,
-    };
+  private createFailureToServiceError(
+    reason: CreateProjectRequestFailureReason,
+  ): ProjectRequestError {
+    switch (reason) {
+      case "BRIEF_NOT_FOUND":
+        return new ProjectRequestError(
+          "ProjectBrief not found.",
+          "PROJECT_REQUEST_BRIEF_NOT_FOUND",
+        );
+      case "BRIEF_FORBIDDEN":
+        return new ProjectRequestError(
+          "ProjectBrief does not belong to this Workspace.",
+          "PROJECT_REQUEST_BRIEF_FORBIDDEN",
+        );
+      case "OFFERING_NOT_IN_BRIEF":
+      case "OFFERING_INELIGIBLE":
+        return new ProjectRequestError(
+          "The selected ServiceOffering is no longer eligible.",
+          "PROJECT_REQUEST_OFFERING_INELIGIBLE",
+        );
+      case "ALREADY_PENDING":
+        return new ProjectRequestError(
+          "A Pending ProjectRequest already exists for this selection.",
+          "PROJECT_REQUEST_ALREADY_PENDING",
+        );
+    }
   }
 
   private decideErrorToServiceError(
@@ -397,16 +326,20 @@ export class ProjectRequestService {
 // ---------- DTO mapping ----------
 
 export function toPublicProjectRequest(persisted: PersistedProjectRequest): ProjectRequestPublicV1 {
+  // Private human-actor identifiers are intentionally omitted from the
+  // counterparty-visible surface. The persisted columns remain in
+  // PostgreSQL as audit evidence (and are available to internal /
+  // separately-authorized audit presentations), but they MUST NOT
+  // cross this public DTO. See projectRequestPublicV1Schema for the
+  // allow-list contract.
   return {
     projectRequestId: persisted.id,
     buyerWorkspaceId: persisted.buyerWorkspaceId,
     sellerWorkspaceId: persisted.sellerWorkspaceId,
     serviceOfferingId: persisted.serviceOfferingId,
     projectBriefId: persisted.projectBriefId,
-    createdByUserId: persisted.createdByUserId,
     status: persisted.status,
     sellerDecisionAt: persisted.sellerDecisionAt ? persisted.sellerDecisionAt.toISOString() : null,
-    sellerDecisionByUserId: persisted.sellerDecisionByUserId,
     sellerConsentAt: persisted.sellerConsentAt ? persisted.sellerConsentAt.toISOString() : null,
     createdAt: persisted.createdAt.toISOString(),
   };

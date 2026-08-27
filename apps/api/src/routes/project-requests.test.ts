@@ -35,7 +35,6 @@ import type { AuthenticationService } from "../services/authentication.service.j
 import type { Express } from "express";
 
 const BUYER_USER_ID = "user-buyer";
-const SELLER_USER_ID = "user-seller";
 const BUYER_WORKSPACE_ID = "ws-buyer";
 const SELLER_WORKSPACE_ID = "ws-seller";
 const NON_MEMBER_USER_ID = "user-non-member";
@@ -90,10 +89,8 @@ class FakeProjectRequestService {
         sellerWorkspaceId: SELLER_WORKSPACE_ID,
         serviceOfferingId: "of-1",
         projectBriefId: "brief-1",
-        createdByUserId: BUYER_USER_ID,
         status: "Pending",
         sellerDecisionAt: null,
-        sellerDecisionByUserId: null,
         sellerConsentAt: null,
         createdAt: new Date("2026-08-27T00:00:00Z").toISOString(),
       },
@@ -118,10 +115,8 @@ class FakeProjectRequestService {
         sellerWorkspaceId: SELLER_WORKSPACE_ID,
         serviceOfferingId: "of-1",
         projectBriefId: "brief-1",
-        createdByUserId: BUYER_USER_ID,
         status: "Accepted",
         sellerDecisionAt: new Date("2026-08-27T00:00:01Z").toISOString(),
-        sellerDecisionByUserId: SELLER_USER_ID,
         sellerConsentAt: new Date("2026-08-27T00:00:01Z").toISOString(),
         createdAt: new Date("2026-08-27T00:00:00Z").toISOString(),
       },
@@ -148,10 +143,8 @@ class FakeProjectRequestService {
         sellerWorkspaceId: SELLER_WORKSPACE_ID,
         serviceOfferingId: "of-1",
         projectBriefId: "brief-1",
-        createdByUserId: BUYER_USER_ID,
         status: "Declined",
         sellerDecisionAt: new Date("2026-08-27T00:00:01Z").toISOString(),
-        sellerDecisionByUserId: SELLER_USER_ID,
         sellerConsentAt: null,
         createdAt: new Date("2026-08-27T00:00:00Z").toISOString(),
       },
@@ -167,10 +160,8 @@ class FakeProjectRequestService {
         sellerWorkspaceId: SELLER_WORKSPACE_ID,
         serviceOfferingId: "of-1",
         projectBriefId: "brief-1",
-        createdByUserId: BUYER_USER_ID,
         status: "Pending",
         sellerDecisionAt: null,
-        sellerDecisionByUserId: null,
         sellerConsentAt: null,
         createdAt: new Date("2026-08-27T00:00:00Z").toISOString(),
       },
@@ -187,10 +178,8 @@ class FakeProjectRequestService {
           sellerWorkspaceId: SELLER_WORKSPACE_ID,
           serviceOfferingId: "of-1",
           projectBriefId: "brief-1",
-          createdByUserId: BUYER_USER_ID,
           status: "Pending",
           sellerDecisionAt: null,
-          sellerDecisionByUserId: null,
           sellerConsentAt: null,
           createdAt: new Date("2026-08-27T00:00:00Z").toISOString(),
         },
@@ -392,6 +381,82 @@ describe("ProjectRequest route contract", () => {
     // `.strict()`, so an unexpected field would have failed the
     // safeParse above.
     assert.equal(pr.declineCalls.length, 1);
+  });
+
+  // P0-001 verification: every ProjectRequest response MUST be free of
+  // private human-actor identifiers (CLAUDE.md: "Do not expose account
+  // identity... publicly"). The fields `createdByUserId` and
+  // `sellerDecisionByUserId` are persisted as audit evidence only.
+  test("every ProjectRequest response is free of UserAccount identifiers", async () => {
+    FakeProjectRequestService.NEXT_BUYER_REJECTION = null;
+
+    const fields: readonly string[] = ["createdByUserId", "sellerDecisionByUserId"];
+
+    // POST /api/project-requests
+    const createResponse = await request(app).post("/api/project-requests").send({
+      actingWorkspaceId: BUYER_WORKSPACE_ID,
+      projectBriefId: "brief-1",
+      serviceOfferingId: "of-1",
+    });
+    assert.equal(createResponse.status, 201);
+    const createProjectRequest = (
+      createResponse.body as {
+        ok: true;
+        projectRequest: Record<string, unknown>;
+      }
+    ).projectRequest;
+    for (const field of fields) {
+      assert.equal(
+        createProjectRequest[field],
+        undefined,
+        `POST response must not include ${field}`,
+      );
+    }
+
+    // GET /api/project-requests/:id
+    const getResponse = await request(app).get(
+      `/api/project-requests/pr-1?actingWorkspaceId=${BUYER_WORKSPACE_ID}`,
+    );
+    assert.equal(getResponse.status, 200);
+    const getProjectRequest = (getResponse.body as { projectRequest: Record<string, unknown> })
+      .projectRequest;
+    for (const field of fields) {
+      assert.equal(getProjectRequest[field], undefined, `GET response must not include ${field}`);
+    }
+
+    // GET /api/project-requests (list)
+    const listResponse = await request(app).get(
+      `/api/project-requests?actingWorkspaceId=${BUYER_WORKSPACE_ID}`,
+    );
+    assert.equal(listResponse.status, 200);
+    const list = (listResponse.body as { projectRequests: ReadonlyArray<Record<string, unknown>> })
+      .projectRequests;
+    assert.equal(list.length, 1);
+    for (const item of list) {
+      for (const field of fields) {
+        assert.equal(item[field], undefined, `LIST response must not include ${field}`);
+      }
+    }
+
+    // POST /api/project-requests/:id/accept
+    const acceptResponse = await request(app)
+      .post("/api/project-requests/pr-1/accept")
+      .send({ actingWorkspaceId: SELLER_WORKSPACE_ID });
+    assert.equal(acceptResponse.status, 200);
+    const acceptProjectRequest = (
+      acceptResponse.body as {
+        ok: true;
+        projectRequest: Record<string, unknown>;
+        deal: Record<string, unknown>;
+      }
+    ).projectRequest;
+    for (const field of fields) {
+      assert.equal(
+        acceptProjectRequest[field],
+        undefined,
+        `ACCEPT response must not include ${field}`,
+      );
+    }
   });
 });
 
