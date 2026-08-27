@@ -54,6 +54,7 @@ function mapStatus(code: ApiErrorCodeV1): number {
     case "INVALID_JSON":
     case "INVALID_SEARCH_CRITERIA":
     case "INVALID_AUTH_REQUEST":
+    case "MATCHMAKER_INVALID_REQUEST":
       return 400;
     case "UNSUPPORTED_MEDIA_TYPE":
       return 415;
@@ -62,9 +63,11 @@ function mapStatus(code: ApiErrorCodeV1): number {
       return 429;
     case "SEARCH_FAILED":
     case "AUTH_FAILED":
+    case "MATCHMAKER_FAILED":
       return 500;
     case "SEARCH_UNAVAILABLE":
     case "AUTH_PROVIDER_UNAVAILABLE":
+    case "MATCHMAKER_AI_UNAVAILABLE":
       return 503;
     // GS 4 / GS 5 authorization rejections. The standard safe envelope
     // does not include 401/403 by default, so we map the new
@@ -75,10 +78,12 @@ function mapStatus(code: ApiErrorCodeV1): number {
     case "SESSION_EXPIRED":
       return 401;
     case "WORKSPACE_NOT_FOUND":
+    case "BRIEF_NOT_FOUND":
       return 404;
     case "WORKSPACE_INELIGIBLE":
     case "NOT_A_MEMBER":
     case "MISSING_CAPABILITY":
+    case "BRIEF_FORBIDDEN":
       return 403;
   }
 }

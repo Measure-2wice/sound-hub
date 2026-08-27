@@ -7,20 +7,30 @@ import { healthRoutes } from "./routes/health.js";
 import { createSearchRouter } from "./routes/search.js";
 import { createMetadataRouter } from "./routes/metadata.js";
 import { createAuthRouter } from "./routes/auth.js";
+import { createMatchmakerRouter } from "./routes/matchmaker.js";
 import { TalentSearchService } from "./services/talent-search.service.js";
 import { AuthenticationService } from "./services/authentication.service.js";
 import { WorkspaceAuthorizationService } from "./services/workspace-authorization.service.js";
+import { MatchmakerService } from "./services/matchmaker.service.js";
 import { PrismaTalentSearchRepository } from "./repositories/prisma-talent-search.repository.js";
 import { PrismaMetadataRepository } from "./repositories/prisma-metadata.repository.js";
 import { PrismaAuthRepository } from "./auth-repository/prisma-auth-repository.js";
+import { PrismaProjectBriefRepository } from "./matchmaker/prisma-project-brief.repository.js";
+import type { ProjectBriefRepository } from "./matchmaker/project-brief.repository.js";
 import type { MetadataRepository } from "./repositories/metadata.repository.js";
 import type { AuthRepository } from "./auth-repository/auth-repository.js";
 import type { IdentityAdapter } from "./identity/identity-adapter.js";
+import type { AiAdapter } from "./matchmaker/ai-adapter.js";
 import {
   buildIdentityAdapters,
   buildIdentityAdaptersAsync,
   type BuiltIdentityAdapters,
 } from "./identity/identity-adapter-factory.js";
+import {
+  buildAiAdapters,
+  readImpalaConfigFromEnv,
+  type BuiltAiAdapters,
+} from "./matchmaker/ai-adapter-factory.js";
 import type { SmokeResult } from "./identity/managed-identity-adapter.js";
 import { buildSafeError, generateRequestId, writeSafeError } from "./lib/errors.js";
 
@@ -58,6 +68,16 @@ export interface AppOptions {
    * harnesses can stay network-free.
    */
   readonly identityAdapterOverride?: "managed-magic-link" | "deterministic";
+  /**
+   * Pre-built AI adapter bundle. The Matchmaker service uses the
+   * active adapter as its primary path; the deterministic fallback
+   * is always wired in. Tests can inject their own bundle to
+   * exercise the managed path.
+   */
+  readonly aiAdapters?: BuiltAiAdapters;
+  readonly projectBriefRepository?: ProjectBriefRepository;
+  readonly matchmakerService?: MatchmakerService;
+  readonly aiAdapter?: AiAdapter;
 }
 
 export interface BuiltApp {
@@ -68,6 +88,8 @@ export interface BuiltApp {
   readonly workspaceAuthorizationService: WorkspaceAuthorizationService;
   readonly authRepository: AuthRepository;
   readonly identityAdapter: IdentityAdapter;
+  readonly matchmakerService: MatchmakerService;
+  readonly aiAdapter: AiAdapter;
 }
 
 export function buildApp(options: AppOptions = {}): BuiltApp {
@@ -106,6 +128,37 @@ export function buildApp(options: AppOptions = {}): BuiltApp {
   const workspaceAuthorizationService =
     options.workspaceAuthorizationService ?? new WorkspaceAuthorizationService({ authRepository });
 
+  // BG3 Matchmaker: build the AI adapter bundle (managed stub OR
+  // deterministic fallback) and the project-brief repository, then
+  // wire the MatchmakerService. The deterministic fallback is the
+  // approved buildathon path; a future managed adapter slots in via
+  // the factory without changing the service contract.
+  //
+  // The factory reads IMPALA_BASE_URL / IMPALA_API_KEY / IMPALA_MODEL
+  // from the process env at composition time. The API key is held
+  // inside the adapter instance and is never logged, returned by
+  // the factory, or surfaced through any DTO.
+  const aiAdapters =
+    options.aiAdapters ??
+    buildAiAdapters({
+      managedConfig: readImpalaConfigFromEnv() ?? undefined,
+      log: (message) => {
+        console.log(`[matchmaker] ${message}`);
+      },
+    });
+  const aiAdapter = options.aiAdapter ?? aiAdapters.active;
+  const projectBriefRepository =
+    options.projectBriefRepository ?? new PrismaProjectBriefRepository(prisma);
+  const matchmakerService =
+    options.matchmakerService ??
+    new MatchmakerService({
+      talentSearchService: service,
+      workspaceAuthorizationService,
+      projectBriefRepository,
+      aiAdapter,
+      fallbackAiAdapter: aiAdapters.deterministic,
+    });
+
   const app: Application = express();
   app.disable("x-powered-by");
   app.use(helmet());
@@ -136,6 +189,13 @@ export function buildApp(options: AppOptions = {}): BuiltApp {
       authenticationService,
       workspaceAuthorizationService,
       authRepository,
+    }),
+  );
+  app.use(
+    "/api/matchmaker",
+    createMatchmakerRouter({
+      authenticationService,
+      matchmakerService,
     }),
   );
 
@@ -173,6 +233,8 @@ export function buildApp(options: AppOptions = {}): BuiltApp {
     workspaceAuthorizationService,
     authRepository,
     identityAdapter,
+    matchmakerService,
+    aiAdapter,
   };
 }
 

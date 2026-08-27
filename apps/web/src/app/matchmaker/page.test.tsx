@@ -1,0 +1,909 @@
+/* eslint-disable @typescript-eslint/no-floating-promises */
+// Matchmaker page contract tests.
+//
+// Background: ticket #60 ships the buyer-facing Matchmaker flow.
+// The page submits the buyer's natural-language brief to
+// /api/matchmaker/brief and renders the resulting eligibility-
+// determined recommendations. These tests pin the React boundary
+// contract at two layers:
+//
+//   1. Source-pattern tests pin the page's authoritative code
+//      paths (DEFAULT_BRIEF wording, Buyer-capability filter,
+//      wired submission, fallback notice element, fact-only
+//      explanation rendering) so a refactor cannot silently
+//      disconnect the buyer journey.
+//
+//   2. Runtime tests exercise the extracted
+//      `submitBriefFromForm` test seam with a controlled fetch
+//      (no live AI, no live database). The success path proves
+//      the page actually posts the buyer workspace + brief text
+//      AND records the returned recommendations (the page's
+//      `setResponse` is exercised end to end). The rejection
+//      path proves the page surfaces the error and resets
+//      submitting so the form can be used again. Removing the
+//      `setResponse(result)` call from the page's submit
+//      handler would fail the runtime success test because the
+//      recorded response state stays null.
+
+import assert from "node:assert/strict";
+import { readFileSync } from "node:fs";
+import { afterEach, beforeEach, describe, test } from "node:test";
+import type * as React from "react";
+import type {
+  CategoryMetadataItemV1,
+  ProjectBriefPublicV1,
+  SubmitBriefRequestV1,
+  SubmitBriefResponseV1,
+} from "@soundhub/types";
+import { submitBriefResponseV1Schema } from "@soundhub/types";
+import type { submitBrief as submitBriefFn } from "../lib/matchmaker-client";
+import { submitBriefFromForm } from "./submit-brief-from-form.js";
+import { BriefSummary } from "./brief-summary.js";
+
+// Canonical Category metadata used by the presentation-coverage
+// tests. Mirrors what /api/metadata/categories returns at runtime
+// (PostgreSQL is the source of truth; this fixture exists so the
+// tests stay network-free).
+const EXAMPLE_CATEGORIES: readonly CategoryMetadataItemV1[] = [
+  { key: "music-production", name: "Music Production" },
+  { key: "songwriting", name: "Songwriting" },
+  { key: "mixing", name: "Mixing" },
+  { key: "session-vocals", name: "Session Vocals" },
+  { key: "live-performance", name: "Live Performance" },
+];
+
+const repoRoot = `${new URL("../../../../", import.meta.url).pathname}web`;
+
+function readMatchmakerPage(): string {
+  return readFileSync(`${repoRoot}/src/app/matchmaker/page.tsx`, "utf8");
+}
+
+// ---------- Runtime tests (controlled fetch) ----------
+
+function buildResponse(override: Partial<SubmitBriefResponseV1> = {}): SubmitBriefResponseV1 {
+  return {
+    ok: true,
+    brief: {
+      briefId: "brief-runtime-1",
+      actingWorkspaceId: "ws-buyer-runtime",
+      createdByUserId: "user-runtime-buyer",
+      briefText: "I need a Brooklyn-based producer for a remote Haitian dancehall single.",
+      criteria: { required: { primaryCategoryKeys: ["music-production"] } },
+      aiProvider: "deterministic-fallback",
+      aiModelId: null,
+      aiFallbackUsed: true,
+      createdAt: "2026-08-26T00:00:00.000Z",
+      buyerWorkspace: {
+        workspaceId: "ws-buyer-runtime",
+        slug: "bg1-demo-buyer",
+        name: "BG1 Demo Buyer",
+      },
+    },
+    recommendations: [
+      {
+        sellerId: "seller-runtime-1",
+        professionalName: "Marc-André Pierre",
+        bestMatchingOfferingId: "of-runtime-1",
+        relevanceScore: 0.9,
+        explanations: [
+          { kind: "matched-offering-title", label: "Matched the offering title" },
+          { kind: "preferred-genre", label: "Preferred genre: Dancehall" },
+        ],
+        matchReason: "matched offering title; preferred genre: Dancehall",
+        bestMatchingOffering: {
+          offeringId: "of-runtime-1",
+          title: "Haitian dancehall single production — remote",
+          description: "Caribbean-flavored dancehall production.",
+          primaryCategory: { key: "music-production", name: "Music Production" },
+          includedServices: [],
+          genreTags: ["Dancehall"],
+          serviceMode: "Remote",
+          serviceAreas: [{ city: "Brooklyn", region: "NY", countryCode: "US" }],
+        },
+        seller: {
+          sellerId: "seller-runtime-1",
+          professionalName: "Marc-André Pierre",
+          specialties: ["Producer"],
+          bio: "Brooklyn-based producer.",
+          basedIn: { city: "Brooklyn", region: "NY", countryCode: "US" },
+          caribbeanAffiliationCodes: ["HT"],
+        },
+        additionalMatchingOfferings: [],
+      },
+    ],
+    totalResults: 1,
+    strategy: "postgres-text-v1",
+    fallbackNotice: "The AI interpretation used the deterministic fallback.",
+    ...override,
+  };
+}
+
+interface RecordedSubmission {
+  readonly url: string;
+  readonly body: SubmitBriefRequestV1;
+}
+
+let originalFetch: typeof fetch;
+let recordedSubmissions: RecordedSubmission[];
+let queuedResponse: Response | Error | null;
+
+function installFetchStub(): void {
+  originalFetch = globalThis.fetch;
+  recordedSubmissions = [];
+  queuedResponse = null;
+  /* eslint-disable @typescript-eslint/require-await */
+  globalThis.fetch = async (input: RequestInfo | URL, init?: RequestInit) => {
+    const url =
+      typeof input === "string" ? input : input instanceof URL ? input.toString() : input.url;
+    let body: unknown = undefined;
+    const rawBody = init?.body;
+    if (typeof rawBody === "string" && rawBody.length > 0) {
+      body = JSON.parse(rawBody);
+    }
+    recordedSubmissions.push({ url, body: body as SubmitBriefRequestV1 });
+    if (queuedResponse instanceof Error) {
+      throw queuedResponse;
+    }
+    if (queuedResponse instanceof Response) {
+      return queuedResponse;
+    }
+    return new Response("{}", { status: 500 });
+  };
+  /* eslint-enable @typescript-eslint/require-await */
+}
+
+beforeEach(() => {
+  installFetchStub();
+});
+afterEach(() => {
+  globalThis.fetch = originalFetch;
+});
+
+describe("BG3 Matchmaker page runtime submit path", () => {
+  test("a successful submission posts the buyer workspace + brief text and records the response", async () => {
+    const controlled = buildResponse();
+    queuedResponse = new Response(JSON.stringify(controlled), {
+      status: 200,
+      headers: { "Content-Type": "application/json" },
+    });
+    const setErrorCalls: (string | null)[] = [];
+    const setResponseCalls: (SubmitBriefResponseV1 | null)[] = [];
+    const setSubmittingCalls: boolean[] = [];
+
+    await submitBriefFromForm({
+      actingWorkspaceId: "ws-buyer-runtime",
+      briefText: "I need a Brooklyn-based producer for a remote Haitian dancehall single.",
+      setError: (value) => setErrorCalls.push(value),
+      setResponse: (value) => setResponseCalls.push(value),
+      setSubmitting: (value) => setSubmittingCalls.push(value),
+    });
+
+    // The runtime path emitted exactly one POST to the documented
+    // endpoint with the buyer workspace + trimmed brief text. A
+    // refactor that drops the workspace id or replaces the brief
+    // text would fail this assertion.
+    assert.equal(recordedSubmissions.length, 1);
+    const recorded = recordedSubmissions[0]!;
+    assert.equal(recorded.url, "/api/matchmaker/brief");
+    assert.equal(recorded.body.actingWorkspaceId, "ws-buyer-runtime");
+    assert.equal(
+      recorded.body.briefText,
+      "I need a Brooklyn-based producer for a remote Haitian dancehall single.",
+    );
+    // The buyer Non-search requirements block is optional and the
+    // page does not forward one, so the body must omit it.
+    assert.equal(recorded.body.nonSearchRequirements, undefined);
+
+    // The page receives the validated response and records it.
+    // This is the assertion that fails if the page's submit
+    // handler stops calling setResponse(result) — the recorded
+    // state would stay null.
+    // setError(null) is called once at the top of the seam to
+    // clear stale state; the successful path does not invoke
+    // setError again, so the array contains exactly one null.
+    assert.equal(setErrorCalls.length, 1);
+    assert.equal(setErrorCalls[0], null);
+    // The handler clears any stale response before the fetch, so
+    // two setResponse calls are expected: null (clear) and the
+    // recorded response. The recorded value is the last entry.
+    assert.equal(setResponseCalls.length, 2);
+    const recordedResponse = setResponseCalls[1]!;
+    submitBriefResponseV1Schema.parse(recordedResponse);
+    assert.equal(recordedResponse.totalResults, 1);
+    assert.equal(recordedResponse.recommendations.length, 1);
+    assert.equal(recordedResponse.recommendations[0]?.sellerId, "seller-runtime-1");
+
+    // The submitting flag must toggle: true before the fetch, false
+    // after. Without this, the submit button would never re-enable
+    // and the buyer could not submit another brief.
+    assert.deepEqual(setSubmittingCalls, [true, false]);
+  });
+
+  test("a failing submission surfaces the error and resets submitting so the form can be used again", async () => {
+    queuedResponse = new Response(
+      JSON.stringify({
+        error: {
+          code: "MATCHMAKER_INVALID_REQUEST",
+          message: "ProjectBrief submission failed schema validation.",
+          requestId: "req-runtime-1",
+        },
+      }),
+      { status: 400, headers: { "Content-Type": "application/json" } },
+    );
+    const setErrorCalls: (string | null)[] = [];
+    const setResponseCalls: (SubmitBriefResponseV1 | null)[] = [];
+    const setSubmittingCalls: boolean[] = [];
+
+    await submitBriefFromForm({
+      actingWorkspaceId: "ws-buyer-runtime",
+      briefText: "I need a Brooklyn-based producer for a remote Haitian dancehall single.",
+      setError: (value) => setErrorCalls.push(value),
+      setResponse: (value) => setResponseCalls.push(value),
+      setSubmitting: (value) => setSubmittingCalls.push(value),
+    });
+
+    // The fetch fired (the page attempts the request before
+    // seeing the error), the response was discarded, and the
+    // error message from the safe envelope was surfaced.
+    assert.equal(recordedSubmissions.length, 1);
+    // setError is called twice (null + the safe-envelope message).
+    // setResponse is called once (null, BEFORE the fetch — the
+    // catch block does not run setResponse because the fetch
+    // throws before the success assignment). The submitting
+    // flag toggles true → false.
+    assert.equal(setResponseCalls.length, 1);
+    assert.equal(setResponseCalls[0], null, "failed submission must not record a response");
+    assert.equal(setErrorCalls.length, 2);
+    assert.equal(setErrorCalls[0], null);
+    assert.match(setErrorCalls[1] ?? "", /ProjectBrief submission failed schema validation/);
+    assert.deepEqual(setSubmittingCalls, [true, false], "submitting flag must reset on failure");
+  });
+
+  test("a SESSION_INVALID response triggers onSessionInvalid so the page converges on the signed-out state", async () => {
+    // Simulate the buyer signing out in another tab (or the cookie
+    // expiring) by returning a 401 with the SESSION_INVALID safe
+    // envelope code. The seam must invoke onSessionInvalid so the
+    // page can refresh the shared BG1 SessionProvider so the header
+    // email and workspace list disappear and the Matchmaker page
+    // shows its signed-out empty-state.
+    queuedResponse = new Response(
+      JSON.stringify({
+        error: {
+          code: "SESSION_INVALID",
+          message: "Sign in is required to submit a ProjectBrief.",
+          requestId: "req-session-invalid-1",
+        },
+      }),
+      { status: 401, headers: { "Content-Type": "application/json" } },
+    );
+    let calls = 0;
+    await submitBriefFromForm({
+      actingWorkspaceId: "ws-buyer-runtime",
+      briefText: "I need a Brooklyn-based producer for a remote Haitian dancehall single.",
+      setError: () => {},
+      setResponse: () => {},
+      setSubmitting: () => {},
+      onSessionInvalid: () => {
+        calls += 1;
+      },
+    });
+    assert.equal(calls, 1, "SESSION_INVALID response must invoke onSessionInvalid exactly once");
+  });
+
+  test("an AUTH_FAILED response also triggers onSessionInvalid (legacy / cross-tab invalidation)", async () => {
+    queuedResponse = new Response(
+      JSON.stringify({
+        error: {
+          code: "AUTH_FAILED",
+          message: "Magic link is invalid, expired, or already used.",
+          requestId: "req-auth-failed-1",
+        },
+      }),
+      { status: 401, headers: { "Content-Type": "application/json" } },
+    );
+    let calls = 0;
+    await submitBriefFromForm({
+      actingWorkspaceId: "ws-buyer-runtime",
+      briefText: "I need a Brooklyn-based producer for a remote Haitian dancehall single.",
+      setError: () => {},
+      setResponse: () => {},
+      setSubmitting: () => {},
+      onSessionInvalid: () => {
+        calls += 1;
+      },
+    });
+    assert.equal(calls, 1, "AUTH_FAILED must also trigger onSessionInvalid");
+  });
+
+  test("a non-401 failure does NOT trigger onSessionInvalid", async () => {
+    queuedResponse = new Response(
+      JSON.stringify({
+        error: {
+          code: "MATCHMAKER_INVALID_REQUEST",
+          message: "ProjectBrief cannot be interpreted.",
+          requestId: "req-bad-brief-1",
+        },
+      }),
+      { status: 400, headers: { "Content-Type": "application/json" } },
+    );
+    let calls = 0;
+    await submitBriefFromForm({
+      actingWorkspaceId: "ws-buyer-runtime",
+      briefText: "I need a Brooklyn-based producer for a remote Haitian dancehall single.",
+      setError: () => {},
+      setResponse: () => {},
+      setSubmitting: () => {},
+      onSessionInvalid: () => {
+        calls += 1;
+      },
+    });
+    assert.equal(
+      calls,
+      0,
+      "non-401 failures must NOT trigger onSessionInvalid (the session is still valid)",
+    );
+  });
+
+  test("a network failure does NOT trigger onSessionInvalid (the session is still valid; only retry)", async () => {
+    queuedResponse = new Error("network unreachable");
+    let calls = 0;
+    await submitBriefFromForm({
+      actingWorkspaceId: "ws-buyer-runtime",
+      briefText: "I need a Brooklyn-based producer for a remote Haitian dancehall single.",
+      setError: () => {},
+      setResponse: () => {},
+      setSubmitting: () => {},
+      onSessionInvalid: () => {
+        calls += 1;
+      },
+    });
+    assert.equal(
+      calls,
+      0,
+      "network failures must NOT trigger onSessionInvalid — only HTTP 401 envelope codes do",
+    );
+  });
+
+  test("a network failure surfaces the error and resets submitting", async () => {
+    queuedResponse = new Error("network unreachable");
+    const setErrorCalls: (string | null)[] = [];
+    const setResponseCalls: (SubmitBriefResponseV1 | null)[] = [];
+    const setSubmittingCalls: boolean[] = [];
+
+    await submitBriefFromForm({
+      actingWorkspaceId: "ws-buyer-runtime",
+      briefText: "I need a Brooklyn-based producer for a remote Haitian dancehall single.",
+      setError: (value) => setErrorCalls.push(value),
+      setResponse: (value) => setResponseCalls.push(value),
+      setSubmitting: (value) => setSubmittingCalls.push(value),
+    });
+
+    // The network error throws inside the fetch before the
+    // success branch runs. setError is called twice (null + the
+    // thrown Error message). setResponse is called once (null,
+    // before the fetch). The submitting flag toggles true →
+    // false.
+    assert.equal(setResponseCalls.length, 1);
+    assert.equal(setResponseCalls[0], null);
+    assert.equal(setErrorCalls.length, 2);
+    assert.equal(setErrorCalls[0], null);
+    assert.match(setErrorCalls[1] ?? "", /network unreachable/);
+    assert.deepEqual(setSubmittingCalls, [true, false]);
+  });
+
+  test("missing workspace selection short-circuits with a validation error and no fetch", async () => {
+    const setErrorCalls: (string | null)[] = [];
+    const setResponseCalls: (SubmitBriefResponseV1 | null)[] = [];
+    const setSubmittingCalls: boolean[] = [];
+
+    await submitBriefFromForm({
+      actingWorkspaceId: "",
+      briefText: "I need a Brooklyn-based producer for a remote Haitian dancehall single.",
+      setError: (value) => setErrorCalls.push(value),
+      setResponse: (value) => setResponseCalls.push(value),
+      setSubmitting: (value) => setSubmittingCalls.push(value),
+    });
+
+    assert.equal(
+      recordedSubmissions.length,
+      0,
+      "must not issue a fetch without an acting workspace",
+    );
+    // Validation short-circuits before the fetch: setResponse is
+    // called once (to clear stale state), setError is called
+    // twice (null + the validation message), and no setSubmitting
+    // transition occurs.
+    assert.equal(setResponseCalls.length, 1);
+    assert.equal(setResponseCalls[0], null);
+    assert.equal(setErrorCalls.length, 2);
+    assert.equal(setErrorCalls[0], null);
+    assert.match(setErrorCalls[1] ?? "", /Pick an acting Workspace/);
+    assert.deepEqual(
+      setSubmittingCalls,
+      [],
+      "validation short-circuit must not toggle the submitting flag",
+    );
+  });
+
+  test("an injection-mode submit function receives the buyer workspace + trimmed brief text", async () => {
+    // The test seam accepts an injected submit function so the
+    // UI test can validate the page's payload contract without
+    // exercising the network. A refactor that drops the acting
+    // workspace id or fails to trim the brief text would fail
+    // this assertion.
+    const captured: SubmitBriefRequestV1[] = [];
+    /* eslint-disable @typescript-eslint/require-await */
+    const fakeSubmit: typeof submitBriefFn = async (input) => {
+      captured.push(input);
+      return buildResponse();
+    };
+    /* eslint-enable @typescript-eslint/require-await */
+    const setResponseCalls: (SubmitBriefResponseV1 | null)[] = [];
+
+    await submitBriefFromForm({
+      actingWorkspaceId: "ws-buyer-injected",
+      briefText: "   Brooklyn-based producer for a remote Haitian dancehall single.   ",
+      setError: () => {},
+      setResponse: (value) => setResponseCalls.push(value),
+      setSubmitting: () => {},
+      submit: fakeSubmit,
+    });
+
+    assert.equal(captured.length, 1);
+    assert.equal(captured[0]!.actingWorkspaceId, "ws-buyer-injected");
+    assert.equal(
+      captured[0]!.briefText,
+      "Brooklyn-based producer for a remote Haitian dancehall single.",
+      "brief text must be trimmed before submission",
+    );
+    assert.equal(setResponseCalls.length, 2);
+    const recordedResponse = setResponseCalls[1]!;
+    submitBriefResponseV1Schema.parse(recordedResponse);
+  });
+});
+
+// ---------- Presentation coverage (rendered BriefSummary) ----------
+
+describe("BriefSummary presentation coverage", () => {
+  // The buyer-facing summary renders every supported criteria axis as
+  // a labeled value or chip. These tests use `react-dom/server` to
+  // render the extracted `BriefSummary` module with a realistic
+  // brief so a regression that drops any axis fails this layer.
+
+  // Lazy import so the file can run in environments without
+  // react-dom/server (none of the other tests exercise SSR).
+  type RenderFn = (element: React.ReactElement) => string;
+  let renderToString: RenderFn | null = null;
+  const loadRenderer = async (): Promise<RenderFn> => {
+    if (!renderToString) {
+      const server = await import("react-dom/server");
+      renderToString = (element) => server.renderToString(element);
+    }
+    return renderToString;
+  };
+
+  // Build a ProjectBriefPublicV1 fixture with every supported axis
+  // populated. The shapes here match the BG3 runtime contract; if a
+  // future ticket changes an axis shape, the corresponding
+  // presentation-coverage test fails until the renderer is updated.
+  function buildBrief(
+    overrides: Partial<ProjectBriefPublicV1["criteria"]> = {},
+  ): ProjectBriefPublicV1 {
+    return {
+      briefId: "brief-test",
+      actingWorkspaceId: "ws-buyer-1",
+      createdByUserId: "user-1",
+      briefText: "I need a Brooklyn-based producer for a remote Haitian dancehall single.",
+      aiProvider: "deterministic-fallback",
+      aiModelId: null,
+      aiFallbackUsed: true,
+      createdAt: "2026-08-26T00:00:00.000Z",
+      buyerWorkspace: {
+        workspaceId: "ws-buyer-1",
+        slug: "bg1-demo-buyer",
+        name: "BG1 Demo Buyer",
+      },
+      criteria: {
+        required: {
+          primaryCategoryKeys: ["music-production"],
+          independentlyPurchasableServiceKeys: ["songwriting"],
+          serviceModes: ["Remote"],
+          basedIn: { city: "Brooklyn", region: "NY", countryCode: "US" },
+          serviceArea: { countryCode: "US" },
+        },
+        preferred: {
+          categoryKeys: ["music-production"],
+          includedServiceKeys: ["mixing"],
+          specialties: ["Producer"],
+          genreTags: ["dancehall", "R&B"],
+          caribbeanAffiliationCodes: ["HT"],
+          basedIn: { city: "Brooklyn", countryCode: "US" },
+          serviceModes: ["Remote"],
+        },
+        query: "brooklyn dancehall producer",
+        nonSearchRequirements: {
+          fundingDeadline: "march 14",
+          customRiderNote: "deliver wav + stems",
+        },
+        ...overrides,
+      },
+    };
+  }
+
+  test("does NOT render raw criteria JSON", async () => {
+    // The original implementation rendered `criteria.required`
+    // and `criteria.preferred` as `JSON.stringify(...)`. The
+    // human-readable implementation must not include those strings
+    // anywhere in the rendered output for a fully-populated brief.
+    const render = await loadRenderer();
+    const brief = buildBrief();
+    const html = render(<BriefSummary brief={brief} categories={EXAMPLE_CATEGORIES} />);
+    assert.ok(
+      !html.includes("JSON.stringify"),
+      "BriefSummary must not call JSON.stringify on the criteria axes",
+    );
+    assert.ok(
+      !html.includes(JSON.stringify(brief.criteria.required)),
+      "rendered BriefSummary must not embed the raw Required JSON",
+    );
+    assert.ok(
+      !html.includes(JSON.stringify(brief.criteria.preferred)),
+      "rendered BriefSummary must not embed the raw Preferred JSON",
+    );
+    assert.ok(
+      !/&quot;primaryCategoryKeys&quot;/.test(html),
+      "rendered BriefSummary must not surface machine keys inside a JSON blob",
+    );
+  });
+
+  test("renders every Required axis with a labeled chip row", async () => {
+    const render = await loadRenderer();
+    const brief = buildBrief();
+    const html = render(<BriefSummary brief={brief} categories={EXAMPLE_CATEGORIES} />);
+    for (const testId of [
+      "matchmaker-criteria-required-category",
+      "matchmaker-criteria-required-independent-service",
+      "matchmaker-criteria-required-service-mode",
+      "matchmaker-criteria-required-based-in",
+      "matchmaker-criteria-required-service-area",
+    ]) {
+      assert.ok(html.includes(`data-testid="${testId}"`), `Required section must render ${testId}`);
+    }
+  });
+
+  test("Preferred section renders every supported axis", async () => {
+    const render = await loadRenderer();
+    const brief = buildBrief();
+    const html = render(<BriefSummary brief={brief} categories={EXAMPLE_CATEGORIES} />);
+    for (const testId of [
+      "matchmaker-criteria-preferred-category",
+      "matchmaker-criteria-preferred-included-service",
+      "matchmaker-criteria-preferred-specialty",
+      "matchmaker-criteria-preferred-genre",
+      "matchmaker-criteria-preferred-affiliation",
+      "matchmaker-criteria-preferred-based-in",
+      "matchmaker-criteria-preferred-service-mode",
+    ]) {
+      assert.ok(
+        html.includes(`data-testid="${testId}"`),
+        `Preferred section must render ${testId}`,
+      );
+    }
+  });
+
+  test("category keys are humanised; localities render as City, Region, Country", async () => {
+    const render = await loadRenderer();
+    const brief = buildBrief();
+    const html = render(<BriefSummary brief={brief} categories={EXAMPLE_CATEGORIES} />);
+    // music-production -> Music Production (canonical metadata)
+    assert.ok(html.includes("Music Production"), "category must show canonical name");
+    // Brooklyn + NY + US collapsed into one chip line; the
+    // dynamic segments may carry an inserted React comment node,
+    // so a regex with optional HTML-comment tolerance is needed.
+    assert.ok(
+      /Brooklyn,\s*(?:<!--[^>]*-->)?\s*NY,\s*(?:<!--[^>]*-->)?\s*US/.test(html),
+      "Based in must render as City, Region, Country",
+    );
+    // Required service area has no city / region; just US
+    assert.ok(
+      /data-testid="matchmaker-criteria-required-service-area"[\s\S]{0,500}>US</.test(html),
+      "Service area (no city/region) renders as just the country code",
+    );
+  });
+
+  test("Search terms renders the criteria.query axis under the new label", async () => {
+    const render = await loadRenderer();
+    const brief = buildBrief();
+    const html = render(<BriefSummary brief={brief} categories={EXAMPLE_CATEGORIES} />);
+    assert.ok(html.includes("Search terms"), "the buyer-facing label must read 'Search terms'");
+    assert.ok(
+      /brooklyn dancehall producer/.test(html),
+      "the normalised query string must render under Search terms",
+    );
+    assert.ok(
+      !html.includes("Normalized query"),
+      "the legacy 'Normalized query' label must no longer appear",
+    );
+  });
+
+  test("Other requirements renders every nonSearchRequirement entry with humanised keys", async () => {
+    const render = await loadRenderer();
+    const brief = buildBrief();
+    const html = render(<BriefSummary brief={brief} categories={EXAMPLE_CATEGORIES} />);
+    assert.ok(
+      html.includes('data-testid="matchmaker-other-requirements"'),
+      "Other requirements section must be present",
+    );
+    // fundingDeadline -> Funding Deadline
+    assert.ok(
+      html.includes("Funding Deadline"),
+      "nonSearchRequirement keys must be humanised (camelCase / snake_case)",
+    );
+    // customRiderNote -> Custom Rider Note
+    assert.ok(
+      html.includes("Custom Rider Note"),
+      "unknown nonSearchRequirement keys must still render with a humanised label",
+    );
+    // Values are preserved verbatim
+    assert.ok(
+      html.includes("march 14") && html.includes("deliver wav + stems"),
+      "nonSearchRequirement values must be preserved",
+    );
+  });
+
+  test("unknown nonSearchRequirement keys are never silently dropped", async () => {
+    const render = await loadRenderer();
+    const brief = buildBrief({
+      nonSearchRequirements: {
+        liveSoundCheckRequired: "yes",
+        customRiderNote: "extra-long",
+        preferred_rider_template: "v1",
+      },
+    });
+    const html = render(<BriefSummary brief={brief} categories={EXAMPLE_CATEGORIES} />);
+    // liveSoundCheckRequired -> Live Sound Check Required
+    assert.ok(
+      html.includes("Live Sound Check Required"),
+      "every nonSearchRequirement key must render with a humanised label",
+    );
+    // preferred_rider_template -> Preferred Rider Template
+    assert.ok(html.includes("Preferred Rider Template"), "snake_case keys must also be humanised");
+  });
+
+  test("missing axes are silently omitted (no empty rows)", async () => {
+    const render = await loadRenderer();
+    // Empty required + preferred + query + nonSearch.
+    const brief = buildBrief();
+    brief.criteria.required = {
+      primaryCategoryKeys: [],
+      independentlyPurchasableServiceKeys: [],
+      serviceModes: [],
+      basedIn: undefined,
+      serviceArea: undefined,
+    };
+    delete brief.criteria.preferred;
+    delete brief.criteria.query;
+    delete brief.criteria.nonSearchRequirements;
+    const html = render(<BriefSummary brief={brief} categories={EXAMPLE_CATEGORIES} />);
+    // The shell containers are present but their inner chip rows
+    // are not rendered when the axis is empty.
+    // The shell container stays mounted so the surrounding dt label
+    // (e.g. "Required criteria") reads consistently, but the chip
+    // row itself is omitted when the axis is empty (the row component
+    // returns null on empty input).
+    assert.ok(
+      html.includes('data-testid="matchmaker-criteria-required"'),
+      "Required section shell must remain mounted",
+    );
+    assert.ok(
+      !html.includes('data-testid="matchmaker-criteria-required-category-chip"'),
+      "Required categories chip row should be omitted when axis is empty",
+    );
+    assert.ok(
+      !html.includes('data-testid="matchmaker-criteria-preferred"'),
+      "Preferred section should be omitted when preferred is absent",
+    );
+    assert.ok(
+      !html.includes('data-testid="matchmaker-search-terms"'),
+      "Search terms chip should be omitted when query is absent",
+    );
+    assert.ok(
+      !html.includes('data-testid="matchmaker-other-requirements"'),
+      "Other requirements section should be omitted when empty",
+    );
+    // Provenance + Original brief still render
+    assert.ok(html.includes('data-testid="matchmaker-provenance"'));
+  });
+
+  test("provenance + fallback information is preserved", async () => {
+    const render = await loadRenderer();
+    const brief = buildBrief();
+    brief.aiProvider = "deterministic-fallback";
+    brief.aiModelId = null;
+    brief.aiFallbackUsed = true;
+    const html = render(<BriefSummary brief={brief} categories={EXAMPLE_CATEGORIES} />);
+    // Buyer-friendly label: "Interpretation method: Deterministic"
+    // when the deterministic fallback path produced the criteria,
+    // "Interpretation method: Managed AI" when the managed path
+    // produced them. The buyer never sees the internal
+    // `deterministic-fallback` string or a contradictory
+    // "Fallback: no" indicator.
+    assert.ok(
+      /Interpretation method:[\s\S]*?Deterministic/.test(html),
+      "buyer-friendly provenance label must surface 'Deterministic' for the fallback path",
+    );
+    assert.ok(
+      !html.includes("deterministic-fallback"),
+      "raw provider key must not leak to the buyer UI",
+    );
+    assert.ok(
+      !html.includes("Fallback: "),
+      "the 'Fallback: yes/no' indicator must not appear in the buyer UI",
+    );
+    assert.ok(html.includes('data-testid="matchmaker-provenance"'));
+    assert.ok(html.includes('data-testid="matchmaker-provenance-method"'));
+  });
+
+  test("provenance label surfaces 'Managed AI' when the managed path produced the criteria", async () => {
+    const render = await loadRenderer();
+    const brief = buildBrief();
+    brief.aiProvider = "managed";
+    brief.aiModelId = "qwen3.6-27b";
+    brief.aiFallbackUsed = false;
+    const html = render(<BriefSummary brief={brief} categories={EXAMPLE_CATEGORIES} />);
+    assert.ok(
+      /Interpretation method:[\s\S]*?Managed AI/.test(html),
+      "managed-path briefs must surface 'Managed AI' as the interpretation method",
+    );
+    assert.ok(
+      !html.includes("qwen"),
+      "raw model id must not leak to the buyer UI (kept on the DTO for ops)",
+    );
+  });
+});
+
+// ---------- Source-pattern contract tests ----------
+
+describe("BG3 Matchmaker page source contract", () => {
+  test("DEFAULT_BRIEF preserves the shipped Brooklyn-based phrasing (GS 14)", () => {
+    // The buyer UI ships this exact brief text; the deterministic
+    // adapter must recognise "Brooklyn-based" so the required
+    // location survives interpretation. If a refactor changes the
+    // phrasing, the deterministic adapter's LOCATION_PHRASES
+    // table must keep up.
+    const source = readMatchmakerPage();
+    assert.match(
+      source,
+      /DEFAULT_BRIEF\s*=\s*"I need a Brooklyn-based producer[^"]*"/,
+      "DEFAULT_BRIEF must use Brooklyn-based phrasing so the deterministic adapter preserves the required location",
+    );
+  });
+
+  test("buyer submission delegates to the test seam and forwards actingWorkspaceId + briefText", () => {
+    const source = readMatchmakerPage();
+    // The page MUST route the form submit through the test seam
+    // so the runtime UI test can exercise the full payload +
+    // response + error handling path. Removing this delegation
+    // would break the runtime UI test's success case.
+    assert.match(
+      source,
+      /await submitBriefFromForm\(\{/,
+      "buyer page must delegate to submitBriefFromForm test seam",
+    );
+    assert.match(
+      source,
+      /actingWorkspaceId,\s*briefText,\s*setError,\s*setResponse,\s*setSubmitting/,
+      "buyer page must forward all five state setters + the form fields",
+    );
+  });
+
+  test("buyer page filters workspaces by Buyer capability", () => {
+    const source = readMatchmakerPage();
+    assert.match(
+      source,
+      /capabilities\.includes\("Buyer"\)/,
+      "buyer page must filter acting workspaces by Buyer capability",
+    );
+    assert.match(
+      source,
+      /data-testid="matchmaker-no-buyer-workspace"/,
+      "buyer page must surface the empty-state when no Buyer-capable Workspace is available",
+    );
+  });
+
+  test("buyer page surfaces AI provenance + fallback notice", () => {
+    // Provenance + fallback notice live in the extracted BriefSummary
+    // module (page.tsx is a Next.js page component and cannot export
+    // additional named exports). Read that module's source for the
+    // patterns the buyer sees.
+    const summarySource = readFileSync(`${repoRoot}/src/app/matchmaker/brief-summary.tsx`, "utf8");
+    const pageSource = readMatchmakerPage();
+    assert.match(
+      pageSource,
+      /data-testid="matchmaker-fallback-notice"/,
+      "buyer page must surface the fallback notice when the deterministic fallback ran",
+    );
+    assert.match(
+      summarySource,
+      /Interpretation method:/,
+      "BriefSummary module must render the buyer-friendly 'Interpretation method:' provenance label",
+    );
+    assert.match(
+      summarySource,
+      /brief\.aiProvider === "managed" \? "Managed AI" : "Deterministic"/,
+      "BriefSummary module must map the provider key to a buyer-friendly label",
+    );
+    assert.doesNotMatch(
+      summarySource,
+      /Provider: \{brief\.aiProvider\}/,
+      "BriefSummary module must NOT render the legacy 'Provider:' label",
+    );
+    assert.doesNotMatch(
+      summarySource,
+      /Fallback: \{brief\.aiFallbackUsed/,
+      "BriefSummary module must NOT render the legacy 'Fallback: yes/no' indicator",
+    );
+  });
+
+  test("buyer page renders the human-readable summary from the extracted module", () => {
+    const pageSource = readMatchmakerPage();
+    const summarySource = readFileSync(`${repoRoot}/src/app/matchmaker/brief-summary.tsx`, "utf8");
+    // The page renders BriefSummary from the dedicated module so
+    // the criterion axes have presentation coverage (Codex UI
+    // feedback). The page must wire the categories fetch + brief
+    // payload; the module must render every Required + Preferred
+    // axis and the Other Requirements list.
+    assert.match(
+      pageSource,
+      /<BriefSummary brief=\{response\.brief\} categories=\{categories\} \/>/,
+      "page must render BriefSummary with both brief and categories props",
+    );
+    // Shell containers use literal data-testid attributes.
+    for (const shell of [
+      "matchmaker-criteria-required",
+      "matchmaker-criteria-preferred",
+      "matchmaker-other-requirements",
+      "matchmaker-search-terms",
+      "matchmaker-provenance",
+    ]) {
+      assert.match(
+        summarySource,
+        new RegExp(`data-testid="${shell}"`),
+        `BriefSummary must render the ${shell} section`,
+      );
+    }
+    // Axis rows are driven by a dynamic `testId` prop. Verify the
+    // module enumerates each Required + Preferred axis and feeds
+    // them through the same `data-testid={testId}` binding.
+    for (const axisLabel of [
+      "Category",
+      "Independently purchasable service",
+      "Service mode",
+      "Based in",
+      "Service area",
+      "Included service",
+      "Specialty",
+      "Genre",
+      "Caribbean affiliation",
+    ]) {
+      assert.ok(
+        summarySource.includes(`label="${axisLabel}"`),
+        `BriefSummary must include a row labeled "${axisLabel}"`,
+      );
+    }
+  });
+
+  test("buyer page renders factual explanations (no AI-invented text)", () => {
+    const source = readMatchmakerPage();
+    assert.match(
+      source,
+      /data-testid="matchmaker-explanation-item"/,
+      "buyer page must render each explanation entry from the validated DTO",
+    );
+    assert.match(
+      source,
+      /recommendation\.explanations\.map\(/,
+      "buyer page must drive the explanations list off the DTO, not a generated string",
+    );
+  });
+});

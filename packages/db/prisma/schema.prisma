@@ -86,6 +86,8 @@ model UserAccount {
   ownedWorkspaces     Workspace[]            @relation("WorkspaceOwner")
   identityProviders   IdentityProvider[]
   authSessions        AuthSession[]
+  // Briefs the human authored as the buyer-side actor (BG3).
+  authoredBriefs      ProjectBrief[]         @relation("BriefCreatedByUser")
 
   @@map("user_accounts")
 }
@@ -151,6 +153,11 @@ model Workspace {
   memberships   WorkspaceMembership[]
   capabilities  WorkspaceCapability[]
   sellerProfile SellerProfile?
+  // Briefs authored under this Workspace as the buyer (BG3). A
+  // Workspace must hold the Buyer capability at brief-creation time;
+  // a future BG4 ticket will add seller-side ProjectRequests, and
+  // BG5 will add Deal/terms models referencing this same Workspace.
+  buyerBriefs   ProjectBrief[]        @relation("BuyerWorkspaceBriefs")
 
   @@map("workspaces")
 }
@@ -332,4 +339,115 @@ model ServiceOfferingPricing {
   unit     PricingUnit?    @relation(fields: [unitId], references: [id], onDelete: Restrict)
 
   @@map("offering_pricing")
+}
+
+// ---------- ProjectBrief (Buildathon Golden Slice 3) ----------
+//
+// A Workspace-owned record of the buyer's natural-language creative
+// need. Created under an explicitly acting Buyer-capable Workspace
+// (per GS 4 / GS 6). Carries the verbatim original text, the
+// validated required constraints and preferences produced by the
+// Matchmaker AI boundary (with provenance: AI provider key + model
+// id + fallback flag), and the non-search project requirements that
+// are useful downstream but never influence eligibility. The Brief is
+// immutable: once persisted it is the source of truth for what the
+// buyer asked. Any change creates a new Brief row; we never mutate an
+// existing one in place. This makes the ProjectRequest revalidation
+// step trivially safe (the buyer's intended criteria cannot drift
+// after persistence).
+model ProjectBrief {
+  id           String   @id @default(cuid())
+  buyerWorkspaceId String
+  // The acting human who authored the brief. Recorded for audit; not
+  // an authorization signal (Workspace membership is).
+  createdByUserId String
+  // The verbatim text the buyer submitted (trimmed + collapsed; full
+  // normalisation rules live in @soundhub/types).
+  originalText String
+  // Validated required criteria, JSON-encoded per the shared Zod
+  // TalentSearchRequiredCriteriaV1 schema. Required constraints may
+  // never be silently relaxed by AI or fallback behaviour.
+  requiredCriteriaJson Json
+  // Normalised buyer query (per normalizedQuerySchema). Persisted
+  // alongside the required/preferred axes so a brief whose criteria
+  // surface only a query (e.g. the deterministic fallback when the
+  // buyer named no recognised category / location / mode) round-
+  // trips through the schema without dropping the axis.
+  criteriaQueryJson Json?
+  // Validated preferred criteria (may be absent when the buyer did
+  // not express any preference signal).
+  preferredCriteriaJson Json?
+  // Non-search project requirements (e.g. funding deadline, scope
+  // hints captured by the brief). Persisted as a free-form JSON
+  // blob so the brief can carry whatever the buyer asked without
+  // being forced to extend the search contract. NOT consumed by the
+  // TalentSearchService.
+  nonSearchRequirementsJson Json?
+  // Provenance: which AI adapter produced the validated criteria
+  // (managed or deterministic-fallback) and the adapter-supplied
+  // model id (null for the deterministic fallback). Recorded so the
+  // UI can disclose provenance and so audits can prove which path
+  // produced the result. `aiFallbackUsed: true` means the
+  // deterministic fallback crossed the same validation +
+  // TalentSearchService boundary (per the BG3 ticket).
+  aiProvider String
+  aiModelId  String?
+  aiFallbackUsed Boolean
+  createdAt  DateTime @default(now())
+
+  buyerWorkspace Workspace        @relation("BuyerWorkspaceBriefs", fields: [buyerWorkspaceId], references: [id], onDelete: Cascade)
+  createdByUser  UserAccount      @relation("BriefCreatedByUser", fields: [createdByUserId], references: [id], onDelete: Restrict)
+  searchResults  BriefSearchResult[]
+
+  @@index([buyerWorkspaceId, createdAt])
+  @@map("project_briefs")
+}
+
+// BriefSearchResult records the eligibility-determined recommendations
+// the Matchmaker surfaced for a ProjectBrief. Persisted so the buyer
+// can re-render the same recommendations without re-running the
+// brief, and so the later ProjectRequest step can revalidate against
+// the same evidence (the selection must reference an offering that
+// surfaced here).
+//
+// The Matchmaker returns at most 10 eligible sellers (per the
+// TalentSearchService contract); we persist all returned results so
+// the revalidation step can prove the selected offering appeared in
+// this list at brief time. The `matchReason` and coverage counts are
+// persisted verbatim — they are factual evidence (matched fields,
+// preference atom coverage, query token coverage), never derived from
+// relevanceScore.
+model BriefSearchResult {
+  id                       String   @id @default(cuid())
+  briefId                  String
+  // Deterministic ordering position within the brief result list.
+  // 1-based; ties on the bounded score are broken by sellerId asc
+  // (TalentSearchService contract).
+  resultPosition           Int
+  sellerId                 String
+  // The marketplace-shaped public seller summary as returned by the
+  // search. Persisted as JSON so the buyer can re-render without
+  // depending on whether the seller is still eligible.
+  sellerSnapshotJson       Json
+  // The selected best-matching offering's id and snapshot.
+  bestOfferingId           String
+  bestOfferingSnapshotJson Json
+  // Up to two additional standalone matching offerings that
+  // surfaced alongside the best match. Persisted as a JSON array
+  // (empty when the seller only had one eligible offering) so the
+  // buyer can see the full eligibility evidence without a
+  // follow-up search and so the later ProjectRequest step can
+  // revalidate against the same context.
+  additionalOfferingsJson   Json
+  relevanceScore           Float
+  matchReason              String
+  preferenceCoverageJson   Json?
+  textCoverageJson         Json?
+
+  brief ProjectBrief @relation(fields: [briefId], references: [id], onDelete: Cascade)
+
+  @@unique([briefId, resultPosition])
+  @@index([briefId])
+  @@index([sellerId])
+  @@map("brief_search_results")
 }

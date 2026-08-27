@@ -1183,7 +1183,12 @@ async function applyIdentityProviders(tx: Prisma.TransactionClient): Promise<voi
 
 async function applySeed(): Promise<void> {
   await prisma.$transaction(async (tx) => {
-    // Controlled records (categorical taxonomies).
+    // Controlled records (categorical taxonomies). Upserts are
+    // idempotent but do not remove rows a test or a previous
+    // untracked migration may have left behind; the canonical-state
+    // convergence pass below deletes any row whose key is not in
+    // the closed canonical set so a contaminated DB still converges
+    // back to the documented state on the next reset.
     for (const category of SERVICE_CATEGORIES) {
       await tx.serviceCategory.upsert({
         where: { key: category.key },
@@ -1209,7 +1214,6 @@ async function applySeed(): Promise<void> {
         update: { name: unit.name },
       });
     }
-
     // Sellers and their full relationship graph. The canonical SELLERS
     // and the M1.3 negative fixtures share the same persistence flow;
     // `applySellerGraph` (below) is the single source of truth and
