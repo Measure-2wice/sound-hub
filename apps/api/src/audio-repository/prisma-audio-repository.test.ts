@@ -8,18 +8,51 @@
 // disposable PostgreSQL so the supported `pg_advisory_xact_lock(int,
 // int)` overload and the signed 32-bit key derivation are validated
 // in the same process that runs the deployed migrations. These tests
-// never touch the developer database. The seed wrapper is invoked via
-// `resetViaSeed()` so every test begins from the deterministic
-// canonical state.
+// never touch the developer database.
+//
+// Per ticket #61 follow-up review (P1-002) every test cleans up its
+// own test-created rows BEFORE the canonical seed reset runs in
+// `beforeEach`. The canonical seed asserts a closed count of
+// offerings per seller; without cleanup the second test sees the
+// offering the first test added and the canonical snapshot
+// diverges from the expected count, failing the suite. Cleanup
+// deletes every offering whose slug starts with the test prefix,
+// along with the audio samples and orphan locators those offerings
+// own. This guarantees the next reset runs against the same
+// canonical state every time.
 
 import assert from "node:assert/strict";
 import { spawn } from "node:child_process";
-import { beforeEach, describe, test } from "node:test";
+import { afterEach, beforeEach, describe, test } from "node:test";
 import { createTestPrismaClient } from "../lib/test-database.js";
 import { PrismaAudioRepository } from "./prisma-audio-repository.js";
 import { AudioSampleCleanupStatus } from "@soundhub/db";
 
 const repository = new PrismaAudioRepository(createTestPrismaClient());
+
+const TEST_SLUG_PREFIX = "of-bg2-prisma-";
+
+/**
+ * Clean up every test-created offering (and its dependent audio
+ * samples + orphan locators) so the canonical seed reset can run
+ * against the deterministic snapshot. Without this the canonical
+ * count assertion fires after the first test adds an offering.
+ */
+async function cleanUpTestRows(): Promise<void> {
+  const prisma = createTestPrismaClient();
+  try {
+    // Offerings own their audio samples via FK; deleting the
+    // offering cascades through ServiceOfferingAudioSample and
+    // AudioSampleOrphanedStorage. The orphan-locator table also
+    // cascades. Pricing and service-area rows cascade from the
+    // offering, so deleting the offering alone is sufficient.
+    await prisma.serviceOffering.deleteMany({
+      where: { slug: { startsWith: TEST_SLUG_PREFIX } },
+    });
+  } finally {
+    await prisma.$disconnect();
+  }
+}
 
 function resetViaSeed(): Promise<void> {
   return new Promise((resolve, reject) => {
@@ -48,7 +81,12 @@ function resetViaSeed(): Promise<void> {
 }
 
 beforeEach(async () => {
+  await cleanUpTestRows();
   await resetViaSeed();
+});
+
+afterEach(async () => {
+  await cleanUpTestRows();
 });
 
 /**
@@ -66,7 +104,7 @@ async function seedOfferingWithContext(): Promise<string> {
     assert.ok(seller, "seed must include at least one Published seller");
     const offering = await prisma.serviceOffering.create({
       data: {
-        slug: `of-bg2-prisma-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`,
+        slug: `${TEST_SLUG_PREFIX}${Date.now()}-${Math.random().toString(36).slice(2, 8)}`,
         sellerProfileId: seller.id,
         title: "BG2 Prisma Test Offering",
         description: "Integration-test offering for the audio repository.",
@@ -189,9 +227,12 @@ describe("PrismaAudioRepository P0-001", () => {
     // database version were broken, this query would fail with
     // `function pg_advisory_xact_lock(integer, integer) does not
     // exist`. A successful return proves the signature is supported.
+    // Use $executeRaw (not $queryRaw) because the function returns
+    // void and Prisma cannot deserialize the void result through
+    // $queryRaw.
     const prisma = createTestPrismaClient();
     try {
-      await prisma.$queryRaw`SELECT pg_advisory_xact_lock(1096107081::int, 0::int)`;
+      await prisma.$executeRaw`SELECT pg_advisory_xact_lock(1096107081::int, 0::int)`;
     } finally {
       await prisma.$disconnect();
     }

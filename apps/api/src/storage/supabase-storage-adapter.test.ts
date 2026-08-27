@@ -231,32 +231,140 @@ describe("SupabaseStorageAdapter", () => {
     assert.equal(calls.length, 0, "no fetch call is made for an unindexed reference");
   });
 
-  test("removeSample issues a DELETE that returns 404 idempotently", async () => {
-    // Stub returns 200 for uploads (so the test can mint a ref)
-    // and 404 for DELETEs (so the adapter treats it as already gone).
-    const { fetchImpl, calls } = makeFetchStub((call) => {
-      if (call.init.method === "DELETE") return new Response(null, { status: 404 });
-      return new Response(null, { status: 200 });
+  test("P1-001: removeSample issues a provider-faithful DELETE against /storage/v1/object/<bucket>", async () => {
+    // Per ticket #61 follow-up review (P1-001): the official Supabase
+    // Storage REST removal contract sends DELETE to the bucket URL
+    // with a JSON body `{ prefixes: [objectPath] }`. The previous
+    // implementation issued DELETE against the object URL with no
+    // body, which the provider ignores; a 404 from the wrong route
+    // was treated as already-absent. This test pins the exact URL,
+    // method, JSON body, and content-type against a faithful fetch
+    // stub.
+    const uploadBytes = new Uint8Array([
+      0x49, 0x44, 0x33, 0x04, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+    ]);
+    const recordedCalls: FetchCall[] = [];
+    let capturedObjectPath = "";
+    const { fetchImpl } = makeFetchStub((call) => {
+      recordedCalls.push(call);
+      const uploadPrefix = `${SUPABASE_URL}/storage/v1/object/offering-audio/samples/of-1/`;
+      if (call.init.method === "POST" && call.url.startsWith(uploadPrefix)) {
+        // The provider-faithful prefixes body uses the full object
+        // path including the path prefix (`samples/of-1/<cuid>.mp3`).
+        capturedObjectPath = `samples/of-1/${call.url.slice(uploadPrefix.length)}`;
+        return new Response(null, { status: 200 });
+      }
+      // Correct provider-faithful removal URL: bucket URL only,
+      // never the object URL.
+      const deleteUrl = `${SUPABASE_URL}/storage/v1/object/offering-audio`;
+      if (call.init.method === "DELETE" && call.url === deleteUrl) {
+        // The provider-faithful body is `{ prefixes: [objectPath] }`.
+        const bodyText =
+          typeof call.init.body === "string"
+            ? call.init.body
+            : call.init.body instanceof Uint8Array
+              ? new TextDecoder().decode(call.init.body)
+              : "";
+        const parsed: unknown = JSON.parse(bodyText);
+        assert.deepEqual(parsed, { prefixes: [capturedObjectPath] });
+        assert.equal(headersValue(call.init.headers, "Content-Type"), "application/json");
+        return new Response(null, { status: 200 });
+      }
+      return new Response(null, { status: 404 });
     });
     const adapter = new SupabaseStorageAdapter({
       supabaseUrl: SUPABASE_URL,
       supabaseServiceRoleKey: SUPABASE_KEY,
+      bucket: "offering-audio",
+      pathPrefix: "samples",
       fetchImpl,
     });
     const ref = (
       await adapter.uploadSample({
         label: "S",
         contentType: "audio/mpeg",
-        byteSize: 4,
+        byteSize: uploadBytes.byteLength,
         offeringId: "of-1",
-        bytes: new Uint8Array(4),
+        bytes: uploadBytes,
       })
     ).storageRef;
     await adapter.removeSample(ref);
-    // Final call is the DELETE for the just-uploaded ref.
-    const last = calls[calls.length - 1];
-    assert.ok(last);
-    assert.equal(last.init.method, "DELETE");
+    const deleteCall = recordedCalls.find((c) => c.init.method === "DELETE");
+    assert.ok(deleteCall, "exactly one DELETE call is issued");
+    assert.equal(
+      deleteCall.url,
+      `${SUPABASE_URL}/storage/v1/object/offering-audio`,
+      "DELETE targets the bucket URL, not the object URL",
+    );
+  });
+
+  test("P1-001: removeSample treats 404 from the bucket DELETE as idempotent success", async () => {
+    // The provider reports the object as already absent via a 404
+    // from the correct bucket DELETE. The adapter treats that as
+    // idempotent success so the bounded retry can finalize the
+    // durable cleanup row.
+    const uploadBytes = new Uint8Array([
+      0x49, 0x44, 0x33, 0x04, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+    ]);
+    const { fetchImpl, calls } = makeFetchStub((call) => {
+      if (call.init.method === "POST") return new Response(null, { status: 200 });
+      if (call.init.method === "DELETE") return new Response(null, { status: 404 });
+      return new Response(null, { status: 404 });
+    });
+    const adapter = new SupabaseStorageAdapter({
+      supabaseUrl: SUPABASE_URL,
+      supabaseServiceRoleKey: SUPABASE_KEY,
+      bucket: "offering-audio",
+      pathPrefix: "samples",
+      fetchImpl,
+    });
+    const ref = (
+      await adapter.uploadSample({
+        label: "S",
+        contentType: "audio/mpeg",
+        byteSize: uploadBytes.byteLength,
+        offeringId: "of-1",
+        bytes: uploadBytes,
+      })
+    ).storageRef;
+    await adapter.removeSample(ref);
+    const deleteCall = calls.find((c) => c.init.method === "DELETE");
+    assert.ok(deleteCall);
+    assert.equal(deleteCall.url, `${SUPABASE_URL}/storage/v1/object/offering-audio`);
+  });
+
+  test("P1-001: removeSample surfaces a StorageUnavailableError on provider failure", async () => {
+    // Provider returns 500. The adapter must surface the failure as
+    // a retryable storage error so the bounded retry can drive
+    // the next attempt.
+    const uploadBytes = new Uint8Array([
+      0x49, 0x44, 0x33, 0x04, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+    ]);
+    const { fetchImpl } = makeFetchStub((call) => {
+      if (call.init.method === "POST") return new Response(null, { status: 200 });
+      if (call.init.method === "DELETE") return new Response(null, { status: 500 });
+      return new Response(null, { status: 404 });
+    });
+    const adapter = new SupabaseStorageAdapter({
+      supabaseUrl: SUPABASE_URL,
+      supabaseServiceRoleKey: SUPABASE_KEY,
+      bucket: "offering-audio",
+      pathPrefix: "samples",
+      fetchImpl,
+    });
+    const ref = (
+      await adapter.uploadSample({
+        label: "S",
+        contentType: "audio/mpeg",
+        byteSize: uploadBytes.byteLength,
+        offeringId: "of-1",
+        bytes: uploadBytes,
+      })
+    ).storageRef;
+    await assert.rejects(
+      () => adapter.removeSample(ref),
+      (err: unknown) => err instanceof StorageUnavailableError,
+    );
   });
 
   test("the storage reference is durable (self-contained) but never crosses the public DTO", async () => {
@@ -398,6 +506,184 @@ describe("SupabaseStorageAdapter", () => {
     assert.ok(
       !downloadCall.url.startsWith(`${SUPABASE_URL}/object/sign/`),
       `GET must NOT target the project root, got ${downloadCall.url}`,
+    );
+  });
+
+  test("P0-001: a signedURL pointing at an attacker origin is rejected with no outbound GET", async () => {
+    // Per ticket #61 follow-up review (P0-001): the adapter must
+    // reject any signedURL that resolves to a host outside the
+    // configured Supabase project. A compromised provider response
+    // cannot be allowed to forge SoundHub's downstream GET to
+    // attacker.example / loopback / link-local / a different
+    // Supabase project / a protocol-relative URL / a credential-
+    // bearing URL / or any other unexpected origin.
+    const uploadBytes = new Uint8Array([
+      0x49, 0x44, 0x33, 0x04, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 1, 2, 3, 4,
+    ]);
+    const recordedCalls: FetchCall[] = [];
+    const attackerOrigins = [
+      "https://attacker.example/object/sign/offering-audio/samples/x.mp3?token=evil",
+      "https://localhost:4000/storage/v1/object/sign/offering-audio/samples/x.mp3?token=evil",
+      "https://169.254.169.254/latest/meta-data/object/sign/x.mp3?token=evil",
+      "https://other-supabase.example.test/storage/v1/object/sign/offering-audio/samples/x.mp3?token=evil",
+      "//attacker.example/storage/v1/object/sign/offering-audio/samples/x.mp3?token=evil",
+      `${SUPABASE_URL.replace("https://", "https://user:pass@")}/storage/v1/object/sign/offering-audio/samples/x.mp3?token=evil`,
+    ];
+    const { fetchImpl } = makeFetchStub((call) => {
+      recordedCalls.push(call);
+      const uploadPrefix = `${SUPABASE_URL}/storage/v1/object/offering-audio/samples/of-1/`;
+      if (call.init.method === "POST" && call.url.startsWith(uploadPrefix)) {
+        return new Response(null, { status: 200 });
+      }
+      const signUrl = `${SUPABASE_URL}/storage/v1/object/sign/offering-audio/samples/of-1/`;
+      if (call.init.method === "POST" && call.url.startsWith(signUrl)) {
+        // Cycle through the hostile payloads so every variant is
+        // exercised on its own getPlaybackBytes call.
+        const calls = recordedCalls.filter(
+          (c) => c.init.method === "POST" && c.url.startsWith(signUrl),
+        ).length;
+        const hostileSigned = attackerOrigins[(calls - 1) % attackerOrigins.length];
+        return jsonResponse({ signedURL: hostileSigned });
+      }
+      return new Response(null, { status: 404 });
+    });
+    const adapter = new SupabaseStorageAdapter({
+      supabaseUrl: SUPABASE_URL,
+      supabaseServiceRoleKey: SUPABASE_KEY,
+      bucket: "offering-audio",
+      pathPrefix: "samples",
+      fetchImpl,
+    });
+    const ref = (
+      await adapter.uploadSample({
+        label: "S",
+        contentType: "audio/mpeg",
+        byteSize: uploadBytes.byteLength,
+        offeringId: "of-1",
+        bytes: uploadBytes,
+      })
+    ).storageRef;
+    // Each call to getPlaybackBytes triggers one sign call; assert
+    // that NO GET is issued because the resolved URL is rejected.
+    for (let i = 0; i < attackerOrigins.length; i += 1) {
+      await assert.rejects(
+        () => adapter.getPlaybackBytes(ref),
+        (err: unknown) =>
+          err instanceof StorageUnavailableError ||
+          (err instanceof Error && err.name === "StorageReferenceUnknownError"),
+      );
+    }
+    const getCalls = recordedCalls.filter((c) => c.init.method === "GET");
+    assert.equal(getCalls.length, 0, "no outbound GET may be issued for hostile signedURL values");
+  });
+
+  test("P0-001: a signedURL with embedded traversal escapes is rejected", async () => {
+    const uploadBytes = new Uint8Array([
+      0x49, 0x44, 0x33, 0x04, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 1, 2, 3, 4,
+    ]);
+    const recordedCalls: FetchCall[] = [];
+    const traversalPaths = [
+      "/storage/v1/object/sign/offering-audio/../escape.mp3?token=evil",
+      "/storage/v1/object/sign/../etc/passwd?token=evil",
+      "/storage/v1/object/sign/offering-audio/samples/..%2F..%2Fescape.mp3?token=evil",
+    ];
+    const { fetchImpl } = makeFetchStub((call) => {
+      recordedCalls.push(call);
+      const uploadPrefix = `${SUPABASE_URL}/storage/v1/object/offering-audio/samples/of-1/`;
+      if (call.init.method === "POST" && call.url.startsWith(uploadPrefix)) {
+        return new Response(null, { status: 200 });
+      }
+      const signUrl = `${SUPABASE_URL}/storage/v1/object/sign/offering-audio/samples/of-1/`;
+      if (call.init.method === "POST" && call.url.startsWith(signUrl)) {
+        const calls = recordedCalls.filter(
+          (c) => c.init.method === "POST" && c.url.startsWith(signUrl),
+        ).length;
+        return jsonResponse({
+          signedURL: traversalPaths[(calls - 1) % traversalPaths.length],
+        });
+      }
+      return new Response(null, { status: 404 });
+    });
+    const adapter = new SupabaseStorageAdapter({
+      supabaseUrl: SUPABASE_URL,
+      supabaseServiceRoleKey: SUPABASE_KEY,
+      bucket: "offering-audio",
+      pathPrefix: "samples",
+      fetchImpl,
+    });
+    const ref = (
+      await adapter.uploadSample({
+        label: "S",
+        contentType: "audio/mpeg",
+        byteSize: uploadBytes.byteLength,
+        offeringId: "of-1",
+        bytes: uploadBytes,
+      })
+    ).storageRef;
+    for (let i = 0; i < traversalPaths.length; i += 1) {
+      await assert.rejects(() => adapter.getPlaybackBytes(ref));
+    }
+    const getCalls = recordedCalls.filter((c) => c.init.method === "GET");
+    assert.equal(
+      getCalls.length,
+      0,
+      "no outbound GET may be issued for traversal signedURL values",
+    );
+  });
+
+  test("P0-001: malformed signedURL values are rejected", async () => {
+    const uploadBytes = new Uint8Array([
+      0x49, 0x44, 0x33, 0x04, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 1, 2, 3, 4,
+    ]);
+    const recordedCalls: FetchCall[] = [];
+    const malformedValues = [
+      "",
+      "not-a-url",
+      "ftp://attacker.example/storage/v1/object/sign/x.mp3?token=evil",
+      "javascript:alert(1)",
+      "  ",
+    ];
+    const { fetchImpl } = makeFetchStub((call) => {
+      recordedCalls.push(call);
+      const uploadPrefix = `${SUPABASE_URL}/storage/v1/object/offering-audio/samples/of-1/`;
+      if (call.init.method === "POST" && call.url.startsWith(uploadPrefix)) {
+        return new Response(null, { status: 200 });
+      }
+      const signUrl = `${SUPABASE_URL}/storage/v1/object/sign/offering-audio/samples/of-1/`;
+      if (call.init.method === "POST" && call.url.startsWith(signUrl)) {
+        const calls = recordedCalls.filter(
+          (c) => c.init.method === "POST" && c.url.startsWith(signUrl),
+        ).length;
+        return jsonResponse({
+          signedURL: malformedValues[(calls - 1) % malformedValues.length],
+        });
+      }
+      return new Response(null, { status: 404 });
+    });
+    const adapter = new SupabaseStorageAdapter({
+      supabaseUrl: SUPABASE_URL,
+      supabaseServiceRoleKey: SUPABASE_KEY,
+      bucket: "offering-audio",
+      pathPrefix: "samples",
+      fetchImpl,
+    });
+    const ref = (
+      await adapter.uploadSample({
+        label: "S",
+        contentType: "audio/mpeg",
+        byteSize: uploadBytes.byteLength,
+        offeringId: "of-1",
+        bytes: uploadBytes,
+      })
+    ).storageRef;
+    for (let i = 0; i < malformedValues.length; i += 1) {
+      await assert.rejects(() => adapter.getPlaybackBytes(ref));
+    }
+    const getCalls = recordedCalls.filter((c) => c.init.method === "GET");
+    assert.equal(
+      getCalls.length,
+      0,
+      "no outbound GET may be issued for malformed signedURL values",
     );
   });
 });

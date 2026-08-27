@@ -237,21 +237,34 @@ export class SupabaseStorageAdapter implements StorageAdapter {
       // removed so a retried command never raises.
       return;
     }
-    const url = `${this.supabaseUrl}/storage/v1/object/${record.bucket}/${record.objectPath}`;
+    // Per ticket #61 follow-up review (P1-001): the official Supabase
+    // Storage REST removal contract issues DELETE against the
+    // bucket URL with a JSON body of `{ prefixes: [objectPath] }`.
+    // The previous implementation issued DELETE against the object
+    // URL with no body, which the provider ignores; a 404 from the
+    // wrong route was treated as already-absent, leaving the object
+    // permanently stored while the service finalized its durable
+    // cleanup row. See StorageFileApi.remove in
+    // supabase/storage-js.
+    const url = `${this.supabaseUrl}/storage/v1/object/${record.bucket}`;
     let response: Response;
     try {
       response = await this.fetchImpl(url, {
         method: "DELETE",
         headers: {
+          "Content-Type": "application/json",
           Authorization: `Bearer ${this.supabaseServiceRoleKey}`,
           apikey: this.supabaseServiceRoleKey ?? "",
         },
+        body: JSON.stringify({ prefixes: [record.objectPath] }),
       });
     } catch (err) {
       throw new StorageUnavailableError(err instanceof Error ? err.message : String(err));
     }
-    if (response.status === 404) {
-      // Already gone — idempotent success.
+    if (response.status === 404 || response.status === 400) {
+      // The provider reports the object as already absent. Treat
+      // as idempotent success so the bounded retry can finalize the
+      // durable cleanup row.
       return;
     }
     if (!response.ok) {
@@ -337,7 +350,21 @@ export class SupabaseStorageAdapter implements StorageAdapter {
     // fails, so managed playback is broken even though upload
     // succeeded. The Storage SDK and supabase-js both compose the
     // same base; see SupabaseClient and StorageFileApi.
-    return resolveSupabaseStorageUrl(this.supabaseUrl ?? "", parsed.signedURL);
+    //
+    // Per ticket #61 follow-up review (P0-001) the resolved URL
+    // MUST stay on the configured Supabase origin. A hostile
+    // signedURL that escapes to attacker.example / loopback / a
+    // different Supabase project would let a compromised provider
+    // response forge SoundHub's downstream GET. `resolveSupabaseStorageUrl`
+    // returns `null` when the URL fails origin/path validation, which
+    // we surface as a safe provider error.
+    const resolvedUrl = resolveSupabaseStorageUrl(this.supabaseUrl ?? "", parsed.signedURL);
+    if (!resolvedUrl) {
+      throw new StorageUnavailableError(
+        "Supabase Storage signed URL resolved to a host outside the configured project origin.",
+      );
+    }
+    return resolvedUrl;
   }
 
   private makeCuid(): string {
@@ -366,22 +393,86 @@ function parseSignSuccessBody(raw: unknown): SignSuccessBody | null {
  * `signedURL` (e.g. `/object/sign/<bucket>/<path>?token=...`). The
  * resolved URL must live under `${SUPABASE_URL}/storage/v1`, NOT
  * the project root, so the subsequent GET actually targets the
- * Storage API. Accepts both already-absolute URLs (defensive) and
- * path-only responses.
+ * Storage API.
  *
- * Exported for unit testing the URL composition independently of
- * the network stack.
+ * Per ticket #61 follow-up review (P0-001) the adapter MUST reject
+ * any signedURL that resolves to a host outside the configured
+ * Supabase project origin. A compromised provider response (or a
+ * cross-tenant response mix-up) cannot be allowed to redirect
+ * SoundHub's downstream GET to attacker.example, loopback, a
+ * different Supabase project, a protocol-relative URL, a
+ * credential-bearing URL, or any other unexpected origin. Only the
+ * exact configured origin plus a `/storage/v1/object/sign/<bucket>/...`
+ * path is accepted.
+ *
+ * Returns `null` when the input fails validation. Exported for
+ * unit testing the URL composition independently of the network
+ * stack.
  */
-export function resolveSupabaseStorageUrl(supabaseUrl: string, signedPath: string): string {
+export function resolveSupabaseStorageUrl(supabaseUrl: string, signedPath: string): string | null {
   const base = supabaseUrl.replace(/\/+$/, "");
-  // Already absolute — trust the storage API to have composed a
-  // full URL; do not re-prefix.
-  if (/^https?:\/\//i.test(signedPath)) {
-    return signedPath;
+  if (!base) return null;
+
+  // Reject `..` traversal segments (raw or percent-encoded) in
+  // the input path BEFORE resolution. `new URL` would silently
+  // normalize `..` to navigate above the bucket prefix, which
+  // would let a hostile signedURL escape its declared bucket. A
+  // legitimate Storage signedURL never contains `..` segments.
+  const normalizedForTraversal = decodeURIComponent(signedPath);
+  if (normalizedForTraversal.split("/").includes("..")) return null;
+
+  // Protocol-relative URLs (`//attacker.example/...`) must be
+  // rejected outright. They are NOT legitimate signed-URL
+  // responses from the Storage REST endpoint.
+  if (signedPath.startsWith("//")) return null;
+
+  // Resolve the path against the configured origin. This collapses
+  // both already-absolute HTTP(S) URLs and relative paths into a
+  // single URL object we can validate.
+  let resolved: URL;
+  try {
+    resolved = new URL(signedPath, `${base}/`);
+  } catch {
+    return null;
   }
-  // Path-only responses always start with `/`. Supabase Storage
-  // returns paths under the `/storage/v1` prefix; join them so a
-  // relative path resolves correctly.
-  const path = signedPath.startsWith("/") ? signedPath : `/${signedPath}`;
-  return `${base}/storage/v1${path}`;
+
+  // Reject unexpected schemes. The signed-URL response is always
+  // https or http against the configured Supabase project.
+  if (resolved.protocol !== "https:" && resolved.protocol !== "http:") {
+    return null;
+  }
+
+  // Reject credential-bearing URLs (user:pass@host) and
+  // fragment-bearing URLs. Neither is legitimate from the Storage
+  // REST endpoint and both are common SSRF vectors.
+  if (resolved.username || resolved.password || resolved.hash.length > 0) {
+    return null;
+  }
+
+  // The origin MUST equal the configured Supabase project origin.
+  // Anything else — attacker.example, loopback, link-local, a
+  // different Supabase project — is a server-side request forgery.
+  if (resolved.origin !== base) return null;
+
+  // The path MUST live under the Storage API signed-URL family.
+  // Supabase Storage's /object/sign endpoint returns a relative
+  // path of the form `/object/sign/<bucket>/<path>?token=...` which
+  // the SDK prefixes with `/storage/v1`. Accept either prefix; if
+  // the resolved path is the unprefixed `/object/sign/...` form,
+  // canonicalize it to the `/storage/v1/object/sign/...` form so
+  // the downstream fetch targets the Storage API exactly as the
+  // SDK would. A path under neither prefix (a different path
+  // family or a path outside the bucket) is rejected.
+  const storageV1Prefix = `/storage/v1/object/sign/`;
+  const relativePrefix = `/object/sign/`;
+  if (resolved.pathname.startsWith(storageV1Prefix)) {
+    return resolved.toString();
+  }
+  if (resolved.pathname.startsWith(relativePrefix)) {
+    const canonical = new URL(
+      `${base}${storageV1Prefix}${resolved.pathname.slice(relativePrefix.length)}?${resolved.searchParams.toString()}`,
+    );
+    return canonical.toString();
+  }
+  return null;
 }
