@@ -11,7 +11,7 @@
 
 import assert from "node:assert/strict";
 import { describe, test } from "node:test";
-import { SupabaseStorageAdapter } from "./supabase-storage-adapter.js";
+import { resolveSupabaseStorageUrl, SupabaseStorageAdapter } from "./supabase-storage-adapter.js";
 import { StorageRejectedError, StorageUnavailableError } from "./storage-adapter.js";
 import { BG2_AUDIO_SAMPLE_MAX_BYTE_SIZE } from "@soundhub/types";
 
@@ -367,6 +367,44 @@ describe("SupabaseStorageAdapter", () => {
     );
   });
 
+  test("P1-001 (latest): removeSample surfaces a StorageUnavailableError on a generic 400 response", async () => {
+    // Per ticket #61 follow-up review (P1-001): a generic 400 from
+    // the bucket DELETE indicates a malformed request, invalid
+    // bucket, invalid prefix, or policy rejection — NOT object
+    // absence. Treating 400 as idempotent success would let the
+    // service finalize the durable cleanup row while the bytes
+    // remain. The adapter must surface the 400 as a retryable
+    // storage error so the bounded retry drives the next attempt.
+    const uploadBytes = new Uint8Array([
+      0x49, 0x44, 0x33, 0x04, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+    ]);
+    const { fetchImpl } = makeFetchStub((call) => {
+      if (call.init.method === "POST") return new Response(null, { status: 200 });
+      if (call.init.method === "DELETE") return new Response(null, { status: 400 });
+      return new Response(null, { status: 404 });
+    });
+    const adapter = new SupabaseStorageAdapter({
+      supabaseUrl: SUPABASE_URL,
+      supabaseServiceRoleKey: SUPABASE_KEY,
+      bucket: "offering-audio",
+      pathPrefix: "samples",
+      fetchImpl,
+    });
+    const ref = (
+      await adapter.uploadSample({
+        label: "S",
+        contentType: "audio/mpeg",
+        byteSize: uploadBytes.byteLength,
+        offeringId: "of-1",
+        bytes: uploadBytes,
+      })
+    ).storageRef;
+    await assert.rejects(
+      () => adapter.removeSample(ref),
+      (err: unknown) => err instanceof StorageUnavailableError,
+    );
+  });
+
   test("the storage reference is durable (self-contained) but never crosses the public DTO", async () => {
     // Per ticket #61 follow-up review (P1-001) the storage ref is a
     // self-contained server-internal locator the adapter parses on
@@ -685,5 +723,302 @@ describe("SupabaseStorageAdapter", () => {
       0,
       "no outbound GET may be issued for malformed signedURL values",
     );
+  });
+
+  test("P2-001: malformed percent encoding in signedURL does not throw URIError", async () => {
+    // Per ticket #61 follow-up review (P2-001): the parser must
+    // be total — malformed percent encoding must return the
+    // helper's documented null result (which surfaces as a safe
+    // StorageUnavailableError) rather than letting a URIError
+    // escape the validator. A bare `%`, an incomplete multibyte
+    // escape, and a mixed malformed escape are all common
+    // provider response corruption modes.
+    const uploadBytes = new Uint8Array([
+      0x49, 0x44, 0x33, 0x04, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+    ]);
+    const recordedCalls: FetchCall[] = [];
+    const malformedEncodings = [
+      "/object/sign/offering-audio/samples/of-1/%,mp3?token=evil",
+      "/object/sign/offering-audio/samples/of-1/%E0%A4%A?token=evil",
+      "/object/sign/offering-audio/samples/of-1/%FF%FE%FD%FC?token=evil",
+      "/object/sign/offering-audio/samples/of-1/%C3%28?token=evil",
+      "/object/sign/offering-audio/samples/of-1/%G0?token=evil",
+    ];
+    const { fetchImpl } = makeFetchStub((call) => {
+      recordedCalls.push(call);
+      const uploadPrefix = `${SUPABASE_URL}/storage/v1/object/offering-audio/samples/of-1/`;
+      if (call.init.method === "POST" && call.url.startsWith(uploadPrefix)) {
+        return new Response(null, { status: 200 });
+      }
+      const signUrl = `${SUPABASE_URL}/storage/v1/object/sign/offering-audio/samples/of-1/`;
+      if (call.init.method === "POST" && call.url.startsWith(signUrl)) {
+        const calls = recordedCalls.filter(
+          (c) => c.init.method === "POST" && c.url.startsWith(signUrl),
+        ).length;
+        return jsonResponse({
+          signedURL: malformedEncodings[(calls - 1) % malformedEncodings.length],
+        });
+      }
+      return new Response(null, { status: 404 });
+    });
+    const adapter = new SupabaseStorageAdapter({
+      supabaseUrl: SUPABASE_URL,
+      supabaseServiceRoleKey: SUPABASE_KEY,
+      bucket: "offering-audio",
+      pathPrefix: "samples",
+      fetchImpl,
+    });
+    const ref = (
+      await adapter.uploadSample({
+        label: "S",
+        contentType: "audio/mpeg",
+        byteSize: uploadBytes.byteLength,
+        offeringId: "of-1",
+        bytes: uploadBytes,
+      })
+    ).storageRef;
+    for (let i = 0; i < malformedEncodings.length; i += 1) {
+      await assert.rejects(
+        () => adapter.getPlaybackBytes(ref),
+        (err: unknown) =>
+          err instanceof StorageUnavailableError ||
+          (err instanceof Error && (err.name === "URIError") === false && false),
+      );
+    }
+    const getCalls = recordedCalls.filter((c) => c.init.method === "GET");
+    assert.equal(
+      getCalls.length,
+      0,
+      "no outbound GET may be issued for malformed percent encoding",
+    );
+  });
+
+  test("P2-001: resolveSupabaseStorageUrl returns null for malformed percent encoding", () => {
+    // Direct unit test of the parser-totality contract (P2-001).
+    // Each malformed encoding must return null rather than
+    // throwing URIError past the helper boundary.
+    const supabaseUrl = "https://supabase.example.test";
+    assert.equal(
+      resolveSupabaseStorageUrl(supabaseUrl, "/object/sign/x/%"),
+      null,
+      "bare % is malformed",
+    );
+    assert.equal(
+      resolveSupabaseStorageUrl(supabaseUrl, "/object/sign/x/%E0%A4%A"),
+      null,
+      "truncated multibyte escape is malformed",
+    );
+    assert.equal(
+      resolveSupabaseStorageUrl(supabaseUrl, "/object/sign/x/%C3%28"),
+      null,
+      "invalid UTF-8 byte sequence is malformed",
+    );
+    assert.equal(
+      resolveSupabaseStorageUrl(supabaseUrl, "/object/sign/x/%G0"),
+      null,
+      "invalid hex digit is malformed",
+    );
+    assert.equal(
+      resolveSupabaseStorageUrl(supabaseUrl, "/object/sign/x/foo", {
+        bucket: "x",
+        objectPath: "%",
+      }),
+      null,
+      "malformed expected objectPath is rejected",
+    );
+  });
+
+  test("P0-001 (latest): a signedURL for a different bucket is rejected", async () => {
+    // Per the latest ticket #61 follow-up review: the resolved
+    // URL must match the exact bucket + object the caller asked
+    // the provider to sign. A same-origin cross-bucket response
+    // (e.g. another bucket's signed bytes) must NOT be allowed to
+    // make SoundHub proxy another private object's bytes.
+    const uploadBytes = new Uint8Array([
+      0x49, 0x44, 0x33, 0x04, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+    ]);
+    const recordedCalls: FetchCall[] = [];
+    const { fetchImpl } = makeFetchStub((call) => {
+      recordedCalls.push(call);
+      const uploadPrefix = `${SUPABASE_URL}/storage/v1/object/offering-audio/samples/of-1/`;
+      if (call.init.method === "POST" && call.url.startsWith(uploadPrefix)) {
+        return new Response(null, { status: 200 });
+      }
+      const signUrl = `${SUPABASE_URL}/storage/v1/object/sign/offering-audio/samples/of-1/`;
+      if (call.init.method === "POST" && call.url.startsWith(signUrl)) {
+        // Cross-bucket: signedURL points at `other-bucket` instead of
+        // `offering-audio` (the configured bucket).
+        return jsonResponse({
+          signedURL: "/object/sign/other-bucket/samples/of-1/x.mp3?token=evil",
+        });
+      }
+      return new Response(null, { status: 404 });
+    });
+    const adapter = new SupabaseStorageAdapter({
+      supabaseUrl: SUPABASE_URL,
+      supabaseServiceRoleKey: SUPABASE_KEY,
+      bucket: "offering-audio",
+      pathPrefix: "samples",
+      fetchImpl,
+    });
+    const ref = (
+      await adapter.uploadSample({
+        label: "S",
+        contentType: "audio/mpeg",
+        byteSize: uploadBytes.byteLength,
+        offeringId: "of-1",
+        bytes: uploadBytes,
+      })
+    ).storageRef;
+    await assert.rejects(() => adapter.getPlaybackBytes(ref));
+    const getCalls = recordedCalls.filter((c) => c.init.method === "GET");
+    assert.equal(getCalls.length, 0, "no outbound GET for cross-bucket signedURL");
+  });
+
+  test("P0-001 (latest): a signedURL for a sibling object in the same bucket is rejected", async () => {
+    const uploadBytes = new Uint8Array([
+      0x49, 0x44, 0x33, 0x04, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+    ]);
+    const recordedCalls: FetchCall[] = [];
+    const { fetchImpl } = makeFetchStub((call) => {
+      recordedCalls.push(call);
+      const uploadPrefix = `${SUPABASE_URL}/storage/v1/object/offering-audio/samples/of-1/`;
+      if (call.init.method === "POST" && call.url.startsWith(uploadPrefix)) {
+        return new Response(null, { status: 200 });
+      }
+      const signUrl = `${SUPABASE_URL}/storage/v1/object/sign/offering-audio/samples/of-1/`;
+      if (call.init.method === "POST" && call.url.startsWith(signUrl)) {
+        // Same bucket, different object path. The exact-object
+        // binding must reject the cross-object response even
+        // though the origin and bucket match.
+        return jsonResponse({
+          signedURL: "/object/sign/offering-audio/samples/of-2/sibling.mp3?token=evil",
+        });
+      }
+      return new Response(null, { status: 404 });
+    });
+    const adapter = new SupabaseStorageAdapter({
+      supabaseUrl: SUPABASE_URL,
+      supabaseServiceRoleKey: SUPABASE_KEY,
+      bucket: "offering-audio",
+      pathPrefix: "samples",
+      fetchImpl,
+    });
+    const ref = (
+      await adapter.uploadSample({
+        label: "S",
+        contentType: "audio/mpeg",
+        byteSize: uploadBytes.byteLength,
+        offeringId: "of-1",
+        bytes: uploadBytes,
+      })
+    ).storageRef;
+    await assert.rejects(() => adapter.getPlaybackBytes(ref));
+    const getCalls = recordedCalls.filter((c) => c.init.method === "GET");
+    assert.equal(getCalls.length, 0, "no outbound GET for sibling-object signedURL");
+  });
+
+  test("P0-001 (latest): a prefix-confusable encoded signedURL is rejected", async () => {
+    // A legitimate object path is `samples/of-1/x.mp3`. A hostile
+    // signedURL for `samples/of-1/x.mp3-evil` (prefix confusion)
+    // shares the same prefix but differs in the suffix. The
+    // exact-object binding must reject this.
+    const uploadBytes = new Uint8Array([
+      0x49, 0x44, 0x33, 0x04, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+    ]);
+    const recordedCalls: FetchCall[] = [];
+    const { fetchImpl } = makeFetchStub((call) => {
+      recordedCalls.push(call);
+      const uploadPrefix = `${SUPABASE_URL}/storage/v1/object/offering-audio/samples/of-1/`;
+      if (call.init.method === "POST" && call.url.startsWith(uploadPrefix)) {
+        return new Response(null, { status: 200 });
+      }
+      const signUrl = `${SUPABASE_URL}/storage/v1/object/sign/offering-audio/samples/of-1/`;
+      if (call.init.method === "POST" && call.url.startsWith(signUrl)) {
+        // Return a signedURL whose object path is a prefix of the
+        // real one — a different object entirely. The exact-object
+        // binding must reject it even though it shares the same
+        // path prefix.
+        return jsonResponse({
+          signedURL: "/object/sign/offering-audio/samples/of-1/x.mp3?token=evil",
+        });
+      }
+      return new Response(null, { status: 404 });
+    });
+    const adapter = new SupabaseStorageAdapter({
+      supabaseUrl: SUPABASE_URL,
+      supabaseServiceRoleKey: SUPABASE_KEY,
+      bucket: "offering-audio",
+      pathPrefix: "samples",
+      fetchImpl,
+    });
+    const ref = (
+      await adapter.uploadSample({
+        label: "S",
+        contentType: "audio/mpeg",
+        byteSize: uploadBytes.byteLength,
+        offeringId: "of-1",
+        bytes: uploadBytes,
+      })
+    ).storageRef;
+    // Mint a real storageRef against a known objectPath. The
+    // adapter will sign that exact objectPath; the hostile
+    // response points at a different (prefix-confusable) path.
+    await assert.rejects(() => adapter.getPlaybackBytes(ref));
+    const getCalls = recordedCalls.filter((c) => c.init.method === "GET");
+    assert.equal(getCalls.length, 0, "no outbound GET for prefix-confusable signedURL");
+  });
+
+  test("P0-001 (latest): exact bucket+object match is accepted (positive)", async () => {
+    // The positive counterpart to the cross-bucket/cross-object
+    // tests: a signedURL whose bucket and objectPath exactly match
+    // what the caller asked the provider to sign IS accepted and
+    // produces the expected outbound GET.
+    const uploadBytes = new Uint8Array([
+      0x49, 0x44, 0x33, 0x04, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+    ]);
+    const recordedCalls: FetchCall[] = [];
+    let capturedObjectPath = "";
+    const { fetchImpl } = makeFetchStub((call) => {
+      recordedCalls.push(call);
+      const uploadPrefix = `${SUPABASE_URL}/storage/v1/object/offering-audio/samples/of-1/`;
+      if (call.init.method === "POST" && call.url.startsWith(uploadPrefix)) {
+        capturedObjectPath = call.url.slice(uploadPrefix.length);
+        return new Response(null, { status: 200 });
+      }
+      const signUrl = `${SUPABASE_URL}/storage/v1/object/sign/offering-audio/samples/of-1/`;
+      if (call.init.method === "POST" && call.url.startsWith(signUrl)) {
+        // Exact match: bucket = offering-audio, object path =
+        // samples/of-1/<cuid>.mp3 (the exact objectPath the
+        // adapter is asking to sign).
+        return jsonResponse({
+          signedURL: `/object/sign/offering-audio/samples/of-1/${capturedObjectPath}?token=abc`,
+        });
+      }
+      const downloadUrl = `${SUPABASE_URL}/storage/v1/object/sign/offering-audio/samples/of-1/${capturedObjectPath}?token=abc`;
+      if (call.init.method === "GET" && call.url === downloadUrl) {
+        return new Response(uploadBytes, { status: 200 });
+      }
+      return new Response(null, { status: 404 });
+    });
+    const adapter = new SupabaseStorageAdapter({
+      supabaseUrl: SUPABASE_URL,
+      supabaseServiceRoleKey: SUPABASE_KEY,
+      bucket: "offering-audio",
+      pathPrefix: "samples",
+      fetchImpl,
+    });
+    const ref = (
+      await adapter.uploadSample({
+        label: "S",
+        contentType: "audio/mpeg",
+        byteSize: uploadBytes.byteLength,
+        offeringId: "of-1",
+        bytes: uploadBytes,
+      })
+    ).storageRef;
+    const bytes = await adapter.getPlaybackBytes(ref);
+    assert.ok(bytes);
+    assert.equal(bytes.byteLength, uploadBytes.byteLength);
   });
 });

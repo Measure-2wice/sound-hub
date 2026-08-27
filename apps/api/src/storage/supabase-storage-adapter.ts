@@ -261,11 +261,27 @@ export class SupabaseStorageAdapter implements StorageAdapter {
     } catch (err) {
       throw new StorageUnavailableError(err instanceof Error ? err.message : String(err));
     }
-    if (response.status === 404 || response.status === 400) {
-      // The provider reports the object as already absent. Treat
-      // as idempotent success so the bounded retry can finalize the
-      // durable cleanup row.
+    if (response.status === 404) {
+      // The provider reports the object as already absent via a
+      // bucket-level 404 (e.g. the prefixes body did not match any
+      // object, or the bucket is empty). Treat as idempotent
+      // success so the bounded retry can finalize the durable
+      // cleanup row.
       return;
+    }
+    if (response.status === 400) {
+      // Per ticket #61 follow-up review (P1-001): a generic 400
+      // from the bucket DELETE indicates a malformed request,
+      // invalid bucket, invalid prefix, or policy rejection — NOT
+      // object absence. The provider-faithful contract is silent
+      // about whether 400 is ever a valid "already absent" signal;
+      // the safe interpretation is to surface the failure as a
+      // retryable storage error so the bounded retry drives the
+      // next attempt. A 200 or 404 remains the only confirmed-
+      // success / confirmed-absent path.
+      throw new StorageUnavailableError(
+        `Supabase Storage delete returned 400 (malformed request, invalid prefix, or policy rejection): not treated as object absence.`,
+      );
     }
     if (!response.ok) {
       throw new StorageUnavailableError(
@@ -358,10 +374,21 @@ export class SupabaseStorageAdapter implements StorageAdapter {
     // response forge SoundHub's downstream GET. `resolveSupabaseStorageUrl`
     // returns `null` when the URL fails origin/path validation, which
     // we surface as a safe provider error.
-    const resolvedUrl = resolveSupabaseStorageUrl(this.supabaseUrl ?? "", parsed.signedURL);
+    //
+    // Per ticket #61 follow-up review (latest) the resolved URL
+    // MUST also match the exact bucket + objectPath we asked the
+    // provider to sign. A same-origin cross-bucket or cross-object
+    // response must NOT be allowed to make SoundHub proxy another
+    // private object's bytes. The helper accepts an `expected`
+    // tuple (bucket, objectPath) and rejects any URL whose
+    // pathname resolves to a different bucket or object.
+    const resolvedUrl = resolveSupabaseStorageUrl(this.supabaseUrl ?? "", parsed.signedURL, {
+      bucket,
+      objectPath,
+    });
     if (!resolvedUrl) {
       throw new StorageUnavailableError(
-        "Supabase Storage signed URL resolved to a host outside the configured project origin.",
+        "Supabase Storage signed URL did not match the requested bucket and object.",
       );
     }
     return resolvedUrl;
@@ -405,11 +432,23 @@ function parseSignSuccessBody(raw: unknown): SignSuccessBody | null {
  * exact configured origin plus a `/storage/v1/object/sign/<bucket>/...`
  * path is accepted.
  *
+ * Per ticket #61 follow-up review (latest) the resolved URL MUST
+ * also match the exact bucket + object the caller asked the
+ * provider to sign. A same-origin cross-bucket or cross-object
+ * response must NOT be allowed to make SoundHub proxy another
+ * private object's bytes. When `expected` is provided the helper
+ * rejects any URL whose pathname resolves to a different bucket or
+ * a different object, including encoded-confusable variants.
+ *
  * Returns `null` when the input fails validation. Exported for
  * unit testing the URL composition independently of the network
  * stack.
  */
-export function resolveSupabaseStorageUrl(supabaseUrl: string, signedPath: string): string | null {
+export function resolveSupabaseStorageUrl(
+  supabaseUrl: string,
+  signedPath: string,
+  expected?: { readonly bucket: string; readonly objectPath: string },
+): string | null {
   const base = supabaseUrl.replace(/\/+$/, "");
   if (!base) return null;
 
@@ -418,7 +457,14 @@ export function resolveSupabaseStorageUrl(supabaseUrl: string, signedPath: strin
   // normalize `..` to navigate above the bucket prefix, which
   // would let a hostile signedURL escape its declared bucket. A
   // legitimate Storage signedURL never contains `..` segments.
-  const normalizedForTraversal = decodeURIComponent(signedPath);
+  // Wrap the decoder so malformed percent encoding returns null
+  // through the same safe-validation path rather than throwing.
+  let normalizedForTraversal: string;
+  try {
+    normalizedForTraversal = decodeURIComponent(signedPath);
+  } catch {
+    return null;
+  }
   if (normalizedForTraversal.split("/").includes("..")) return null;
 
   // Protocol-relative URLs (`//attacker.example/...`) must be
@@ -465,14 +511,41 @@ export function resolveSupabaseStorageUrl(supabaseUrl: string, signedPath: strin
   // family or a path outside the bucket) is rejected.
   const storageV1Prefix = `/storage/v1/object/sign/`;
   const relativePrefix = `/object/sign/`;
+  let canonicalPath: string;
   if (resolved.pathname.startsWith(storageV1Prefix)) {
-    return resolved.toString();
+    canonicalPath = resolved.pathname;
+  } else if (resolved.pathname.startsWith(relativePrefix)) {
+    canonicalPath = `${storageV1Prefix}${resolved.pathname.slice(relativePrefix.length)}`;
+  } else {
+    return null;
   }
-  if (resolved.pathname.startsWith(relativePrefix)) {
-    const canonical = new URL(
-      `${base}${storageV1Prefix}${resolved.pathname.slice(relativePrefix.length)}?${resolved.searchParams.toString()}`,
-    );
-    return canonical.toString();
+
+  // Per ticket #61 follow-up review (latest): bind the resolved
+  // pathname to the exact bucket + object the caller asked the
+  // provider to sign. A same-origin cross-bucket or cross-object
+  // response (e.g. a sibling object in the same bucket, or a
+  // prefix-confusable encoded variant) must NOT be allowed to make
+  // SoundHub proxy another private object's bytes. We compare
+  // canonical, percent-decoded bucket and object segments so an
+  // attacker cannot bypass the check with `..` segments or
+  // double-encoded variants (the `..` traversal check above
+  // already rejects literal `..`, but encoded equivalents are
+  // normalized here for a final equivalence check). All
+  // decodeURIComponent calls are wrapped in try/catch so malformed
+  // percent encoding returns null through the safe validation
+  // path rather than throwing URIError past the helper boundary.
+  if (expected) {
+    let expectedBucket: string;
+    let expectedObject: string;
+    try {
+      expectedBucket = decodeURIComponent(expected.bucket);
+      expectedObject = decodeURIComponent(expected.objectPath);
+    } catch {
+      return null;
+    }
+    const expectedSignPath = `${storageV1Prefix}${encodeURIComponent(expectedBucket).replace(/%2F/gi, "/")}/${encodeURIComponent(expectedObject).replace(/%2F/gi, "/")}`;
+    if (canonicalPath !== expectedSignPath) return null;
   }
-  return null;
+
+  return new URL(`${base}${canonicalPath}?${resolved.searchParams.toString()}`).toString();
 }
