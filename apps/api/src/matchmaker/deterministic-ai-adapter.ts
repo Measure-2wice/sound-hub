@@ -123,35 +123,88 @@ const CATEGORY_PHRASES: ReadonlyArray<{
 // hard `basedIn` constraint when the buyer explicitly names a
 // city/region/country — inferring location from context would be
 // exactly the "silent broadening" the GS 14 contract forbids.
+//
+// Each canonical city carries every natural-language cue a buyer
+// might use (`in <city>`, `<city>-based`, `based in <city>`, `from
+// <city>`, `located in <city>`). The adapter picks the FIRST
+// canonical phrase that matches the buyer's text in declaration
+// order, and each city's phrases are listed longest-first so a
+// multi-word location like `based in port of spain` is preferred
+// over a shorter partial match.
+//
+// The fail-closed detector (see `detectUnsupportedLocation` below)
+// scans buyer cues bounded at project-clause transitions so a
+// supported trailing-clause phrasing (`based in Port of Spain for
+// a remote single`) produces a canonical `basedIn` constraint
+// instead of falsely rejecting the supported city.
 const LOCATION_PHRASES: ReadonlyArray<{
   readonly phrase: string;
   readonly countryCode: string;
   readonly city?: string;
   readonly region?: string;
 }> = [
-  // City -> country shortcuts the seed uses. Kept explicit so the
-  // fallback cannot accidentally broaden a buyer request. The
-  // first matching phrase wins (declaration order matters); each
-  // city therefore has the most natural phrasing (e.g. "in
-  // brooklyn") listed first, followed by alternates the buyer
-  // UI may emit ("brooklyn-based", "based in brooklyn", the
-  // documented default brief wording).
+  // Brooklyn (US / NY)
+  { phrase: "based in brooklyn", countryCode: "US", city: "Brooklyn", region: "NY" },
+  { phrase: "located in brooklyn", countryCode: "US", city: "Brooklyn", region: "NY" },
+  { phrase: "from brooklyn", countryCode: "US", city: "Brooklyn", region: "NY" },
   { phrase: "in brooklyn", countryCode: "US", city: "Brooklyn", region: "NY" },
   { phrase: "brooklyn-based", countryCode: "US", city: "Brooklyn", region: "NY" },
-  { phrase: "based in brooklyn", countryCode: "US", city: "Brooklyn", region: "NY" },
-  { phrase: "from brooklyn", countryCode: "US", city: "Brooklyn", region: "NY" },
+  // Toronto (CA / ON)
+  { phrase: "based in toronto", countryCode: "CA", city: "Toronto", region: "ON" },
+  { phrase: "located in toronto", countryCode: "CA", city: "Toronto", region: "ON" },
+  { phrase: "from toronto", countryCode: "CA", city: "Toronto", region: "ON" },
   { phrase: "in toronto", countryCode: "CA", city: "Toronto", region: "ON" },
   { phrase: "toronto-based", countryCode: "CA", city: "Toronto", region: "ON" },
+  // London (GB)
+  { phrase: "based in london", countryCode: "GB", city: "London" },
+  { phrase: "located in london", countryCode: "GB", city: "London" },
+  { phrase: "from london", countryCode: "GB", city: "London" },
   { phrase: "in london", countryCode: "GB", city: "London" },
   { phrase: "london-based", countryCode: "GB", city: "London" },
+  // Santo Domingo (DO)
+  { phrase: "based in santo domingo", countryCode: "DO", city: "Santo Domingo" },
+  { phrase: "located in santo domingo", countryCode: "DO", city: "Santo Domingo" },
+  { phrase: "from santo domingo", countryCode: "DO", city: "Santo Domingo" },
   { phrase: "in santo domingo", countryCode: "DO", city: "Santo Domingo" },
   { phrase: "santo domingo-based", countryCode: "DO", city: "Santo Domingo" },
+  // Nassau (BS)
+  { phrase: "based in nassau", countryCode: "BS", city: "Nassau" },
+  { phrase: "located in nassau", countryCode: "BS", city: "Nassau" },
+  { phrase: "from nassau", countryCode: "BS", city: "Nassau" },
   { phrase: "in nassau", countryCode: "BS", city: "Nassau" },
+  { phrase: "nassau-based", countryCode: "BS", city: "Nassau" },
+  // Kingston (JM)
+  { phrase: "based in kingston", countryCode: "JM", city: "Kingston" },
+  { phrase: "located in kingston", countryCode: "JM", city: "Kingston" },
+  { phrase: "from kingston", countryCode: "JM", city: "Kingston" },
   { phrase: "in kingston", countryCode: "JM", city: "Kingston" },
+  { phrase: "kingston-based", countryCode: "JM", city: "Kingston" },
+  // Port of Spain (TT) — multi-word city.
+  { phrase: "based in port of spain", countryCode: "TT", city: "Port of Spain" },
+  { phrase: "located in port of spain", countryCode: "TT", city: "Port of Spain" },
+  { phrase: "from port of spain", countryCode: "TT", city: "Port of Spain" },
   { phrase: "in port of spain", countryCode: "TT", city: "Port of Spain" },
+  { phrase: "port of spain-based", countryCode: "TT", city: "Port of Spain" },
+  // Bridgetown (BB)
+  { phrase: "based in bridgetown", countryCode: "BB", city: "Bridgetown" },
+  { phrase: "located in bridgetown", countryCode: "BB", city: "Bridgetown" },
+  { phrase: "from bridgetown", countryCode: "BB", city: "Bridgetown" },
   { phrase: "in bridgetown", countryCode: "BB", city: "Bridgetown" },
+  { phrase: "bridgetown-based", countryCode: "BB", city: "Bridgetown" },
+  // Castries (LC)
+  { phrase: "based in castries", countryCode: "LC", city: "Castries" },
+  { phrase: "located in castries", countryCode: "LC", city: "Castries" },
+  { phrase: "from castries", countryCode: "LC", city: "Castries" },
   { phrase: "in castries", countryCode: "LC", city: "Castries" },
+  { phrase: "castries-based", countryCode: "LC", city: "Castries" },
+  // St. George's (GD) — apostrophe-bearing city. The dot and
+  // apostrophe are preserved verbatim so a buyer typing
+  // "St. George's" matches the canonical phrase.
+  { phrase: "based in st. george's", countryCode: "GD", city: "St. George's" },
+  { phrase: "located in st. george's", countryCode: "GD", city: "St. George's" },
+  { phrase: "from st. george's", countryCode: "GD", city: "St. George's" },
   { phrase: "in st. george's", countryCode: "GD", city: "St. George's" },
+  { phrase: "st. george's-based", countryCode: "GD", city: "St. George's" },
 ];
 
 // Caribbean affiliation codes the deterministic fallback recognises
@@ -228,9 +281,19 @@ export class DeterministicAiAdapter implements AiAdapter {
       }
     }
 
-    // Location: emit the FIRST recognised phrase as a hard
-    // `basedIn` constraint. The buyer explicitly said "in
-    // <city>"; the search service narrows to that geography.
+    // Location: the buyer explicitly named a location. GS 14
+    // forbids silently dropping required constraints, so we MUST
+    // detect the buyer's location cue and fail closed if the named
+    // location is not in the canonical LOCATION_PHRASES list. The
+    // detector returns the unmatched token; the adapter throws so
+    // the application boundary surfaces MATCHMAKER_INVALID_REQUEST
+    // rather than running a relaxed search.
+    const unsupported = detectUnsupportedLocation(input.briefText);
+    if (unsupported !== null) {
+      throw new AiInvalidOutputError(
+        `ProjectBrief location "${unsupported}" cannot be interpreted into a canonical SoundHub location. Rephrase the brief using a supported city (Brooklyn, Toronto, London, Santo Domingo, Nassau, Kingston, Port of Spain, Bridgetown, Castries, St. George's).`,
+      );
+    }
     for (const entry of LOCATION_PHRASES) {
       if (normalized.includes(entry.phrase)) {
         required.basedIn = {
@@ -338,4 +401,111 @@ export class DeterministicAiAdapter implements AiAdapter {
       candidate,
     });
   }
+}
+
+// ---------- Location fail-closed detection (GS 14) ----------
+//
+// When the buyer's natural-language brief expresses a required
+// location (e.g. "based in Antarctica" or "<City>-based"), the
+// deterministic adapter MUST resolve the named location to a
+// canonical LOCATION_PHRASES entry. A buyer-explicit but
+// unsupported location is a fail-closed signal: the adapter throws
+// AiInvalidOutputError so the application boundary translates it
+// into MATCHMAKER_INVALID_REQUEST (HTTP 400) instead of running a
+// relaxed search.
+//
+// The detector recognises every buyer-natural location cue the
+// canonical LOCATION_PHRASES table covers:
+//   - "based in <Location>" (e.g. "based in Antarctica")
+//   - "in <Location>" (e.g. "in Reykjavik")
+//   - "located in <Location>" (e.g. "located in Reykjavik")
+//   - "from <Location>" (e.g. "from Port of Spain")
+//   - "<Location>-based" (e.g. "Brooklyn-based")
+//
+// Captures are bounded at sentence punctuation AND at project-
+// clause transitions (` for `, ` who `, ` and `, ` to `, ` with `,
+// ` by `, ` on `) so a supported trailing-clause phrasing like
+// "based in Port of Spain for a remote single" does not pick up
+// the project clause as part of the location token.
+function detectUnsupportedLocation(original: string): string | null {
+  // "based in <Location>" / "in <Location>" / "located in
+  // <Location>" / "from <Location>" — non-greedy capture bounded
+  // by sentence punctuation, end-of-string, OR a project-clause
+  // transition. The location must be at least 2 characters to
+  // avoid false positives on tiny tokens.
+  const basedInMatch =
+    /\b(?:based|located)\s+in\s+([^.,;]+?)(?=\s+(?:for|who|and|to|with|by|on)\b|[.,;]|$)/i.exec(
+      original,
+    );
+  if (basedInMatch) {
+    const token = basedInMatch[1]!.trim();
+    if (token.length >= 2 && !matchesKnownLocation(token)) {
+      return token;
+    }
+  }
+  const inMatch =
+    /\bin\s+([A-Z][a-z]+(?:\s+(?:of|[A-Z][a-z]+|St\.))*(?:\s+(?:de|la|el|los|las|du|le|von|van|di|del))?)(?=\s+(?:for|who|and|to|with|by|on)\b|[.,;]|$)/.exec(
+      original,
+    );
+  if (inMatch) {
+    const token = inMatch[1]!.trim();
+    if (token.length >= 2 && !matchesKnownLocation(token)) {
+      return token;
+    }
+  }
+  const fromMatch =
+    /\bfrom\s+([A-Z][a-z]+(?:\s+(?:of|[A-Z][a-z]+|St\.))*(?:\s+(?:de|la|el|los|las|du|le|von|van|di|del))?)(?=\s+(?:for|who|and|to|with|by|on)\b|[.,;]|$)/.exec(
+      original,
+    );
+  if (fromMatch) {
+    const token = fromMatch[1]!.trim();
+    if (token.length >= 2 && !matchesKnownLocation(token)) {
+      return token;
+    }
+  }
+
+  // "<Location>-based" with a Capitalised prefix. Buyer phrasing
+  // ends at the `-based` suffix so the capture lands on the
+  // proper-noun location token without picking up trailing project
+  // clause text. The Capitalised prefix prevents "remote-based" or
+  // "music-based" from false-positive triggering fail-closed.
+  const xBasedMatch = /\b([A-Z][a-z]+(?:\s+(?:of|[A-Z][a-z]+|St\.|George's))*)-based\b/.exec(
+    original,
+  );
+  if (xBasedMatch) {
+    const token = xBasedMatch[1]!.trim().replace(/[.,;]+$/, "");
+    if (token.length >= 2 && !matchesKnownLocation(token)) {
+      return token;
+    }
+  }
+
+  return null;
+}
+
+function matchesKnownLocation(token: string): boolean {
+  const lc = token.toLowerCase();
+  // Buyers name the bare city ("Brooklyn"), not the canonical
+  // phrase ("in brooklyn"). Match against the LOCATION_PHRASES
+  // fields so a token equal to a canonical city/region/country
+  // counts as known, regardless of whether the buyer said "in
+  // brooklyn" or "Brooklyn-based". Apostrophe-bearing canonical
+  // cities like "St. George's" are normalised by stripping the
+  // apostrophe so the buyer-side token "St. George" matches.
+  const lcNormalized = lc.replace(/[''`]/g, "");
+  for (const entry of LOCATION_PHRASES) {
+    if (entry.city !== undefined) {
+      const cityLc = entry.city.toLowerCase();
+      if (cityLc === lc || cityLc.replace(/[''`]/g, "") === lcNormalized) return true;
+      if (lc.includes(cityLc)) return true;
+    }
+    if (entry.region !== undefined && entry.region.toLowerCase() === lc) {
+      return true;
+    }
+    if (entry.countryCode.toLowerCase() === lc) return true;
+  }
+  // Service-mode keywords are not locations. Treating them as
+  // fail-closed candidates would block legitimate briefs like
+  // "remote-based producer".
+  const SERVICE_MODE_KEYWORDS = ["remote", "hybrid", "in-person", "in person", "online", "offline"];
+  return SERVICE_MODE_KEYWORDS.includes(lc);
 }

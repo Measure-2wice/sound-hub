@@ -28,6 +28,10 @@
     "db:test:migrate": "pnpm db:test:wait && apps/api/node_modules/.bin/tsx scripts/db-test-migrate.mjs",
     "db:test:seed": "apps/api/node_modules/.bin/tsx scripts/db-test-seed.mjs",
     "db:test:cycle": "apps/api/node_modules/.bin/tsx scripts/db-test-cycle.mjs",
+    "db:qa:wait": "apps/api/node_modules/.bin/tsx scripts/db-qa-wait.mjs",
+    "db:qa:migrate": "pnpm db:qa:wait && apps/api/node_modules/.bin/tsx scripts/db-qa-migrate.mjs",
+    "db:qa:seed": "pnpm db:qa:wait && apps/api/node_modules/.bin/tsx scripts/db-qa-seed.mjs",
+    "dev:qa": "apps/api/node_modules/.bin/tsx scripts/dev-qa.mjs",
     "check:forbidden-deps": "node scripts/check-forbidden-deps.mjs",
     "acceptance-gate": "node scripts/acceptance-gate.mjs"
   },

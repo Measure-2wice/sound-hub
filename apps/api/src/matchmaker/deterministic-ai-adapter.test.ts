@@ -168,3 +168,128 @@ test("deterministic fallback refuses to emit an unvalidated criteria payload (pu
   assert.ok(caught instanceof Error);
   assert.equal(caught.name, "AiInvalidOutputError");
 });
+
+test("deterministic fallback fails closed on an unsupported explicit location (GS 14)", async () => {
+  // QA reproduction: "I need an in-person music producer based in
+  // Antarctica." The buyer's natural-language brief explicitly named
+  // Antarctica as the required location. The deterministic adapter
+  // does not know Antarctica (the canonical LOCATION_PHRASES list is
+  // closed), so it MUST surface AiInvalidOutputError rather than
+  // silently dropping the location and running a relaxed search
+  // (GS 14: required constraints must never be silently relaxed).
+  let caught: unknown;
+  try {
+    await adapter.interpretBrief({
+      actingWorkspaceId: "ws-buyer-1",
+      briefText: "I need an in-person music producer based in Antarctica.",
+    });
+  } catch (err) {
+    caught = err;
+  }
+  assert.ok(caught instanceof Error);
+  assert.equal(caught.name, "AiInvalidOutputError");
+  assert.match(
+    caught.message,
+    /Antarctica/,
+    "the error message must echo the unsupported location so the buyer can rephrase",
+  );
+});
+
+test("deterministic fallback fails closed on an unsupported <X>-based location", async () => {
+  // Same fail-closed invariant via the "<City>-based" cue. "Reykjavik"
+  // is not in LOCATION_PHRASES; the adapter must throw instead of
+  // silently dropping the location and treating the brief as
+  // location-unconstrained.
+  let caught: unknown;
+  try {
+    await adapter.interpretBrief({
+      actingWorkspaceId: "ws-buyer-1",
+      briefText: "I need a Reykjavik-based music producer for a remote single.",
+    });
+  } catch (err) {
+    caught = err;
+  }
+  assert.ok(caught instanceof Error);
+  assert.equal(caught.name, "AiInvalidOutputError");
+});
+
+test("deterministic fallback does not fail closed on canonical service-mode phrasings", async () => {
+  // "remote-based" describes a service mode, not a location. The
+  // fail-closed detector must NOT trigger on service-mode keywords
+  // because a buyer writing "a remote-based producer" is expressing
+  // a service preference, not a city.
+  const criteria = await interpret("I need a remote-based music producer for a remote single.");
+  assert.ok(criteria.required.serviceModes?.includes("Remote"));
+});
+
+test("deterministic fallback fails closed on 'in <unsupported-city>' cues", async () => {
+  // P1-001 reproduction: "I need a music producer in Antarctica."
+  // The buyer used the `in <Location>` cue. Antarctica is not in
+  // LOCATION_PHRASES; the detector must surface AiInvalidOutputError
+  // rather than silently dropping the location and running a
+  // relaxed search (GS 14: required constraints are never silently
+  // relaxed).
+  let caught: unknown;
+  try {
+    await adapter.interpretBrief({
+      actingWorkspaceId: "ws-buyer-1",
+      briefText: "I need a music producer in Antarctica.",
+    });
+  } catch (err) {
+    caught = err;
+  }
+  assert.ok(caught instanceof Error);
+  assert.equal(caught.name, "AiInvalidOutputError");
+  assert.match(caught.message, /Antarctica/);
+});
+
+test("deterministic fallback fails closed on 'located in <unsupported-city>' cues", async () => {
+  // P1-001 reproduction: "I am located in Reykjavik and need a
+  // producer." The buyer used the `located in <Location>` cue.
+  // Reykjavik is not in LOCATION_PHRASES; the detector must throw.
+  let caught: unknown;
+  try {
+    await adapter.interpretBrief({
+      actingWorkspaceId: "ws-buyer-1",
+      briefText: "I am located in Reykjavik and need a music producer.",
+    });
+  } catch (err) {
+    caught = err;
+  }
+  assert.ok(caught instanceof Error);
+  assert.equal(caught.name, "AiInvalidOutputError");
+  assert.match(caught.message, /Reykjavik/);
+});
+
+test("deterministic fallback resolves 'based in Port of Spain' with a trailing project clause", async () => {
+  // P1-001 reproduction: "based in Port of Spain for a remote
+  // single". Port of Spain is canonical (TT) and the buyer used
+  // the supported `based in <Location>` cue. The detector must
+  // NOT falsely reject this brief as unsupported, and the
+  // canonical-phrase scan must produce the TT basedIn constraint.
+  const criteria = await interpret("I need a producer based in Port of Spain for a remote single.");
+  assert.equal(criteria.required.basedIn?.countryCode, "TT");
+  assert.equal(criteria.required.basedIn?.city, "Port of Spain");
+  assert.ok(criteria.required.serviceModes?.includes("Remote"));
+});
+
+test("deterministic fallback resolves 'in <unsupported-city>' followed by a project clause", async () => {
+  // Belt-and-suspenders: the clause-bound capture must reject
+  // trailing project text. "in Reykjavik for a remote single"
+  // should fail closed with "Reykjavik" — NOT "Reykjavik for a
+  // remote single" — so the buyer sees a precise, actionable
+  // error.
+  let caught: unknown;
+  try {
+    await adapter.interpretBrief({
+      actingWorkspaceId: "ws-buyer-1",
+      briefText: "I need a music producer in Reykjavik for a remote single.",
+    });
+  } catch (err) {
+    caught = err;
+  }
+  assert.ok(caught instanceof Error);
+  assert.equal(caught.name, "AiInvalidOutputError");
+  assert.match(caught.message, /Reykjavik/);
+  assert.doesNotMatch(caught.message, /for a remote single/);
+});
