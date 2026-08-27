@@ -444,6 +444,20 @@ export const apiErrorCodeV1Schema = z.enum([
   "AUDIO_PAYLOAD_MISSING",
   "AUDIO_PROVIDER_UNAVAILABLE",
   "AUDIO_STORAGE_FAILED",
+  // Buildathon Golden Slice 4 error codes. ProjectRequest / Deal
+  // specific. The 403 codes cover both buyer-side and seller-side
+  // authorization failures (route layer collapses them to a single
+  // safe envelope); PROJECT_REQUEST_ALREADY_PENDING and
+  // PROJECT_REQUEST_ALREADY_RESPONDED surface as 409 to indicate a
+  // retry that would have produced a duplicate row.
+  "PROJECT_REQUEST_INVALID",
+  "PROJECT_REQUEST_BRIEF_NOT_FOUND",
+  "PROJECT_REQUEST_BRIEF_FORBIDDEN",
+  "PROJECT_REQUEST_OFFERING_INELIGIBLE",
+  "PROJECT_REQUEST_NOT_FOUND",
+  "PROJECT_REQUEST_FORBIDDEN",
+  "PROJECT_REQUEST_ALREADY_PENDING",
+  "PROJECT_REQUEST_ALREADY_RESPONDED",
 ]);
 export type ApiErrorCodeV1 = z.infer<typeof apiErrorCodeV1Schema>;
 
@@ -535,6 +549,14 @@ export const pricingKindValuesV1 = ["StartingAt", "Fixed", "ContactForQuote"] as
 export type PricingKindV1 = (typeof pricingKindValuesV1)[number];
 export const purchaseModeValuesV1 = ["BundleOnly"] as const;
 export type PurchaseModeV1 = (typeof purchaseModeValuesV1)[number];
+
+// BG4 closed behavior states. These mirror the Prisma enum values
+// added in migration 20260827090000_bg4_project_requests.
+export const projectRequestStatusValuesV1 = ["Pending", "Accepted", "Declined"] as const;
+export type ProjectRequestStatusV1 = (typeof projectRequestStatusValuesV1)[number];
+
+export const dealStatusValuesV1 = ["Negotiating", "Active"] as const;
+export type DealStatusV1 = (typeof dealStatusValuesV1)[number];
 
 // ===========================================================================
 // Buildathon Golden Slice 1 (BG1) shared runtime contracts.
@@ -1247,3 +1269,152 @@ export const BG2_AUDIO_SAMPLE_MAX_DISPLAY_ORDER = 3;
 // detector can compare this list against the runtime error builder.
 // The drift test (`apps/api/src/lib/enum-drift.test.ts`) is the only
 // place that consults this list outside the route layer.
+
+// ===========================================================================
+// Buildathon Golden Slice 4 (BG4) shared runtime contracts.
+//
+// These schemas cover the ProjectRequest + seller-consent slice:
+// persistence, decision, view, and list endpoints. The same patterns
+// as the BG3 contracts are reused: shared Zod is the executable
+// contract; TypeScript types are inferred from it; the same schema is
+// consumed by the API route validator and the browser response parser.
+// No Prisma model, raw provider subject, or storage key ever crosses
+// a public DTO.
+//
+// Per ticket #62, GS 16–18 require:
+//   GS 16 — ProjectRequest creation revalidates current eligibility
+//           and persists a Pending request owned by the buyer
+//           Workspace; it does not create a Deal.
+//   GS 17 — Only an authorized seller Workspace member can accept or
+//           decline the request.
+//   GS 18 — Decline creates no Deal; acceptance records seller
+//           consent and creates exactly one Negotiating Deal.
+// And GS 26 requires that retries cannot create duplicate
+// ProjectRequests or multiple Deals for one accepted ProjectRequest.
+// ===========================================================================
+
+// ---------- ProjectRequest public DTO ----------
+
+// Allow-listed ProjectRequest shape. Mirrors the persisted columns
+// with one exception: `sellerConsentAt` is the canonical
+// "explicit seller consent" evidence referenced by GS 18 / future
+// activation invariants. It is null for Pending and Declined
+// requests and the timestamp of the accept call for Accepted ones.
+export const projectRequestPublicV1Schema = z
+  .object({
+    projectRequestId: z.string().min(1).max(128),
+    buyerWorkspaceId: z.string().min(1).max(128),
+    sellerWorkspaceId: z.string().min(1).max(128),
+    serviceOfferingId: z.string().min(1).max(128),
+    projectBriefId: z.string().min(1).max(128),
+    createdByUserId: z.string().min(1).max(128),
+    status: z.enum(projectRequestStatusValuesV1),
+    sellerDecisionAt: z.string().datetime().nullable(),
+    sellerDecisionByUserId: z.string().min(1).max(128).nullable(),
+    sellerConsentAt: z.string().datetime().nullable(),
+    createdAt: z.string().datetime(),
+  })
+  .strict();
+export type ProjectRequestPublicV1 = z.infer<typeof projectRequestPublicV1Schema>;
+
+// ---------- Deal public DTO ----------
+
+// Allow-listed Deal shape. BG4 only ever emits Negotiating Deals; the
+// `activatedAt` field is always null in this slice. Future
+// activation-invariant code (a later ticket) will set it.
+export const dealPublicV1Schema = z
+  .object({
+    dealId: z.string().min(1).max(128),
+    buyerWorkspaceId: z.string().min(1).max(128),
+    sellerWorkspaceId: z.string().min(1).max(128),
+    serviceOfferingId: z.string().min(1).max(128),
+    projectBriefId: z.string().min(1).max(128),
+    projectRequestId: z.string().min(1).max(128),
+    status: z.enum(dealStatusValuesV1),
+    activatedAt: z.string().datetime().nullable(),
+    createdAt: z.string().datetime(),
+  })
+  .strict();
+export type DealPublicV1 = z.infer<typeof dealPublicV1Schema>;
+
+// ---------- ProjectRequest endpoints ----------
+
+// Create-ProjectRequest request body. The buyer-side acting
+// Workspace id (GS 4 / GS 5 / GS 6 authority contract), the persisted
+// ProjectBrief id (required by ticket #62 GS 16 — selection is
+// grounded in a previously-persisted brief), and the selected
+// ServiceOffering id (one of the eligibility-determined offerings).
+export const createProjectRequestRequestV1Schema = z
+  .object({
+    actingWorkspaceId: z.string().min(1).max(128),
+    projectBriefId: z.string().min(1).max(128),
+    serviceOfferingId: z.string().min(1).max(128),
+  })
+  .strict();
+export type CreateProjectRequestRequestV1 = z.infer<typeof createProjectRequestRequestV1Schema>;
+
+export const createProjectRequestResponseV1Schema = z
+  .object({
+    ok: z.literal(true),
+    projectRequest: projectRequestPublicV1Schema,
+  })
+  .strict();
+export type CreateProjectRequestResponseV1 = z.infer<typeof createProjectRequestResponseV1Schema>;
+
+// View one ProjectRequest. Authorization is revalidated on every
+// read (GS 4); a non-member of either side receives
+// PROJECT_REQUEST_FORBIDDEN (403) and an unknown id receives
+// PROJECT_REQUEST_NOT_FOUND (404).
+export const getProjectRequestResponseV1Schema = z
+  .object({
+    projectRequest: projectRequestPublicV1Schema,
+  })
+  .strict();
+export type GetProjectRequestResponseV1 = z.infer<typeof getProjectRequestResponseV1Schema>;
+
+// List ProjectRequests for an acting Workspace. Used by the seller
+// inbox (statusFilter=Pending) and the audit view (no filter). The
+// route revalidates current membership on every call.
+export const listProjectRequestsRequestV1Schema = z
+  .object({
+    actingWorkspaceId: z.string().min(1).max(128),
+    statusFilter: z.enum(projectRequestStatusValuesV1).optional(),
+  })
+  .strict();
+export type ListProjectRequestsRequestV1 = z.infer<typeof listProjectRequestsRequestV1Schema>;
+
+export const listProjectRequestsResponseV1Schema = z
+  .object({
+    projectRequests: z.array(projectRequestPublicV1Schema).max(200),
+  })
+  .strict();
+export type ListProjectRequestsResponseV1 = z.infer<typeof listProjectRequestsResponseV1Schema>;
+
+// ---------- Seller decision endpoints ----------
+
+// Accept / Decline carry the same payload: the acting Workspace id
+// is required so the route can revalidate membership and the
+// seller-side authorization before touching the request row.
+export const respondProjectRequestRequestV1Schema = z
+  .object({
+    actingWorkspaceId: z.string().min(1).max(128),
+  })
+  .strict();
+export type RespondProjectRequestRequestV1 = z.infer<typeof respondProjectRequestRequestV1Schema>;
+
+export const acceptProjectRequestResponseV1Schema = z
+  .object({
+    ok: z.literal(true),
+    projectRequest: projectRequestPublicV1Schema,
+    deal: dealPublicV1Schema,
+  })
+  .strict();
+export type AcceptProjectRequestResponseV1 = z.infer<typeof acceptProjectRequestResponseV1Schema>;
+
+export const declineProjectRequestResponseV1Schema = z
+  .object({
+    ok: z.literal(true),
+    projectRequest: projectRequestPublicV1Schema,
+  })
+  .strict();
+export type DeclineProjectRequestResponseV1 = z.infer<typeof declineProjectRequestResponseV1Schema>;

@@ -84,6 +84,28 @@ enum AudioSampleCleanupStatus {
   Removed
 }
 
+enum ProjectRequestStatus {
+  // Seller has not yet responded.
+  Pending
+  // Seller explicitly accepted; a Negotiating Deal was atomically
+  // created. Terminal.
+  Accepted
+  // Seller explicitly declined. No Deal was created. Terminal.
+  Declined
+}
+
+enum DealStatus {
+  // The seller accepted the ProjectRequest but the parties have not
+  // yet both approved a TermsVersion and the buyer has not initiated
+  // funding. The Deal can transition to Active only via the
+  // deterministic activation invariant owned by a later ticket.
+  Negotiating
+  // Both parties have approved the same current TermsVersion and
+  // the buyer's sandbox funding for that version has been confirmed.
+  // Owned by a later ticket; never set in BG4.
+  Active
+}
+
 // ---------- Identity and authority ----------
 
 model UserAccount {
@@ -104,6 +126,11 @@ model UserAccount {
   authSessions        AuthSession[]
   // Briefs the human authored as the buyer-side actor (BG3).
   authoredBriefs      ProjectBrief[]         @relation("BriefCreatedByUser")
+  // BG4 ProjectRequests. Two relations: the buyer-side creator and
+  // the seller-side decision actor. A NULL sellerDecisionByUserId
+  // means the request is still Pending.
+  authoredProjectRequests    ProjectRequest[] @relation("ProjectRequestCreatedBy")
+  decidedProjectRequests     ProjectRequest[] @relation("ProjectRequestDecidedBy")
 
   @@map("user_accounts")
 }
@@ -170,10 +197,21 @@ model Workspace {
   capabilities  WorkspaceCapability[]
   sellerProfile SellerProfile?
   // Briefs authored under this Workspace as the buyer (BG3). A
-  // Workspace must hold the Buyer capability at brief-creation time;
-  // a future BG4 ticket will add seller-side ProjectRequests, and
-  // BG5 will add Deal/terms models referencing this same Workspace.
+  // Workspace must hold the Buyer capability at brief-creation time.
   buyerBriefs   ProjectBrief[]        @relation("BuyerWorkspaceBriefs")
+  // BG4 ProjectRequests referencing this Workspace as either side.
+  // The buyer side is gated on the Buyer capability at create time;
+  // the seller side is gated on the Seller capability (and a
+  // matching SellerProfile / ServiceOffering ownership) at create
+  // time and on current WorkspaceMembership at accept/decline time.
+  buyerProjectRequests  ProjectRequest[] @relation("BuyerWorkspaceProjectRequests")
+  sellerProjectRequests ProjectRequest[] @relation("SellerWorkspaceProjectRequests")
+  // BG4 Deals referencing this Workspace as either side. The
+  // accepted ProjectRequest's buyer/seller workspaces are copied
+  // onto the Deal so authorization can revalidate them without
+  // joining through ProjectRequest.
+  buyerDeals  Deal[] @relation("BuyerWorkspaceDeals")
+  sellerDeals Deal[] @relation("SellerWorkspaceDeals")
 
   @@map("workspaces")
 }
@@ -311,6 +349,12 @@ model ServiceOffering {
   pricing          ServiceOfferingPricing?
   audioSamples     ServiceOfferingAudioSample[]
   orphanedAudioStorage AudioSampleOrphanedStorage[]
+  // BG4 references: a ServiceOffering can be selected by many
+  // ProjectRequests over time and become the basis for many Deals.
+  // RESTRICT on delete prevents an offering from being removed
+  // while it is referenced.
+  projectRequests  ProjectRequest[]
+  deals            Deal[]
 
   @@index([sellerProfileId])
   @@index([primaryCategoryId])
@@ -416,6 +460,11 @@ model ProjectBrief {
   buyerWorkspace Workspace        @relation("BuyerWorkspaceBriefs", fields: [buyerWorkspaceId], references: [id], onDelete: Cascade)
   createdByUser  UserAccount      @relation("BriefCreatedByUser", fields: [createdByUserId], references: [id], onDelete: Restrict)
   searchResults  BriefSearchResult[]
+  // BG4 reverse relations: a Brief may be referenced by zero or
+  // more ProjectRequests (and therefore by the Deals that follow
+  // accepted ones).
+  projectRequests ProjectRequest[]
+  deals           Deal[]
 
   @@index([buyerWorkspaceId, createdAt])
   @@map("project_briefs")
@@ -565,4 +614,107 @@ model AudioSampleOrphanedStorage {
 
   @@index([offeringId])
   @@map("audio_sample_orphaned_storage")
+}
+
+// ---------- Buildathon Golden Slice 4 (BG4) ----------
+//
+// ProjectRequest is a buyer Workspace's invitation to a seller
+// Workspace to discuss a project. Seller acceptance opens
+// negotiation but does not approve terms or activate paid work
+// (CONTEXT.md: "ProjectRequest — A buyer Workspace's invitation to a
+// seller Workspace to discuss a project. Seller acceptance opens
+// negotiation but does not approve terms or activate paid work.").
+//
+// Required statuses (per ticket #62): `Pending | Accepted | Declined`.
+// Pending is the only non-terminal state; Accepted and Declined are
+// terminal and cannot be reversed in this slice.
+//
+// The unique constraint on `projectRequestId` in the Deal table
+// prevents retries from creating multiple Deals for one accepted
+// ProjectRequest (GS 26). The partial unique index
+// `(buyerWorkspaceId, sellerWorkspaceId, serviceOfferingId,
+// projectBriefId) WHERE status = 'Pending'` prevents inappropriate
+// duplicate Pending ProjectRequests while still allowing the buyer
+// to send a follow-up request after a Decline or a closed Deal.
+model ProjectRequest {
+  id                  String               @id @default(cuid())
+  buyerWorkspaceId    String
+  sellerWorkspaceId   String
+  serviceOfferingId   String
+  projectBriefId      String
+  // The acting human who created the request. Recorded for audit;
+  // authorization is decided by WorkspaceMembership, not by this
+  // column.
+  createdByUserId     String
+  status              ProjectRequestStatus @default(Pending)
+  // Set the moment the seller accepts OR declines. Null while
+  // Pending. Used by the seller inbox to render ordering.
+  sellerDecisionAt   DateTime?
+  // The acting seller human who issued the decision. Null while
+  // Pending. Recorded for audit (the workspace authorization was
+  // revalidated at decision time).
+  sellerDecisionByUserId String?
+  // Set the moment the seller accepts the request. Equivalent to
+  // `sellerDecisionAt` when status = Accepted; null otherwise.
+  // Persisted as a separate column because it is the canonical
+  // "explicit seller consent" evidence referenced by GS 18 and by
+  // every future activation invariant.
+  sellerConsentAt    DateTime?
+  createdAt           DateTime              @default(now())
+
+  buyerWorkspace    Workspace      @relation("BuyerWorkspaceProjectRequests",   fields: [buyerWorkspaceId],   references: [id], onDelete: Cascade)
+  sellerWorkspace   Workspace      @relation("SellerWorkspaceProjectRequests",   fields: [sellerWorkspaceId],  references: [id], onDelete: Cascade)
+  serviceOffering   ServiceOffering @relation(fields: [serviceOfferingId], references: [id], onDelete: Restrict)
+  projectBrief      ProjectBrief   @relation(fields: [projectBriefId],    references: [id], onDelete: Restrict)
+  createdByUser     UserAccount    @relation("ProjectRequestCreatedBy",  fields: [createdByUserId],    references: [id], onDelete: Restrict)
+  sellerDecisionBy  UserAccount?   @relation("ProjectRequestDecidedBy", fields: [sellerDecisionByUserId], references: [id], onDelete: SetNull)
+
+  deal              Deal?
+
+  @@index([buyerWorkspaceId, status, createdAt])
+  @@index([sellerWorkspaceId, status, createdAt])
+  @@index([serviceOfferingId])
+  @@index([projectBriefId])
+  @@map("project_requests")
+}
+
+// Deal is an accepted commercial engagement between buyer and seller
+// Workspaces (CONTEXT.md: "Deal — An accepted commercial engagement
+// between buyer and seller Workspaces. It becomes Active only after
+// both parties approve the same TermsVersion and escrow funding
+// succeeds.").
+//
+// The BG4 slice creates exactly one Deal in `Negotiating` per accepted
+// ProjectRequest; the (projectRequestId) unique constraint prevents
+// retries from creating a second Deal (GS 26). Transitions to Active
+// are owned by a later ticket (Deal/TermsVersion/approvals) and never
+// happen in BG4.
+model Deal {
+  id                String     @id @default(cuid())
+  buyerWorkspaceId  String
+  sellerWorkspaceId String
+  serviceOfferingId String
+  projectBriefId    String
+  // Natural uniqueness: exactly one Deal per accepted
+  // ProjectRequest. A retried accept on the same already-accepted
+  // request cannot create a second row because the unique index
+  // fails the insert.
+  projectRequestId  String     @unique
+  status            DealStatus @default(Negotiating)
+  // Set when the deterministic activation invariant transitions the
+  // Deal to Active. Always null in BG4 (Active transitions are
+  // owned by a later ticket); included now so the column exists
+  // when the activation invariant lands.
+  activatedAt       DateTime?
+  createdAt         DateTime   @default(now())
+
+  buyerWorkspace    Workspace      @relation("BuyerWorkspaceDeals",  fields: [buyerWorkspaceId],  references: [id], onDelete: Cascade)
+  sellerWorkspace   Workspace      @relation("SellerWorkspaceDeals",  fields: [sellerWorkspaceId], references: [id], onDelete: Cascade)
+  serviceOffering   ServiceOffering @relation(fields: [serviceOfferingId], references: [id], onDelete: Restrict)
+  projectBrief      ProjectBrief   @relation(fields: [projectBriefId],    references: [id], onDelete: Restrict)
+  projectRequest    ProjectRequest  @relation(fields: [projectRequestId],  references: [id], onDelete: Cascade)
+
+  @@index([buyerWorkspaceId, status, createdAt])
+  @@index([sellerWorkspaceId, status, createdAt])
+  @@map("deals")
 }

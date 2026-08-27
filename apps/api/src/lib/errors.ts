@@ -84,6 +84,8 @@ function mapStatus(code: ApiErrorCodeV1): number {
     case "NOT_A_MEMBER":
     case "MISSING_CAPABILITY":
     case "BRIEF_FORBIDDEN":
+    case "PROJECT_REQUEST_FORBIDDEN":
+    case "PROJECT_REQUEST_BRIEF_FORBIDDEN":
       return 403;
     // Buildathon Golden Slice 2 (BG2) seller-audio rejection
     // surfaces. Each code maps to a stable HTTP status that respects
@@ -112,6 +114,25 @@ function mapStatus(code: ApiErrorCodeV1): number {
       return 500;
     case "AUDIO_SAMPLE_NOT_FOUND":
       return 404;
+    case "PROJECT_REQUEST_NOT_FOUND":
+    case "PROJECT_REQUEST_BRIEF_NOT_FOUND":
+      return 404;
+    case "PROJECT_REQUEST_INVALID":
+      return 400;
+    case "PROJECT_REQUEST_OFFERING_INELIGIBLE":
+      // The selected offering is ineligible at the revalidation
+      // step (stale, suspended, archived, etc.). Surface as 422 to
+      // signal the request was well-formed but the chosen resource
+      // does not satisfy current eligibility. The safe envelope
+      // stays buyer-safe; the offering id is not echoed.
+      return 422;
+    case "PROJECT_REQUEST_ALREADY_PENDING":
+    case "PROJECT_REQUEST_ALREADY_RESPONDED":
+      // 409 Conflict. A retry would have produced a duplicate
+      // ProjectRequest or a duplicate Deal; the guarded state
+      // transition rejected the duplicate. The caller can read the
+      // current state via GET /api/project-requests/:id.
+      return 409;
   }
 }
 
