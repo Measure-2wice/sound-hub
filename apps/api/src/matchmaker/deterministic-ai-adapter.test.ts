@@ -634,3 +634,96 @@ test("deterministic fallback still fails closed on an unsupported 'St.' location
   assert.ok(caught instanceof Error);
   assert.equal(caught.name, "AiInvalidOutputError");
 });
+
+// --- P1-001 regression coverage (Codex re-review): substring substitution ---
+//
+// The previous `matchesKnownLocation()` accepted a captured location
+// whenever it contained a canonical city substring. That silently
+// narrowed longer unsupported locations to a canonical substring:
+// Brooklyn Heights → Brooklyn, London Ontario → London GB, Kingston
+// Ontario → Kingston Jamaica. The detector now uses exact normalized
+// equality (with apostrophe-style variants as the only supported
+// non-semantic normalisation) and the canonical-phrase scanner uses
+// word-boundary phrase matching instead of substring matching.
+
+test("deterministic fallback resolves 'in Brooklyn' (canonical supported city)", async () => {
+  const criteria = await interpret("I need a music producer in Brooklyn for a remote single.");
+  assert.equal(criteria.required.basedIn?.countryCode, "US");
+  assert.equal(criteria.required.basedIn?.city, "Brooklyn");
+  assert.equal(criteria.required.basedIn?.region, "NY");
+});
+
+test("deterministic fallback fails closed on 'in Brooklyn Heights' (no substring narrowing to Brooklyn)", async () => {
+  let caught: unknown;
+  try {
+    await adapter.interpretBrief({
+      actingWorkspaceId: "ws-buyer-1",
+      briefText: "I need a producer based in Brooklyn Heights for a single.",
+    });
+  } catch (err) {
+    caught = err;
+  }
+  assert.ok(caught instanceof Error);
+  assert.equal(caught.name, "AiInvalidOutputError");
+  assert.match(caught.message, /Brooklyn Heights/);
+});
+
+test("deterministic fallback resolves 'in London' (canonical supported city)", async () => {
+  const criteria = await interpret("I need a music producer in London for a single.");
+  assert.equal(criteria.required.basedIn?.countryCode, "GB");
+  assert.equal(criteria.required.basedIn?.city, "London");
+});
+
+test("deterministic fallback fails closed on 'in London Ontario' (no narrowing to London GB)", async () => {
+  let caught: unknown;
+  try {
+    await adapter.interpretBrief({
+      actingWorkspaceId: "ws-buyer-1",
+      briefText: "I need a producer based in London Ontario for a single.",
+    });
+  } catch (err) {
+    caught = err;
+  }
+  assert.ok(caught instanceof Error);
+  assert.equal(caught.name, "AiInvalidOutputError");
+  assert.match(caught.message, /London Ontario/);
+});
+
+test("deterministic fallback resolves 'in Kingston' (canonical supported city)", async () => {
+  const criteria = await interpret("I need a music producer in Kingston for a single.");
+  assert.equal(criteria.required.basedIn?.countryCode, "JM");
+  assert.equal(criteria.required.basedIn?.city, "Kingston");
+});
+
+test("deterministic fallback fails closed on 'in Kingston Ontario' (no narrowing to Kingston JM)", async () => {
+  let caught: unknown;
+  try {
+    await adapter.interpretBrief({
+      actingWorkspaceId: "ws-buyer-1",
+      briefText: "I need a producer based in Kingston Ontario for a single.",
+    });
+  } catch (err) {
+    caught = err;
+  }
+  assert.ok(caught instanceof Error);
+  assert.equal(caught.name, "AiInvalidOutputError");
+  assert.match(caught.message, /Kingston Ontario/);
+});
+
+test("deterministic fallback fails closed on 'Brooklyn Heights-based' (no substring narrowing)", async () => {
+  // Belt-and-suspenders: the <X>-based cue must also reject
+  // longer unsupported locations instead of narrowing them to the
+  // canonical city substring.
+  let caught: unknown;
+  try {
+    await adapter.interpretBrief({
+      actingWorkspaceId: "ws-buyer-1",
+      briefText: "I need a Brooklyn Heights-based producer.",
+    });
+  } catch (err) {
+    caught = err;
+  }
+  assert.ok(caught instanceof Error);
+  assert.equal(caught.name, "AiInvalidOutputError");
+  assert.match(caught.message, /Brooklyn Heights/);
+});

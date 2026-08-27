@@ -295,7 +295,13 @@ export class DeterministicAiAdapter implements AiAdapter {
       );
     }
     for (const entry of LOCATION_PHRASES) {
-      if (normalized.includes(entry.phrase)) {
+      // Use strict word-boundary phrase matching (not substring) so
+      // longer unsupported locations cannot be silently narrowed to
+      // a canonical substring. The detector above has already
+      // validated the captured location candidate via exact match;
+      // this scan only runs when the detector returned null and
+      // honours the canonical phrase as a complete word sequence.
+      if (phraseMatchesInBrief(normalized, entry.phrase)) {
         required.basedIn = {
           countryCode: entry.countryCode,
           ...(entry.city !== undefined ? { city: entry.city } : {}),
@@ -568,6 +574,26 @@ const CREATIVE_OBJECT_PHRASES: ReadonlySet<string> = new Set([
   "flac",
 ]);
 
+// True when the canonical phrase appears as a complete word sequence
+// in the normalised brief. The trailing lookahead rejects substring
+// matches where the phrase is extended by an additional location
+// word (e.g. "based in brooklyn" inside "based in brooklyn heights")
+// so longer unsupported locations cannot be silently narrowed to a
+// canonical substring. Acceptable terminators:
+//   - end of string
+//   - sentence punctuation [.,;!?]
+//   - project-clause transition (for, who, and, ...)
+//   - whitespace + a letter that is not the start of a new
+//     capitalised location word (i.e. a noun or verb continuation)
+function phraseMatchesInBrief(normalized: string, phrase: string): boolean {
+  const escaped = phrase.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+  const re = new RegExp(
+    `\\b${escaped}\\b(?=$|[.,;!?]|\\s+(?:${BOUNDARY_WORDS_SOURCE})\\b|\\s+[a-z])`,
+    "i",
+  );
+  return re.test(normalized);
+}
+
 function detectUnsupportedLocation(original: string): string | null {
   // "based in <Location>" / "located in <Location>" — non-greedy
   // capture bounded by sentence punctuation, end-of-string, a
@@ -641,19 +667,20 @@ function detectUnsupportedLocation(original: string): string | null {
 
 function matchesKnownLocation(token: string): boolean {
   const lc = token.toLowerCase();
-  // Buyers name the bare city ("Brooklyn"), not the canonical
-  // phrase ("in brooklyn"). Match against the LOCATION_PHRASES
-  // fields so a token equal to a canonical city/region/country
-  // counts as known, regardless of whether the buyer said "in
-  // brooklyn" or "Brooklyn-based". Apostrophe-bearing canonical
-  // cities like "St. George's" are normalised by stripping the
-  // apostrophe so the buyer-side token "St. George" matches.
+  // Exact normalized match against canonical LOCATION_PHRASES
+  // fields. The complete captured token must equal the canonical
+  // city/region/country — substring matching was intentionally
+  // removed so longer unsupported locations (e.g. "Brooklyn
+  // Heights", "London Ontario", "Kingston Ontario") cannot be
+  // silently narrowed to a canonical substring. Apostrophe-style
+  // normalisation is retained as a supported punctuation variant
+  // (e.g. "St. Georges" matches the canonical "St. George's");
+  // the review allows only non-semantic formatting changes here.
   const lcNormalized = lc.replace(/[''`]/g, "");
   for (const entry of LOCATION_PHRASES) {
     if (entry.city !== undefined) {
       const cityLc = entry.city.toLowerCase();
       if (cityLc === lc || cityLc.replace(/[''`]/g, "") === lcNormalized) return true;
-      if (lc.includes(cityLc)) return true;
     }
     if (entry.region !== undefined && entry.region.toLowerCase() === lc) {
       return true;
