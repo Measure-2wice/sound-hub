@@ -14,12 +14,72 @@ const envExamplePath = fileURLToPath(new URL("../.env.example", import.meta.url)
 
 const APPROVED_QA_DATABASE_NAME = "soundhub_qa";
 const APPROVED_QA_DATABASE_PORT = 5433;
+// The QA database lives on the local Compose instance; only loopback
+// hosts are accepted by the centralised guard so a URL pointing at a
+// remote database (even one named `soundhub_qa`) is rejected.
+const APPROVED_QA_DATABASE_HOSTS = new Set(["localhost", "127.0.0.1", "::1"]);
 
 export const APPROVED_QA = {
   name: APPROVED_QA_DATABASE_NAME,
   port: APPROVED_QA_DATABASE_PORT,
+  hosts: APPROVED_QA_DATABASE_HOSTS,
   defaultUrl: `postgresql://soundhub:password@localhost:${APPROVED_QA_DATABASE_PORT}/${APPROVED_QA_DATABASE_NAME}`,
 };
+
+/**
+ * Fail-closed validation for `QA_DATABASE_URL`. Every QA wrapper
+ * (wait / migrate / seed / dev) calls this helper before any
+ * mutation; the helper rejects non-postgres schemes, non-loopback
+ * hosts, the wrong port, and the wrong database name. The check is
+ * centralised in `scripts/db-qa-env.mjs` so the QA scripts all share
+ * the same guard, and so `scripts/db-qa-env.test.mjs` can pin every
+ * branch to a regression test.
+ */
+export function assertApprovedQaDatabaseUrl(url) {
+  let parsed;
+  try {
+    parsed = new URL(url);
+  } catch (err) {
+    throw new Error(
+      `QA_DATABASE_URL is not a valid URL: ${err instanceof Error ? err.message : String(err)}`,
+    );
+  }
+  if (parsed.protocol !== "postgresql:" && parsed.protocol !== "postgres:") {
+    throw new Error(`QA_DATABASE_URL must be a postgresql:// URL (got ${parsed.protocol}).`);
+  }
+  // WHATWG URL preserves the brackets around an IPv6 host
+  // (`[::1]`). Strip them so the loopback-host set check matches the
+  // canonical `::1` entry.
+  const host = parsed.hostname.replace(/^\[(.*)\]$/, "$1");
+  const port = Number(parsed.port || 5432);
+  const database = parsed.pathname.replace(/^\/+/, "");
+  if (!APPROVED_QA_DATABASE_HOSTS.has(host)) {
+    throw new Error(
+      `Refusing to use QA_DATABASE_URL: host ${host} is not the approved local host (${[...APPROVED_QA_DATABASE_HOSTS].join(", ")}).`,
+    );
+  }
+  if (port !== APPROVED_QA_DATABASE_PORT) {
+    throw new Error(
+      `Refusing to use QA_DATABASE_URL: port ${port} must be ${APPROVED_QA_DATABASE_PORT}.`,
+    );
+  }
+  if (database !== APPROVED_QA_DATABASE_NAME) {
+    throw new Error(
+      `Refusing to use QA_DATABASE_URL: database name '${database}' must be exactly '${APPROVED_QA_DATABASE_NAME}'.`,
+    );
+  }
+  return { url, host, port, database };
+}
+
+/**
+ * Load `QA_DATABASE_URL` (defaulting to the approved local QA
+ * target) and validate it. Returns the validated components so
+ * wrapper scripts can log the resolved target before mutating it.
+ */
+export function resolveApprovedQaDatabaseUrl() {
+  const url = process.env.QA_DATABASE_URL ?? APPROVED_QA.defaultUrl;
+  return assertApprovedQaDatabaseUrl(url);
+}
 
 export function loadQaDatabaseEnv() {
   if (process.env.QA_DATABASE_URL) return;

@@ -293,3 +293,157 @@ test("deterministic fallback resolves 'in <unsupported-city>' followed by a proj
   assert.match(caught.message, /Reykjavik/);
   assert.doesNotMatch(caught.message, /for a remote single/);
 });
+
+// --- P1-001 regression coverage (Codex review) -----------------------
+//
+// The Codex review flagged that the location detector both relaxed
+// explicit required constraints (`in antarctica`, `in Antarctica
+// next month`, `from antarctica for a single`, `reykjavik-based`)
+// and misclassified non-location language (`mixing in Dolby Atmos`)
+// as a geographic cue. These regression tests pin every branch of
+// the case-insensitive detector and the creative-verb preceding-word
+// check so a regression in either direction — silent relaxation or
+// false-positive fail-closed — cannot ship.
+
+test("deterministic fallback fails closed on a lowercase 'in <unsupported-city>' cue", async () => {
+  // P1-001 reproduction: `in antarctica` (lowercase). The detector
+  // must be case-insensitive so a lowercase city/country name
+  // triggers the same fail-closed path as its capitalised
+  // equivalent. The error message must echo the unsupported
+  // location so the buyer can rephrase.
+  let caught: unknown;
+  try {
+    await adapter.interpretBrief({
+      actingWorkspaceId: "ws-buyer-1",
+      briefText: "I need a music producer in antarctica.",
+    });
+  } catch (err) {
+    caught = err;
+  }
+  assert.ok(caught instanceof Error);
+  assert.equal(caught.name, "AiInvalidOutputError");
+  assert.match(caught.message, /antarctica/i);
+});
+
+test("deterministic fallback fails closed on a lowercase 'from <unsupported-city>' cue", async () => {
+  // P1-001 reproduction: `from antarctica for a single`. The
+  // detector must capture "antarctica" (lowercase) — NOT "antarctica
+  // for a single" — and fail-closed with the unsupported token in
+  // the message.
+  let caught: unknown;
+  try {
+    await adapter.interpretBrief({
+      actingWorkspaceId: "ws-buyer-1",
+      briefText: "I need a producer from antarctica for a single.",
+    });
+  } catch (err) {
+    caught = err;
+  }
+  assert.ok(caught instanceof Error);
+  assert.equal(caught.name, "AiInvalidOutputError");
+  assert.match(caught.message, /antarctica/i);
+  assert.doesNotMatch(caught.message, /for a single/);
+});
+
+test("deterministic fallback fails closed on 'in <unsupported-city>' followed by a temporal phrase", async () => {
+  // P1-001 reproduction: `in Antarctica next month`. The detector
+  // must bound the capture at the temporal adverb (next) so the
+  // token is just "Antarctica" — NOT "Antarctica next month" — and
+  // fail-closed with "Antarctica" in the error message.
+  let caught: unknown;
+  try {
+    await adapter.interpretBrief({
+      actingWorkspaceId: "ws-buyer-1",
+      briefText: "I need a music producer in Antarctica next month.",
+    });
+  } catch (err) {
+    caught = err;
+  }
+  assert.ok(caught instanceof Error);
+  assert.equal(caught.name, "AiInvalidOutputError");
+  assert.match(caught.message, /Antarctica/);
+  assert.doesNotMatch(caught.message, /next month/);
+});
+
+test("deterministic fallback fails closed on a lowercase '<X>-based' cue", async () => {
+  // P1-001 reproduction: `reykjavik-based` (lowercase). The
+  // `<X>-based` matcher must be case-insensitive so a lowercase
+  // location prefix reaches the same fail-closed path. The captured
+  // token preserves the buyer's original casing (lowercase), which
+  // is what surfaces in the error message.
+  let caught: unknown;
+  try {
+    await adapter.interpretBrief({
+      actingWorkspaceId: "ws-buyer-1",
+      briefText: "I need a reykjavik-based music producer for a remote single.",
+    });
+  } catch (err) {
+    caught = err;
+  }
+  assert.ok(caught instanceof Error);
+  assert.equal(caught.name, "AiInvalidOutputError");
+  assert.match(caught.message, /reykjavik/i);
+});
+
+test("deterministic fallback does not fail closed on 'mixing in <Creative Technology>'", async () => {
+  // P1-001 reproduction: `mixing in Dolby Atmos`. The buyer used a
+  // creative-phrase verb before "in", so the detector must skip the
+  // "in" occurrence and the brief must NOT be rejected as
+  // unsupported geography. The canonical-phrase scanner does not
+  // match "dolby atmos" (it is not a city), so basedIn stays unset.
+  const criteria = await interpret("I need a music producer for mixing in Dolby Atmos.");
+  assert.equal(criteria.required.basedIn, undefined);
+});
+
+test("deterministic fallback does not fail closed on 'mastering in <Creative Technology>'", async () => {
+  // Belt-and-suspenders: the creative-verb preceding-word set
+  // covers the most common verbs that introduce a creative phrase
+  // after "in". "mastering in Dolby Atmos" must also stay unflagged.
+  const criteria = await interpret(
+    "I need a music producer for mastering in Dolby Atmos for a film.",
+  );
+  assert.equal(criteria.required.basedIn, undefined);
+});
+
+test("deterministic fallback does not fail closed when creative phrase precedes a canonical location", async () => {
+  // Belt-and-suspenders: the creative-verb preceding-word check
+  // skips only the matching "in" occurrence. A later canonical
+  // location must still be honoured. "mixing in Brooklyn for film"
+  // → skip "in Brooklyn" via the creative check (no false-positive
+  // fail-closed), and the canonical-phrase scanner picks up the
+  // `in brooklyn` substring to set basedIn. The brief ends up with
+  // the correct required.basedIn constraint.
+  const criteria = await interpret("I need a producer mixing in Brooklyn for film.");
+  assert.equal(criteria.required.basedIn?.city, "Brooklyn");
+});
+
+test("deterministic fallback fails closed on unknown explicit geography even with mixed creative phrasing", async () => {
+  // Belt-and-suspenders: when a brief mixes creative-phrase "in"
+  // (skipped by the creative-verb check) with a later unknown
+  // geography ("in Antarctica"), the detector must skip the first
+  // "in" but still fail-closed on the second. This proves the
+  // creative-verb skip is per-occurrence, not global.
+  let caught: unknown;
+  try {
+    await adapter.interpretBrief({
+      actingWorkspaceId: "ws-buyer-1",
+      briefText: "I need a producer for mixing in Dolby Atmos and a second producer in Antarctica.",
+    });
+  } catch (err) {
+    caught = err;
+  }
+  assert.ok(caught instanceof Error);
+  assert.equal(caught.name, "AiInvalidOutputError");
+  assert.match(caught.message, /Antarctica/);
+  assert.doesNotMatch(caught.message, /Dolby/);
+});
+
+test("deterministic fallback still resolves a lowercase canonical 'in <city>' cue", async () => {
+  // Belt-and-suspenders: case-insensitive matching must not regress
+  // the canonical path. A lowercase "in brooklyn" continues to set
+  // the required basedIn constraint, so the brief stays accepted
+  // and the canonical location is preserved.
+  const criteria = await interpret("I need a music producer in brooklyn for a remote single.");
+  assert.equal(criteria.required.basedIn?.countryCode, "US");
+  assert.equal(criteria.required.basedIn?.city, "Brooklyn");
+});

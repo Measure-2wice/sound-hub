@@ -8,23 +8,16 @@
 // for the same-DB-name guard that enforces the separation.
 
 import { spawn } from "node:child_process";
-import { APPROVED_QA, loadQaDatabaseEnv, packagesDbDir } from "./db-qa-env.mjs";
+import { resolveApprovedQaDatabaseUrl, packagesDbDir } from "./db-qa-env.mjs";
 
-loadQaDatabaseEnv();
-
-const url = process.env.QA_DATABASE_URL ?? APPROVED_QA.defaultUrl;
-
-const parsed = new URL(url);
-const host = parsed.hostname;
-const port = Number(parsed.port || APPROVED_QA.port);
-const database = parsed.pathname.replace(/^\/+/, "") || APPROVED_QA.name;
-
-if (database !== APPROVED_QA.name) {
-  console.error(
-    `❌ Refusing to migrate: target ${host}:${port}/${database} is not the approved QA target (${APPROVED_QA.name}).`,
-  );
+let target;
+try {
+  target = resolveApprovedQaDatabaseUrl();
+} catch (err) {
+  console.error(`❌ ${err instanceof Error ? err.message : String(err)}`);
   process.exit(1);
 }
+const { url, host, port, database } = target;
 
 async function main() {
   console.log(`▶ Applying migrations to approved QA target ${host}:${port}/${database}`);

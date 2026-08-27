@@ -422,57 +422,152 @@ export class DeterministicAiAdapter implements AiAdapter {
 //   - "from <Location>" (e.g. "from Port of Spain")
 //   - "<Location>-based" (e.g. "Brooklyn-based")
 //
-// Captures are bounded at sentence punctuation AND at project-
-// clause transitions (` for `, ` who `, ` and `, ` to `, ` with `,
-// ` by `, ` on `) so a supported trailing-clause phrasing like
-// "based in Port of Spain for a remote single" does not pick up
-// the project clause as part of the location token.
+// The matchers are case-insensitive (`/i` flag) so a buyer typing
+// `in antarctica` (lowercase) triggers the same fail-closed path as
+// `in Antarctica`. The detector also disambiguates geographic syntax
+// from creative-phrase wording: when the word immediately preceding
+// "in" is a known creative/service verb (e.g. "mixing in Dolby
+// Atmos"), the "in" is treated as part of a creative phrase, not as
+// a location cue. This prevents legitimate briefs like "mixing in
+// Dolby Atmos" from being rejected as unsupported geography.
+//
+// Captures are bounded at sentence punctuation AND at project-clause
+// transitions (` for `, ` who `, ` and `, ` to `, ` with `, ` by `,
+// ` on `) so a supported trailing-clause phrasing like "based in
+// Port of Spain for a remote single" does not pick up the project
+// clause as part of the location token. The lookahead also accepts
+// common temporal adverbs ("next month", "this week", etc.) and
+// end-of-string so brief phrasing like "in Antarctica next month"
+// captures only "Antarctica".
+//
+// A word in the BOUNDARY_WORDS list is also excluded from the
+// location-word non-capturing group via a negative lookahead, so
+// the regex never consumes "for", "next", "month" etc. as part of a
+// location token (which would otherwise let the capture balloon
+// past a temporal phrase like "next month" because the case-
+// insensitive `[A-Z][a-z]+` matches those lowercase words too).
+const BOUNDARY_WORDS = [
+  "for",
+  "who",
+  "and",
+  "to",
+  "with",
+  "by",
+  "on",
+  "next",
+  "this",
+  "coming",
+  "today",
+  "tomorrow",
+  "asap",
+  "soon",
+  "month",
+  "week",
+  "year",
+  "day",
+  "right",
+  "now",
+] as const;
+const BOUNDARY_WORDS_SOURCE = BOUNDARY_WORDS.join("|");
+
+const LOCATION_CLAUSE_BOUNDARY = new RegExp(`\\s+(?:${BOUNDARY_WORDS_SOURCE})\\b|[.,;]|$`, "i");
+
+// A single location word. Case-insensitive (`/i` flag is set on
+// every regex that uses this token) but explicitly NOT one of the
+// project-clause / temporal boundary words above. The negative
+// lookahead sits at the start of the word so the engine never
+// begins matching a known boundary word.
+const LOCATION_WORD = String.raw`(?!(?:${BOUNDARY_WORDS_SOURCE})\b)[A-Z][a-z]+`;
+
+// Creative-phrase verbs that introduce a non-geographic use of "in"
+// (e.g. "mixing in Dolby Atmos", "mastering in Abbey Road"). When a
+// word in this set immediately precedes "in", the detector skips
+// that occurrence so the brief is not falsely rejected as
+// unsupported geography. The set is intentionally narrow so
+// person-role words like "producer" or "songwriter" still count as a
+// geographic context — only verbs that explicitly describe a
+// creative or technical activity are listed.
+const CREATIVE_PRECEDING_WORDS: ReadonlySet<string> = new Set([
+  "mixing",
+  "mastering",
+  "recording",
+  "tracking",
+  "singing",
+  "vocal",
+]);
+
+function isPrecededByCreativeVerb(original: string, matchIndex: number): boolean {
+  // Walk back from the "in" position to find the immediately
+  // preceding word. The regex requires a trailing word boundary so
+  // punctuation (commas, periods) does not bleed into the captured
+  // word. We compare lowercase so "Mixing" and "mixing" both match.
+  const before = original.slice(0, matchIndex);
+  const wordMatch = /(\w+)\W*$/i.exec(before);
+  if (!wordMatch) return false;
+  return CREATIVE_PRECEDING_WORDS.has(wordMatch[1]!.toLowerCase());
+}
+
 function detectUnsupportedLocation(original: string): string | null {
-  // "based in <Location>" / "in <Location>" / "located in
-  // <Location>" / "from <Location>" — non-greedy capture bounded
-  // by sentence punctuation, end-of-string, OR a project-clause
-  // transition. The location must be at least 2 characters to
-  // avoid false positives on tiny tokens.
-  const basedInMatch =
-    /\b(?:based|located)\s+in\s+([^.,;]+?)(?=\s+(?:for|who|and|to|with|by|on)\b|[.,;]|$)/i.exec(
-      original,
-    );
+  // "based in <Location>" / "located in <Location>" — non-greedy
+  // capture bounded by sentence punctuation, end-of-string, a
+  // project-clause transition, or a common temporal adverb. The
+  // location must be at least 2 characters to avoid false positives
+  // on tiny tokens. Case-insensitive so lowercase phrasing
+  // ("based in antarctica") triggers the same fail-closed path.
+  const basedInMatch = new RegExp(
+    `\\b(?:based|located)\\s+in\\s+([^.,;]+?)(?=${LOCATION_CLAUSE_BOUNDARY.source})`,
+    "i",
+  ).exec(original);
   if (basedInMatch) {
     const token = basedInMatch[1]!.trim();
     if (token.length >= 2 && !matchesKnownLocation(token)) {
       return token;
     }
   }
-  const inMatch =
-    /\bin\s+([A-Z][a-z]+(?:\s+(?:of|[A-Z][a-z]+|St\.))*(?:\s+(?:de|la|el|los|las|du|le|von|van|di|del))?)(?=\s+(?:for|who|and|to|with|by|on)\b|[.,;]|$)/.exec(
-      original,
-    );
-  if (inMatch) {
+  // "in <Location>" — case-insensitive, with creative-verb
+  // preceding-word check so creative briefs ("mixing in Dolby
+  // Atmos") are not falsely rejected. The `/g` flag iterates every
+  // occurrence because a brief can mix creative phrasing
+  // ("mixing in Dolby Atmos") with a later geographic cue
+  // ("producer in Antarctica"); only the geographic cue should
+  // fail-closed.
+  const inRegex = new RegExp(
+    `\\bin\\s+(${LOCATION_WORD}(?:\\s+(?:of|${LOCATION_WORD}|St\\.))*(?:\\s+(?:de|la|el|los|las|du|le|von|van|di|del))?)(?=${LOCATION_CLAUSE_BOUNDARY.source})`,
+    "gi",
+  );
+  let inMatch: RegExpExecArray | null;
+  while ((inMatch = inRegex.exec(original)) !== null) {
+    if (isPrecededByCreativeVerb(original, inMatch.index)) continue;
     const token = inMatch[1]!.trim();
     if (token.length >= 2 && !matchesKnownLocation(token)) {
       return token;
     }
   }
-  const fromMatch =
-    /\bfrom\s+([A-Z][a-z]+(?:\s+(?:of|[A-Z][a-z]+|St\.))*(?:\s+(?:de|la|el|los|las|du|le|von|van|di|del))?)(?=\s+(?:for|who|and|to|with|by|on)\b|[.,;]|$)/.exec(
-      original,
-    );
-  if (fromMatch) {
+  // "from <Location>" — case-insensitive.
+  const fromRegex = new RegExp(
+    `\\bfrom\\s+(${LOCATION_WORD}(?:\\s+(?:of|${LOCATION_WORD}|St\\.))*(?:\\s+(?:de|la|el|los|las|du|le|von|van|di|del))?)(?=${LOCATION_CLAUSE_BOUNDARY.source})`,
+    "gi",
+  );
+  let fromMatch: RegExpExecArray | null;
+  while ((fromMatch = fromRegex.exec(original)) !== null) {
     const token = fromMatch[1]!.trim();
     if (token.length >= 2 && !matchesKnownLocation(token)) {
       return token;
     }
   }
 
-  // "<Location>-based" with a Capitalised prefix. Buyer phrasing
-  // ends at the `-based` suffix so the capture lands on the
-  // proper-noun location token without picking up trailing project
-  // clause text. The Capitalised prefix prevents "remote-based" or
-  // "music-based" from false-positive triggering fail-closed.
-  const xBasedMatch = /\b([A-Z][a-z]+(?:\s+(?:of|[A-Z][a-z]+|St\.|George's))*)-based\b/.exec(
-    original,
+  // "<Location>-based" — case-insensitive. The Capitalised prefix
+  // prevents "remote-based" or "music-based" from false-positive
+  // triggering fail-closed; service-mode keywords are excluded by
+  // `matchesKnownLocation`. Case-insensitive flag means
+  // "reykjavik-based" (lowercase) reaches the same path as
+  // "Reykjavik-based".
+  const xBasedRegex = new RegExp(
+    `\\b(${LOCATION_WORD}(?:\\s+(?:of|${LOCATION_WORD}|St\\.|George's))*)-based\\b`,
+    "gi",
   );
-  if (xBasedMatch) {
+  let xBasedMatch: RegExpExecArray | null;
+  while ((xBasedMatch = xBasedRegex.exec(original)) !== null) {
     const token = xBasedMatch[1]!.trim().replace(/[.,;]+$/, "");
     if (token.length >= 2 && !matchesKnownLocation(token)) {
       return token;

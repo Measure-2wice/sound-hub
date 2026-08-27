@@ -13,22 +13,16 @@
 
 import { setTimeout as sleep } from "node:timers/promises";
 import net from "node:net";
-import { APPROVED_QA, loadQaDatabaseEnv } from "./db-qa-env.mjs";
+import { resolveApprovedQaDatabaseUrl } from "./db-qa-env.mjs";
 
-loadQaDatabaseEnv();
-
-const url = process.env.QA_DATABASE_URL ?? APPROVED_QA.defaultUrl;
-const parsed = new URL(url);
-const host = parsed.hostname;
-const port = Number(parsed.port || APPROVED_QA.port);
-const database = parsed.pathname.replace(/^\/+/, "") || APPROVED_QA.name;
-
-if (database !== APPROVED_QA.name) {
-  console.error(
-    `❌ Refusing to wait: target ${host}:${port}/${database} is not the approved QA target (${APPROVED_QA.name}).`,
-  );
+let target;
+try {
+  target = resolveApprovedQaDatabaseUrl();
+} catch (err) {
+  console.error(`❌ ${err instanceof Error ? err.message : String(err)}`);
   process.exit(1);
 }
+const { host, port, database } = target;
 
 async function tcpReady() {
   return new Promise((resolve) => {
