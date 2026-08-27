@@ -1214,22 +1214,6 @@ async function applySeed(): Promise<void> {
         update: { name: unit.name },
       });
     }
-    // Canonical-state convergence pass. Any row whose key is not in
-    // the closed canonical set (a leaked test row, a future
-    // migration's stale entry) is removed so the next
-    // `db:test:seed` / `beforeEach` reset produces the documented
-    // state. Test code SHOULD clean up after itself; this pass is
-    // a second-line guarantee, not a substitute.
-    await tx.serviceCategory.deleteMany({
-      where: { key: { notIn: SERVICE_CATEGORIES.map((c) => c.key) } },
-    });
-    await tx.specialty.deleteMany({
-      where: { key: { notIn: [...SPECIALTY_KEYS] } },
-    });
-    await tx.pricingUnit.deleteMany({
-      where: { key: { notIn: PRICING_UNITS.map((u) => u.key) } },
-    });
-
     // Sellers and their full relationship graph. The canonical SELLERS
     // and the M1.3 negative fixtures share the same persistence flow;
     // `applySellerGraph` (below) is the single source of truth and

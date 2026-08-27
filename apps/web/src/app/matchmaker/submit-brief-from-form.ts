@@ -28,6 +28,20 @@ export interface SubmitBriefFromFormInput {
    * `submitBrief` so production wiring is unchanged.
    */
   readonly submit?: typeof submitBrief;
+  /**
+   * Invoked when the Matchmaker API rejects the request because the
+   * shared session cookie is invalid or expired (HTTP 401). The page
+   * uses this hook to refresh the BG1 SessionProvider so the header
+   * email and workspace list converge on the signed-out state
+   * (and so the buyer never sees a stale "demo.buyer@…" with a
+   * stale workspace selection).
+   *
+   * Cookies are origin-shared across browser tabs, so a sign-out
+   * in another tab invalidates this tab's cookie on the next
+   * request — that request then hits this hook and the page
+   * converges on the signed-out state without a manual reload.
+   */
+  readonly onSessionInvalid?: () => void;
 }
 
 export async function submitBriefFromForm(input: SubmitBriefFromFormInput): Promise<void> {
@@ -51,6 +65,21 @@ export async function submitBriefFromForm(input: SubmitBriefFromFormInput): Prom
     input.setResponse(result);
   } catch (err) {
     input.setError(err instanceof Error ? err.message : "Could not submit the brief.");
+    // If the rejection was a session-invalid 401, refresh the
+    // shared SessionProvider so the page converges on the
+    // signed-out state. Detection is name-based because the safe
+    // envelope is the only signal the client can rely on
+    // regardless of which Matchmaker or future BG path returned
+    // the 401.
+    if (
+      input.onSessionInvalid &&
+      err instanceof Error &&
+      ((err as { code?: string }).code === "SESSION_INVALID" ||
+        (err as { code?: string }).code === "AUTH_FAILED" ||
+        (err as { code?: string }).code === "SESSION_EXPIRED")
+    ) {
+      input.onSessionInvalid();
+    }
   } finally {
     input.setSubmitting(false);
   }

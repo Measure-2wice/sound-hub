@@ -1,16 +1,19 @@
+"use client";
+
 // Top navigation. Renders the SoundHub title plus a sign-in / sign-out
-// affordance backed by the BG1 authentication API. The nav is a
-// server component for the title (so it renders statically) and a
-// client component for the auth state. The split keeps the server-
-// rendered title in the static HTML while letting the auth widget
-// revalidate via the session-info endpoint.
+// affordance backed by the BG1 authentication API.
 //
-// The Matchmaker link is only rendered for authenticated buyers.
-// The session-aware SessionStatus widget owns the visibility
-// signal; the link itself stays a static server component so
-// it does not double-render during hydration.
+// The Matchmaker entry is Buyer-gated:
+//   - The link is hidden for unauthenticated visitors.
+//   - The link is hidden for authenticated users whose workspaces
+//     do not include a Buyer-capable Workspace (e.g. Seller-only).
+//
+// SessionStatus owns the visible sign-in / sign-out affordance; the
+// Matchmaker link owns its own auth-aware visibility because its
+// gating is Buyer-capability specific.
 
 import Link from "next/link";
+import { useSession } from "./SessionProvider";
 import { SessionStatus } from "./SessionStatus";
 
 export function Navigation() {
@@ -33,11 +36,15 @@ export function Navigation() {
   );
 }
 
-// Renders the Matchmaker entry only when a user is signed in.
-// Server-rendered as a placeholder so the static markup includes
-// the link shell; the SessionProvider on the client hydrates it
-// with the actual signed-in state.
+// Renders the Matchmaker entry only when the signed-in user has at
+// least one Buyer-capable Workspace. The server component shell
+// never emits the link, so unauthenticated visitors and
+// authenticated users without a Buyer Workspace do not see it.
 function SessionAwareMatchmakerLink() {
+  const { user, loading } = useSession();
+  if (loading || !user) return null;
+  const hasBuyerWorkspace = user.workspaces.some((w) => w.capabilities.includes("Buyer"));
+  if (!hasBuyerWorkspace) return null;
   return (
     <Link
       href="/matchmaker"

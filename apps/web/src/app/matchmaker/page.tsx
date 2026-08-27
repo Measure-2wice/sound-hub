@@ -17,27 +17,65 @@
 // of the allow-listed kinds and is assembled by the API layer
 // from the persisted search result.
 
-import { useState, type FormEvent } from "react";
+import { useEffect, useState, type FormEvent } from "react";
 import Link from "next/link";
 import type {
-  ProjectBriefPublicV1,
+  CategoryMetadataItemV1,
   MatchmakerRecommendationV1,
   SubmitBriefResponseV1,
 } from "@soundhub/types";
+import { categoryMetadataResponseV1Schema } from "@soundhub/types";
 import { useSession } from "../components/SessionProvider";
 import { submitBriefFromForm } from "./submit-brief-from-form";
+import { BriefSummary } from "./brief-summary";
 import { Card } from "../components/ui/Card";
 
 const DEFAULT_BRIEF =
   "I need a Brooklyn-based producer for a remote Haitian dancehall single, ideally delivered before March 14.";
 
 export default function MatchmakerPage() {
-  const { user, loading } = useSession();
+  const { user, loading, refresh } = useSession();
   const [actingWorkspaceId, setActingWorkspaceId] = useState<string>("");
   const [briefText, setBriefText] = useState<string>(DEFAULT_BRIEF);
   const [submitting, setSubmitting] = useState<boolean>(false);
   const [error, setError] = useState<string | null>(null);
   const [response, setResponse] = useState<SubmitBriefResponseV1 | null>(null);
+
+  // Canonical categories fetched from the public metadata seam so
+  // the brief summary's chip renderer never holds a second,
+  // independently deployable list of category keys. PostgreSQL is
+  // the source of truth (Codex P2-001).
+  const [categories, setCategories] = useState<readonly CategoryMetadataItemV1[]>([]);
+
+  useEffect(() => {
+    let cancelled = false;
+    void (async () => {
+      try {
+        const fetchResponse = await fetch("/api/metadata/categories", {
+          method: "GET",
+          headers: { Accept: "application/json" },
+        });
+        if (!fetchResponse.ok) {
+          throw new Error(`Metadata request failed (${fetchResponse.status}).`);
+        }
+        const body: unknown = await fetchResponse.json();
+        const parsed = categoryMetadataResponseV1Schema.safeParse(body);
+        if (!parsed.success) {
+          throw new Error("Metadata response does not match the shared category schema.");
+        }
+        if (cancelled) return;
+        setCategories(parsed.data.categories);
+      } catch {
+        // Categories are a presentation aid. A failed metadata fetch
+        // leaves the lookup map empty and the chip renderer falls
+        // back to a humanised-key display so the buyer still sees
+        // every axis.
+      }
+    })();
+    return () => {
+      cancelled = true;
+    };
+  }, []);
 
   if (loading) {
     return (
@@ -83,6 +121,15 @@ export default function MatchmakerPage() {
       setError,
       setResponse,
       setSubmitting,
+      // SESSION_INVALID / AUTH_FAILED / SESSION_EXPIRED responses
+      // mean the shared session cookie is no longer valid (the user
+      // may have signed out in another tab, or the cookie expired).
+      // Refresh the BG1 SessionProvider so the header email,
+      // workspace list, and Matchmaker page converge on the
+      // signed-out state without a manual reload.
+      onSessionInvalid: () => {
+        void refresh();
+      },
     });
   };
 
@@ -176,12 +223,18 @@ export default function MatchmakerPage() {
         </Card.Content>
       </Card>
 
-      {response && <BriefResults response={response} />}
+      {response && <BriefResults response={response} categories={categories} />}
     </div>
   );
 }
 
-function BriefResults({ response }: { readonly response: SubmitBriefResponseV1 }) {
+function BriefResults({
+  response,
+  categories,
+}: {
+  readonly response: SubmitBriefResponseV1;
+  readonly categories: readonly CategoryMetadataItemV1[];
+}) {
   return (
     <>
       <Card data-testid="matchmaker-brief-summary">
@@ -195,7 +248,7 @@ function BriefResults({ response }: { readonly response: SubmitBriefResponseV1 }
           </Card.Description>
         </Card.Header>
         <Card.Content>
-          <BriefSummary brief={response.brief} />
+          <BriefSummary brief={response.brief} categories={categories} />
           {response.fallbackNotice && (
             <p className="mt-3 text-sm text-amber-700" data-testid="matchmaker-fallback-notice">
               {response.fallbackNotice}
@@ -232,54 +285,6 @@ function BriefResults({ response }: { readonly response: SubmitBriefResponseV1 }
         </Card.Content>
       </Card>
     </>
-  );
-}
-
-function BriefSummary({ brief }: { readonly brief: ProjectBriefPublicV1 }) {
-  return (
-    <dl className="grid grid-cols-1 gap-y-2 text-sm" data-testid="matchmaker-brief-summary-list">
-      <div>
-        <dt className="font-medium text-gray-700">Original brief</dt>
-        <dd className="text-gray-900">{brief.briefText}</dd>
-      </div>
-      <div>
-        <dt className="font-medium text-gray-700">Required criteria</dt>
-        <dd>
-          <code className="text-xs bg-gray-100 px-1 rounded whitespace-pre-wrap break-words">
-            {JSON.stringify(brief.criteria.required)}
-          </code>
-        </dd>
-      </div>
-      {brief.criteria.preferred && (
-        <div>
-          <dt className="font-medium text-gray-700">Preferred criteria</dt>
-          <dd>
-            <code className="text-xs bg-gray-100 px-1 rounded whitespace-pre-wrap break-words">
-              {JSON.stringify(brief.criteria.preferred)}
-            </code>
-          </dd>
-        </div>
-      )}
-      {brief.criteria.query && (
-        <div>
-          <dt className="font-medium text-gray-700">Normalized query</dt>
-          <dd>
-            <code className="text-xs bg-gray-100 px-1 rounded">{brief.criteria.query}</code>
-          </dd>
-        </div>
-      )}
-      <div>
-        <dt className="font-medium text-gray-700">Provenance</dt>
-        <dd>
-          <span className="text-xs text-gray-700">
-            Provider: {brief.aiProvider}
-            {brief.aiModelId ? ` (model: ${brief.aiModelId})` : ""}
-            {" · "}
-            Fallback: {brief.aiFallbackUsed ? "yes" : "no"}
-          </span>
-        </dd>
-      </div>
-    </dl>
   );
 }
 
