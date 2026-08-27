@@ -424,12 +424,23 @@ export class DeterministicAiAdapter implements AiAdapter {
 //
 // The matchers are case-insensitive (`/i` flag) so a buyer typing
 // `in antarctica` (lowercase) triggers the same fail-closed path as
-// `in Antarctica`. The detector also disambiguates geographic syntax
-// from creative-phrase wording: when the word immediately preceding
-// "in" is a known creative/service verb (e.g. "mixing in Dolby
-// Atmos"), the "in" is treated as part of a creative phrase, not as
-// a location cue. This prevents legitimate briefs like "mixing in
-// Dolby Atmos" from being rejected as unsupported geography.
+// `in Antarctica`. The detector disambiguates geographic syntax
+// from creative/technical phrasing by looking at the captured
+// OBJECT after `in`, not at the preceding verb. A bounded allow-list
+// (`CREATIVE_OBJECT_PHRASES` below) covers phrases the buyer
+// unambiguously means as a non-geographic object — audio formats
+// (`stereo`, `mono`, `dolby atmos`), languages (`english`,
+// `spanish`), and DAW software (`pro tools`, `logic`, `ableton`).
+// When the captured object is one of these, the detector treats it
+// as a creative/technical phrase and does NOT fail closed. Any other
+// `in <X>` is treated as a potential geographic cue: a canonical
+// LOCATION_PHRASES entry is honoured, and anything else (e.g.
+// `recording in Antarctica`, `in Atlantis`) fails closed.
+//
+// The disambiguation is anchored on the OBJECT, not the preceding
+// verb, so a creative verb followed by an explicit place name
+// (`recording in Antarctica`) still fails closed rather than
+// silently dropping the geography.
 //
 // Captures are bounded at sentence punctuation AND at project-clause
 // transitions (` for `, ` who `, ` and `, ` to `, ` with `, ` by `,
@@ -479,33 +490,67 @@ const LOCATION_CLAUSE_BOUNDARY = new RegExp(`\\s+(?:${BOUNDARY_WORDS_SOURCE})\\b
 // begins matching a known boundary word.
 const LOCATION_WORD = String.raw`(?!(?:${BOUNDARY_WORDS_SOURCE})\b)[A-Z][a-z]+`;
 
-// Creative-phrase verbs that introduce a non-geographic use of "in"
-// (e.g. "mixing in Dolby Atmos", "mastering in Abbey Road"). When a
-// word in this set immediately precedes "in", the detector skips
-// that occurrence so the brief is not falsely rejected as
-// unsupported geography. The set is intentionally narrow so
-// person-role words like "producer" or "songwriter" still count as a
-// geographic context — only verbs that explicitly describe a
-// creative or technical activity are listed.
-const CREATIVE_PRECEDING_WORDS: ReadonlySet<string> = new Set([
-  "mixing",
-  "mastering",
-  "recording",
-  "tracking",
-  "singing",
-  "vocal",
+// Bounded allow-list of `in <X>` objects that are unambiguously
+// non-geographic. The list covers audio formats, languages, and DAW
+// software — categories where the buyer is naming a creative or
+// technical tool, not a place. Anything not in this list is
+// considered a potential location cue: a canonical LOCATION_PHRASES
+// entry is honoured, and anything else fails closed.
+//
+// The list is bounded and reviewed: any new entry must be a term
+// whose every use after `in` is unambiguously non-geographic in the
+// Caribbean music marketplace. Real place names — even ones that
+// happen to coincide with a word in another language (e.g.
+// "Sterling", "Hamilton") — are deliberately excluded so the
+// detector fails closed on those.
+const CREATIVE_OBJECT_PHRASES: ReadonlySet<string> = new Set([
+  // Audio formats / recording environments.
+  "stereo",
+  "mono",
+  "surround",
+  "surround sound",
+  "atmos",
+  "dolby atmos",
+  "dolby digital",
+  "analog",
+  "analogue",
+  "digital",
+  "studio",
+  // Languages — used as `vocals in english`, `lyrics in spanish`.
+  "english",
+  "spanish",
+  "french",
+  "portuguese",
+  "italian",
+  "german",
+  "japanese",
+  "korean",
+  "mandarin",
+  "cantonese",
+  "hindi",
+  "arabic",
+  "patois",
+  "creole",
+  "haitian creole",
+  "jamaican patois",
+  // DAW / production software.
+  "pro tools",
+  "protools",
+  "logic",
+  "logic pro",
+  "ableton",
+  "ableton live",
+  "fl studio",
+  "reason",
+  "cubase",
+  "garageband",
+  "reaper",
+  // File formats / generic production nouns.
+  "wav",
+  "mp3",
+  "aiff",
+  "flac",
 ]);
-
-function isPrecededByCreativeVerb(original: string, matchIndex: number): boolean {
-  // Walk back from the "in" position to find the immediately
-  // preceding word. The regex requires a trailing word boundary so
-  // punctuation (commas, periods) does not bleed into the captured
-  // word. We compare lowercase so "Mixing" and "mixing" both match.
-  const before = original.slice(0, matchIndex);
-  const wordMatch = /(\w+)\W*$/i.exec(before);
-  if (!wordMatch) return false;
-  return CREATIVE_PRECEDING_WORDS.has(wordMatch[1]!.toLowerCase());
-}
 
 function detectUnsupportedLocation(original: string): string | null {
   // "based in <Location>" / "located in <Location>" — non-greedy
@@ -524,21 +569,22 @@ function detectUnsupportedLocation(original: string): string | null {
       return token;
     }
   }
-  // "in <Location>" — case-insensitive, with creative-verb
-  // preceding-word check so creative briefs ("mixing in Dolby
-  // Atmos") are not falsely rejected. The `/g` flag iterates every
-  // occurrence because a brief can mix creative phrasing
-  // ("mixing in Dolby Atmos") with a later geographic cue
-  // ("producer in Antarctica"); only the geographic cue should
-  // fail-closed.
+  // "in <Location>" — case-insensitive. The detector iterates every
+  // occurrence (the `/g` flag) because a brief can mix a non-
+  // geographic `in <X>` (`mixing in Dolby Atmos`) with a later
+  // geographic cue (`producer in Antarctica`). Each captured object
+  // is checked against `CREATIVE_OBJECT_PHRASES`; only objects in
+  // that bounded allow-list are skipped. Any other object is treated
+  // as a potential location cue: a canonical LOCATION_PHRASES entry
+  // is honoured, and anything else fails closed.
   const inRegex = new RegExp(
     `\\bin\\s+(${LOCATION_WORD}(?:\\s+(?:of|${LOCATION_WORD}|St\\.))*(?:\\s+(?:de|la|el|los|las|du|le|von|van|di|del))?)(?=${LOCATION_CLAUSE_BOUNDARY.source})`,
     "gi",
   );
   let inMatch: RegExpExecArray | null;
   while ((inMatch = inRegex.exec(original)) !== null) {
-    if (isPrecededByCreativeVerb(original, inMatch.index)) continue;
     const token = inMatch[1]!.trim();
+    if (CREATIVE_OBJECT_PHRASES.has(token.toLowerCase())) continue;
     if (token.length >= 2 && !matchesKnownLocation(token)) {
       return token;
     }

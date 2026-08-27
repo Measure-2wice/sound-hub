@@ -447,3 +447,133 @@ test("deterministic fallback still resolves a lowercase canonical 'in <city>' cu
   assert.equal(criteria.required.basedIn?.countryCode, "US");
   assert.equal(criteria.required.basedIn?.city, "Brooklyn");
 });
+
+// --- P1-001 + P2-001 regression coverage (Codex re-review) ----------
+//
+// The previous fix skipped location detection whenever `in`
+// immediately followed one of six creative verbs. That
+// categorically ignored the object even when it was clearly
+// geographic (e.g. "recording in Antarctica"). It also left the
+// underlying ambiguity in place: nearly every `in <X>` was treated
+// as geography unless the immediately preceding word happened to be
+// on the six-word exemption list, so ordinary creative briefs like
+// "production in stereo" or "vocals in English" failed with
+// AiInvalidOutputError.
+//
+// The new detector anchors the disambiguation on the captured
+// OBJECT (a bounded allow-list of clearly non-geographic terms) and
+// treats every other `in <X>` as a potential location cue. The tests
+// below pin both directions:
+
+test("deterministic fallback fails closed on 'recording in <Explicit Geography>' (P1-001)", async () => {
+  // P1-001 reproduction: "I need an in-person recording in Antarctica."
+  // The previous creative-verb exemption silently dropped the
+  // Antarctica location because "recording" preceded "in". The
+  // detector must now examine the OBJECT — "Antarctica" is a clear
+  // geographic reference (a place name), not a creative term — and
+  // fail closed so the buyer can rephrase using a supported city.
+  let caught: unknown;
+  try {
+    await adapter.interpretBrief({
+      actingWorkspaceId: "ws-buyer-1",
+      briefText: "I need an in-person recording in Antarctica.",
+    });
+  } catch (err) {
+    caught = err;
+  }
+  assert.ok(caught instanceof Error);
+  assert.equal(caught.name, "AiInvalidOutputError");
+  assert.match(caught.message, /Antarctica/);
+});
+
+test("deterministic fallback fails closed on 'mixing in <Explicit Geography>' (P1-001 follow-up)", async () => {
+  // P1-001 follow-up: the same fail-closed invariant via the
+  // "mixing in" verb the previous fix exempted. "Antarctica" is
+  // still a place name; the detector must not let the verb exempt
+  // the geography.
+  let caught: unknown;
+  try {
+    await adapter.interpretBrief({
+      actingWorkspaceId: "ws-buyer-1",
+      briefText: "I need a mixing in Antarctica for a single.",
+    });
+  } catch (err) {
+    caught = err;
+  }
+  assert.ok(caught instanceof Error);
+  assert.equal(caught.name, "AiInvalidOutputError");
+  assert.match(caught.message, /Antarctica/);
+});
+
+test("deterministic fallback does not fail closed on 'production in stereo' (P2-001)", async () => {
+  // P2-001 reproduction: "Need production in stereo for a single".
+  // "stereo" is an audio format, not a place. The bounded
+  // CREATIVE_OBJECT_PHRASES allow-list lets the brief pass without
+  // surfacing MATCHMAKER_INVALID_REQUEST.
+  const criteria = await interpret("Need production in stereo for a single.");
+  assert.equal(criteria.required.basedIn, undefined);
+});
+
+test("deterministic fallback does not fail closed on 'vocals in English' (P2-001)", async () => {
+  // P2-001 reproduction: "Need vocals in English for a single".
+  // "English" is a language, not a place. The detector must NOT
+  // treat "in English" as a geographic cue.
+  const criteria = await interpret("Need vocals in English for a single.");
+  assert.equal(criteria.required.basedIn, undefined);
+});
+
+test("deterministic fallback does not fail closed on 'working in Pro Tools' (P2-001)", async () => {
+  // P2-001 reproduction: "Need a producer working in Pro Tools for
+  // a single". "Pro Tools" is DAW software, not a place. The
+  // detector must skip the object because it is in the bounded
+  // CREATIVE_OBJECT_PHRASES allow-list.
+  const criteria = await interpret("Need a producer working in Pro Tools for a single.");
+  assert.equal(criteria.required.basedIn, undefined);
+});
+
+test("deterministic fallback does not fail closed on 'experienced in Dolby Atmos' (P2-001)", async () => {
+  // P2-001 reproduction: "I need a producer experienced in Dolby
+  // Atmos." The detector must recognise "Dolby Atmos" as a
+  // technology, not a place, regardless of the verb preceding it.
+  const criteria = await interpret("I need a producer experienced in Dolby Atmos.");
+  assert.equal(criteria.required.basedIn, undefined);
+});
+
+test("deterministic fallback does not fail closed on 'specializing in Dolby Atmos' (P2-001)", async () => {
+  // P2-001 reproduction: "I need a producer specializing in Dolby
+  // Atmos." Same invariant as above via a different preceding verb.
+  const criteria = await interpret("I need a producer specializing in Dolby Atmos.");
+  assert.equal(criteria.required.basedIn, undefined);
+});
+
+test("deterministic fallback still fails closed on unknown explicit geography even when the verb is creative (P1-001 belt-and-suspenders)", async () => {
+  // P1-001 belt-and-suspenders: a creative verb followed by an
+  // explicit geographic name (Antarctica) must still fail closed.
+  // The disambiguation is anchored on the OBJECT, not the verb, so
+  // the previous "skip if preceded by a creative verb" exemption
+  // does not re-introduce silent relaxation.
+  let caught: unknown;
+  try {
+    await adapter.interpretBrief({
+      actingWorkspaceId: "ws-buyer-1",
+      briefText: "I need an in-person recording in Antarctica for a single.",
+    });
+  } catch (err) {
+    caught = err;
+  }
+  assert.ok(caught instanceof Error);
+  assert.equal(caught.name, "AiInvalidOutputError");
+  assert.match(caught.message, /Antarctica/);
+});
+
+test("deterministic fallback does not fail closed when a non-geographic in-object precedes a geographic in-object (P1-001 + P2-001 interaction)", async () => {
+  // Belt-and-suspenders for the interaction between P1-001 and
+  // P2-001: a brief that mixes creative/technical phrasing
+  // ("mixing in Dolby Atmos") with a later geographic cue
+  // ("producer in Brooklyn") must skip the first occurrence and
+  // honour the canonical location on the second.
+  const criteria = await interpret(
+    "I need a music producer for mixing in Dolby Atmos and a second producer in Brooklyn.",
+  );
+  assert.equal(criteria.required.basedIn?.city, "Brooklyn");
+});
