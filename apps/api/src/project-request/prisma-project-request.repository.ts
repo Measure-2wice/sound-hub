@@ -102,33 +102,6 @@ function toDealStatus(value: DbDealStatus): DealStatusV1 {
 // emit a safe 409 envelope.
 const P2034_RETRY_BUDGET = 3;
 
-// ---------- test barrier seam ----------
-//
-// `TransactionStageSynchronizer` is an optional awaitable that the
-// repository invokes immediately after the authoritative
-// authority / eligibility rows are FOR UPDATE-locked but BEFORE
-// the use case runs and BEFORE the INSERT / UPDATE commits.
-// Production NEVER supplies it; only disposable-PostgreSQL tests
-// that need to coordinate a second connection against the real
-// production transaction path install it on the EXACT repository
-// instance they want to instrument. The collaborator is held as
-// a private instance field, never as a process-global, so:
-//
-//   - two separately constructed `PrismaProjectRequestRepository`
-//     instances never observe one another's test instrumentation;
-//   - the application/domain `ProjectRequestRepository` interface
-//     has no awareness of the collaborator;
-//   - production construction supplies no collaborator and
-//     executes exactly as it did before the seam existed.
-//
-// This is intentionally a constructor-time collaborator, not a
-// general hook framework: there is no setter, no registry, and no
-// way to install the hook on a repository that has already been
-// constructed. The collaborator only exists to let the
-// PostgreSQL concurrency test deterministically overlap a
-// conflicting second connection.
-type TransactionStageSynchronizer = () => Promise<void> | void;
-
 // The safe typed failure reason a BG4 command returns after the
 // retry budget is exhausted. Routes collapse it onto the existing
 // safe envelope (PROJECT_REQUEST_OFFERING_INELIGIBLE for create,
@@ -208,14 +181,7 @@ async function runWithBoundedP2034Retry<TValue, TFailure>(
 }
 
 export class PrismaProjectRequestRepository implements ProjectRequestRepository {
-  private readonly stageSynchronizer: TransactionStageSynchronizer | undefined;
-
-  constructor(
-    private readonly prisma: PrismaClient,
-    stageSynchronizer?: TransactionStageSynchronizer,
-  ) {
-    this.stageSynchronizer = stageSynchronizer;
-  }
+  constructor(private readonly prisma: PrismaClient) {}
 
   // ---------- create ----------
 
@@ -234,12 +200,6 @@ export class PrismaProjectRequestRepository implements ProjectRequestRepository 
       return { ok: false, reason: envelope.outcome.failure };
     }
     return envelope.outcome.value;
-  }
-
-  private async runStageSynchronizer(): Promise<void> {
-    if (this.stageSynchronizer) {
-      await this.stageSynchronizer();
-    }
   }
 
   private async runCreateTransactionOnce(
@@ -265,12 +225,6 @@ export class PrismaProjectRequestRepository implements ProjectRequestRepository 
           // recommendation boundary is a buyer-safe provenance
           // check that the application policy owns.
           const briefRecommendations = await this.loadAndLockBriefRecommendations(tx, input);
-
-          // Test barrier seam: invoked after every authoritative
-          // FOR UPDATE-locked row has been acquired but BEFORE
-          // the use case runs and BEFORE the INSERT / UPDATE
-          // commits. Production never sets the hook.
-          await this.runStageSynchronizer();
 
           // Step 4: hand the snapshots to the application-owned
           // use case. The repository MUST NOT decide whether the
@@ -555,14 +509,6 @@ export class PrismaProjectRequestRepository implements ProjectRequestRepository 
             input,
             requestRow.sellerWorkspaceId,
           );
-
-          // Test barrier seam: invoked after every authoritative
-          // FOR UPDATE-locked row has been acquired (ProjectRequest
-          // + seller Workspace + seller WorkspaceMembership +
-          // seller WorkspaceCapability) but BEFORE the use case
-          // runs and BEFORE the guarded UPDATE / Deal create.
-          // Production never sets the hook.
-          await this.runStageSynchronizer();
 
           // Hand the snapshot to the application-owned use case.
           const projectRequest: PersistedProjectRequest = toPersisted(requestRow);
