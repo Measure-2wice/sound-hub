@@ -5,7 +5,7 @@
 // accept/decline, and the eligibility revalidation that protects
 // against stale selections (GS 16). The service threads:
 //   - authenticated human + acting Workspace authorization
-//   - the brief-recommendation boundary check (P1-001)
+//     (the policy decision — the application owns authorization)
 //   - eligibility revalidation of the selected ServiceOffering
 //     (workspace active + Seller capability + SellerProfile Published
 //     + ServiceOffering Active + ownership — i.e. the offering
@@ -15,13 +15,14 @@
 //   - atomic Deal creation on accept
 //
 // The service is the only layer that knows the domain rules. The
-// route layer translates the typed errors into the safe envelope;
-// the repository layer owns the SQL boundary. The service has NO
-// Prisma dependency — every read and write is delegated to the
-// repository contract (P1-003). The repository runs the brief-ownership,
-// brief-recommendation, offering-eligibility, and INSERT inside a
-// single `$transaction` (P1-002) so a concurrent mutation cannot
-// produce an ineligible Pending row.
+// route layer translates the typed errors into the safe envelope.
+// The repository layer owns persistence + transactions only — the
+// service makes the authorization policy decision BEFORE calling
+// the repository. The repository's transaction is the atomic guard
+// for the brief-ownership, brief-recommendation, and offering
+// eligibility facts, and the natural uniqueness constraint plus
+// guarded state transitions provide the retry-safety contract
+// required by ticket #62 (GS 26).
 
 import type {
   CreateProjectRequestRequestV1,
@@ -126,12 +127,18 @@ export class ProjectRequestService {
   async createProjectRequest(input: CreateProjectRequestInput): Promise<{
     readonly projectRequest: ProjectRequestPublicV1;
   }> {
-    // The repository owns the entire revalidation + INSERT
-    // pipeline, including the buyer Workspace / membership /
-    // capability check (P1-001). The service does NOT call
-    // authz.requireCapability up front: doing so would create a
-    // window between the upstream authorize and the repository
-    // INSERT where a concurrent revoke could slip through.
+    // The application owns the authorization policy. The service
+    // makes the upfront decision by calling the existing
+    // WorkspaceAuthorizationService, which the repository will
+    // re-check inside its atomic transaction as a second-layer
+    // guard. Both layers read the same source of truth so the
+    // policy decision is identical.
+    await this.authz.requireCapability({
+      userAccountId: input.userAccountId,
+      workspaceId: input.actingWorkspaceId,
+      requiredCapability: "Buyer",
+    });
+
     const result = await this.repository.createProjectRequestWithRevalidation({
       userAccountId: input.userAccountId,
       buyerWorkspaceId: input.actingWorkspaceId,
@@ -161,21 +168,22 @@ export class ProjectRequestService {
     // GS 17 — only the seller Workspace owning this request may
     // accept. The acting Workspace MUST match the persisted
     // sellerWorkspaceId; if it does not, fail closed before touching
-    // the row. The repository then revalidates current seller
-    // membership, capability, and Workspace status inside the same
-    // `$transaction` as the guarded Pending→Accepted transition
-    // (P1-002).
+    // the row. The application then revalidates current seller
+    // membership via WorkspaceAuthorizationService before the
+    // repository runs its atomic guarded transition.
     if (existing.sellerWorkspaceId !== input.actingWorkspaceId) {
       throw new ProjectRequestError(
         "You are not authorized to respond to this ProjectRequest.",
         "PROJECT_REQUEST_FORBIDDEN",
       );
     }
+    await this.authz.requireActingMembership({
+      userAccountId: input.userAccountId,
+      workspaceId: input.actingWorkspaceId,
+    });
 
     const result = await this.repository.acceptProjectRequest({
       projectRequestId: existing.id,
-      actingWorkspaceId: input.actingWorkspaceId,
-      userAccountId: input.userAccountId,
       sellerDecisionByUserId: input.userAccountId,
       now: this.now(),
     });
@@ -205,11 +213,13 @@ export class ProjectRequestService {
         "PROJECT_REQUEST_FORBIDDEN",
       );
     }
+    await this.authz.requireActingMembership({
+      userAccountId: input.userAccountId,
+      workspaceId: input.actingWorkspaceId,
+    });
 
     const result = await this.repository.declineProjectRequest({
       projectRequestId: existing.id,
-      actingWorkspaceId: input.actingWorkspaceId,
-      userAccountId: input.userAccountId,
       sellerDecisionByUserId: input.userAccountId,
       now: this.now(),
     });
@@ -275,11 +285,6 @@ export class ProjectRequestService {
     reason: CreateProjectRequestFailureReason,
   ): ProjectRequestError {
     switch (reason) {
-      case "BUYER_NOT_AUTHORIZED":
-        return new ProjectRequestError(
-          "You are not authorized to create this ProjectRequest.",
-          "PROJECT_REQUEST_FORBIDDEN",
-        );
       case "BRIEF_NOT_FOUND":
         return new ProjectRequestError(
           "ProjectBrief not found.",
@@ -305,16 +310,10 @@ export class ProjectRequestService {
   }
 
   private decideErrorToServiceError(
-    reason: "NOT_FOUND" | "ALREADY_RESPONDED" | "SELLER_NOT_AUTHORIZED",
+    reason: "NOT_FOUND" | "ALREADY_RESPONDED",
   ): ProjectRequestError {
     if (reason === "NOT_FOUND") {
       return new ProjectRequestError("ProjectRequest not found.", "PROJECT_REQUEST_NOT_FOUND");
-    }
-    if (reason === "SELLER_NOT_AUTHORIZED") {
-      return new ProjectRequestError(
-        "You are not authorized to respond to this ProjectRequest.",
-        "PROJECT_REQUEST_FORBIDDEN",
-      );
     }
     return new ProjectRequestError(
       "This ProjectRequest has already been responded to.",

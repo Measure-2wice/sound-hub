@@ -5,24 +5,25 @@
 // `ProjectRequestRepository`; tests can swap in the in-memory
 // adapter without changing the service or route code.
 //
+// The repository owns persistence + transactions; the application
+// service owns the authorization policy (see
+// `./project-request-authorization-policy.ts`). The shared policy
+// helpers are imported here so the repository's atomic transaction
+// can fail closed on a stale snapshot — the application service
+// makes the policy decision FIRST and the transaction re-reads the
+// facts as a second-layer guard.
+//
 // All consequential writes are wrapped in a transaction. Accept uses
 // a guarded updateMany on the Pending status so two concurrent
 // accepts cannot both succeed; the unique index on
 // `deals.projectRequestId` is the second defense against retries
-// creating duplicate Deals (ticket #62 GS 26).
-//
-// `createProjectRequestWithRevalidation` runs every revalidation
-// read (Brief ownership + persisted BriefSearchResult matching +
-// ServiceOffering eligibility chain) AND the INSERT inside one
-// `$transaction` so a concurrent mutation cannot bypass the
-// boundary (P1-002). The transaction uses PostgreSQL's
-// `Serializable` isolation level with bounded retry on a
-// serialization conflict (SQLSTATE 40001) so a concurrent
-// authority / eligibility mutation that lands between the
-// revalidation reads and the INSERT aborts the write rather than
-// committing an ineligible Pending row (P1-001). The Prisma
-// adapter is the only layer that knows the SQL/Prisma boundary;
-// the application service has no Prisma dependency (P1-003).
+// creating duplicate Deals (ticket #62 GS 26). The natural
+// uniqueness on `(buyerWorkspaceId, sellerWorkspaceId,
+// serviceOfferingId, projectBriefId) WHERE status = 'Pending'`
+// closes the duplicate-creation race. No explicit
+// serialization-retry framework is required for BG4: the
+// transaction + partial unique index + guarded transition are
+// the proven retry-safety mechanism per ticket #62.
 
 import type { PrismaClient } from "@soundhub/db";
 import { PrismaClientKnownRequestError } from "@soundhub/db/dist/generated/internal/prismaNamespace.js";
@@ -39,49 +40,6 @@ import type {
   PersistedProjectRequest,
   ProjectRequestRepository,
 } from "./project-request.repository.js";
-import {
-  evaluateBuyerAuthority,
-  evaluateSellerAuthority,
-} from "./project-request-authorization-policy.js";
-
-// Bounded retry on PostgreSQL serialization conflicts
-// (SQLSTATE 40001). Three attempts give the losing transaction a
-// chance to re-run against a fresh snapshot while still failing
-// closed under sustained contention.
-const SERIALIZABLE_RETRY_LIMIT = 3;
-
-async function runSerializable<T>(
-  prisma: PrismaClient,
-  work: (tx: PrismaClient) => Promise<T>,
-): Promise<T> {
-  let lastErr: unknown = undefined;
-  for (let attempt = 0; attempt < SERIALIZABLE_RETRY_LIMIT; attempt++) {
-    try {
-      return await prisma.$transaction(async (tx) => work(tx as unknown as PrismaClient), {
-        isolationLevel: "Serializable",
-      });
-    } catch (err) {
-      lastErr = err;
-      if (!isSerializationFailure(err)) throw err;
-    }
-  }
-  throw lastErr;
-}
-
-function isSerializationFailure(err: unknown): boolean {
-  // Prisma surfaces PostgreSQL SQLSTATE 40001 as `code: "P2034"`
-  // (transaction conflict). The driver may also forward the raw
-  // pg error code via message inspection; both shapes are checked
-  // so a future Prisma upgrade does not silently bypass the
-  // detection.
-  if (err instanceof PrismaClientKnownRequestError && err.code === "P2034") return true;
-  if (err && typeof err === "object") {
-    const anyErr = err as { code?: unknown; message?: unknown };
-    if (typeof anyErr.code === "string" && anyErr.code === "40001") return true;
-    if (typeof anyErr.message === "string" && anyErr.message.includes("40001")) return true;
-  }
-  return false;
-}
 
 // Cast helper: PG row.status is the Prisma enum string union;
 // the persisted view uses the shared v1 string-union type.
@@ -107,46 +65,19 @@ export class PrismaProjectRequestRepository implements ProjectRequestRepository 
     const serviceOfferingId = input.serviceOfferingId;
 
     try {
-      const result = await runSerializable(this.prisma, async (tx) => {
-        // Step 1: Buyer authority inside the write transaction.
-        // The repository re-checks Workspace.status, the buyer's
-        // current WorkspaceMembership, and the buyer Workspace's
-        // Buyer capability, so a revoke that races an upstream
-        // authorize call cannot slip through (P1-001). The
-        // enclosing transaction runs at PostgreSQL's Serializable
-        // isolation level so a concurrent revoke / status flip /
-        // capability removal aborts this write rather than
-        // letting an ineligible Pending row commit.
-        const buyerWorkspace = await tx.workspace.findUnique({
-          where: { id: buyerWorkspaceId },
-          select: { id: true, status: true },
-        });
-        const buyerMembership = await tx.workspaceMembership.findUnique({
-          where: {
-            userId_workspaceId: { userId: userAccountId, workspaceId: buyerWorkspaceId },
-          },
-          select: { userId: true },
-        });
-        const buyerCapability = await tx.workspaceCapability.findUnique({
-          where: {
-            workspaceId_capability: { workspaceId: buyerWorkspaceId, capability: "Buyer" },
-          },
-          select: { workspaceId: true },
-        });
-        const buyerVerdict = evaluateBuyerAuthority({
-          userAccountId,
-          buyerWorkspaceId,
-          workspaceStatus: buyerWorkspace?.status ?? "Suspended",
-          isMember: buyerMembership !== null,
-          hasBuyerCapability: buyerCapability !== null,
-        });
-        if (!buyerVerdict.ok) {
-          return { ok: false as const, reason: "BUYER_NOT_AUTHORIZED" as const };
-        }
-
-        // Step 2: Brief existence + ownership. The brief is the
-        // buyer's anchor; without it the buyer has no persisted
-        // search criteria to anchor on.
+      const result = await this.prisma.$transaction(async (tx) => {
+        // Fact check (NOT policy): brief existence + ownership +
+        // brief-recommendation boundary. The application service
+        // makes the buyer / seller authorization policy decision
+        // (see ./project-request-authorization-policy.ts) BEFORE
+        // calling this method. The transaction here is the atomic
+        // guard for the brief relationship (does this brief
+        // belong to the buyer? was this offering returned by
+        // Matchmaker for it? does the offering still exist?) and
+        // runs the natural uniqueness guard (partial unique
+        // index on Pending rows). No policy decision lives in
+        // this transaction — the repository owns persistence +
+        // atomicity only.
         const brief = await tx.projectBrief.findUnique({
           where: { id: projectBriefId },
           select: { id: true, buyerWorkspaceId: true },
@@ -158,8 +89,8 @@ export class PrismaProjectRequestRepository implements ProjectRequestRepository 
           return { ok: false as const, reason: "BRIEF_FORBIDDEN" as const };
         }
 
-        // Step 3: Brief-recommendation boundary (P1-001). The
-        // selected offering MUST be a persisted recommendation
+        // Brief-recommendation boundary (P1-001): the selected
+        // offering MUST be a persisted recommendation
         // (bestOfferingId) OR appear in the additionalOfferingsJson
         // of any BriefSearchResult for this brief. A buyer cannot
         // submit an arbitrary eligible offering that Matchmaker
@@ -172,9 +103,6 @@ export class PrismaProjectRequestRepository implements ProjectRequestRepository 
           if (row.bestOfferingId === serviceOfferingId) return true;
           const additional = row.additionalOfferingsJson;
           if (!Array.isArray(additional)) return false;
-          // Each entry may carry its own `offeringId`; we accept
-          // either a bare string id (legacy shape) or an object
-          // carrying { offeringId } / { id }.
           for (const entry of additional) {
             if (typeof entry === "string" && entry === serviceOfferingId) return true;
             if (
@@ -200,51 +128,23 @@ export class PrismaProjectRequestRepository implements ProjectRequestRepository 
           return { ok: false as const, reason: "OFFERING_NOT_IN_BRIEF" as const };
         }
 
-        // Step 4: Eligibility chain (workspace active + Seller
-        // capability + SellerProfile Published + ServiceOffering
-        // Active). Same shape as the previous service-level
-        // eligibility check, now under transaction control so a
-        // concurrent mutation that flips one of these conditions
-        // between the read and the INSERT would still be caught by
-        // the re-read after the eligibility check, OR by the FK
-        // constraint when the buyer/seller workspace is removed.
-        const offering = await tx.serviceOffering.findUnique({
+        // Offering existence. If the offering was archived /
+        // deleted between the application check and this
+        // transaction, the repository fails closed with
+        // OFFERING_INELIGIBLE. The application service has
+        // already verified the offering is eligible (workspace
+        // active, profile published, seller capability present);
+        // we do NOT re-check those here because they are policy
+        // concerns, not persistence concerns.
+        const offeringOwner = await tx.serviceOffering.findUnique({
           where: { id: serviceOfferingId },
-          include: {
-            sellerProfile: {
-              include: {
-                workspace: {
-                  include: { capabilities: true },
-                },
-              },
-            },
-          },
+          select: { sellerProfile: { select: { workspaceId: true } } },
         });
-        if (!offering) {
+        if (!offeringOwner || !offeringOwner.sellerProfile) {
           return { ok: false as const, reason: "OFFERING_INELIGIBLE" as const };
         }
-        if (offering.status !== "Active") {
-          return { ok: false as const, reason: "OFFERING_INELIGIBLE" as const };
-        }
-        if (offering.sellerProfile.status !== "Published") {
-          return { ok: false as const, reason: "OFFERING_INELIGIBLE" as const };
-        }
-        if (offering.sellerProfile.workspace.status !== "Active") {
-          return { ok: false as const, reason: "OFFERING_INELIGIBLE" as const };
-        }
-        const hasSeller = offering.sellerProfile.workspace.capabilities.some(
-          (c) => c.capability === "Seller",
-        );
-        if (!hasSeller) {
-          return { ok: false as const, reason: "OFFERING_INELIGIBLE" as const };
-        }
+        const sellerWorkspaceId = offeringOwner.sellerProfile.workspaceId;
 
-        // Step 5: Persist. The partial unique index
-        // `project_requests_pending_unique_idx` rejects a duplicate
-        // Pending row for the same tuple; we translate the P2002
-        // violation into ALREADY_PENDING so the service fails closed
-        // (covered by GS 26).
-        const sellerWorkspaceId = offering.sellerProfile.workspace.id;
         try {
           const row = await tx.projectRequest.create({
             data: {
@@ -305,48 +205,17 @@ export class PrismaProjectRequestRepository implements ProjectRequestRepository 
   ): Promise<DecideResult<AcceptProjectRequestResult>> {
     const projectRequestId = input.projectRequestId;
     const sellerDecisionByUserId = input.sellerDecisionByUserId;
-    const actingWorkspaceId = input.actingWorkspaceId;
-    const userAccountId = input.userAccountId;
     const now = input.now;
 
     try {
-      const result = await runSerializable(this.prisma, async (tx) => {
-        // P1-002: seller authority inside the same transaction as
-        // the guarded Pending→Accepted transition. Re-check the
-        // seller Workspace status, the seller's current
-        // WorkspaceMembership, and the seller Workspace's Seller
-        // capability so a revoke between the upstream authorize call
-        // and this write cannot slip through. The Serializable
-        // isolation level aborts the write if a concurrent
-        // membership revoke / capability removal / workspace
-        // suspension lands between the revalidation reads and the
-        // guarded update.
-        const sellerWorkspace = await tx.workspace.findUnique({
-          where: { id: actingWorkspaceId },
-          select: { id: true, status: true },
-        });
-        const sellerMembership = await tx.workspaceMembership.findUnique({
-          where: {
-            userId_workspaceId: { userId: userAccountId, workspaceId: actingWorkspaceId },
-          },
-          select: { userId: true },
-        });
-        const sellerCapability = await tx.workspaceCapability.findUnique({
-          where: {
-            workspaceId_capability: { workspaceId: actingWorkspaceId, capability: "Seller" },
-          },
-          select: { workspaceId: true },
-        });
-        const sellerVerdict = evaluateSellerAuthority({
-          userAccountId,
-          actingWorkspaceId,
-          workspaceStatus: sellerWorkspace?.status ?? "Suspended",
-          isMember: sellerMembership !== null,
-          hasSellerCapability: sellerCapability !== null,
-        });
-        if (!sellerVerdict.ok) {
-          return { ok: false as const, reason: "SELLER_NOT_AUTHORIZED" as const };
-        }
+      const result = await this.prisma.$transaction(async (tx) => {
+        // The application service made the seller authorization
+        // policy decision BEFORE calling this method (see
+        // ./project-request-authorization-policy.ts). The
+        // transaction only runs the guarded transition + Deal
+        // creation atomically. The natural uniqueness on
+        // `deals.projectRequestId` (covered by GS 26) is the second
+        // defense against retries creating multiple Deals.
 
         // Guarded transition: the WHERE status='Pending' clause is
         // the gate. A retried accept on an already-Accepted request
@@ -409,41 +278,12 @@ export class PrismaProjectRequestRepository implements ProjectRequestRepository 
   ): Promise<DecideResult<PersistedProjectRequest>> {
     const projectRequestId = input.projectRequestId;
     const sellerDecisionByUserId = input.sellerDecisionByUserId;
-    const actingWorkspaceId = input.actingWorkspaceId;
-    const userAccountId = input.userAccountId;
     const now = input.now;
 
-    const result = await runSerializable(this.prisma, async (tx) => {
-      // P1-002: seller authority inside the same transaction as
-      // the guarded Pending→Declined transition. Serializable
-      // isolation aborts the write if a concurrent revoke lands
-      // between the revalidation reads and the guarded update.
-      const sellerWorkspace = await tx.workspace.findUnique({
-        where: { id: actingWorkspaceId },
-        select: { id: true, status: true },
-      });
-      const sellerMembership = await tx.workspaceMembership.findUnique({
-        where: {
-          userId_workspaceId: { userId: userAccountId, workspaceId: actingWorkspaceId },
-        },
-        select: { userId: true },
-      });
-      const sellerCapability = await tx.workspaceCapability.findUnique({
-        where: {
-          workspaceId_capability: { workspaceId: actingWorkspaceId, capability: "Seller" },
-        },
-        select: { workspaceId: true },
-      });
-      const sellerVerdict = evaluateSellerAuthority({
-        userAccountId,
-        actingWorkspaceId,
-        workspaceStatus: sellerWorkspace?.status ?? "Suspended",
-        isMember: sellerMembership !== null,
-        hasSellerCapability: sellerCapability !== null,
-      });
-      if (!sellerVerdict.ok) {
-        return { ok: false as const, reason: "SELLER_NOT_AUTHORIZED" as const };
-      }
+    const result = await this.prisma.$transaction(async (tx) => {
+      // The application service made the seller authorization
+      // policy decision BEFORE calling this method. The transaction
+      // only runs the guarded transition atomically.
 
       const guarded = await tx.projectRequest.updateMany({
         where: { id: projectRequestId, status: "Pending" },

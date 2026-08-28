@@ -105,33 +105,14 @@ function buildFixture(): Fixture {
   const authz = new WorkspaceAuthorizationService({ authRepository: authRepo });
 
   const projectRequestRepo = new InMemoryProjectRequestRepository();
-  // P1-001 / P1-003: the repository's createProjectRequestWithRevalidation
-  // owns the buyer-authority check. Seed the buyer / other-buyer
-  // Workspace authorization snapshots so the in-memory adapter can
-  // answer the same question the Prisma adapter answers from the live
-  // Workspace / WorkspaceMembership / WorkspaceCapability rows.
-  projectRequestRepo.seedBuyerAuthorization({
-    workspaceId: BUYER_WORKSPACE_ID,
-    status: "Active",
-    memberIds: [BUYER_USER_ID],
-    capabilities: ["Buyer"],
-  });
-  projectRequestRepo.seedBuyerAuthorization({
-    workspaceId: OTHER_BUYER_WORKSPACE_ID,
-    status: "Active",
-    memberIds: [OTHER_BUYER_USER_ID],
-    capabilities: ["Buyer"],
-  });
-  // P1-002: the repository's acceptProjectRequest / declineProjectRequest
-  // owns the seller-authority check. Seed the seller Workspace
-  // authorization snapshot.
-  projectRequestRepo.seedSellerAuthorization({
-    workspaceId: SELLER_WORKSPACE_ID,
-    status: "Active",
-    memberIds: [SELLER_USER_ID],
-    capabilities: ["Seller"],
-  });
-  // Seed the brief → recommendation mapping for P1-001 enforcement.
+  // The application service owns the buyer / seller authorization
+  // policy decision (see ./project-request-authorization-policy.ts
+  // and the WorkspaceAuthorizationService seeded above). The
+  // repository only persists + enforces atomic guards; we seed the
+  // brief → recommendation mapping + the eligibility snapshot so
+  // the in-memory adapter answers the same way the Prisma adapter
+  // answers from the live Workspace / ProjectBrief /
+  // ServiceOffering / SellerProfile rows.
   // BRIEF_ID surfaces OFFERING_ID, OFFERING_OTHER_SELLER_ID,
   // OFFERING_INELIGIBLE_ID; OFFERING_NOT_IN_BRIEF_ID is NOT a
   // recommendation, so submitting it must fail with
@@ -222,9 +203,10 @@ test("createProjectRequest persists a Pending request owned by the buyer Workspa
 test("createProjectRequest rejects a non-Buyer actor with PROJECT_REQUEST_FORBIDDEN", async () => {
   const { projectRequestService } = buildFixture();
   // The seller user is NOT a member of the buyer Workspace, so the
-  // repository's P1-001 buyer-authority check inside the write
-  // transaction fails closed with BUYER_NOT_AUTHORIZED. The route
-  // collapses the typed ProjectRequestError to a safe envelope.
+  // application service's upfront
+  // WorkspaceAuthorizationService.requireCapability fails closed
+  // with NOT_A_MEMBER. The route layer translates this to a safe
+  // envelope.
   await assert.rejects(
     projectRequestService.createProjectRequest({
       userAccountId: SELLER_USER_ID,
@@ -235,8 +217,8 @@ test("createProjectRequest rejects a non-Buyer actor with PROJECT_REQUEST_FORBID
     (err: unknown) => {
       return (
         err instanceof Error &&
-        err.name === "ProjectRequestError" &&
-        (err as { code?: string }).code === "PROJECT_REQUEST_FORBIDDEN"
+        err.name === "AuthorizationError" &&
+        (err as { code?: string }).code === "NOT_A_MEMBER"
       );
     },
   );
@@ -381,8 +363,10 @@ test("acceptProjectRequest rejects a buyer Workspace member (only the seller sid
     serviceOfferingId: OFFERING_ID,
   });
   // The buyer user is not a member of the seller Workspace, so the
-  // repository's P1-002 seller-authority check inside the decision
-  // transaction fails closed with SELLER_NOT_AUTHORIZED.
+  // application service's upfront
+  // WorkspaceAuthorizationService.requireActingMembership fails
+  // closed with NOT_A_MEMBER. The route layer translates this to
+  // PROJECT_REQUEST_FORBIDDEN.
   await assert.rejects(
     projectRequestService.acceptProjectRequest({
       userAccountId: BUYER_USER_ID,
@@ -392,8 +376,8 @@ test("acceptProjectRequest rejects a buyer Workspace member (only the seller sid
     (err: unknown) => {
       return (
         err instanceof Error &&
-        err.name === "ProjectRequestError" &&
-        (err as { code?: string }).code === "PROJECT_REQUEST_FORBIDDEN"
+        err.name === "AuthorizationError" &&
+        (err as { code?: string }).code === "NOT_A_MEMBER"
       );
     },
   );

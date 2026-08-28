@@ -6,18 +6,21 @@
 // Prisma adapter is the canonical implementation; this is for unit
 // tests only.
 //
-// The adapter enforces the same semantic guards as the Prisma adapter:
+// The application service owns the buyer / seller authorization
+// policy decision (see ./project-request-authorization-policy.ts).
+// The in-memory adapter mirrors the Prisma adapter's persistence
+// + atomic guards:
 //
-//   - createProjectRequestWithRevalidation enforces buyer authority
-//     (P1-001), brief-ownership, brief-recommendation, and
-//     offering-eligibility boundaries in one logical operation.
-//     Test fixtures seed `seedBuyerAuthorization` /
-//     `seedOfferingEligibility` / `seedBrief` so the adapter can
-//     answer the relevant checks without a database.
+//   - createProjectRequestWithRevalidation enforces brief-ownership,
+//     brief-recommendation (P1-001), and offering-eligibility in
+//     one logical operation. Test fixtures seed `seedBrief` /
+//     `seedOfferingEligibility` so the adapter can answer the
+//     relevant checks without a database.
 //   - acceptProjectRequest / declineProjectRequest atomically
 //     transition Pending→Accepted/Declined via guarded semantics
-//     and revalidate seller authority inside the same operation
-//     (P1-002).
+//     with the natural uniqueness invariant on
+//     `deals.projectRequestId` (covered by GS 26) as the second
+//     defense against retries creating multiple Deals.
 
 import { randomUUID } from "node:crypto";
 import type {
@@ -32,10 +35,6 @@ import type {
   ProjectRequestRepository,
 } from "./project-request.repository.js";
 import type { ProjectRequestStatusV1 } from "@soundhub/types";
-import {
-  evaluateBuyerAuthority,
-  evaluateSellerAuthority,
-} from "./project-request-authorization-policy.js";
 
 export interface OfferingEligibilityInput {
   readonly id: string;
@@ -44,12 +43,6 @@ export interface OfferingEligibilityInput {
   readonly workspaceStatus: "Active" | "Suspended";
   readonly workspaceHasSellerCapability: boolean;
   readonly profileStatus: "Draft" | "Published" | "Suspended";
-}
-
-interface BuyerAuthorizationSnapshot {
-  readonly status: "Active" | "Suspended";
-  readonly members: Set<string>;
-  readonly capabilities: Set<"Buyer" | "Seller">;
 }
 
 export class InMemoryProjectRequestRepository implements ProjectRequestRepository {
@@ -61,10 +54,6 @@ export class InMemoryProjectRequestRepository implements ProjectRequestRepositor
   private readonly briefOwnership = new Map<string, string>();
   /** Offering id → eligibility snapshot. */
   private readonly offeringEligibility = new Map<string, OfferingEligibilityInput>();
-  /** workspaceId → buyer authority snapshot. */
-  private readonly buyerAuthorizations = new Map<string, BuyerAuthorizationSnapshot>();
-  /** projectRequestId → seller authority snapshot. */
-  private readonly sellerAuthorizations = new Map<string, BuyerAuthorizationSnapshot>();
 
   /** Test seam: register a brief's ownership + persisted recommendations. */
   seedBrief(input: {
@@ -81,63 +70,10 @@ export class InMemoryProjectRequestRepository implements ProjectRequestRepositor
     this.offeringEligibility.set(input.id, input);
   }
 
-  /**
-   * Test seam: register the buyer Workspace's current authority
-   * snapshot (status + members + capabilities). The repository's
-   * P1-001 buyer-authority check uses this map exactly the way the
-   * Prisma adapter uses the live WorkspaceMembership +
-   * WorkspaceCapability rows.
-   */
-  seedBuyerAuthorization(input: {
-    readonly workspaceId: string;
-    readonly status: "Active" | "Suspended";
-    readonly memberIds: readonly string[];
-    readonly capabilities: readonly ("Buyer" | "Seller")[];
-  }): void {
-    this.buyerAuthorizations.set(input.workspaceId, {
-      status: input.status,
-      members: new Set(input.memberIds),
-      capabilities: new Set(input.capabilities),
-    });
-  }
-
-  /**
-   * Test seam: register the seller Workspace's current authority
-   * snapshot for the seller-side decision checks (P1-002).
-   */
-  seedSellerAuthorization(input: {
-    readonly workspaceId: string;
-    readonly status: "Active" | "Suspended";
-    readonly memberIds: readonly string[];
-    readonly capabilities: readonly ("Buyer" | "Seller")[];
-  }): void {
-    this.sellerAuthorizations.set(input.workspaceId, {
-      status: input.status,
-      members: new Set(input.memberIds),
-      capabilities: new Set(input.capabilities),
-    });
-  }
-
   async createProjectRequestWithRevalidation(
     input: CreateProjectRequestRevalidatedInput,
   ): Promise<CreateProjectRequestResult> {
-    // Step 1: Buyer authority (P1-001). The repository consumes the
-    // application-owned authorization policy via the shared helper
-    // (P1-003). The snapshot is built from the seeded maps so a new
-    // adapter cannot redefine authority semantics.
-    const buyerAuth = this.buyerAuthorizations.get(input.buyerWorkspaceId);
-    const buyerVerdict = evaluateBuyerAuthority({
-      userAccountId: input.userAccountId,
-      buyerWorkspaceId: input.buyerWorkspaceId,
-      workspaceStatus: buyerAuth?.status ?? "Suspended",
-      isMember: buyerAuth?.members.has(input.userAccountId) ?? false,
-      hasBuyerCapability: buyerAuth?.capabilities.has("Buyer") ?? false,
-    });
-    if (!buyerVerdict.ok) {
-      return { ok: false, reason: "BUYER_NOT_AUTHORIZED" };
-    }
-
-    // Step 2: Brief existence + ownership.
+    // Step 1: Brief existence + ownership.
     const buyerWorkspaceId = this.briefOwnership.get(input.projectBriefId);
     if (!buyerWorkspaceId) {
       return { ok: false, reason: "BRIEF_NOT_FOUND" };
@@ -146,13 +82,19 @@ export class InMemoryProjectRequestRepository implements ProjectRequestRepositor
       return { ok: false, reason: "BRIEF_FORBIDDEN" };
     }
 
-    // Step 3: Brief-recommendation boundary (P1-001).
+    // Step 2: Brief-recommendation boundary (P1-001). The selected
+    // offering MUST be a persisted recommendation for this brief.
     const recommendations = this.briefRecommendations.get(input.projectBriefId);
     if (!recommendations || !recommendations.has(input.serviceOfferingId)) {
       return { ok: false, reason: "OFFERING_NOT_IN_BRIEF" };
     }
 
-    // Step 4: Offering eligibility chain.
+    // Step 3: Offering eligibility chain. The application service
+    // has already verified the buyer / seller authorization. The
+    // repository still re-reads the offering's current state so
+    // a stale snapshot (e.g. an offering that was archived
+    // between the service check and the repository call) fails
+    // closed via the OFFERING_INELIGIBLE reason.
     const offering = this.offeringEligibility.get(input.serviceOfferingId);
     if (!offering) {
       return { ok: false, reason: "OFFERING_INELIGIBLE" };
@@ -170,7 +112,10 @@ export class InMemoryProjectRequestRepository implements ProjectRequestRepositor
       return { ok: false, reason: "OFFERING_INELIGIBLE" };
     }
 
-    // Step 5: Persist with Pending duplicate guard.
+    // Step 4: Persist with Pending duplicate guard. The in-memory
+    // adapter mirrors the Prisma adapter's natural uniqueness
+    // invariant (a Pending row per tuple) so the service can
+    // rely on the same ALREADY_PENDING semantic.
     for (const existing of this.requests.values()) {
       if (
         existing.status === "Pending" &&
@@ -220,20 +165,13 @@ export class InMemoryProjectRequestRepository implements ProjectRequestRepositor
   async acceptProjectRequest(
     input: AcceptProjectRequestInput,
   ): Promise<DecideResult<AcceptProjectRequestResult>> {
-    // P1-002: revalidate the seller Workspace authority inside the
-    // same operation as the guarded Pending→Accepted transition via
-    // the shared application policy (P1-003).
-    const sellerAuth = this.sellerAuthorizations.get(input.actingWorkspaceId);
-    const sellerVerdict = evaluateSellerAuthority({
-      userAccountId: input.userAccountId,
-      actingWorkspaceId: input.actingWorkspaceId,
-      workspaceStatus: sellerAuth?.status ?? "Suspended",
-      isMember: sellerAuth?.members.has(input.userAccountId) ?? false,
-      hasSellerCapability: sellerAuth?.capabilities.has("Seller") ?? false,
-    });
-    if (!sellerVerdict.ok) {
-      return Promise.resolve({ ok: false, reason: "SELLER_NOT_AUTHORIZED" });
-    }
+    // The application service made the seller authorization policy
+    // decision BEFORE calling this method (see
+    // ./project-request-authorization-policy.ts). The repository
+    // only runs the guarded Pending→Accepted transition +
+    // Deal creation atomically. The natural uniqueness on
+    // `deals.projectRequestId` (covered by GS 26) is the second
+    // defense against retries creating multiple Deals.
 
     const existing = this.requests.get(input.projectRequestId);
     if (!existing) return Promise.resolve({ ok: false, reason: "NOT_FOUND" });
@@ -274,20 +212,9 @@ export class InMemoryProjectRequestRepository implements ProjectRequestRepositor
   async declineProjectRequest(
     input: DeclineProjectRequestInput,
   ): Promise<DecideResult<PersistedProjectRequest>> {
-    // P1-002: revalidate the seller Workspace authority inside the
-    // same operation as the guarded Pending→Declined transition via
-    // the shared application policy (P1-003).
-    const sellerAuth = this.sellerAuthorizations.get(input.actingWorkspaceId);
-    const sellerVerdict = evaluateSellerAuthority({
-      userAccountId: input.userAccountId,
-      actingWorkspaceId: input.actingWorkspaceId,
-      workspaceStatus: sellerAuth?.status ?? "Suspended",
-      isMember: sellerAuth?.members.has(input.userAccountId) ?? false,
-      hasSellerCapability: sellerAuth?.capabilities.has("Seller") ?? false,
-    });
-    if (!sellerVerdict.ok) {
-      return Promise.resolve({ ok: false, reason: "SELLER_NOT_AUTHORIZED" });
-    }
+    // The application service made the seller authorization policy
+    // decision BEFORE calling this method. The repository only runs
+    // the guarded Pending→Declined transition atomically.
 
     const existing = this.requests.get(input.projectRequestId);
     if (!existing) return Promise.resolve({ ok: false, reason: "NOT_FOUND" });

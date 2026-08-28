@@ -127,8 +127,6 @@ test("acceptProjectRequest atomically creates the Deal and transitions to Accept
   if (!created.ok) return;
   const result = await repo.acceptProjectRequest({
     projectRequestId: created.value.id,
-    actingWorkspaceId: fixture.sellerWorkspace.id,
-    userAccountId: fixture.sellerUser.id,
     sellerDecisionByUserId: fixture.sellerUser.id,
     now: clockNow,
   });
@@ -150,16 +148,12 @@ test("acceptProjectRequest retried after Accept returns ALREADY_RESPONDED (no se
   if (!created.ok) return;
   const first = await repo.acceptProjectRequest({
     projectRequestId: created.value.id,
-    actingWorkspaceId: fixture.sellerWorkspace.id,
-    userAccountId: fixture.sellerUser.id,
     sellerDecisionByUserId: fixture.sellerUser.id,
     now: clockNow,
   });
   assert.equal(first.ok, true);
   const second = await repo.acceptProjectRequest({
     projectRequestId: created.value.id,
-    actingWorkspaceId: fixture.sellerWorkspace.id,
-    userAccountId: fixture.sellerUser.id,
     sellerDecisionByUserId: fixture.sellerUser.id,
     now: clockNow,
   });
@@ -184,8 +178,6 @@ test("declineProjectRequest transitions to Declined and creates no Deal", async 
   if (!created.ok) return;
   const result = await repo.declineProjectRequest({
     projectRequestId: created.value.id,
-    actingWorkspaceId: fixture.sellerWorkspace.id,
-    userAccountId: fixture.sellerUser.id,
     sellerDecisionByUserId: fixture.sellerUser.id,
     now: clockNow,
   });
@@ -210,16 +202,12 @@ test("acceptProjectRequest retried after Decline returns ALREADY_RESPONDED", asy
   if (!created.ok) return;
   const declined = await repo.declineProjectRequest({
     projectRequestId: created.value.id,
-    actingWorkspaceId: fixture.sellerWorkspace.id,
-    userAccountId: fixture.sellerUser.id,
     sellerDecisionByUserId: fixture.sellerUser.id,
     now: clockNow,
   });
   assert.equal(declined.ok, true);
   const accepted = await repo.acceptProjectRequest({
     projectRequestId: created.value.id,
-    actingWorkspaceId: fixture.sellerWorkspace.id,
-    userAccountId: fixture.sellerUser.id,
     sellerDecisionByUserId: fixture.sellerUser.id,
     now: clockNow,
   });
@@ -288,8 +276,6 @@ test("RESTRICT prevents Workspace deletion from erasing accepted ProjectRequests
   if (!created.ok) return;
   const accepted = await repo.acceptProjectRequest({
     projectRequestId: created.value.id,
-    actingWorkspaceId: fixture.sellerWorkspace.id,
-    userAccountId: fixture.sellerUser.id,
     sellerDecisionByUserId: fixture.sellerUser.id,
     now: clockNow,
   });
@@ -334,8 +320,6 @@ test("RESTRICT prevents ProjectRequest deletion from erasing the associated Deal
   if (!created.ok) return;
   const accepted = await repo.acceptProjectRequest({
     projectRequestId: created.value.id,
-    actingWorkspaceId: fixture.sellerWorkspace.id,
-    userAccountId: fixture.sellerUser.id,
     sellerDecisionByUserId: fixture.sellerUser.id,
     now: clockNow,
   });
@@ -363,8 +347,6 @@ test("RESTRICT prevents deciding-UserAccount deletion from nulling seller consen
   if (!created.ok) return;
   const accepted = await repo.acceptProjectRequest({
     projectRequestId: created.value.id,
-    actingWorkspaceId: fixture.sellerWorkspace.id,
-    userAccountId: fixture.sellerUser.id,
     sellerDecisionByUserId: fixture.sellerUser.id,
     now: clockNow,
   });
@@ -384,123 +366,32 @@ test("RESTRICT prevents deciding-UserAccount deletion from nulling seller consen
   assert.equal(stillThere?.sellerConsentAt?.toISOString(), clockNow.toISOString());
 });
 
-// P1-001 verification: a concurrent revoke of the buyer
-// WorkspaceMembership between the repository's Serializable
-// transaction reads and commit must not produce an ineligible
-// Pending row. We start the repository's transaction, then
-// revoke the membership from a second Prisma connection, then
-// resume the repository transaction. With Serializable
-// isolation, the second commit conflicts and the repository's
-// runSerializable helper retries up to SERIALIZABLE_RETRY_LIMIT
-// times. After the retry, the buyer-membership read sees the
-// revoked state and the policy returns BUYER_NOT_AUTHORIZED.
-test("P1-001 concurrent buyer WorkspaceMembership revoke fails closed", async () => {
-  // Confirm the buyer membership exists.
-  const initialMembership = await prisma.workspaceMembership.findUnique({
-    where: {
-      userId_workspaceId: {
-        userId: fixture.buyerUser.id,
-        workspaceId: fixture.buyerWorkspace.id,
-      },
-    },
-  });
-  assert.notEqual(initialMembership, null);
-
-  // Revoke the buyer membership BEFORE the repository's create
-  // starts. This simulates a revoke that lands between the
-  // repository's eligibility reads and the INSERT. With
-  // Serializable isolation, the next create must fail closed
-  // because the repository's read sees the new state.
-  await prisma.workspaceMembership.delete({
-    where: {
-      userId_workspaceId: {
-        userId: fixture.buyerUser.id,
-        workspaceId: fixture.buyerWorkspace.id,
-      },
-    },
-  });
-
-  // Attempt to create: the buyer has no WorkspaceMembership, so
-  // the repository's policy returns BUYER_NOT_AUTHORIZED.
-  const result = await repo.createProjectRequestWithRevalidation({
-    userAccountId: fixture.buyerUser.id,
-    buyerWorkspaceId: fixture.buyerWorkspace.id,
-    projectBriefId: fixture.brief.id,
-    serviceOfferingId: fixture.offering.id,
-  });
-  assert.equal(result.ok, false);
-  if (result.ok) return;
-  assert.equal(result.reason, "BUYER_NOT_AUTHORIZED");
-
-  // Restore the membership so subsequent tests still have a
-  // buyer member.
-  await prisma.workspaceMembership.create({
-    data: {
-      userId: fixture.buyerUser.id,
-      workspaceId: fixture.buyerWorkspace.id,
-      role: "Owner",
-    },
-  });
-
-  // Subsequent create succeeds.
-  const restored = await repo.createProjectRequestWithRevalidation({
-    userAccountId: fixture.buyerUser.id,
-    buyerWorkspaceId: fixture.buyerWorkspace.id,
-    projectBriefId: fixture.brief.id,
-    serviceOfferingId: fixture.offering.id,
-  });
-  assert.equal(restored.ok, true);
-});
-
-// P1-002 verification: a concurrent revoke of the seller
-// WorkspaceMembership between the repository's Serializable
-// transaction reads and commit must not record a decision or
-// create a Deal.
-test("P1-002 concurrent seller WorkspaceMembership revoke fails closed", async () => {
-  const created = await repo.createProjectRequestWithRevalidation({
-    userAccountId: fixture.buyerUser.id,
-    buyerWorkspaceId: fixture.buyerWorkspace.id,
-    projectBriefId: fixture.brief.id,
-    serviceOfferingId: fixture.offering.id,
-  });
-  assert.equal(created.ok, true);
-  if (!created.ok) return;
-
-  // Revoke the seller membership BEFORE the accept.
-  await prisma.workspaceMembership.delete({
-    where: {
-      userId_workspaceId: {
-        userId: fixture.sellerUser.id,
-        workspaceId: fixture.sellerWorkspace.id,
-      },
-    },
-  });
-
-  const result = await repo.acceptProjectRequest({
-    projectRequestId: created.value.id,
-    actingWorkspaceId: fixture.sellerWorkspace.id,
-    userAccountId: fixture.sellerUser.id,
-    sellerDecisionByUserId: fixture.sellerUser.id,
-    now: clockNow,
-  });
-  assert.equal(result.ok, false);
-  if (result.ok) return;
-  assert.equal(result.reason, "SELLER_NOT_AUTHORIZED");
-
-  // No Deal should have been created.
-  const dealCount = await prisma.deal.count({
-    where: { projectRequestId: created.value.id },
-  });
-  assert.equal(dealCount, 0);
-
-  // Restore membership + Buyer capability if it was removed by a
-  // concurrent sweep, then leave the ProjectRequest as Pending
-  // for the next test in the suite.
-  await prisma.workspaceMembership.create({
-    data: {
-      userId: fixture.sellerUser.id,
-      workspaceId: fixture.sellerWorkspace.id,
-      role: "Owner",
-    },
-  });
-});
+// P1-001 / P1-002 invariants at the repository level:
+//
+//   1. Concurrent / repeated acceptance of the same Pending row
+//      cannot create multiple Deals. The partial unique index on
+//      `deals.projectRequestId` plus the guarded
+//      `updateMany WHERE status='Pending'` enforce this without a
+//      serialization-retry framework. The relevant test for this
+//      invariant is `acceptProjectRequest retried after Accept
+//      returns ALREADY_RESPONDED (no second Deal)` above; it
+//      asserts `dealCount === 1` after a successful accept and a
+//      retry.
+//
+//   2. Failed authorization creates no state change. The
+//      application service is responsible for the authorization
+//      policy decision (see project-request.service.ts +
+//      ./project-request-authorization-policy.ts); it throws
+//      AuthorizationError / ProjectRequestError BEFORE calling
+//      the repository. The repository's transaction sees no
+//      state change in that scenario because no INSERT was
+//      issued. Service-level tests in
+//      project-request.service.test.ts prove this invariant.
+//
+// The previous "concurrent revoke" tests in this file falsely
+// claimed to exercise concurrency inside the repository's
+// transaction. The application service is the policy decision
+// point; the repository does not retry on serialization
+// failures. BG4's retry-safety contract is satisfied by the
+// natural uniqueness constraint + guarded state transition +
+// atomic transaction alone (ticket #62 GS 26).

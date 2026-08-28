@@ -68,21 +68,16 @@ export interface CreateProjectRequestRevalidatedInput {
 
 export interface AcceptProjectRequestInput {
   readonly projectRequestId: string;
-  /** Acting seller Workspace id (GS 17). */
-  readonly actingWorkspaceId: string;
-  /** Acting seller human. */
-  readonly userAccountId: string;
-  /** Pre-resolved seller decision actor id (the same userAccountId
-   *  once authorization succeeds). The repository persists this on
-   *  the ProjectRequest row inside the decision transaction. */
+  /** Pre-resolved seller decision actor id. The application service
+   *  has already verified the seller is currently authorized to
+   *  respond; the repository persists this id on the ProjectRequest
+   *  row inside the decision transaction. */
   readonly sellerDecisionByUserId: string;
   readonly now: Date;
 }
 
 export interface DeclineProjectRequestInput {
   readonly projectRequestId: string;
-  readonly actingWorkspaceId: string;
-  readonly userAccountId: string;
   readonly sellerDecisionByUserId: string;
   readonly now: Date;
 }
@@ -92,7 +87,7 @@ export interface AcceptProjectRequestResult {
   readonly deal: PersistedDeal;
 }
 
-export type DecideFailureReason = "NOT_FOUND" | "ALREADY_RESPONDED" | "SELLER_NOT_AUTHORIZED";
+export type DecideFailureReason = "NOT_FOUND" | "ALREADY_RESPONDED";
 
 export type DecideResult<T> =
   | { readonly ok: true; readonly value: T }
@@ -100,12 +95,12 @@ export type DecideResult<T> =
 
 /**
  * Failure reasons for {@link ProjectRequestRepository.createProjectRequestWithRevalidation}.
- * The repository runs every revalidation step + the INSERT inside one
- * transaction; a stale or ineligible state at any step fails closed
- * without leaving a partial ProjectRequest row.
+ * The repository's transaction runs the brief-ownership, brief-
+ * recommendation, and offering-eligibility checks + the INSERT
+ * atomically. The buyer / seller authorization policy decision is
+ * made by the application service BEFORE this method is called.
  */
 export type CreateProjectRequestFailureReason =
-  | "BUYER_NOT_AUTHORIZED"
   | "BRIEF_NOT_FOUND"
   | "BRIEF_FORBIDDEN"
   | "OFFERING_NOT_IN_BRIEF"
@@ -118,21 +113,20 @@ export type CreateProjectRequestResult =
 
 export interface ProjectRequestRepository {
   /**
-   * Atomically revalidate the buyer authority, brief-ownership,
-   * brief-recommendation boundary, and offering-eligibility chain,
-   * then persist a Pending ProjectRequest. The entire operation
-   * runs inside a single Prisma `$transaction` so a concurrent
-   * mutation between any read and the INSERT cannot produce an
-   * ineligible Pending request. Returns `{ok:false,...}` for any
-   * revalidation failure without leaving a partial ProjectRequest
-   * row.
+   * Atomically revalidate the brief-ownership, brief-recommendation
+   * boundary, and offering-eligibility chain, then persist a Pending
+   * ProjectRequest. The entire operation runs inside a single
+   * Prisma `$transaction` so a concurrent mutation between any read
+   * and the INSERT cannot produce an ineligible Pending request.
+   * Returns `{ok:false,...}` for any revalidation failure without
+   * leaving a partial ProjectRequest row.
+   *
+   * The application service makes the buyer / seller authorization
+   * policy decision BEFORE calling this method; this method does
+   * NOT re-evaluate authorization. It only persists the brief
+   * relationship + the natural-uniqueness guard.
    *
    * Failure reasons:
-   *   - `BUYER_NOT_AUTHORIZED` — the buyer's current Workspace
-   *      membership, Buyer capability, or buyer-workspace status
-   *      check failed inside the transaction (P1-001). A revoke
-   *      between an upstream authorize call and this call cannot
-   *      slip through.
    *   - `BRIEF_NOT_FOUND` — the ProjectBrief id does not exist.
    *   - `BRIEF_FORBIDDEN` — the ProjectBrief is owned by a
    *      different buyer Workspace than the one the caller is
@@ -141,10 +135,10 @@ export interface ProjectRequestRepository {
    *      was not returned by the brief's persisted Matchmaker
    *      recommendations (P1-001). A buyer cannot submit an
    *      arbitrary eligible offering that the buyer never saw.
-   *   - `OFFERING_INELIGIBLE` — the selected offering (or its
-   *      owning Workspace / SellerProfile) is no longer in the
-   *      eligibility chain (Active workspace + Seller capability
-   *      + Published profile + Active offering).
+   *   - `OFFERING_INELIGIBLE` — the selected offering was
+   *      archived / deactivated / had its SellerProfile
+   *      unpublished / lost its Workspace's Seller capability
+   *      between the application check and this transaction.
    *   - `ALREADY_PENDING` — a Pending ProjectRequest already
    *      exists for the same tuple. The partial unique index
    *      enforces this; retries return this reason instead of
@@ -169,18 +163,14 @@ export interface ProjectRequestRepository {
   }): Promise<readonly PersistedProjectRequest[]>;
 
   /**
-   * Atomically revalidate the seller authority and transition the
-   * named ProjectRequest from Pending to Accepted, then create the
-   * Negotiating Deal — all inside one Prisma `$transaction` (P1-002).
-   * The repository re-checks Workspace.status, the seller's current
-   * WorkspaceMembership, and the seller Workspace's Seller
-   * capability so a revoke between an upstream authorize call and
-   * this write cannot slip through (P1-002).
+   * Atomically transition the named ProjectRequest from Pending to
+   * Accepted and create the Negotiating Deal — all inside one
+   * Prisma `$transaction` (ticket #62 GS 18). The application
+   * service has already verified the seller is currently
+   * authorized; this method only persists the guarded
+   * transition + Deal creation.
    *
    * Failure reasons:
-   *   - `SELLER_NOT_AUTHORIZED` — the seller's current membership
-   *      / capability / workspace-status check failed inside the
-   *      transaction. No Deal is created.
    *   - `NOT_FOUND` — the row is missing.
    *   - `ALREADY_RESPONDED` — the row is not in Pending status
    *      (already Accepted or Declined).
@@ -190,9 +180,9 @@ export interface ProjectRequestRepository {
   ): Promise<DecideResult<AcceptProjectRequestResult>>;
 
   /**
-   * Atomically revalidate the seller authority and transition the
-   * named ProjectRequest from Pending to Declined. Same failure
-   * reasons as {@link acceptProjectRequest}. No Deal is created.
+   * Atomically transition the named ProjectRequest from Pending
+   * to Declined. Same failure reasons as
+   * {@link acceptProjectRequest}. No Deal is created.
    */
   declineProjectRequest(
     input: DeclineProjectRequestInput,
