@@ -104,26 +104,30 @@ const P2034_RETRY_BUDGET = 3;
 
 // ---------- test barrier seam ----------
 //
-// `transactionStageHook` is an optional awaitable that the
+// `TransactionStageSynchronizer` is an optional awaitable that the
 // repository invokes immediately after the authoritative
 // authority / eligibility rows are FOR UPDATE-locked but BEFORE
 // the use case runs and BEFORE the INSERT / UPDATE commits.
-// Production NEVER sets it; only disposable-PostgreSQL tests
+// Production NEVER supplies it; only disposable-PostgreSQL tests
 // that need to coordinate a second connection against the real
-// production transaction path install it. The hook is kept
-// internal to this persistence module so it cannot leak into
-// application code or become a generalized event/hook framework.
-export type TransactionStageHook = () => Promise<void> | void;
-let transactionStageHook: TransactionStageHook | undefined;
-
-export function setTransactionStageHookForTesting(hook: TransactionStageHook | undefined): void {
-  transactionStageHook = hook;
-}
-export async function runTransactionStageHookForTesting(): Promise<void> {
-  if (transactionStageHook) {
-    await transactionStageHook();
-  }
-}
+// production transaction path install it on the EXACT repository
+// instance they want to instrument. The collaborator is held as
+// a private instance field, never as a process-global, so:
+//
+//   - two separately constructed `PrismaProjectRequestRepository`
+//     instances never observe one another's test instrumentation;
+//   - the application/domain `ProjectRequestRepository` interface
+//     has no awareness of the collaborator;
+//   - production construction supplies no collaborator and
+//     executes exactly as it did before the seam existed.
+//
+// This is intentionally a constructor-time collaborator, not a
+// general hook framework: there is no setter, no registry, and no
+// way to install the hook on a repository that has already been
+// constructed. The collaborator only exists to let the
+// PostgreSQL concurrency test deterministically overlap a
+// conflicting second connection.
+type TransactionStageSynchronizer = () => Promise<void> | void;
 
 // The safe typed failure reason a BG4 command returns after the
 // retry budget is exhausted. Routes collapse it onto the existing
@@ -204,7 +208,14 @@ async function runWithBoundedP2034Retry<TValue, TFailure>(
 }
 
 export class PrismaProjectRequestRepository implements ProjectRequestRepository {
-  constructor(private readonly prisma: PrismaClient) {}
+  private readonly stageSynchronizer: TransactionStageSynchronizer | undefined;
+
+  constructor(
+    private readonly prisma: PrismaClient,
+    stageSynchronizer?: TransactionStageSynchronizer,
+  ) {
+    this.stageSynchronizer = stageSynchronizer;
+  }
 
   // ---------- create ----------
 
@@ -223,6 +234,12 @@ export class PrismaProjectRequestRepository implements ProjectRequestRepository 
       return { ok: false, reason: envelope.outcome.failure };
     }
     return envelope.outcome.value;
+  }
+
+  private async runStageSynchronizer(): Promise<void> {
+    if (this.stageSynchronizer) {
+      await this.stageSynchronizer();
+    }
   }
 
   private async runCreateTransactionOnce(
@@ -253,7 +270,7 @@ export class PrismaProjectRequestRepository implements ProjectRequestRepository 
           // FOR UPDATE-locked row has been acquired but BEFORE
           // the use case runs and BEFORE the INSERT / UPDATE
           // commits. Production never sets the hook.
-          await runTransactionStageHookForTesting();
+          await this.runStageSynchronizer();
 
           // Step 4: hand the snapshots to the application-owned
           // use case. The repository MUST NOT decide whether the
@@ -545,7 +562,7 @@ export class PrismaProjectRequestRepository implements ProjectRequestRepository 
           // seller WorkspaceCapability) but BEFORE the use case
           // runs and BEFORE the guarded UPDATE / Deal create.
           // Production never sets the hook.
-          await runTransactionStageHookForTesting();
+          await this.runStageSynchronizer();
 
           // Hand the snapshot to the application-owned use case.
           const projectRequest: PersistedProjectRequest = toPersisted(requestRow);

@@ -9,12 +9,16 @@
 // the disposable PostgreSQL target and exercise the REAL
 // production `PrismaProjectRequestRepository.createProjectRequestInTransaction`
 // / `respondToProjectRequestInTransaction` commands. The only
-// non-production seam is `setTransactionStageHookForTesting`,
-// which pauses the real transaction AFTER every authoritative
-// FOR UPDATE-locked row has been acquired but BEFORE the use case
-// runs and BEFORE the INSERT / UPDATE commits. Production never
-// installs the hook; tests install it to coordinate a second
-// connection against the real transaction path.
+// non-production seam is an optional `TransactionStageSynchronizer`
+// collaborator supplied directly to the test repository
+// constructor; it pauses the real transaction AFTER every
+// authoritative FOR UPDATE-locked row has been acquired but BEFORE
+// the use case runs and BEFORE the INSERT / UPDATE commits.
+// Production never supplies the collaborator; tests construct a
+// dedicated repository instance with the collaborator installed
+// on that instance only. There is no global hook registry — two
+// separately constructed `PrismaProjectRequestRepository`
+// instances never observe one another's test instrumentation.
 //
 // Required ordering semantics (ticket #62):
 //
@@ -38,14 +42,11 @@
 //   - no seller decision evidence,
 //   - no Deal row.
 
-import { test, before, after, beforeEach, afterEach } from "node:test";
+import { test, before, after, beforeEach } from "node:test";
 import assert from "node:assert/strict";
 import { createPrismaClient, type PrismaClient } from "@soundhub/db";
 import { assertDisposableTestDatabase, readTestDatabaseUrl } from "../lib/test-database.js";
-import {
-  PrismaProjectRequestRepository,
-  setTransactionStageHookForTesting,
-} from "./prisma-project-request.repository.js";
+import { PrismaProjectRequestRepository } from "./prisma-project-request.repository.js";
 import { loadOrCreateFixture, type ProjectRequestFixture } from "./test-fixture.js";
 import { buyerOkUseCase, buildAcceptUseCase, buildDeclineUseCase } from "./test-use-cases.js";
 
@@ -66,10 +67,6 @@ before(async () => {
 });
 
 after(async () => {
-  // Defensive: tests that throw out of a hook leave the hook
-  // installed. Clear it before disconnecting so subsequent test
-  // files cannot accidentally inherit the hook.
-  setTransactionStageHookForTesting(undefined);
   if (prismaA) await prismaA.$disconnect();
   if (prismaB) await prismaB.$disconnect();
 });
@@ -133,34 +130,31 @@ beforeEach(async () => {
   repo = new PrismaProjectRequestRepository(prismaA);
 });
 
-afterEach(() => {
-  // Defensive: tests that throw out of a hook leave the hook
-  // installed. Clear it before each subsequent test so no hook
-  // leaks between cases.
-  setTransactionStageHookForTesting(undefined);
-});
-
 // ---------- helpers ----------
 
 /**
- * Install the production-path barrier hook, run the supplied
- * production command via the real repository, and return a
- * controller the test can use to wait until the barrier has
- * fired and to release the production transaction.
+ * Construct a DEDICATED `PrismaProjectRequestRepository` instance
+ * whose `TransactionStageSynchronizer` collaborator pauses the
+ * real transaction AFTER every authoritative FOR UPDATE-locked row
+ * has been acquired but BEFORE the use case runs and BEFORE any
+ * write commits. Returns the controller the test uses to wait for
+ * the barrier to fire and to release the production transaction.
  *
- * `command` is the awaited result of invoking
- * `repo.createProjectRequestInTransaction(...)` /
- * `repo.respondToProjectRequestInTransaction(...)`. The hook
- * fires INSIDE the production transaction AFTER every
- * authoritative FOR UPDATE-locked row has been acquired but
- * BEFORE the use case runs and BEFORE any write commits.
+ * `command` receives the barrier repository instance so the test
+ * runs through the instrumented instance only — never through the
+ * hook-free default `repo` and never through any other
+ * `PrismaProjectRequestRepository` instance. The hook is bound to
+ * the instance created here; two separately constructed instances
+ * cannot observe one another's test instrumentation.
  */
 interface BarrierController {
   readonly promise: Promise<void>;
   release(): void;
 }
 
-function runWithProductionBarrier<T>(command: () => Promise<T>): {
+function runWithProductionBarrier<T>(
+  command: (barrierRepo: PrismaProjectRequestRepository) => Promise<T>,
+): {
   result: Promise<T>;
   controller: BarrierController;
 } {
@@ -172,12 +166,12 @@ function runWithProductionBarrier<T>(command: () => Promise<T>): {
   const barrierPromise = new Promise<void>((resolve) => {
     release = resolve;
   });
-  setTransactionStageHookForTesting(async () => {
+  const barrierRepo = new PrismaProjectRequestRepository(prismaA, async () => {
     resolveHook!();
     await barrierPromise;
   });
   // Kick off the production command without awaiting it.
-  const result = command();
+  const result = command(barrierRepo);
   return {
     result,
     controller: {
@@ -210,8 +204,8 @@ test("create: BG4 first — buyer membership revocation blocks until the real cr
   //    Workspace / WorkspaceMembership / WorkspaceCapability
   //    + the seller / offering / brief rows, then pauses at
   //    the test barrier.
-  const { result, controller } = runWithProductionBarrier(() =>
-    repo.createProjectRequestInTransaction(
+  const { result, controller } = runWithProductionBarrier((barrierRepo) =>
+    barrierRepo.createProjectRequestInTransaction(
       {
         buyerWorkspaceId: fixture.buyerWorkspace.id,
         projectBriefId: fixture.brief.id,
@@ -331,8 +325,8 @@ test("accept: BG4 first — seller membership revocation blocks until the real a
   //    production transaction FOR UPDATE-locks the
   //    ProjectRequest + seller authority rows, then pauses at
   //    the test barrier.
-  const { result, controller } = runWithProductionBarrier(() =>
-    repo.respondToProjectRequestInTransaction(
+  const { result, controller } = runWithProductionBarrier((barrierRepo) =>
+    barrierRepo.respondToProjectRequestInTransaction(
       {
         projectRequestId,
         actingWorkspaceId: fixture.sellerWorkspace.id,
@@ -433,8 +427,8 @@ test("accept: revoke first — seller membership revoked before the real accept 
 
 test("decline: BG4 first — seller membership revocation blocks until the real decline command commits", async () => {
   const projectRequestId = await seedPendingRequest();
-  const { result, controller } = runWithProductionBarrier(() =>
-    repo.respondToProjectRequestInTransaction(
+  const { result, controller } = runWithProductionBarrier((barrierRepo) =>
+    barrierRepo.respondToProjectRequestInTransaction(
       {
         projectRequestId,
         actingWorkspaceId: fixture.sellerWorkspace.id,
@@ -515,4 +509,108 @@ test("decline: revoke first — seller membership revoked before the real declin
   });
   assert.equal(stillPending?.status, "Pending");
   assert.equal(stillPending?.sellerDecisionAt, null);
+});
+
+// ---------- hook isolation ----------
+//
+// Two separately constructed `PrismaProjectRequestRepository`
+// instances must never observe one another's test
+// instrumentation. The collaborator is bound to the instance
+// created with it; there is no global registry.
+
+test("two separately constructed PrismaProjectRequestRepository instances cannot observe or inherit one another's test instrumentation", async () => {
+  // Reset state so the create commands below start clean.
+  await prismaA.projectRequest.deleteMany({
+    where: { projectBriefId: fixture.brief.id },
+  });
+  await prismaA.deal.deleteMany({
+    where: { projectBriefId: fixture.brief.id },
+  });
+
+  let firesA = 0;
+  let firesB = 0;
+  // repoA installs a hook collaborator that counts how many
+  // times it fires when commands run through repoA.
+  const repoA = new PrismaProjectRequestRepository(prismaA, () => {
+    firesA += 1;
+  });
+  // repoB installs a hook collaborator that counts how many
+  // times it fires when commands run through repoB.
+  const repoB = new PrismaProjectRequestRepository(prismaA, () => {
+    firesB += 1;
+  });
+
+  // Drive a REAL production create command through repoA. The
+  // hook bound to repoA must fire once; repoB's hook must not
+  // fire because the collaborator lives on the instance only.
+  const resultA = await repoA.createProjectRequestInTransaction(
+    {
+      buyerWorkspaceId: fixture.buyerWorkspace.id,
+      projectBriefId: fixture.brief.id,
+      serviceOfferingId: fixture.offering.id,
+      userAccountId: fixture.buyerUser.id,
+    },
+    buyerOkUseCase,
+  );
+  assert.equal(resultA.ok, true);
+  assert.equal(firesA, 1, "repoA's hook fires exactly once when commands run through repoA");
+  assert.equal(
+    firesB,
+    0,
+    "repoB's hook must not fire when commands run through repoA — collaborators are instance-scoped",
+  );
+
+  // Now drive a command through repoB. The second create for
+  // the same tuple returns ALREADY_PENDING (the unique partial
+  // index surfaces a conflict), but the hook still fires
+  // because the repository acquires the FOR UPDATE-locked
+  // snapshot before the use case rejects. repoA's hook count
+  // must remain at 1.
+  const resultB = await repoB.createProjectRequestInTransaction(
+    {
+      buyerWorkspaceId: fixture.buyerWorkspace.id,
+      projectBriefId: fixture.brief.id,
+      serviceOfferingId: fixture.offering.id,
+      userAccountId: fixture.buyerUser.id,
+    },
+    buyerOkUseCase,
+  );
+  assert.equal(resultB.ok, false);
+  if (resultB.ok) return;
+  assert.equal(resultB.reason, "ALREADY_PENDING");
+  assert.equal(
+    firesA,
+    1,
+    "repoA's hook still fires only once when commands run through repoB — collaborators are instance-scoped",
+  );
+  assert.equal(
+    firesB,
+    1,
+    "repoB's hook fires exactly once when commands run through repoB",
+  );
+
+  // Constructing yet another repository with no hook
+  // collaborator must not pick up either of the previously
+  // installed hooks.
+  const repoC = new PrismaProjectRequestRepository(prismaA);
+  const resultC = await repoC.createProjectRequestInTransaction(
+    {
+      buyerWorkspaceId: fixture.buyerWorkspace.id,
+      projectBriefId: fixture.brief.id,
+      serviceOfferingId: fixture.offering.id,
+      userAccountId: fixture.buyerUser.id,
+    },
+    buyerOkUseCase,
+  );
+  assert.equal(typeof resultC.ok, "boolean");
+  assert.equal(
+    firesA,
+    1,
+    "repoA's hook still must not fire after running through repoC",
+  );
+  assert.equal(
+    firesB,
+    1,
+    "repoB's hook does not fire for commands dispatched through repoC",
+  );
 });
