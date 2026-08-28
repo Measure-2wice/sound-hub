@@ -23,6 +23,11 @@ import assert from "node:assert/strict";
 import type { ProjectBriefPublicV1 } from "@soundhub/types";
 import { ProjectRequestService } from "./project-request.service.js";
 import { InMemoryProjectRequestRepository } from "./in-memory-project-request.repository.js";
+import {
+  InMemoryAuthRepository,
+  type InMemoryUserSeed,
+} from "../auth-repository/in-memory-auth-repository.js";
+import { WorkspaceAuthorizationService } from "../services/workspace-authorization.service.js";
 
 const BUYER_USER_ID = "user-buyer";
 const BUYER_WORKSPACE_ID = "ws-buyer";
@@ -40,11 +45,66 @@ const OTHER_BRIEF_ID = "brief-other";
 interface Fixture {
   projectRequestService: ProjectRequestService;
   projectRequestRepo: InMemoryProjectRequestRepository;
+  authRepo: InMemoryAuthRepository;
   now: () => Date;
   clock: { current: Date };
 }
 
 function buildFixture(): Fixture {
+  const buyerSeed: InMemoryUserSeed = {
+    userAccountId: BUYER_USER_ID,
+    email: "buyer@example.com",
+    identityProvider: "deterministic",
+    identitySubject: "buyer-subject",
+    memberships: [
+      {
+        workspaceId: BUYER_WORKSPACE_ID,
+        slug: "buyer",
+        name: "Buyer",
+        workspaceType: "Personal",
+        workspaceStatus: "Active",
+        role: "Owner",
+        capabilities: ["Buyer"],
+      },
+    ],
+  };
+  const otherBuyerSeed: InMemoryUserSeed = {
+    userAccountId: OTHER_BUYER_USER_ID,
+    email: "other-buyer@example.com",
+    identityProvider: "deterministic",
+    identitySubject: "other-buyer-subject",
+    memberships: [
+      {
+        workspaceId: OTHER_BUYER_WORKSPACE_ID,
+        slug: "other-buyer",
+        name: "Other Buyer",
+        workspaceType: "Personal",
+        workspaceStatus: "Active",
+        role: "Owner",
+        capabilities: ["Buyer"],
+      },
+    ],
+  };
+  const sellerSeed: InMemoryUserSeed = {
+    userAccountId: SELLER_USER_ID,
+    email: "seller@example.com",
+    identityProvider: "deterministic",
+    identitySubject: "seller-subject",
+    memberships: [
+      {
+        workspaceId: SELLER_WORKSPACE_ID,
+        slug: "seller",
+        name: "Seller",
+        workspaceType: "Personal",
+        workspaceStatus: "Active",
+        role: "Owner",
+        capabilities: ["Seller"],
+      },
+    ],
+  };
+  const authRepo = new InMemoryAuthRepository([buyerSeed, otherBuyerSeed, sellerSeed]);
+  const authz = new WorkspaceAuthorizationService({ authRepository: authRepo });
+
   const projectRequestRepo = new InMemoryProjectRequestRepository();
   // Seed the in-memory snapshot state the policy evaluators
   // consume. The repository loads + locks these snapshots inside
@@ -79,14 +139,15 @@ function buildFixture(): Fixture {
     buyerCapability: false,
     sellerCapability: true,
   });
-  projectRequestRepo.seedSellerProfile({
-    workspaceId: "ws-different-seller",
-    status: "Published",
-  });
   projectRequestRepo.seedMembership({
     userId: "user-different-seller",
     workspaceId: "ws-different-seller",
   });
+  // The InMemoryProjectRequestRepository's buyer/seller authority
+  // snapshots still read the seeded `memberships` map directly
+  // because the FOR UPDATE-locked reads do not consult the auth
+  // repo. Keep the seeded memberships aligned with the auth repo
+  // memberships so the two paths produce the same verdict.
   projectRequestRepo.seedMembership({
     userId: BUYER_USER_ID,
     workspaceId: BUYER_WORKSPACE_ID,
@@ -99,7 +160,10 @@ function buildFixture(): Fixture {
     userId: SELLER_USER_ID,
     workspaceId: SELLER_WORKSPACE_ID,
   });
-
+  projectRequestRepo.seedSellerProfile({
+    workspaceId: "ws-different-seller",
+    status: "Published",
+  });
   projectRequestRepo.seedSellerProfile({
     workspaceId: SELLER_WORKSPACE_ID,
     status: "Published",
@@ -141,12 +205,14 @@ function buildFixture(): Fixture {
 
   const service = new ProjectRequestService({
     projectRequestRepository: projectRequestRepo,
+    workspaceAuthorizationService: authz,
     now,
   });
 
   return {
     projectRequestService: service,
     projectRequestRepo,
+    authRepo,
     now,
     clock,
   };
@@ -537,6 +603,235 @@ test("getProjectRequest rejects a non-member of either side", async () => {
       userAccountId: OTHER_BUYER_USER_ID,
       actingWorkspaceId: OTHER_BUYER_WORKSPACE_ID,
       projectRequestId: created.projectRequest.projectRequestId,
+    }),
+    (err: unknown) => {
+      return (
+        err instanceof Error &&
+        err.name === "ProjectRequestError" &&
+        (err as { code?: string }).code === "PROJECT_REQUEST_NOT_FOUND"
+      );
+    },
+  );
+});
+
+// P0-001 verification: getProjectRequest requires the
+// authenticated UserAccount to hold a current WorkspaceMembership
+// in the explicitly acting Workspace BEFORE the repository is
+// consulted. Supplying an actingWorkspaceId that matches a
+// request party is not sufficient — the route still has to
+// revalidate current membership.
+
+test("getProjectRequest allows a current member to read", async () => {
+  const { projectRequestService } = buildFixture();
+  const created = await projectRequestService.createProjectRequest({
+    userAccountId: BUYER_USER_ID,
+    actingWorkspaceId: BUYER_WORKSPACE_ID,
+    projectBriefId: BRIEF_ID,
+    serviceOfferingId: OFFERING_ID,
+  });
+  // The seller is a current member of the seller Workspace.
+  const result = await projectRequestService.getProjectRequest({
+    userAccountId: SELLER_USER_ID,
+    actingWorkspaceId: SELLER_WORKSPACE_ID,
+    projectRequestId: created.projectRequest.projectRequestId,
+  });
+  assert.equal(result.projectRequest.projectRequestId, created.projectRequest.projectRequestId);
+});
+
+test("getProjectRequest rejects an authenticated non-member using a real Workspace id", async () => {
+  const { projectRequestService } = buildFixture();
+  const created = await projectRequestService.createProjectRequest({
+    userAccountId: BUYER_USER_ID,
+    actingWorkspaceId: BUYER_WORKSPACE_ID,
+    projectBriefId: BRIEF_ID,
+    serviceOfferingId: OFFERING_ID,
+  });
+  // The other buyer supplies the BUYER_WORKSPACE_ID (the real
+  // buyer side) but is NOT a current member. The service must
+  // fail closed WITHOUT revealing the request's existence, with
+  // PROJECT_REQUEST_NOT_FOUND (the existing safe envelope).
+  await assert.rejects(
+    projectRequestService.getProjectRequest({
+      userAccountId: OTHER_BUYER_USER_ID,
+      actingWorkspaceId: BUYER_WORKSPACE_ID,
+      projectRequestId: created.projectRequest.projectRequestId,
+    }),
+    (err: unknown) => {
+      return (
+        err instanceof Error &&
+        err.name === "ProjectRequestError" &&
+        (err as { code?: string }).code === "PROJECT_REQUEST_NOT_FOUND"
+      );
+    },
+  );
+});
+
+test("getProjectRequest rejects an authenticated non-member using a real request id (actingWorkspaceId mismatch)", async () => {
+  const { projectRequestService } = buildFixture();
+  const created = await projectRequestService.createProjectRequest({
+    userAccountId: BUYER_USER_ID,
+    actingWorkspaceId: BUYER_WORKSPACE_ID,
+    projectBriefId: BRIEF_ID,
+    serviceOfferingId: OFFERING_ID,
+  });
+  // The other buyer supplies the seller Workspace ID (a real
+  // request party) without being a current member. The service
+  // must fail closed with PROJECT_REQUEST_NOT_FOUND so the
+  // envelope never reveals whether the request exists.
+  await assert.rejects(
+    projectRequestService.getProjectRequest({
+      userAccountId: OTHER_BUYER_USER_ID,
+      actingWorkspaceId: SELLER_WORKSPACE_ID,
+      projectRequestId: created.projectRequest.projectRequestId,
+    }),
+    (err: unknown) => {
+      return (
+        err instanceof Error &&
+        err.name === "ProjectRequestError" &&
+        (err as { code?: string }).code === "PROJECT_REQUEST_NOT_FOUND"
+      );
+    },
+  );
+});
+
+test("getProjectRequest immediately denies a revoked former member", async () => {
+  const { projectRequestService } = buildFixture();
+  const created = await projectRequestService.createProjectRequest({
+    userAccountId: BUYER_USER_ID,
+    actingWorkspaceId: BUYER_WORKSPACE_ID,
+    projectBriefId: BRIEF_ID,
+    serviceOfferingId: OFFERING_ID,
+  });
+  // First, the seller reads successfully.
+  const initial = await projectRequestService.getProjectRequest({
+    userAccountId: SELLER_USER_ID,
+    actingWorkspaceId: SELLER_WORKSPACE_ID,
+    projectRequestId: created.projectRequest.projectRequestId,
+  });
+  assert.equal(initial.projectRequest.projectRequestId, created.projectRequest.projectRequestId);
+  // Revoke the seller's current membership. The auth repo does
+  // not expose a membership-remove primitive; rebuild it without
+  // the seller's seller-workspace membership.
+  const rebuilt = new InMemoryAuthRepository([
+    {
+      userAccountId: SELLER_USER_ID,
+      email: "seller@example.com",
+      identityProvider: "deterministic",
+      identitySubject: "seller-subject",
+      memberships: [], // revoked
+    },
+  ]);
+  const authz = new WorkspaceAuthorizationService({ authRepository: rebuilt });
+  // Wire the revoked authz into a fresh service so the
+  // WorkspaceAuthorizationService lookup sees the revoked state.
+  const freshService = new ProjectRequestService({
+    projectRequestRepository: undefined as never, // not exercised on this path
+    workspaceAuthorizationService: authz,
+  });
+  // The service collapses AuthorizationError to
+  // PROJECT_REQUEST_NOT_FOUND on reads so the safe envelope
+  // does not leak the request's existence.
+  await assert.rejects(
+    freshService.getProjectRequest({
+      userAccountId: SELLER_USER_ID,
+      actingWorkspaceId: SELLER_WORKSPACE_ID,
+      projectRequestId: created.projectRequest.projectRequestId,
+    }),
+    (err: unknown) => {
+      return (
+        err instanceof Error &&
+        err.name === "ProjectRequestError" &&
+        (err as { code?: string }).code === "PROJECT_REQUEST_NOT_FOUND"
+      );
+    },
+  );
+});
+
+test("listProjectRequests allows a current member to list", async () => {
+  const { projectRequestService } = buildFixture();
+  const created = await projectRequestService.createProjectRequest({
+    userAccountId: BUYER_USER_ID,
+    actingWorkspaceId: BUYER_WORKSPACE_ID,
+    projectBriefId: BRIEF_ID,
+    serviceOfferingId: OFFERING_ID,
+  });
+  // The buyer is a current member of the buyer Workspace and may
+  // list its requests.
+  const result = await projectRequestService.listProjectRequests({
+    userAccountId: BUYER_USER_ID,
+    actingWorkspaceId: BUYER_WORKSPACE_ID,
+    statusFilter: "Pending",
+  });
+  assert.equal(result.projectRequests.length, 1);
+  assert.equal(
+    result.projectRequests[0]!.projectRequestId,
+    created.projectRequest.projectRequestId,
+  );
+});
+
+test("listProjectRequests rejects an authenticated non-member using a real Workspace id", async () => {
+  const { projectRequestService } = buildFixture();
+  await projectRequestService.createProjectRequest({
+    userAccountId: BUYER_USER_ID,
+    actingWorkspaceId: BUYER_WORKSPACE_ID,
+    projectBriefId: BRIEF_ID,
+    serviceOfferingId: OFFERING_ID,
+  });
+  // The other buyer supplies the BUYER_WORKSPACE_ID but is not a
+  // member. The service must fail closed before any list row is
+  // produced, with PROJECT_REQUEST_NOT_FOUND so the envelope
+  // does not leak the Workspace's request set existence.
+  await assert.rejects(
+    projectRequestService.listProjectRequests({
+      userAccountId: OTHER_BUYER_USER_ID,
+      actingWorkspaceId: BUYER_WORKSPACE_ID,
+      statusFilter: "Pending",
+    }),
+    (err: unknown) => {
+      return (
+        err instanceof Error &&
+        err.name === "ProjectRequestError" &&
+        (err as { code?: string }).code === "PROJECT_REQUEST_NOT_FOUND"
+      );
+    },
+  );
+});
+
+test("listProjectRequests rejects a revoked former member immediately", async () => {
+  const { projectRequestService } = buildFixture();
+  await projectRequestService.createProjectRequest({
+    userAccountId: BUYER_USER_ID,
+    actingWorkspaceId: BUYER_WORKSPACE_ID,
+    projectBriefId: BRIEF_ID,
+    serviceOfferingId: OFFERING_ID,
+  });
+  // First, the buyer lists successfully.
+  const initial = await projectRequestService.listProjectRequests({
+    userAccountId: BUYER_USER_ID,
+    actingWorkspaceId: BUYER_WORKSPACE_ID,
+    statusFilter: "Pending",
+  });
+  assert.equal(initial.projectRequests.length, 1);
+  // Rebuilt auth repo with no buyer membership.
+  const rebuilt = new InMemoryAuthRepository([
+    {
+      userAccountId: BUYER_USER_ID,
+      email: "buyer@example.com",
+      identityProvider: "deterministic",
+      identitySubject: "buyer-subject",
+      memberships: [], // revoked
+    },
+  ]);
+  const authz = new WorkspaceAuthorizationService({ authRepository: rebuilt });
+  const freshService = new ProjectRequestService({
+    projectRequestRepository: undefined as never,
+    workspaceAuthorizationService: authz,
+  });
+  await assert.rejects(
+    freshService.listProjectRequests({
+      userAccountId: BUYER_USER_ID,
+      actingWorkspaceId: BUYER_WORKSPACE_ID,
+      statusFilter: "Pending",
     }),
     (err: unknown) => {
       return (

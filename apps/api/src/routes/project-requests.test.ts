@@ -63,6 +63,13 @@ class FakeProjectRequestService {
   // ProjectRequestError so we can pin the FORBIDDEN envelope path.
   static ACCEPT_REJECTION: "OK" | "NOT_FOUND" | "ALREADY_RESPONDED" | "FORBIDDEN" = "OK";
 
+  // Toggle for getProjectRequest: simulate the service collapsing
+  // a non-member AuthorizationError to PROJECT_REQUEST_NOT_FOUND.
+  static NEXT_GET_REJECTION: "OK" | "NOT_A_MEMBER" = "OK";
+
+  // Toggle for listProjectRequests: same collapse as get.
+  static NEXT_LIST_REJECTION: "OK" | "NOT_A_MEMBER" = "OK";
+
   // Counters for asserting call counts and payloads.
   readonly createCalls: unknown[] = [];
   readonly acceptCalls: unknown[] = [];
@@ -152,6 +159,12 @@ class FakeProjectRequestService {
 
   async getProjectRequest(input: unknown) {
     this.getCalls.push(input);
+    if (FakeProjectRequestService.NEXT_GET_REJECTION === "NOT_A_MEMBER") {
+      // The real service collapses the AuthorizationError thrown
+      // by requireActingMembership to PROJECT_REQUEST_NOT_FOUND
+      // so the safe envelope never reveals the record exists.
+      throw new ProjectRequestError("ProjectRequest not found.", "PROJECT_REQUEST_NOT_FOUND");
+    }
     return {
       projectRequest: {
         projectRequestId: "pr-1",
@@ -169,6 +182,9 @@ class FakeProjectRequestService {
 
   async listProjectRequests(input: unknown) {
     this.listCalls.push(input);
+    if (FakeProjectRequestService.NEXT_LIST_REJECTION === "NOT_A_MEMBER") {
+      throw new ProjectRequestError("ProjectRequest not found.", "PROJECT_REQUEST_NOT_FOUND");
+    }
     return {
       projectRequests: [
         {
@@ -308,6 +324,47 @@ describe("ProjectRequest route contract", () => {
     const parsed = getProjectRequestResponseV1Schema.safeParse(response.body);
     assert.equal(parsed.success, true);
     assert.equal(pr.getCalls.length, 1);
+  });
+
+  // P0-001 API regression: an authenticated non-member supplying a
+  // real buyer Workspace id cannot fetch a request through the
+  // getProjectRequest route. The safe envelope must not reveal
+  // whether the record exists, so the route returns the same
+  // PROJECT_REQUEST_NOT_FOUND (404) envelope as a missing id.
+  test("GET /api/project-requests/:id returns PROJECT_REQUEST_NOT_FOUND for an authenticated non-member", async () => {
+    FakeProjectRequestService.NEXT_GET_REJECTION = "NOT_A_MEMBER";
+    try {
+      const response = await request(app).get(
+        `/api/project-requests/pr-1?actingWorkspaceId=${BUYER_WORKSPACE_ID}`,
+      );
+      assert.equal(response.status, 404);
+      assert.equal(
+        (response.body as { error: { code: string } }).error.code,
+        "PROJECT_REQUEST_NOT_FOUND",
+      );
+    } finally {
+      FakeProjectRequestService.NEXT_GET_REJECTION = "OK";
+    }
+  });
+
+  // P0-001 API regression: an authenticated non-member supplying a
+  // real Workspace id cannot list requests through the
+  // listProjectRequests route. The safe envelope must not reveal
+  // whether the Workspace has any records.
+  test("GET /api/project-requests returns PROJECT_REQUEST_NOT_FOUND for an authenticated non-member", async () => {
+    FakeProjectRequestService.NEXT_LIST_REJECTION = "NOT_A_MEMBER";
+    try {
+      const response = await request(app).get(
+        `/api/project-requests?actingWorkspaceId=${BUYER_WORKSPACE_ID}&status=Pending`,
+      );
+      assert.equal(response.status, 404);
+      assert.equal(
+        (response.body as { error: { code: string } }).error.code,
+        "PROJECT_REQUEST_NOT_FOUND",
+      );
+    } finally {
+      FakeProjectRequestService.NEXT_LIST_REJECTION = "OK";
+    }
   });
 
   test("POST /api/project-requests/:id/accept returns 200 + Deal on success", async () => {

@@ -240,6 +240,7 @@ export function buildApp(options: AppOptions = {}): BuiltApp {
     options.projectRequestService ??
     new ProjectRequestService({
       projectRequestRepository,
+      workspaceAuthorizationService,
     });
 
   const app: Application = express();

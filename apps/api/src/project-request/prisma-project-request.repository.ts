@@ -30,6 +30,23 @@
 // guarded `updateMany WHERE status='Pending'` plus the unique index
 // on `deals.projectRequestId` remain the second defenses against
 // retries creating duplicate decisions (ticket #62 GS 26).
+//
+// Serializable concurrency (P1-001):
+//
+//   Both transactional command methods open a PostgreSQL transaction
+//   with `Serializable` isolation. A conflicting commit on any row
+//   the transaction read produces a Prisma `P2034`
+//   (serialization_failure / write conflict) error on COMMIT. The
+//   adapter retries the bounded transaction a small fixed number
+//   of times; each retry re-reads authoritative current facts via
+//   FOR UPDATE so a revocation that committed between attempts is
+//   reflected in the next snapshot. After the retry budget is
+//   exhausted the adapter surfaces a safe typed failure reason
+//   (CONCURRENCY_RETRY_EXHAUSTED) so the application route layer
+//   maps it onto the existing safe envelope. NO partial
+//   ProjectRequest, decision evidence, or Deal may remain from a
+//   failed attempt — the bounded transaction guarantees an all-or-
+//   nothing outcome on every attempt.
 
 import type { PrismaClient } from "@soundhub/db";
 import { PrismaClientKnownRequestError } from "@soundhub/db/dist/generated/internal/prismaNamespace.js";
@@ -41,6 +58,7 @@ import type {
   CreateProjectRequestTransactionInput,
   CreateProjectRequestUseCase,
   CreateProjectRequestUseCaseTools,
+  DecideFailureReason,
   DecideResult,
   PersistedDeal,
   PersistedProjectRequest,
@@ -72,12 +90,119 @@ function toDealStatus(value: DbDealStatus): DealStatusV1 {
   return value;
 }
 
+// Small fixed maximum. The bounded retry is not a generalized
+// framework — it exists only because PostgreSQL's Serializable
+// isolation surfaces a write conflict (P2034) when the transaction's
+// snapshot is invalidated by a concurrent committed write that
+// touched a row the transaction read. A second attempt re-reads
+// authoritative FOR UPDATE-locked state and is overwhelmingly likely
+// to succeed against the now-quiesced background state. Three
+// attempts is the documented upper bound; after that the adapter
+// surfaces CONCURRENCY_RETRY_EXHAUSTED so the route layer can
+// emit a safe 409 envelope.
+const P2034_RETRY_BUDGET = 3;
+
+// The safe typed failure reason a BG4 command returns after the
+// retry budget is exhausted. Routes collapse it onto the existing
+// safe envelope (PROJECT_REQUEST_OFFERING_INELIGIBLE for create,
+// PROJECT_REQUEST_ALREADY_RESPONDED for respond) so the contract
+// never reveals the internal counter to a client.
+const CONCURRENCY_RETRY_EXHAUSTED_CREATE: CreateProjectRequestFailureReason =
+  "CONCURRENCY_RETRY_EXHAUSTED";
+const CONCURRENCY_RETRY_EXHAUSTED_RESPOND: DecideFailureReason = "CONCURRENCY_RETRY_EXHAUSTED";
+
+/**
+ * Returns true when the Prisma error is a serialization_failure
+ * (write conflict) under PostgreSQL Serializable isolation. The
+ * Prisma error code is `P2034`; the underlying SQLSTATE is
+ * `40001` for true serialization failures. Prisma 7+ also
+ * surfaces raw SQLSTATE codes through `PrismaClientKnownRequestError`
+ * so both forms are treated as retryable. A deadlock
+ * (`40P01`) is also surfaced by Prisma as `P2034` and is
+ * recoverable by re-running the bounded transaction.
+ *
+ * For raw `$queryRaw` failures Prisma wraps the error in a
+ * generic `PrismaClientKnownRequestError` whose `code` is the
+ * SQLSTATE string. We match on the code OR fall back to the
+ * `40001` substring on the message so test-injected errors
+ * (which use the same message shape) and any future Prisma
+ * rewording are both caught.
+ */
+function isSerializationConflict(err: unknown): boolean {
+  if (err instanceof PrismaClientKnownRequestError) {
+    if (err.code === "P2034" || err.code === "40001" || err.code === "40P01") return true;
+  }
+  if (
+    err instanceof Error &&
+    /40001|serialization_failure|write conflict|P2034/i.test(err.message)
+  ) {
+    return true;
+  }
+  return false;
+}
+
+/**
+ * Tiny helper that retries a bounded Prisma `$transaction` block on
+ * `P2034` write conflicts. The callable MUST be idempotent (each
+ * attempt re-reads authoritative current facts via FOR UPDATE so a
+ * revocation that committed between attempts is reflected in the
+ * next snapshot). The retry sleeps zero milliseconds between
+ * attempts — the background transaction is the only contention
+ * source and retrying immediately is sufficient for the small
+ * fixed budget. The function returns the result of the first
+ * successful attempt OR a serialization-conflict failure object
+ * the caller can map onto a typed failure reason.
+ *
+ * The wrapper returns a discriminated object so callers whose
+ * success type happens to share a discriminator with the failure
+ * type (e.g. `DecideResult`) can still distinguish the two paths
+ * without runtime type-checking gymnastics.
+ */
+interface BoundedRetryEnvelope<TValue, TFailure> {
+  readonly outcome:
+    | { readonly kind: "value"; readonly value: TValue }
+    | { readonly kind: "exhausted"; readonly failure: TFailure };
+}
+async function runWithBoundedP2034Retry<TValue, TFailure>(
+  attempt: () => Promise<TValue>,
+  buildFailure: () => TFailure,
+): Promise<BoundedRetryEnvelope<TValue, TFailure>> {
+  for (let attemptIndex = 0; attemptIndex < P2034_RETRY_BUDGET; attemptIndex += 1) {
+    try {
+      return { outcome: { kind: "value", value: await attempt() } };
+    } catch (err) {
+      if (!isSerializationConflict(err)) throw err;
+      // Fall through to the next attempt; the background
+      // transaction that triggered the conflict is no longer
+      // holding the locks we need.
+    }
+  }
+  return { outcome: { kind: "exhausted", failure: buildFailure() } };
+}
+
 export class PrismaProjectRequestRepository implements ProjectRequestRepository {
   constructor(private readonly prisma: PrismaClient) {}
 
   // ---------- create ----------
 
   async createProjectRequestInTransaction(
+    input: CreateProjectRequestTransactionInput,
+    useCase: CreateProjectRequestUseCase,
+  ): Promise<CreateProjectRequestResult> {
+    const envelope = await runWithBoundedP2034Retry<
+      CreateProjectRequestResult,
+      CreateProjectRequestFailureReason
+    >(
+      () => this.runCreateTransactionOnce(input, useCase),
+      () => CONCURRENCY_RETRY_EXHAUSTED_CREATE,
+    );
+    if (envelope.outcome.kind === "exhausted") {
+      return { ok: false, reason: envelope.outcome.failure };
+    }
+    return envelope.outcome.value;
+  }
+
+  private async runCreateTransactionOnce(
     input: CreateProjectRequestTransactionInput,
     useCase: CreateProjectRequestUseCase,
   ): Promise<CreateProjectRequestResult> {
@@ -327,6 +452,23 @@ export class PrismaProjectRequestRepository implements ProjectRequestRepository 
   // ---------- respond (accept / decline) ----------
 
   async respondToProjectRequestInTransaction(
+    input: RespondProjectRequestTransactionInput,
+    useCase: RespondProjectRequestUseCase,
+  ): Promise<DecideResult<AcceptProjectRequestResult | PersistedProjectRequest>> {
+    const envelope = await runWithBoundedP2034Retry<
+      DecideResult<AcceptProjectRequestResult | PersistedProjectRequest>,
+      DecideFailureReason
+    >(
+      () => this.runRespondTransactionOnce(input, useCase),
+      () => CONCURRENCY_RETRY_EXHAUSTED_RESPOND,
+    );
+    if (envelope.outcome.kind === "exhausted") {
+      return { ok: false, reason: envelope.outcome.failure };
+    }
+    return envelope.outcome.value;
+  }
+
+  private async runRespondTransactionOnce(
     input: RespondProjectRequestTransactionInput,
     useCase: RespondProjectRequestUseCase,
   ): Promise<DecideResult<AcceptProjectRequestResult | PersistedProjectRequest>> {

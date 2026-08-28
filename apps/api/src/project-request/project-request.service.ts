@@ -28,6 +28,7 @@ import type {
   DealPublicV1,
 } from "@soundhub/types";
 import type { PersistedBrief } from "../matchmaker/project-brief.repository.js";
+import { type WorkspaceAuthorizationService } from "../services/workspace-authorization.service.js";
 import type {
   AcceptProjectRequestResult,
   CreateProjectRequestFailureReason,
@@ -74,6 +75,15 @@ export class ProjectRequestError extends Error {
 export interface ProjectRequestServiceDeps {
   readonly projectRequestRepository: ProjectRequestRepository;
   /**
+   * Used by the read commands (getProjectRequest /
+   * listProjectRequests) to revalidate that the authenticated
+   * UserAccount holds a current WorkspaceMembership in the
+   * explicitly acting Workspace before any private ProjectRequest
+   * DTO is returned. The application owns this policy decision;
+   * the repository never inspects WorkspaceMembership.
+   */
+  readonly workspaceAuthorizationService: WorkspaceAuthorizationService;
+  /**
    * Optional clock injection for tests. Defaults to `new Date()`.
    */
   readonly now?: () => Date;
@@ -112,10 +122,12 @@ export interface ListProjectRequestsInput {
 
 export class ProjectRequestService {
   private readonly repository: ProjectRequestRepository;
+  private readonly authz: WorkspaceAuthorizationService;
   private readonly now: () => Date;
 
   constructor(deps: ProjectRequestServiceDeps) {
     this.repository = deps.projectRequestRepository;
+    this.authz = deps.workspaceAuthorizationService;
     this.now = deps.now ?? (() => new Date());
   }
 
@@ -241,12 +253,29 @@ export class ProjectRequestService {
 
   /**
    * Fetch one ProjectRequest. Either side (buyer or seller
-   * Workspace) may view it; the route revalidates membership via
-   * the service so a revoked member loses access immediately.
+   * Workspace) may view it, but the application requires the
+   * authenticated UserAccount to hold a current WorkspaceMembership
+   * in the explicitly acting Workspace. A revoked former member
+   * loses read access immediately; a non-member using a real
+   * request id receives the same safe PROJECT_REQUEST_NOT_FOUND
+   * envelope so the response contract never reveals whether the
+   * record exists.
    */
   async getProjectRequest(input: GetProjectRequestInput): Promise<{
     readonly projectRequest: ProjectRequestPublicV1;
   }> {
+    try {
+      await this.authz.requireActingMembership({
+        userAccountId: input.userAccountId,
+        workspaceId: input.actingWorkspaceId,
+      });
+    } catch (err) {
+      // Reads collapse all authorization failures to the same
+      // PROJECT_REQUEST_NOT_FOUND envelope so the response
+      // contract never reveals whether the record exists.
+      void err;
+      throw new ProjectRequestError("ProjectRequest not found.", "PROJECT_REQUEST_NOT_FOUND");
+    }
     const existing = await this.repository.findProjectRequestById(input.projectRequestId);
     if (!existing) {
       throw new ProjectRequestError("ProjectRequest not found.", "PROJECT_REQUEST_NOT_FOUND");
@@ -262,12 +291,29 @@ export class ProjectRequestService {
 
   /**
    * List ProjectRequests for an acting Workspace (both sides). The
-   * route can pass `statusFilter` to scope the inbox to Pending
-   * requests only.
+   * application requires the authenticated UserAccount to hold a
+   * current WorkspaceMembership in the explicitly acting
+   * Workspace. A revoked former member loses list access immediately;
+   * a non-member using a real Workspace id receives the same
+   * PROJECT_REQUEST_NOT_FOUND envelope so the response contract
+   * never reveals whether the request set exists. The route can
+   * pass `statusFilter` to scope the inbox to Pending requests
+   * only.
    */
   async listProjectRequests(input: ListProjectRequestsInput): Promise<{
     readonly projectRequests: readonly ProjectRequestPublicV1[];
   }> {
+    try {
+      await this.authz.requireActingMembership({
+        userAccountId: input.userAccountId,
+        workspaceId: input.actingWorkspaceId,
+      });
+    } catch (err) {
+      // Same collapse as getProjectRequest so the safe envelope
+      // does not leak the existence of the Workspace's records.
+      void err;
+      throw new ProjectRequestError("ProjectRequest not found.", "PROJECT_REQUEST_NOT_FOUND");
+    }
     const rows = await this.repository.listProjectRequests({
       workspaceId: input.actingWorkspaceId,
       ...(input.statusFilter ? { statusFilter: input.statusFilter } : {}),
@@ -311,6 +357,11 @@ export class ProjectRequestService {
           "A Pending ProjectRequest already exists for this selection.",
           "PROJECT_REQUEST_ALREADY_PENDING",
         );
+      case "CONCURRENCY_RETRY_EXHAUSTED":
+        return new ProjectRequestError(
+          "The marketplace is busy; please retry.",
+          "PROJECT_REQUEST_OFFERING_INELIGIBLE",
+        );
     }
   }
 
@@ -326,6 +377,11 @@ export class ProjectRequestService {
       case "ALREADY_RESPONDED":
         return new ProjectRequestError(
           "This ProjectRequest has already been responded to.",
+          "PROJECT_REQUEST_ALREADY_RESPONDED",
+        );
+      case "CONCURRENCY_RETRY_EXHAUSTED":
+        return new ProjectRequestError(
+          "The marketplace is busy; please retry.",
           "PROJECT_REQUEST_ALREADY_RESPONDED",
         );
     }

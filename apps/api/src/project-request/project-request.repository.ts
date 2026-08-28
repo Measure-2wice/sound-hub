@@ -96,9 +96,14 @@ export type CreateProjectRequestFailureReason =
   | "BRIEF_NOT_FOUND"
   | "BRIEF_FORBIDDEN"
   | "OFFERING_NOT_IN_BRIEF"
-  | "ALREADY_PENDING";
+  | "ALREADY_PENDING"
+  | "CONCURRENCY_RETRY_EXHAUSTED";
 
-export type DecideFailureReason = "NOT_FOUND" | "ALREADY_RESPONDED" | "SELLER_NOT_AUTHORIZED";
+export type DecideFailureReason =
+  | "NOT_FOUND"
+  | "ALREADY_RESPONDED"
+  | "SELLER_NOT_AUTHORIZED"
+  | "CONCURRENCY_RETRY_EXHAUSTED";
 
 export type CreateProjectRequestResult =
   | { readonly ok: true; readonly value: PersistedProjectRequest }
