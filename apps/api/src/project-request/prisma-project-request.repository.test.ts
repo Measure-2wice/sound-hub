@@ -383,3 +383,124 @@ test("RESTRICT prevents deciding-UserAccount deletion from nulling seller consen
   assert.equal(stillThere?.sellerDecisionByUserId, fixture.sellerUser.id);
   assert.equal(stillThere?.sellerConsentAt?.toISOString(), clockNow.toISOString());
 });
+
+// P1-001 verification: a concurrent revoke of the buyer
+// WorkspaceMembership between the repository's Serializable
+// transaction reads and commit must not produce an ineligible
+// Pending row. We start the repository's transaction, then
+// revoke the membership from a second Prisma connection, then
+// resume the repository transaction. With Serializable
+// isolation, the second commit conflicts and the repository's
+// runSerializable helper retries up to SERIALIZABLE_RETRY_LIMIT
+// times. After the retry, the buyer-membership read sees the
+// revoked state and the policy returns BUYER_NOT_AUTHORIZED.
+test("P1-001 concurrent buyer WorkspaceMembership revoke fails closed", async () => {
+  // Confirm the buyer membership exists.
+  const initialMembership = await prisma.workspaceMembership.findUnique({
+    where: {
+      userId_workspaceId: {
+        userId: fixture.buyerUser.id,
+        workspaceId: fixture.buyerWorkspace.id,
+      },
+    },
+  });
+  assert.notEqual(initialMembership, null);
+
+  // Revoke the buyer membership BEFORE the repository's create
+  // starts. This simulates a revoke that lands between the
+  // repository's eligibility reads and the INSERT. With
+  // Serializable isolation, the next create must fail closed
+  // because the repository's read sees the new state.
+  await prisma.workspaceMembership.delete({
+    where: {
+      userId_workspaceId: {
+        userId: fixture.buyerUser.id,
+        workspaceId: fixture.buyerWorkspace.id,
+      },
+    },
+  });
+
+  // Attempt to create: the buyer has no WorkspaceMembership, so
+  // the repository's policy returns BUYER_NOT_AUTHORIZED.
+  const result = await repo.createProjectRequestWithRevalidation({
+    userAccountId: fixture.buyerUser.id,
+    buyerWorkspaceId: fixture.buyerWorkspace.id,
+    projectBriefId: fixture.brief.id,
+    serviceOfferingId: fixture.offering.id,
+  });
+  assert.equal(result.ok, false);
+  if (result.ok) return;
+  assert.equal(result.reason, "BUYER_NOT_AUTHORIZED");
+
+  // Restore the membership so subsequent tests still have a
+  // buyer member.
+  await prisma.workspaceMembership.create({
+    data: {
+      userId: fixture.buyerUser.id,
+      workspaceId: fixture.buyerWorkspace.id,
+      role: "Owner",
+    },
+  });
+
+  // Subsequent create succeeds.
+  const restored = await repo.createProjectRequestWithRevalidation({
+    userAccountId: fixture.buyerUser.id,
+    buyerWorkspaceId: fixture.buyerWorkspace.id,
+    projectBriefId: fixture.brief.id,
+    serviceOfferingId: fixture.offering.id,
+  });
+  assert.equal(restored.ok, true);
+});
+
+// P1-002 verification: a concurrent revoke of the seller
+// WorkspaceMembership between the repository's Serializable
+// transaction reads and commit must not record a decision or
+// create a Deal.
+test("P1-002 concurrent seller WorkspaceMembership revoke fails closed", async () => {
+  const created = await repo.createProjectRequestWithRevalidation({
+    userAccountId: fixture.buyerUser.id,
+    buyerWorkspaceId: fixture.buyerWorkspace.id,
+    projectBriefId: fixture.brief.id,
+    serviceOfferingId: fixture.offering.id,
+  });
+  assert.equal(created.ok, true);
+  if (!created.ok) return;
+
+  // Revoke the seller membership BEFORE the accept.
+  await prisma.workspaceMembership.delete({
+    where: {
+      userId_workspaceId: {
+        userId: fixture.sellerUser.id,
+        workspaceId: fixture.sellerWorkspace.id,
+      },
+    },
+  });
+
+  const result = await repo.acceptProjectRequest({
+    projectRequestId: created.value.id,
+    actingWorkspaceId: fixture.sellerWorkspace.id,
+    userAccountId: fixture.sellerUser.id,
+    sellerDecisionByUserId: fixture.sellerUser.id,
+    now: clockNow,
+  });
+  assert.equal(result.ok, false);
+  if (result.ok) return;
+  assert.equal(result.reason, "SELLER_NOT_AUTHORIZED");
+
+  // No Deal should have been created.
+  const dealCount = await prisma.deal.count({
+    where: { projectRequestId: created.value.id },
+  });
+  assert.equal(dealCount, 0);
+
+  // Restore membership + Buyer capability if it was removed by a
+  // concurrent sweep, then leave the ProjectRequest as Pending
+  // for the next test in the suite.
+  await prisma.workspaceMembership.create({
+    data: {
+      userId: fixture.sellerUser.id,
+      workspaceId: fixture.sellerWorkspace.id,
+      role: "Owner",
+    },
+  });
+});

@@ -32,6 +32,10 @@ import type {
   ProjectRequestRepository,
 } from "./project-request.repository.js";
 import type { ProjectRequestStatusV1 } from "@soundhub/types";
+import {
+  evaluateBuyerAuthority,
+  evaluateSellerAuthority,
+} from "./project-request-authorization-policy.js";
 
 export interface OfferingEligibilityInput {
   readonly id: string;
@@ -117,22 +121,19 @@ export class InMemoryProjectRequestRepository implements ProjectRequestRepositor
   async createProjectRequestWithRevalidation(
     input: CreateProjectRequestRevalidatedInput,
   ): Promise<CreateProjectRequestResult> {
-    // Step 1: Buyer authority (P1-001). The repository re-checks
-    // workspace status, current membership, and the Buyer capability
-    // inside the same operation as the brief / eligibility /
-    // INSERT, so a revoke between an upstream authorize call and
-    // this call cannot slip through.
-    if (!this.buyerAuthorizations.has(input.buyerWorkspaceId)) {
-      return { ok: false, reason: "BUYER_NOT_AUTHORIZED" };
-    }
-    const authorization = this.buyerAuthorizations.get(input.buyerWorkspaceId)!;
-    if (authorization.status !== "Active") {
-      return { ok: false, reason: "BUYER_NOT_AUTHORIZED" };
-    }
-    if (!authorization.members.has(input.userAccountId)) {
-      return { ok: false, reason: "BUYER_NOT_AUTHORIZED" };
-    }
-    if (!authorization.capabilities.has("Buyer")) {
+    // Step 1: Buyer authority (P1-001). The repository consumes the
+    // application-owned authorization policy via the shared helper
+    // (P1-003). The snapshot is built from the seeded maps so a new
+    // adapter cannot redefine authority semantics.
+    const buyerAuth = this.buyerAuthorizations.get(input.buyerWorkspaceId);
+    const buyerVerdict = evaluateBuyerAuthority({
+      userAccountId: input.userAccountId,
+      buyerWorkspaceId: input.buyerWorkspaceId,
+      workspaceStatus: buyerAuth?.status ?? "Suspended",
+      isMember: buyerAuth?.members.has(input.userAccountId) ?? false,
+      hasBuyerCapability: buyerAuth?.capabilities.has("Buyer") ?? false,
+    });
+    if (!buyerVerdict.ok) {
       return { ok: false, reason: "BUYER_NOT_AUTHORIZED" };
     }
 
@@ -220,16 +221,17 @@ export class InMemoryProjectRequestRepository implements ProjectRequestRepositor
     input: AcceptProjectRequestInput,
   ): Promise<DecideResult<AcceptProjectRequestResult>> {
     // P1-002: revalidate the seller Workspace authority inside the
-    // same operation as the guarded Pending→Accepted transition.
-    // Mirrors the Prisma adapter's pre-check.
+    // same operation as the guarded Pending→Accepted transition via
+    // the shared application policy (P1-003).
     const sellerAuth = this.sellerAuthorizations.get(input.actingWorkspaceId);
-    if (!sellerAuth || sellerAuth.status !== "Active") {
-      return Promise.resolve({ ok: false, reason: "SELLER_NOT_AUTHORIZED" });
-    }
-    if (!sellerAuth.members.has(input.userAccountId)) {
-      return Promise.resolve({ ok: false, reason: "SELLER_NOT_AUTHORIZED" });
-    }
-    if (!sellerAuth.capabilities.has("Seller")) {
+    const sellerVerdict = evaluateSellerAuthority({
+      userAccountId: input.userAccountId,
+      actingWorkspaceId: input.actingWorkspaceId,
+      workspaceStatus: sellerAuth?.status ?? "Suspended",
+      isMember: sellerAuth?.members.has(input.userAccountId) ?? false,
+      hasSellerCapability: sellerAuth?.capabilities.has("Seller") ?? false,
+    });
+    if (!sellerVerdict.ok) {
       return Promise.resolve({ ok: false, reason: "SELLER_NOT_AUTHORIZED" });
     }
 
@@ -273,15 +275,17 @@ export class InMemoryProjectRequestRepository implements ProjectRequestRepositor
     input: DeclineProjectRequestInput,
   ): Promise<DecideResult<PersistedProjectRequest>> {
     // P1-002: revalidate the seller Workspace authority inside the
-    // same operation as the guarded Pending→Declined transition.
+    // same operation as the guarded Pending→Declined transition via
+    // the shared application policy (P1-003).
     const sellerAuth = this.sellerAuthorizations.get(input.actingWorkspaceId);
-    if (!sellerAuth || sellerAuth.status !== "Active") {
-      return Promise.resolve({ ok: false, reason: "SELLER_NOT_AUTHORIZED" });
-    }
-    if (!sellerAuth.members.has(input.userAccountId)) {
-      return Promise.resolve({ ok: false, reason: "SELLER_NOT_AUTHORIZED" });
-    }
-    if (!sellerAuth.capabilities.has("Seller")) {
+    const sellerVerdict = evaluateSellerAuthority({
+      userAccountId: input.userAccountId,
+      actingWorkspaceId: input.actingWorkspaceId,
+      workspaceStatus: sellerAuth?.status ?? "Suspended",
+      isMember: sellerAuth?.members.has(input.userAccountId) ?? false,
+      hasSellerCapability: sellerAuth?.capabilities.has("Seller") ?? false,
+    });
+    if (!sellerVerdict.ok) {
       return Promise.resolve({ ok: false, reason: "SELLER_NOT_AUTHORIZED" });
     }
 
