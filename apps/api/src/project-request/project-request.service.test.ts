@@ -20,16 +20,11 @@
 
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import type { MatchmakerCriteriaV1, ProjectBriefPublicV1 } from "@soundhub/types";
+import type { ProjectBriefPublicV1 } from "@soundhub/types";
 import {
   InMemoryAuthRepository,
   type InMemoryUserSeed,
 } from "../auth-repository/in-memory-auth-repository.js";
-import { InMemoryProjectBriefRepository } from "../matchmaker/in-memory-project-brief.repository.js";
-import type {
-  ProjectBriefRepository,
-  PersistedBrief,
-} from "../matchmaker/project-brief.repository.js";
 import { WorkspaceAuthorizationService } from "../services/workspace-authorization.service.js";
 import { ProjectRequestService } from "./project-request.service.js";
 import { InMemoryProjectRequestRepository } from "./in-memory-project-request.repository.js";
@@ -50,8 +45,6 @@ const OTHER_BRIEF_ID = "brief-other";
 interface Fixture {
   projectRequestService: ProjectRequestService;
   projectRequestRepo: InMemoryProjectRequestRepository;
-  briefRepo: ProjectBriefRepository;
-  buildBrief: (id: string, buyerWorkspaceId: string) => PersistedBrief;
   now: () => Date;
   clock: { current: Date };
 }
@@ -112,6 +105,32 @@ function buildFixture(): Fixture {
   const authz = new WorkspaceAuthorizationService({ authRepository: authRepo });
 
   const projectRequestRepo = new InMemoryProjectRequestRepository();
+  // P1-001 / P1-003: the repository's createProjectRequestWithRevalidation
+  // owns the buyer-authority check. Seed the buyer / other-buyer
+  // Workspace authorization snapshots so the in-memory adapter can
+  // answer the same question the Prisma adapter answers from the live
+  // Workspace / WorkspaceMembership / WorkspaceCapability rows.
+  projectRequestRepo.seedBuyerAuthorization({
+    workspaceId: BUYER_WORKSPACE_ID,
+    status: "Active",
+    memberIds: [BUYER_USER_ID],
+    capabilities: ["Buyer"],
+  });
+  projectRequestRepo.seedBuyerAuthorization({
+    workspaceId: OTHER_BUYER_WORKSPACE_ID,
+    status: "Active",
+    memberIds: [OTHER_BUYER_USER_ID],
+    capabilities: ["Buyer"],
+  });
+  // P1-002: the repository's acceptProjectRequest / declineProjectRequest
+  // owns the seller-authority check. Seed the seller Workspace
+  // authorization snapshot.
+  projectRequestRepo.seedSellerAuthorization({
+    workspaceId: SELLER_WORKSPACE_ID,
+    status: "Active",
+    memberIds: [SELLER_USER_ID],
+    capabilities: ["Seller"],
+  });
   // Seed the brief → recommendation mapping for P1-001 enforcement.
   // BRIEF_ID surfaces OFFERING_ID, OFFERING_OTHER_SELLER_ID,
   // OFFERING_INELIGIBLE_ID; OFFERING_NOT_IN_BRIEF_ID is NOT a
@@ -162,42 +181,15 @@ function buildFixture(): Fixture {
     profileStatus: "Published",
   });
 
-  const buildBrief = (id: string, buyerWorkspaceId: string): PersistedBrief => {
-    const criteria: MatchmakerCriteriaV1 = {
-      required: { primaryCategoryKeys: ["music-production"] },
-    };
-    return {
-      id,
-      buyerWorkspaceId,
-      createdByUserId:
-        buyerWorkspaceId === BUYER_WORKSPACE_ID ? BUYER_USER_ID : OTHER_BUYER_USER_ID,
-      briefText: "Need a producer",
-      criteria,
-      aiProvider: "deterministic-fallback",
-      aiModelId: null,
-      aiFallbackUsed: true,
-      createdAt: new Date(),
-      buyerWorkspace: {
-        workspaceId: buyerWorkspaceId,
-        slug: "buyer",
-        name: "Buyer",
-      },
-      results: [],
-    };
-  };
-
-  const briefRepo = new InMemoryProjectBriefRepository();
-  briefRepo.seed(buildBrief(BRIEF_ID, BUYER_WORKSPACE_ID));
-  briefRepo.seed(buildBrief(OTHER_BRIEF_ID, OTHER_BUYER_WORKSPACE_ID));
-
   const clock = { current: new Date("2026-08-27T00:00:00Z") };
   const now = () => clock.current;
 
   // P1-003: the service has NO Prisma dependency. The fixture wires
-  // the in-memory repository directly.
+  // the in-memory repository directly. P1-001 / P1-002 are now owned
+  // by the repository — the service no longer holds a brief or
+  // seller-authorization boundary.
   const service = new ProjectRequestService({
     projectRequestRepository: projectRequestRepo,
-    projectBriefRepository: briefRepo,
     workspaceAuthorizationService: authz,
     now,
   });
@@ -205,8 +197,6 @@ function buildFixture(): Fixture {
   return {
     projectRequestService: service,
     projectRequestRepo,
-    briefRepo,
-    buildBrief,
     now,
     clock,
   };
@@ -231,9 +221,10 @@ test("createProjectRequest persists a Pending request owned by the buyer Workspa
 
 test("createProjectRequest rejects a non-Buyer actor with PROJECT_REQUEST_FORBIDDEN", async () => {
   const { projectRequestService } = buildFixture();
-  // The seller user is not a member of the buyer workspace, so the
-  // workspace authorization service must reject them with
-  // NOT_A_MEMBER. The route collapses it to a safe envelope.
+  // The seller user is NOT a member of the buyer Workspace, so the
+  // repository's P1-001 buyer-authority check inside the write
+  // transaction fails closed with BUYER_NOT_AUTHORIZED. The route
+  // collapses the typed ProjectRequestError to a safe envelope.
   await assert.rejects(
     projectRequestService.createProjectRequest({
       userAccountId: SELLER_USER_ID,
@@ -242,9 +233,11 @@ test("createProjectRequest rejects a non-Buyer actor with PROJECT_REQUEST_FORBID
       serviceOfferingId: OFFERING_ID,
     }),
     (err: unknown) => {
-      // The error surfaces from the workspace authorization
-      // service; the route collapses it to a safe envelope.
-      return err instanceof Error && err.message.includes("not a current member");
+      return (
+        err instanceof Error &&
+        err.name === "ProjectRequestError" &&
+        (err as { code?: string }).code === "PROJECT_REQUEST_FORBIDDEN"
+      );
     },
   );
 });
@@ -387,8 +380,9 @@ test("acceptProjectRequest rejects a buyer Workspace member (only the seller sid
     projectBriefId: BRIEF_ID,
     serviceOfferingId: OFFERING_ID,
   });
-  // The buyer user is not a member of the seller Workspace, so
-  // workspace authorization fails closed with NOT_A_MEMBER.
+  // The buyer user is not a member of the seller Workspace, so the
+  // repository's P1-002 seller-authority check inside the decision
+  // transaction fails closed with SELLER_NOT_AUTHORIZED.
   await assert.rejects(
     projectRequestService.acceptProjectRequest({
       userAccountId: BUYER_USER_ID,
@@ -396,7 +390,11 @@ test("acceptProjectRequest rejects a buyer Workspace member (only the seller sid
       projectRequestId: created.projectRequest.projectRequestId,
     }),
     (err: unknown) => {
-      return err instanceof Error && err.message.includes("not a current member");
+      return (
+        err instanceof Error &&
+        err.name === "ProjectRequestError" &&
+        (err as { code?: string }).code === "PROJECT_REQUEST_FORBIDDEN"
+      );
     },
   );
 });

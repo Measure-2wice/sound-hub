@@ -37,16 +37,21 @@ export function resolveRequestId(req: Request): string {
 
 /**
  * Resolve the authenticated session and the request id in one step.
- * Returns `null` after writing the SESSION_INVALID envelope when the
- * caller is not signed in. The handler MUST bail out when this
- * returns null.
+ * Returns the single request id alongside the session so the handler
+ * can reuse it for envelope writes and log correlation without
+ * resolving a second id (P1-003). Writes the SESSION_INVALID
+ * envelope and returns `null` when the caller is not signed in.
+ * The handler MUST bail out when this returns null.
  */
 export async function resolveSessionForProjectRequest(
   req: Request,
   res: Response,
   authenticationService: { resolveSession(id: string | undefined): Promise<unknown> },
   actionLabel: string,
-): Promise<{ session: { userAccountId: string } } | null> {
+): Promise<{
+  readonly session: { readonly userAccountId: string };
+  readonly requestId: string;
+} | null> {
   const requestId = resolveRequestId(req);
   res.setHeader("x-request-id", requestId);
   const sessionId = readSessionCookie(req);
@@ -63,7 +68,10 @@ export async function resolveSessionForProjectRequest(
     );
     return null;
   }
-  return { session: { userAccountId: (session as { userAccountId: string }).userAccountId } };
+  return {
+    session: { userAccountId: (session as { userAccountId: string }).userAccountId },
+    requestId,
+  };
 }
 
 export function readSessionCookie(req: Request): string | undefined {

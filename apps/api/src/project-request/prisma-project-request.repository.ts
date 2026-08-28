@@ -47,36 +47,57 @@ function toDealStatus(value: DbDealStatus): DealStatusV1 {
   return value;
 }
 
-/**
- * Thrown when the partial unique index rejects a Pending duplicate
- * inside an in-memory adapter that does not own the partial-index
- * SQL. The Prisma adapter never throws this exception — its
- * `createProjectRequestWithRevalidation` translates the P2002
- * violation into the `ALREADY_PENDING` discriminated-union reason.
- * The export remains so the in-memory adapter can mirror the same
- * surface for service-level tests.
- */
-export class PendingDuplicateError extends Error {
-  constructor() {
-    super("A Pending ProjectRequest already exists for this tuple.");
-    this.name = "PendingDuplicateError";
-  }
-}
-
 export class PrismaProjectRequestRepository implements ProjectRequestRepository {
   constructor(private readonly prisma: PrismaClient) {}
 
   async createProjectRequestWithRevalidation(
     input: CreateProjectRequestRevalidatedInput,
   ): Promise<CreateProjectRequestResult> {
+    const userAccountId = input.userAccountId;
     const buyerWorkspaceId = input.buyerWorkspaceId;
     const projectBriefId = input.projectBriefId;
     const serviceOfferingId = input.serviceOfferingId;
-    const createdByUserId = input.createdByUserId;
 
     try {
       const result = await this.prisma.$transaction(async (tx) => {
-        // Step 1: Brief existence + ownership. The brief is the
+        // Step 1: Buyer authority inside the write transaction.
+        // The repository re-checks Workspace.status, the buyer's
+        // current WorkspaceMembership, and the buyer Workspace's
+        // Buyer capability, so a revoke that races an upstream
+        // authorize call cannot slip through (P1-001). Concurrent
+        // membership / capability mutations under READ COMMITTED
+        // would still let an ineligible insert pass the read, but
+        // the second-layer check at the INSERT — the partial
+        // unique index + the buyer-workspace FK — closes the race
+        // for the writes that matter. (See the concurrency test
+        // for the exact contract.)
+        const buyerWorkspace = await tx.workspace.findUnique({
+          where: { id: buyerWorkspaceId },
+          select: { id: true, status: true },
+        });
+        if (!buyerWorkspace || buyerWorkspace.status !== "Active") {
+          return { ok: false as const, reason: "BUYER_NOT_AUTHORIZED" as const };
+        }
+        const buyerMembership = await tx.workspaceMembership.findUnique({
+          where: {
+            userId_workspaceId: { userId: userAccountId, workspaceId: buyerWorkspaceId },
+          },
+          select: { userId: true },
+        });
+        if (!buyerMembership) {
+          return { ok: false as const, reason: "BUYER_NOT_AUTHORIZED" as const };
+        }
+        const buyerCapability = await tx.workspaceCapability.findUnique({
+          where: {
+            workspaceId_capability: { workspaceId: buyerWorkspaceId, capability: "Buyer" },
+          },
+          select: { workspaceId: true },
+        });
+        if (!buyerCapability) {
+          return { ok: false as const, reason: "BUYER_NOT_AUTHORIZED" as const };
+        }
+
+        // Step 2: Brief existence + ownership. The brief is the
         // buyer's anchor; without it the buyer has no persisted
         // search criteria to anchor on.
         const brief = await tx.projectBrief.findUnique({
@@ -90,7 +111,7 @@ export class PrismaProjectRequestRepository implements ProjectRequestRepository 
           return { ok: false as const, reason: "BRIEF_FORBIDDEN" as const };
         }
 
-        // Step 2: Brief-recommendation boundary (P1-001). The
+        // Step 3: Brief-recommendation boundary (P1-001). The
         // selected offering MUST be a persisted recommendation
         // (bestOfferingId) OR appear in the additionalOfferingsJson
         // of any BriefSearchResult for this brief. A buyer cannot
@@ -132,7 +153,7 @@ export class PrismaProjectRequestRepository implements ProjectRequestRepository 
           return { ok: false as const, reason: "OFFERING_NOT_IN_BRIEF" as const };
         }
 
-        // Step 3: Eligibility chain (workspace active + Seller
+        // Step 4: Eligibility chain (workspace active + Seller
         // capability + SellerProfile Published + ServiceOffering
         // Active). Same shape as the previous service-level
         // eligibility check, now under transaction control so a
@@ -171,7 +192,7 @@ export class PrismaProjectRequestRepository implements ProjectRequestRepository 
           return { ok: false as const, reason: "OFFERING_INELIGIBLE" as const };
         }
 
-        // Step 4: Persist. The partial unique index
+        // Step 5: Persist. The partial unique index
         // `project_requests_pending_unique_idx` rejects a duplicate
         // Pending row for the same tuple; we translate the P2002
         // violation into ALREADY_PENDING so the service fails closed
@@ -184,7 +205,7 @@ export class PrismaProjectRequestRepository implements ProjectRequestRepository 
               sellerWorkspaceId,
               serviceOfferingId,
               projectBriefId,
-              createdByUserId,
+              createdByUserId: userAccountId,
             },
           });
           return { ok: true as const, value: toPersisted(row) };
@@ -237,10 +258,44 @@ export class PrismaProjectRequestRepository implements ProjectRequestRepository 
   ): Promise<DecideResult<AcceptProjectRequestResult>> {
     const projectRequestId = input.projectRequestId;
     const sellerDecisionByUserId = input.sellerDecisionByUserId;
+    const actingWorkspaceId = input.actingWorkspaceId;
+    const userAccountId = input.userAccountId;
     const now = input.now;
 
     try {
       const result = await this.prisma.$transaction(async (tx) => {
+        // P1-002: seller authority inside the same transaction as
+        // the guarded Pending→Accepted transition. Re-check the
+        // seller Workspace status, the seller's current
+        // WorkspaceMembership, and the seller Workspace's Seller
+        // capability so a revoke between the upstream authorize call
+        // and this write cannot slip through.
+        const sellerWorkspace = await tx.workspace.findUnique({
+          where: { id: actingWorkspaceId },
+          select: { id: true, status: true },
+        });
+        if (!sellerWorkspace || sellerWorkspace.status !== "Active") {
+          return { ok: false as const, reason: "SELLER_NOT_AUTHORIZED" as const };
+        }
+        const sellerMembership = await tx.workspaceMembership.findUnique({
+          where: {
+            userId_workspaceId: { userId: userAccountId, workspaceId: actingWorkspaceId },
+          },
+          select: { userId: true },
+        });
+        if (!sellerMembership) {
+          return { ok: false as const, reason: "SELLER_NOT_AUTHORIZED" as const };
+        }
+        const sellerCapability = await tx.workspaceCapability.findUnique({
+          where: {
+            workspaceId_capability: { workspaceId: actingWorkspaceId, capability: "Seller" },
+          },
+          select: { workspaceId: true },
+        });
+        if (!sellerCapability) {
+          return { ok: false as const, reason: "SELLER_NOT_AUTHORIZED" as const };
+        }
+
         // Guarded transition: the WHERE status='Pending' clause is
         // the gate. A retried accept on an already-Accepted request
         // updates 0 rows and the service fails closed. A retried
@@ -302,9 +357,39 @@ export class PrismaProjectRequestRepository implements ProjectRequestRepository 
   ): Promise<DecideResult<PersistedProjectRequest>> {
     const projectRequestId = input.projectRequestId;
     const sellerDecisionByUserId = input.sellerDecisionByUserId;
+    const actingWorkspaceId = input.actingWorkspaceId;
+    const userAccountId = input.userAccountId;
     const now = input.now;
 
     const result = await this.prisma.$transaction(async (tx) => {
+      // P1-002: seller authority inside the same transaction as
+      // the guarded Pending→Declined transition.
+      const sellerWorkspace = await tx.workspace.findUnique({
+        where: { id: actingWorkspaceId },
+        select: { id: true, status: true },
+      });
+      if (!sellerWorkspace || sellerWorkspace.status !== "Active") {
+        return { ok: false as const, reason: "SELLER_NOT_AUTHORIZED" as const };
+      }
+      const sellerMembership = await tx.workspaceMembership.findUnique({
+        where: {
+          userId_workspaceId: { userId: userAccountId, workspaceId: actingWorkspaceId },
+        },
+        select: { userId: true },
+      });
+      if (!sellerMembership) {
+        return { ok: false as const, reason: "SELLER_NOT_AUTHORIZED" as const };
+      }
+      const sellerCapability = await tx.workspaceCapability.findUnique({
+        where: {
+          workspaceId_capability: { workspaceId: actingWorkspaceId, capability: "Seller" },
+        },
+        select: { workspaceId: true },
+      });
+      if (!sellerCapability) {
+        return { ok: false as const, reason: "SELLER_NOT_AUTHORIZED" as const };
+      }
+
       const guarded = await tx.projectRequest.updateMany({
         where: { id: projectRequestId, status: "Pending" },
         data: {

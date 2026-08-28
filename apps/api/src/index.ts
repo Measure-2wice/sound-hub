@@ -240,7 +240,6 @@ export function buildApp(options: AppOptions = {}): BuiltApp {
     options.projectRequestService ??
     new ProjectRequestService({
       projectRequestRepository,
-      projectBriefRepository,
       workspaceAuthorizationService,
     });
 

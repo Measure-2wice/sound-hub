@@ -21,7 +21,6 @@ import {
   projectRequestStatusValuesV1,
 } from "@soundhub/types";
 import {
-  resolveRequestId,
   resolveSessionForProjectRequest,
   readJsonBodyForProjectRequest,
   readPathParamForProjectRequest,
@@ -36,7 +35,6 @@ import type { ProjectRequestRouteDeps } from "./project-requests.js";
 
 export function createProjectRequest(deps: ProjectRequestRouteDeps) {
   return async (req: Request, res: Response): Promise<void> => {
-    const requestId = resolveRequestId(req);
     const sessionResult = await resolveSessionForProjectRequest(
       req,
       res,
@@ -44,7 +42,7 @@ export function createProjectRequest(deps: ProjectRequestRouteDeps) {
       "create a ProjectRequest",
     );
     if (!sessionResult) return;
-    const { session } = sessionResult;
+    const { session, requestId } = sessionResult;
 
     const rawBody = await readJsonBodyForProjectRequest(req, res, requestId);
     if (rawBody === null) return;
@@ -82,7 +80,6 @@ export function createProjectRequest(deps: ProjectRequestRouteDeps) {
 
 export function getProjectRequest(deps: ProjectRequestRouteDeps) {
   return async (req: Request, res: Response): Promise<void> => {
-    const requestId = resolveRequestId(req);
     const sessionResult = await resolveSessionForProjectRequest(
       req,
       res,
@@ -90,7 +87,7 @@ export function getProjectRequest(deps: ProjectRequestRouteDeps) {
       "fetch a ProjectRequest",
     );
     if (!sessionResult) return;
-    const { session } = sessionResult;
+    const { session, requestId } = sessionResult;
 
     const projectRequestId = readPathParamForProjectRequest(
       res,
@@ -126,7 +123,6 @@ export function getProjectRequest(deps: ProjectRequestRouteDeps) {
 
 export function listProjectRequests(deps: ProjectRequestRouteDeps) {
   return async (req: Request, res: Response): Promise<void> => {
-    const requestId = resolveRequestId(req);
     const sessionResult = await resolveSessionForProjectRequest(
       req,
       res,
@@ -134,7 +130,7 @@ export function listProjectRequests(deps: ProjectRequestRouteDeps) {
       "list ProjectRequests",
     );
     if (!sessionResult) return;
-    const { session } = sessionResult;
+    const { session, requestId } = sessionResult;
 
     const actingWorkspaceId = readActingWorkspaceIdFromQuery(res, req, requestId);
     if (!actingWorkspaceId) return;
@@ -172,7 +168,6 @@ export function listProjectRequests(deps: ProjectRequestRouteDeps) {
 
 export function acceptProjectRequest(deps: ProjectRequestRouteDeps) {
   return async (req: Request, res: Response): Promise<void> => {
-    const requestId = resolveRequestId(req);
     const sessionResult = await resolveSessionForProjectRequest(
       req,
       res,
@@ -180,7 +175,7 @@ export function acceptProjectRequest(deps: ProjectRequestRouteDeps) {
       "accept a ProjectRequest",
     );
     if (!sessionResult) return;
-    const { session } = sessionResult;
+    const { session, requestId } = sessionResult;
 
     const projectRequestId = readPathParamForProjectRequest(
       res,
@@ -225,7 +220,6 @@ export function acceptProjectRequest(deps: ProjectRequestRouteDeps) {
 
 export function declineProjectRequest(deps: ProjectRequestRouteDeps) {
   return async (req: Request, res: Response): Promise<void> => {
-    const requestId = resolveRequestId(req);
     const sessionResult = await resolveSessionForProjectRequest(
       req,
       res,
@@ -233,7 +227,7 @@ export function declineProjectRequest(deps: ProjectRequestRouteDeps) {
       "decline a ProjectRequest",
     );
     if (!sessionResult) return;
-    const { session } = sessionResult;
+    const { session, requestId } = sessionResult;
 
     const projectRequestId = readPathParamForProjectRequest(
       res,

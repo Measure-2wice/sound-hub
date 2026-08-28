@@ -60,20 +60,29 @@ export interface PersistedDeal {
 }
 
 export interface CreateProjectRequestRevalidatedInput {
+  readonly userAccountId: string;
   readonly buyerWorkspaceId: string;
   readonly projectBriefId: string;
   readonly serviceOfferingId: string;
-  readonly createdByUserId: string;
 }
 
 export interface AcceptProjectRequestInput {
   readonly projectRequestId: string;
+  /** Acting seller Workspace id (GS 17). */
+  readonly actingWorkspaceId: string;
+  /** Acting seller human. */
+  readonly userAccountId: string;
+  /** Pre-resolved seller decision actor id (the same userAccountId
+   *  once authorization succeeds). The repository persists this on
+   *  the ProjectRequest row inside the decision transaction. */
   readonly sellerDecisionByUserId: string;
   readonly now: Date;
 }
 
 export interface DeclineProjectRequestInput {
   readonly projectRequestId: string;
+  readonly actingWorkspaceId: string;
+  readonly userAccountId: string;
   readonly sellerDecisionByUserId: string;
   readonly now: Date;
 }
@@ -83,7 +92,7 @@ export interface AcceptProjectRequestResult {
   readonly deal: PersistedDeal;
 }
 
-export type DecideFailureReason = "NOT_FOUND" | "ALREADY_RESPONDED";
+export type DecideFailureReason = "NOT_FOUND" | "ALREADY_RESPONDED" | "SELLER_NOT_AUTHORIZED";
 
 export type DecideResult<T> =
   | { readonly ok: true; readonly value: T }
@@ -96,6 +105,7 @@ export type DecideResult<T> =
  * without leaving a partial ProjectRequest row.
  */
 export type CreateProjectRequestFailureReason =
+  | "BUYER_NOT_AUTHORIZED"
   | "BRIEF_NOT_FOUND"
   | "BRIEF_FORBIDDEN"
   | "OFFERING_NOT_IN_BRIEF"
@@ -108,16 +118,21 @@ export type CreateProjectRequestResult =
 
 export interface ProjectRequestRepository {
   /**
-   * Atomically revalidate the brief-ownership / brief-recommendation
-   * boundary and the offering-eligibility chain, then persist a
-   * Pending ProjectRequest. The entire operation runs inside a
-   * single Prisma `$transaction` so a concurrent mutation between
-   * the read of the BriefSearchResult, the eligibility lookup,
-   * and the INSERT cannot produce an ineligible Pending request
-   * (P1-002). Returns `{ok:false,...}` for any revalidation
-   * failure without leaving a partial ProjectRequest row.
+   * Atomically revalidate the buyer authority, brief-ownership,
+   * brief-recommendation boundary, and offering-eligibility chain,
+   * then persist a Pending ProjectRequest. The entire operation
+   * runs inside a single Prisma `$transaction` so a concurrent
+   * mutation between any read and the INSERT cannot produce an
+   * ineligible Pending request. Returns `{ok:false,...}` for any
+   * revalidation failure without leaving a partial ProjectRequest
+   * row.
    *
    * Failure reasons:
+   *   - `BUYER_NOT_AUTHORIZED` — the buyer's current Workspace
+   *      membership, Buyer capability, or buyer-workspace status
+   *      check failed inside the transaction (P1-001). A revoke
+   *      between an upstream authorize call and this call cannot
+   *      slip through.
    *   - `BRIEF_NOT_FOUND` — the ProjectBrief id does not exist.
    *   - `BRIEF_FORBIDDEN` — the ProjectBrief is owned by a
    *      different buyer Workspace than the one the caller is
@@ -154,23 +169,30 @@ export interface ProjectRequestRepository {
   }): Promise<readonly PersistedProjectRequest[]>;
 
   /**
-   * Atomically transition the named ProjectRequest from Pending to
-   * Accepted and create the Negotiating Deal. Returns
-   * `{ok:false,reason:"NOT_FOUND"}` when the row is missing,
-   * `{ok:false,reason:"ALREADY_RESPONDED"}` when the row is not in
-   * Pending status (already Accepted or Declined). The guarded
-   * updateMany prevents two concurrent accepts from both succeeding;
-   * the unique index on `deals.projectRequestId` is the second
-   * defense.
+   * Atomically revalidate the seller authority and transition the
+   * named ProjectRequest from Pending to Accepted, then create the
+   * Negotiating Deal — all inside one Prisma `$transaction` (P1-002).
+   * The repository re-checks Workspace.status, the seller's current
+   * WorkspaceMembership, and the seller Workspace's Seller
+   * capability so a revoke between an upstream authorize call and
+   * this write cannot slip through (P1-002).
+   *
+   * Failure reasons:
+   *   - `SELLER_NOT_AUTHORIZED` — the seller's current membership
+   *      / capability / workspace-status check failed inside the
+   *      transaction. No Deal is created.
+   *   - `NOT_FOUND` — the row is missing.
+   *   - `ALREADY_RESPONDED` — the row is not in Pending status
+   *      (already Accepted or Declined).
    */
   acceptProjectRequest(
     input: AcceptProjectRequestInput,
   ): Promise<DecideResult<AcceptProjectRequestResult>>;
 
   /**
-   * Atomically transition the named ProjectRequest from Pending to
-   * Declined and record the seller decision. Same failure reasons as
-   * {@link acceptProjectRequest}. No Deal is created.
+   * Atomically revalidate the seller authority and transition the
+   * named ProjectRequest from Pending to Declined. Same failure
+   * reasons as {@link acceptProjectRequest}. No Deal is created.
    */
   declineProjectRequest(
     input: DeclineProjectRequestInput,

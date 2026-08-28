@@ -458,6 +458,99 @@ describe("ProjectRequest route contract", () => {
       );
     }
   });
+
+  // P1-003 verification: every ProjectRequest response MUST be free of
+  // private human-actor identifiers (CLAUDE.md: "Do not expose account
+  // identity... publicly"). The fields `createdByUserId` and
+  // `sellerDecisionByUserId` are persisted as audit evidence only.
+  test("every ProjectRequest response is free of UserAccount identifiers", async () => {
+    FakeProjectRequestService.NEXT_BUYER_REJECTION = null;
+
+    const fields: readonly string[] = ["createdByUserId", "sellerDecisionByUserId"];
+
+    // POST /api/project-requests
+    const createResponse = await request(app).post("/api/project-requests").send({
+      actingWorkspaceId: BUYER_WORKSPACE_ID,
+      projectBriefId: "brief-1",
+      serviceOfferingId: "of-1",
+    });
+    assert.equal(createResponse.status, 201);
+    const createProjectRequest = (
+      createResponse.body as {
+        ok: true;
+        projectRequest: Record<string, unknown>;
+      }
+    ).projectRequest;
+    for (const field of fields) {
+      assert.equal(
+        createProjectRequest[field],
+        undefined,
+        `POST response must not include ${field}`,
+      );
+    }
+
+    // GET /api/project-requests/:id
+    const getResponse = await request(app).get(
+      `/api/project-requests/pr-1?actingWorkspaceId=${BUYER_WORKSPACE_ID}`,
+    );
+    assert.equal(getResponse.status, 200);
+    const getProjectRequest = (getResponse.body as { projectRequest: Record<string, unknown> })
+      .projectRequest;
+    for (const field of fields) {
+      assert.equal(getProjectRequest[field], undefined, `GET response must not include ${field}`);
+    }
+
+    // GET /api/project-requests (list)
+    const listResponse = await request(app).get(
+      `/api/project-requests?actingWorkspaceId=${BUYER_WORKSPACE_ID}`,
+    );
+    assert.equal(listResponse.status, 200);
+    const list = (listResponse.body as { projectRequests: ReadonlyArray<Record<string, unknown>> })
+      .projectRequests;
+    assert.equal(list.length, 1);
+    for (const item of list) {
+      for (const field of fields) {
+        assert.equal(item[field], undefined, `LIST response must not include ${field}`);
+      }
+    }
+
+    // POST /api/project-requests/:id/accept
+    const acceptResponse = await request(app)
+      .post("/api/project-requests/pr-1/accept")
+      .send({ actingWorkspaceId: SELLER_WORKSPACE_ID });
+    assert.equal(acceptResponse.status, 200);
+    const acceptProjectRequest = (
+      acceptResponse.body as {
+        ok: true;
+        projectRequest: Record<string, unknown>;
+        deal: Record<string, unknown>;
+      }
+    ).projectRequest;
+    for (const field of fields) {
+      assert.equal(
+        acceptProjectRequest[field],
+        undefined,
+        `ACCEPT response must not include ${field}`,
+      );
+    }
+  });
+
+  // P1-003 verification: when no inbound x-request-id is sent, the
+  // handler resolves one ID and propagates it to the header, the
+  // envelope's requestId, and any service-error envelope. They MUST
+  // be identical.
+  test("header, envelope, and error envelope share a single request id", async () => {
+    FakeProjectRequestService.NEXT_BUYER_REJECTION = "NOT_A_MEMBER";
+
+    const response = await request(app)
+      .post("/api/project-requests")
+      .send({ actingWorkspaceId: BUYER_WORKSPACE_ID, projectBriefId: "b", serviceOfferingId: "o" });
+    assert.equal(response.status, 403);
+    const headerId = response.headers["x-request-id"];
+    const envelopeId = (response.body as { error: { requestId: string } }).error.requestId;
+    assert.ok(typeof headerId === "string" && headerId.length > 0);
+    assert.equal(headerId, envelopeId, "header and envelope must share the same request id");
+  });
 });
 
 // Suppress unused-import errors for non-member ids used only in

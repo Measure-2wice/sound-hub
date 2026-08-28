@@ -55,7 +55,7 @@ test("createProjectRequestWithRevalidation persists a Pending row", async () => 
     buyerWorkspaceId: fixture.buyerWorkspace.id,
     projectBriefId: fixture.brief.id,
     serviceOfferingId: fixture.offering.id,
-    createdByUserId: fixture.buyerUser.id,
+    userAccountId: fixture.buyerUser.id,
   });
   assert.equal(result.ok, true);
   if (!result.ok) return;
@@ -72,13 +72,13 @@ test("createProjectRequestWithRevalidation rejects a Pending duplicate with ALRE
     buyerWorkspaceId: fixture.buyerWorkspace.id,
     projectBriefId: fixture.brief.id,
     serviceOfferingId: fixture.offering.id,
-    createdByUserId: fixture.buyerUser.id,
+    userAccountId: fixture.buyerUser.id,
   });
   const second = await repo.createProjectRequestWithRevalidation({
     buyerWorkspaceId: fixture.buyerWorkspace.id,
     projectBriefId: fixture.brief.id,
     serviceOfferingId: fixture.offering.id,
-    createdByUserId: fixture.buyerUser.id,
+    userAccountId: fixture.buyerUser.id,
   });
   assert.equal(second.ok, false);
   if (second.ok) return;
@@ -92,7 +92,7 @@ test("createProjectRequestWithRevalidation rejects an offering not surfaced by t
     buyerWorkspaceId: fixture.buyerWorkspace.id,
     projectBriefId: fixture.brief.id,
     serviceOfferingId: fixture.notRecommendedOffering.id,
-    createdByUserId: fixture.buyerUser.id,
+    userAccountId: fixture.buyerUser.id,
   });
   assert.equal(result.ok, false);
   if (result.ok) return;
@@ -109,7 +109,7 @@ test("createProjectRequestWithRevalidation rejects an unknown brief", async () =
     buyerWorkspaceId: fixture.buyerWorkspace.id,
     projectBriefId: "no-such-brief",
     serviceOfferingId: fixture.offering.id,
-    createdByUserId: fixture.buyerUser.id,
+    userAccountId: fixture.buyerUser.id,
   });
   assert.equal(result.ok, false);
   if (result.ok) return;
@@ -121,12 +121,14 @@ test("acceptProjectRequest atomically creates the Deal and transitions to Accept
     buyerWorkspaceId: fixture.buyerWorkspace.id,
     projectBriefId: fixture.brief.id,
     serviceOfferingId: fixture.offering.id,
-    createdByUserId: fixture.buyerUser.id,
+    userAccountId: fixture.buyerUser.id,
   });
   assert.equal(created.ok, true);
   if (!created.ok) return;
   const result = await repo.acceptProjectRequest({
     projectRequestId: created.value.id,
+    actingWorkspaceId: fixture.sellerWorkspace.id,
+    userAccountId: fixture.sellerUser.id,
     sellerDecisionByUserId: fixture.sellerUser.id,
     now: clockNow,
   });
@@ -142,18 +144,22 @@ test("acceptProjectRequest retried after Accept returns ALREADY_RESPONDED (no se
     buyerWorkspaceId: fixture.buyerWorkspace.id,
     projectBriefId: fixture.brief.id,
     serviceOfferingId: fixture.offering.id,
-    createdByUserId: fixture.buyerUser.id,
+    userAccountId: fixture.buyerUser.id,
   });
   assert.equal(created.ok, true);
   if (!created.ok) return;
   const first = await repo.acceptProjectRequest({
     projectRequestId: created.value.id,
+    actingWorkspaceId: fixture.sellerWorkspace.id,
+    userAccountId: fixture.sellerUser.id,
     sellerDecisionByUserId: fixture.sellerUser.id,
     now: clockNow,
   });
   assert.equal(first.ok, true);
   const second = await repo.acceptProjectRequest({
     projectRequestId: created.value.id,
+    actingWorkspaceId: fixture.sellerWorkspace.id,
+    userAccountId: fixture.sellerUser.id,
     sellerDecisionByUserId: fixture.sellerUser.id,
     now: clockNow,
   });
@@ -172,12 +178,14 @@ test("declineProjectRequest transitions to Declined and creates no Deal", async 
     buyerWorkspaceId: fixture.buyerWorkspace.id,
     projectBriefId: fixture.brief.id,
     serviceOfferingId: fixture.offering.id,
-    createdByUserId: fixture.buyerUser.id,
+    userAccountId: fixture.buyerUser.id,
   });
   assert.equal(created.ok, true);
   if (!created.ok) return;
   const result = await repo.declineProjectRequest({
     projectRequestId: created.value.id,
+    actingWorkspaceId: fixture.sellerWorkspace.id,
+    userAccountId: fixture.sellerUser.id,
     sellerDecisionByUserId: fixture.sellerUser.id,
     now: clockNow,
   });
@@ -196,18 +204,22 @@ test("acceptProjectRequest retried after Decline returns ALREADY_RESPONDED", asy
     buyerWorkspaceId: fixture.buyerWorkspace.id,
     projectBriefId: fixture.brief.id,
     serviceOfferingId: fixture.offering.id,
-    createdByUserId: fixture.buyerUser.id,
+    userAccountId: fixture.buyerUser.id,
   });
   assert.equal(created.ok, true);
   if (!created.ok) return;
   const declined = await repo.declineProjectRequest({
     projectRequestId: created.value.id,
+    actingWorkspaceId: fixture.sellerWorkspace.id,
+    userAccountId: fixture.sellerUser.id,
     sellerDecisionByUserId: fixture.sellerUser.id,
     now: clockNow,
   });
   assert.equal(declined.ok, true);
   const accepted = await repo.acceptProjectRequest({
     projectRequestId: created.value.id,
+    actingWorkspaceId: fixture.sellerWorkspace.id,
+    userAccountId: fixture.sellerUser.id,
     sellerDecisionByUserId: fixture.sellerUser.id,
     now: clockNow,
   });
@@ -243,7 +255,7 @@ test("createProjectRequestWithRevalidation is blocked by an externally-inserted 
     buyerWorkspaceId: fixture.buyerWorkspace.id,
     projectBriefId: fixture.brief.id,
     serviceOfferingId: fixture.offering.id,
-    createdByUserId: fixture.buyerUser.id,
+    userAccountId: fixture.buyerUser.id,
   });
   assert.equal(second.ok, false);
   if (second.ok) return;
@@ -270,12 +282,14 @@ test("RESTRICT prevents Workspace deletion from erasing accepted ProjectRequests
     buyerWorkspaceId: fixture.buyerWorkspace.id,
     projectBriefId: fixture.brief.id,
     serviceOfferingId: fixture.offering.id,
-    createdByUserId: fixture.buyerUser.id,
+    userAccountId: fixture.buyerUser.id,
   });
   assert.equal(created.ok, true);
   if (!created.ok) return;
   const accepted = await repo.acceptProjectRequest({
     projectRequestId: created.value.id,
+    actingWorkspaceId: fixture.sellerWorkspace.id,
+    userAccountId: fixture.sellerUser.id,
     sellerDecisionByUserId: fixture.sellerUser.id,
     now: clockNow,
   });
@@ -314,12 +328,14 @@ test("RESTRICT prevents ProjectRequest deletion from erasing the associated Deal
     buyerWorkspaceId: fixture.buyerWorkspace.id,
     projectBriefId: fixture.brief.id,
     serviceOfferingId: fixture.offering.id,
-    createdByUserId: fixture.buyerUser.id,
+    userAccountId: fixture.buyerUser.id,
   });
   assert.equal(created.ok, true);
   if (!created.ok) return;
   const accepted = await repo.acceptProjectRequest({
     projectRequestId: created.value.id,
+    actingWorkspaceId: fixture.sellerWorkspace.id,
+    userAccountId: fixture.sellerUser.id,
     sellerDecisionByUserId: fixture.sellerUser.id,
     now: clockNow,
   });
@@ -341,12 +357,14 @@ test("RESTRICT prevents deciding-UserAccount deletion from nulling seller consen
     buyerWorkspaceId: fixture.buyerWorkspace.id,
     projectBriefId: fixture.brief.id,
     serviceOfferingId: fixture.offering.id,
-    createdByUserId: fixture.buyerUser.id,
+    userAccountId: fixture.buyerUser.id,
   });
   assert.equal(created.ok, true);
   if (!created.ok) return;
   const accepted = await repo.acceptProjectRequest({
     projectRequestId: created.value.id,
+    actingWorkspaceId: fixture.sellerWorkspace.id,
+    userAccountId: fixture.sellerUser.id,
     sellerDecisionByUserId: fixture.sellerUser.id,
     now: clockNow,
   });

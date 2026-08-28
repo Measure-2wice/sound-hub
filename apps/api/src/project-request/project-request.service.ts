@@ -28,14 +28,8 @@ import type {
   ProjectRequestPublicV1,
   DealPublicV1,
 } from "@soundhub/types";
-import type {
-  ProjectBriefRepository,
-  PersistedBrief,
-} from "../matchmaker/project-brief.repository.js";
-import {
-  type ActingMembership,
-  type WorkspaceAuthorizationService,
-} from "../services/workspace-authorization.service.js";
+import type { PersistedBrief } from "../matchmaker/project-brief.repository.js";
+import { type WorkspaceAuthorizationService } from "../services/workspace-authorization.service.js";
 import type {
   ProjectRequestRepository,
   CreateProjectRequestFailureReason,
@@ -63,7 +57,6 @@ export class ProjectRequestError extends Error {
 
 export interface ProjectRequestServiceDeps {
   readonly projectRequestRepository: ProjectRequestRepository;
-  readonly projectBriefRepository: ProjectBriefRepository;
   readonly workspaceAuthorizationService: WorkspaceAuthorizationService;
   /**
    * Optional clock injection for tests. Defaults to `new Date()`.
@@ -104,13 +97,11 @@ export interface ListProjectRequestsInput {
 
 export class ProjectRequestService {
   private readonly repository: ProjectRequestRepository;
-  private readonly briefs: ProjectBriefRepository;
   private readonly authz: WorkspaceAuthorizationService;
   private readonly now: () => Date;
 
   constructor(deps: ProjectRequestServiceDeps) {
     this.repository = deps.projectRequestRepository;
-    this.briefs = deps.projectBriefRepository;
     this.authz = deps.workspaceAuthorizationService;
     this.now = deps.now ?? (() => new Date());
   }
@@ -135,19 +126,17 @@ export class ProjectRequestService {
   async createProjectRequest(input: CreateProjectRequestInput): Promise<{
     readonly projectRequest: ProjectRequestPublicV1;
   }> {
-    // Step 1: Buyer-side authorization.
-    const membership = await this.authz.requireCapability({
-      userAccountId: input.userAccountId,
-      workspaceId: input.actingWorkspaceId,
-      requiredCapability: "Buyer",
-    });
-
-    // Step 2: Atomic revalidation + INSERT (P1-001 / P1-002 / P1-003).
+    // The repository owns the entire revalidation + INSERT
+    // pipeline, including the buyer Workspace / membership /
+    // capability check (P1-001). The service does NOT call
+    // authz.requireCapability up front: doing so would create a
+    // window between the upstream authorize and the repository
+    // INSERT where a concurrent revoke could slip through.
     const result = await this.repository.createProjectRequestWithRevalidation({
-      buyerWorkspaceId: membership.workspace.workspaceId,
+      userAccountId: input.userAccountId,
+      buyerWorkspaceId: input.actingWorkspaceId,
       projectBriefId: input.projectBriefId,
       serviceOfferingId: input.serviceOfferingId,
-      createdByUserId: input.userAccountId,
     });
     if (!result.ok) {
       throw this.createFailureToServiceError(result.reason);
@@ -169,13 +158,25 @@ export class ProjectRequestService {
     if (!existing) {
       throw new ProjectRequestError("ProjectRequest not found.", "PROJECT_REQUEST_NOT_FOUND");
     }
-    // Membership revalidation against the seller Workspace (GS 17 —
-    // only an authorized seller member may accept).
-    const sellerMembership = await this.requireSellerMembership(input, existing);
+    // GS 17 — only the seller Workspace owning this request may
+    // accept. The acting Workspace MUST match the persisted
+    // sellerWorkspaceId; if it does not, fail closed before touching
+    // the row. The repository then revalidates current seller
+    // membership, capability, and Workspace status inside the same
+    // `$transaction` as the guarded Pending→Accepted transition
+    // (P1-002).
+    if (existing.sellerWorkspaceId !== input.actingWorkspaceId) {
+      throw new ProjectRequestError(
+        "You are not authorized to respond to this ProjectRequest.",
+        "PROJECT_REQUEST_FORBIDDEN",
+      );
+    }
 
     const result = await this.repository.acceptProjectRequest({
       projectRequestId: existing.id,
-      sellerDecisionByUserId: sellerMembership.userAccountId,
+      actingWorkspaceId: input.actingWorkspaceId,
+      userAccountId: input.userAccountId,
+      sellerDecisionByUserId: input.userAccountId,
       now: this.now(),
     });
     if (!result.ok) {
@@ -198,11 +199,18 @@ export class ProjectRequestService {
     if (!existing) {
       throw new ProjectRequestError("ProjectRequest not found.", "PROJECT_REQUEST_NOT_FOUND");
     }
-    const sellerMembership = await this.requireSellerMembership(input, existing);
+    if (existing.sellerWorkspaceId !== input.actingWorkspaceId) {
+      throw new ProjectRequestError(
+        "You are not authorized to respond to this ProjectRequest.",
+        "PROJECT_REQUEST_FORBIDDEN",
+      );
+    }
 
     const result = await this.repository.declineProjectRequest({
       projectRequestId: existing.id,
-      sellerDecisionByUserId: sellerMembership.userAccountId,
+      actingWorkspaceId: input.actingWorkspaceId,
+      userAccountId: input.userAccountId,
+      sellerDecisionByUserId: input.userAccountId,
       now: this.now(),
     });
     if (!result.ok) {
@@ -263,29 +271,15 @@ export class ProjectRequestService {
    * fail closed with NOT_A_MEMBER; the route maps that to
    * PROJECT_REQUEST_FORBIDDEN.
    */
-  private async requireSellerMembership(
-    input: AcceptProjectRequestInput | DeclineProjectRequestInput,
-    existing: PersistedProjectRequest,
-  ): Promise<{ readonly membership: ActingMembership; readonly userAccountId: string }> {
-    if (existing.sellerWorkspaceId !== input.actingWorkspaceId) {
-      // The actor claimed a different acting Workspace. Reject
-      // before touching the row.
-      throw new ProjectRequestError(
-        "You are not authorized to respond to this ProjectRequest.",
-        "PROJECT_REQUEST_FORBIDDEN",
-      );
-    }
-    const membership = await this.authz.requireActingMembership({
-      userAccountId: input.userAccountId,
-      workspaceId: input.actingWorkspaceId,
-    });
-    return { membership, userAccountId: input.userAccountId };
-  }
-
   private createFailureToServiceError(
     reason: CreateProjectRequestFailureReason,
   ): ProjectRequestError {
     switch (reason) {
+      case "BUYER_NOT_AUTHORIZED":
+        return new ProjectRequestError(
+          "You are not authorized to create this ProjectRequest.",
+          "PROJECT_REQUEST_FORBIDDEN",
+        );
       case "BRIEF_NOT_FOUND":
         return new ProjectRequestError(
           "ProjectBrief not found.",
@@ -311,10 +305,16 @@ export class ProjectRequestService {
   }
 
   private decideErrorToServiceError(
-    reason: "NOT_FOUND" | "ALREADY_RESPONDED",
+    reason: "NOT_FOUND" | "ALREADY_RESPONDED" | "SELLER_NOT_AUTHORIZED",
   ): ProjectRequestError {
     if (reason === "NOT_FOUND") {
       return new ProjectRequestError("ProjectRequest not found.", "PROJECT_REQUEST_NOT_FOUND");
+    }
+    if (reason === "SELLER_NOT_AUTHORIZED") {
+      return new ProjectRequestError(
+        "You are not authorized to respond to this ProjectRequest.",
+        "PROJECT_REQUEST_FORBIDDEN",
+      );
     }
     return new ProjectRequestError(
       "This ProjectRequest has already been responded to.",
