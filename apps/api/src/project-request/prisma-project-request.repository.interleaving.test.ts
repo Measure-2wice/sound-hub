@@ -30,26 +30,15 @@ import { createPrismaClient, type PrismaClient } from "@soundhub/db";
 import { assertDisposableTestDatabase, readTestDatabaseUrl } from "../lib/test-database.js";
 import { PrismaProjectRequestRepository } from "./prisma-project-request.repository.js";
 import { loadOrCreateFixture, type ProjectRequestFixture } from "./test-fixture.js";
-import {
-  evaluateBriefRecommendationBoundary,
-  evaluateBuyerAuthority,
-  evaluateSellerAuthority,
-  evaluateSellerEligibility,
-} from "./project-request-authorization-policy.js";
-import type {
-  CreateProjectRequestUseCase,
-  CreateProjectRequestUseCaseContext,
-  CreateProjectRequestUseCaseTools,
-  RespondProjectRequestUseCase,
-  RespondProjectRequestUseCaseContext,
-  RespondProjectRequestUseCaseTools,
-} from "./project-request.repository.js";
+import { buyerOkUseCase, buildAcceptUseCase, buildDeclineUseCase } from "./test-use-cases.js";
 
 let prismaA: PrismaClient;
 let prismaB: PrismaClient;
 let fixture: ProjectRequestFixture;
 let repo: PrismaProjectRequestRepository;
 const clockNow = new Date("2026-08-27T12:00:00Z");
+const acceptUseCase = buildAcceptUseCase(clockNow);
+const declineUseCase = buildDeclineUseCase(clockNow);
 
 before(async () => {
   const url = readTestDatabaseUrl();
@@ -141,54 +130,8 @@ beforeEach(async () => {
 
 // ---------- application-owned policy helpers used in the tests ----------
 
-const buyerOkUseCase: CreateProjectRequestUseCase = (
-  ctx: CreateProjectRequestUseCaseContext,
-  tools: CreateProjectRequestUseCaseTools,
-) => {
-  const briefVerdict = evaluateBriefRecommendationBoundary(
-    ctx.briefRecommendations,
-    ctx.sellerEligibility.serviceOfferingId,
-    ctx.buyerAuthority.buyerWorkspaceId,
-  );
-  if (!briefVerdict.ok) return tools.reject("OFFERING_NOT_IN_BRIEF");
-  const buyerVerdict = evaluateBuyerAuthority(ctx.buyerAuthority);
-  if (!buyerVerdict.ok) return tools.reject("BUYER_NOT_AUTHORIZED");
-  const sellerVerdict = evaluateSellerEligibility(ctx.sellerEligibility);
-  if (!sellerVerdict.ok) return tools.reject("SELLER_INELIGIBLE");
-  return tools.persist({
-    userAccountId: ctx.buyerAuthority.userAccountId,
-    buyerWorkspaceId: ctx.buyerAuthority.buyerWorkspaceId,
-    sellerWorkspaceId: sellerVerdict.sellerWorkspaceId,
-    projectBriefId: ctx.briefRecommendations.projectBriefId,
-    serviceOfferingId: ctx.sellerEligibility.serviceOfferingId,
-  });
-};
-
-const acceptUseCase: RespondProjectRequestUseCase = (
-  ctx: RespondProjectRequestUseCaseContext,
-  tools: RespondProjectRequestUseCaseTools,
-) => {
-  const verdict = evaluateSellerAuthority(ctx.sellerAuthority);
-  if (!verdict.ok) return tools.reject("SELLER_NOT_AUTHORIZED");
-  return tools.accept({
-    projectRequestId: ctx.projectRequest.id,
-    sellerDecisionByUserId: ctx.sellerAuthority.userAccountId,
-    now: clockNow,
-  });
-};
-
-const declineUseCase: RespondProjectRequestUseCase = (
-  ctx: RespondProjectRequestUseCaseContext,
-  tools: RespondProjectRequestUseCaseTools,
-) => {
-  const verdict = evaluateSellerAuthority(ctx.sellerAuthority);
-  if (!verdict.ok) return tools.reject("SELLER_NOT_AUTHORIZED");
-  return tools.decline({
-    projectRequestId: ctx.projectRequest.id,
-    sellerDecisionByUserId: ctx.sellerAuthority.userAccountId,
-    now: clockNow,
-  });
-};
+// (Canonical use cases are imported from ./test-use-cases.js to
+// prevent drift between the four persistence suites.)
 
 // ---------- helpers ----------
 

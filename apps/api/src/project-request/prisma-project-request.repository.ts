@@ -102,6 +102,29 @@ function toDealStatus(value: DbDealStatus): DealStatusV1 {
 // emit a safe 409 envelope.
 const P2034_RETRY_BUDGET = 3;
 
+// ---------- test barrier seam ----------
+//
+// `transactionStageHook` is an optional awaitable that the
+// repository invokes immediately after the authoritative
+// authority / eligibility rows are FOR UPDATE-locked but BEFORE
+// the use case runs and BEFORE the INSERT / UPDATE commits.
+// Production NEVER sets it; only disposable-PostgreSQL tests
+// that need to coordinate a second connection against the real
+// production transaction path install it. The hook is kept
+// internal to this persistence module so it cannot leak into
+// application code or become a generalized event/hook framework.
+export type TransactionStageHook = () => Promise<void> | void;
+let transactionStageHook: TransactionStageHook | undefined;
+
+export function setTransactionStageHookForTesting(hook: TransactionStageHook | undefined): void {
+  transactionStageHook = hook;
+}
+export async function runTransactionStageHookForTesting(): Promise<void> {
+  if (transactionStageHook) {
+    await transactionStageHook();
+  }
+}
+
 // The safe typed failure reason a BG4 command returns after the
 // retry budget is exhausted. Routes collapse it onto the existing
 // safe envelope (PROJECT_REQUEST_OFFERING_INELIGIBLE for create,
@@ -225,6 +248,12 @@ export class PrismaProjectRequestRepository implements ProjectRequestRepository 
           // recommendation boundary is a buyer-safe provenance
           // check that the application policy owns.
           const briefRecommendations = await this.loadAndLockBriefRecommendations(tx, input);
+
+          // Test barrier seam: invoked after every authoritative
+          // FOR UPDATE-locked row has been acquired but BEFORE
+          // the use case runs and BEFORE the INSERT / UPDATE
+          // commits. Production never sets the hook.
+          await runTransactionStageHookForTesting();
 
           // Step 4: hand the snapshots to the application-owned
           // use case. The repository MUST NOT decide whether the
@@ -509,6 +538,14 @@ export class PrismaProjectRequestRepository implements ProjectRequestRepository 
             input,
             requestRow.sellerWorkspaceId,
           );
+
+          // Test barrier seam: invoked after every authoritative
+          // FOR UPDATE-locked row has been acquired (ProjectRequest
+          // + seller Workspace + seller WorkspaceMembership +
+          // seller WorkspaceCapability) but BEFORE the use case
+          // runs and BEFORE the guarded UPDATE / Deal create.
+          // Production never sets the hook.
+          await runTransactionStageHookForTesting();
 
           // Hand the snapshot to the application-owned use case.
           const projectRequest: PersistedProjectRequest = toPersisted(requestRow);

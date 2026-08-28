@@ -22,25 +22,14 @@ import { createPrismaClient, type PrismaClient } from "@soundhub/db";
 import { assertDisposableTestDatabase, readTestDatabaseUrl } from "../lib/test-database.js";
 import { PrismaProjectRequestRepository } from "./prisma-project-request.repository.js";
 import { loadOrCreateFixture, type ProjectRequestFixture } from "./test-fixture.js";
-import {
-  evaluateBriefRecommendationBoundary,
-  evaluateBuyerAuthority,
-  evaluateSellerAuthority,
-  evaluateSellerEligibility,
-} from "./project-request-authorization-policy.js";
-import type {
-  CreateProjectRequestUseCase,
-  CreateProjectRequestUseCaseContext,
-  CreateProjectRequestUseCaseTools,
-  RespondProjectRequestUseCase,
-  RespondProjectRequestUseCaseContext,
-  RespondProjectRequestUseCaseTools,
-} from "./project-request.repository.js";
+import { buyerOkUseCase, buildAcceptUseCase, buildDeclineUseCase } from "./test-use-cases.js";
 
 let prisma: PrismaClient;
 let fixture: ProjectRequestFixture;
 let repo: PrismaProjectRequestRepository;
 const clockNow = new Date("2026-08-27T12:00:00Z");
+const respondAcceptUseCase = buildAcceptUseCase(clockNow);
+const respondDeclineUseCase = buildDeclineUseCase(clockNow);
 
 before(async () => {
   const url = readTestDatabaseUrl();
@@ -66,65 +55,6 @@ beforeEach(async () => {
   });
   repo = new PrismaProjectRequestRepository(prisma);
 });
-
-// Helper: wire a use case that mirrors the application-owned
-// service closure. The repository only loads + locks; the policy
-// evaluators below are the application-owned policy. This proves
-// the repository does not decide whether the facts authorize the
-// command.
-const buyerOkUseCase: CreateProjectRequestUseCase = (
-  ctx: CreateProjectRequestUseCaseContext,
-  tools: CreateProjectRequestUseCaseTools,
-) => {
-  const briefVerdict = evaluateBriefRecommendationBoundary(
-    ctx.briefRecommendations,
-    ctx.sellerEligibility.serviceOfferingId,
-    ctx.buyerAuthority.buyerWorkspaceId,
-  );
-  if (!briefVerdict.ok) {
-    if (briefVerdict.reason === "BRIEF_NOT_FOUND") return tools.reject("BRIEF_NOT_FOUND");
-    if (briefVerdict.reason === "OFFERING_NOT_IN_BRIEF")
-      return tools.reject("OFFERING_NOT_IN_BRIEF");
-    return tools.reject("OFFERING_NOT_IN_BRIEF");
-  }
-  const buyerVerdict = evaluateBuyerAuthority(ctx.buyerAuthority);
-  if (!buyerVerdict.ok) return tools.reject("BUYER_NOT_AUTHORIZED");
-  const sellerVerdict = evaluateSellerEligibility(ctx.sellerEligibility);
-  if (!sellerVerdict.ok) return tools.reject("SELLER_INELIGIBLE");
-  return tools.persist({
-    userAccountId: ctx.buyerAuthority.userAccountId,
-    buyerWorkspaceId: ctx.buyerAuthority.buyerWorkspaceId,
-    sellerWorkspaceId: sellerVerdict.sellerWorkspaceId,
-    projectBriefId: ctx.briefRecommendations.projectBriefId,
-    serviceOfferingId: ctx.sellerEligibility.serviceOfferingId,
-  });
-};
-
-const respondAcceptUseCase: RespondProjectRequestUseCase = (
-  ctx: RespondProjectRequestUseCaseContext,
-  tools: RespondProjectRequestUseCaseTools,
-) => {
-  const verdict = evaluateSellerAuthority(ctx.sellerAuthority);
-  if (!verdict.ok) return tools.reject("SELLER_NOT_AUTHORIZED");
-  return tools.accept({
-    projectRequestId: ctx.projectRequest.id,
-    sellerDecisionByUserId: ctx.sellerAuthority.userAccountId,
-    now: clockNow,
-  });
-};
-
-const respondDeclineUseCase: RespondProjectRequestUseCase = (
-  ctx: RespondProjectRequestUseCaseContext,
-  tools: RespondProjectRequestUseCaseTools,
-) => {
-  const verdict = evaluateSellerAuthority(ctx.sellerAuthority);
-  if (!verdict.ok) return tools.reject("SELLER_NOT_AUTHORIZED");
-  return tools.decline({
-    projectRequestId: ctx.projectRequest.id,
-    sellerDecisionByUserId: ctx.sellerAuthority.userAccountId,
-    now: clockNow,
-  });
-};
 
 // ---------- persistence + uniqueness ----------
 

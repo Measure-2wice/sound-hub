@@ -18,16 +18,7 @@ import { createPrismaClient, type PrismaClient } from "@soundhub/db";
 import { assertDisposableTestDatabase, readTestDatabaseUrl } from "../lib/test-database.js";
 import { PrismaProjectRequestRepository } from "./prisma-project-request.repository.js";
 import { loadOrCreateFixture, type ProjectRequestFixture } from "./test-fixture.js";
-import {
-  evaluateBriefRecommendationBoundary,
-  evaluateBuyerAuthority,
-  evaluateSellerEligibility,
-} from "./project-request-authorization-policy.js";
-import type {
-  CreateProjectRequestUseCase,
-  CreateProjectRequestUseCaseContext,
-  CreateProjectRequestUseCaseTools,
-} from "./project-request.repository.js";
+import { buyerOkUseCase } from "./test-use-cases.js";
 import { PrismaClientKnownRequestError } from "@soundhub/db/dist/generated/internal/prismaNamespace.js";
 
 let prisma: PrismaClient;
@@ -43,29 +34,6 @@ before(async () => {
 after(async () => {
   if (prisma) await prisma.$disconnect();
 });
-
-const buyerOkUseCase: CreateProjectRequestUseCase = (
-  ctx: CreateProjectRequestUseCaseContext,
-  tools: CreateProjectRequestUseCaseTools,
-) => {
-  const briefVerdict = evaluateBriefRecommendationBoundary(
-    ctx.briefRecommendations,
-    ctx.sellerEligibility.serviceOfferingId,
-    ctx.buyerAuthority.buyerWorkspaceId,
-  );
-  if (!briefVerdict.ok) return tools.reject("OFFERING_NOT_IN_BRIEF");
-  const buyerVerdict = evaluateBuyerAuthority(ctx.buyerAuthority);
-  if (!buyerVerdict.ok) return tools.reject("BUYER_NOT_AUTHORIZED");
-  const sellerVerdict = evaluateSellerEligibility(ctx.sellerEligibility);
-  if (!sellerVerdict.ok) return tools.reject("SELLER_INELIGIBLE");
-  return tools.persist({
-    userAccountId: ctx.buyerAuthority.userAccountId,
-    buyerWorkspaceId: ctx.buyerAuthority.buyerWorkspaceId,
-    sellerWorkspaceId: sellerVerdict.sellerWorkspaceId,
-    projectBriefId: ctx.briefRecommendations.projectBriefId,
-    serviceOfferingId: ctx.sellerEligibility.serviceOfferingId,
-  });
-};
 
 /**
  * Build a real Prisma `P2034` error whose code property matches
