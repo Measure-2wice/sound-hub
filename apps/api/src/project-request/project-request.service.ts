@@ -3,26 +3,24 @@
 // Background: ticket #62 requires a single application boundary that
 // owns the buyer-side ProjectRequest creation, the seller-side
 // accept/decline, and the eligibility revalidation that protects
-// against stale selections (GS 16). The service threads:
-//   - authenticated human + acting Workspace authorization
-//     (the policy decision — the application owns authorization)
-//   - eligibility revalidation of the selected ServiceOffering
-//     (workspace active + Seller capability + SellerProfile Published
-//     + ServiceOffering Active + ownership — i.e. the offering
-//     belongs to the seller Workspace the buyer is addressing)
-//   - repository persistence with natural uniqueness + guarded
-//     state transitions
-//   - atomic Deal creation on accept
+// against stale selections (GS 16). The service composes:
 //
-// The service is the only layer that knows the domain rules. The
-// route layer translates the typed errors into the safe envelope.
-// The repository layer owns persistence + transactions only — the
-// service makes the authorization policy decision BEFORE calling
-// the repository. The repository's transaction is the atomic guard
-// for the brief-ownership, brief-recommendation, and offering
-// eligibility facts, and the natural uniqueness constraint plus
-// guarded state transitions provide the retry-safety contract
-// required by ticket #62 (GS 26).
+//   - the application-owned policy evaluators in
+//     `./project-request-authorization-policy.ts` (buyer authority,
+//     complete seller / offering eligibility, brief recommendation
+//     boundary, seller authority), and
+//   - the transaction-scoped repository methods in
+//     `./project-request.repository.ts` (one PostgreSQL transaction
+//     per command, FOR UPDATE-locked fact reads, guarded persistence).
+//
+// For each consequential command the service supplies a pure use-case
+// closure that consumes the snapshot the repository loads inside its
+// transaction and returns either a `persist` verdict or a `reject`
+// verdict. The repository never decides whether the facts authorize
+// the command; the service owns that decision.
+//
+// The repository remains the only layer that touches Prisma. The
+// service has no Prisma dependency.
 
 import type {
   CreateProjectRequestRequestV1,
@@ -30,13 +28,30 @@ import type {
   DealPublicV1,
 } from "@soundhub/types";
 import type { PersistedBrief } from "../matchmaker/project-brief.repository.js";
-import { type WorkspaceAuthorizationService } from "../services/workspace-authorization.service.js";
 import type {
-  ProjectRequestRepository,
+  AcceptProjectRequestResult,
   CreateProjectRequestFailureReason,
-  PersistedProjectRequest,
+  CreateProjectRequestResult,
+  CreateProjectRequestUseCase,
+  CreateProjectRequestUseCaseContext,
+  CreateProjectRequestUseCaseTools,
+  CreateUseCaseOutcome,
+  DecideFailureReason,
+  DecideResult,
   PersistedDeal,
+  PersistedProjectRequest,
+  ProjectRequestRepository,
+  RespondProjectRequestUseCase,
+  RespondProjectRequestUseCaseContext,
+  RespondProjectRequestUseCaseTools,
+  RespondUseCaseOutcome,
 } from "./project-request.repository.js";
+import {
+  evaluateBriefRecommendationBoundary,
+  evaluateBuyerAuthority,
+  evaluateSellerAuthority,
+  evaluateSellerEligibility,
+} from "./project-request-authorization-policy.js";
 
 export class ProjectRequestError extends Error {
   constructor(
@@ -58,7 +73,6 @@ export class ProjectRequestError extends Error {
 
 export interface ProjectRequestServiceDeps {
   readonly projectRequestRepository: ProjectRequestRepository;
-  readonly workspaceAuthorizationService: WorkspaceAuthorizationService;
   /**
    * Optional clock injection for tests. Defaults to `new Date()`.
    */
@@ -98,12 +112,10 @@ export interface ListProjectRequestsInput {
 
 export class ProjectRequestService {
   private readonly repository: ProjectRequestRepository;
-  private readonly authz: WorkspaceAuthorizationService;
   private readonly now: () => Date;
 
   constructor(deps: ProjectRequestServiceDeps) {
     this.repository = deps.projectRequestRepository;
-    this.authz = deps.workspaceAuthorizationService;
     this.now = deps.now ?? (() => new Date());
   }
 
@@ -111,40 +123,34 @@ export class ProjectRequestService {
    * Create a Pending ProjectRequest owned by the acting Buyer
    * Workspace.
    *
-   * Sequence (ticket #62 acceptance criteria):
-   *   1. Revalidate the acting Workspace has current Buyer-capable
-   *      membership (GS 4 / GS 5 / GS 6).
-   *   2. Delegate the brief-ownership / brief-recommendation (P1-001)
-   *      / offering-eligibility revalidation AND the INSERT to the
-   *      repository, which runs the entire operation inside one
-   *      `$transaction` (P1-002). The service has no Prisma
-   *      dependency (P1-003).
-   *   3. Map the repository's discriminated-union failure reasons to
-   *      typed ProjectRequestError values so the route layer can map
-   *      them to the buyer-safe envelope.
-   *   4. Return the public DTO.
+   * The service supplies a use-case callback. The repository opens
+   * one transaction, FOR UPDATE-locks the buyer Workspace /
+   * membership / capability, the seller Workspace / membership /
+   * capability, the seller Profile, the ServiceOffering, and the
+   * ProjectBrief + BriefSearchResult rows, then hands the
+   * snapshots to the use case. The use case evaluates the
+   * application-owned policy and returns either `persist` (with the
+   * sellerWorkspaceId the snapshot surfaced) or `reject`. The
+   * repository persists only when the use case persists.
    */
   async createProjectRequest(input: CreateProjectRequestInput): Promise<{
     readonly projectRequest: ProjectRequestPublicV1;
   }> {
-    // The application owns the authorization policy. The service
-    // makes the upfront decision by calling the existing
-    // WorkspaceAuthorizationService, which the repository will
-    // re-check inside its atomic transaction as a second-layer
-    // guard. Both layers read the same source of truth so the
-    // policy decision is identical.
-    await this.authz.requireCapability({
-      userAccountId: input.userAccountId,
-      workspaceId: input.actingWorkspaceId,
-      requiredCapability: "Buyer",
-    });
+    const useCase: CreateProjectRequestUseCase = (
+      ctx: CreateProjectRequestUseCaseContext,
+      tools: CreateProjectRequestUseCaseTools,
+    ): CreateUseCaseOutcome => evaluateCreateUseCase(ctx, tools, input);
 
-    const result = await this.repository.createProjectRequestWithRevalidation({
-      userAccountId: input.userAccountId,
-      buyerWorkspaceId: input.actingWorkspaceId,
-      projectBriefId: input.projectBriefId,
-      serviceOfferingId: input.serviceOfferingId,
-    });
+    const result = await this.repository.createProjectRequestInTransaction(
+      {
+        userAccountId: input.userAccountId,
+        buyerWorkspaceId: input.actingWorkspaceId,
+        projectBriefId: input.projectBriefId,
+        serviceOfferingId: input.serviceOfferingId,
+      },
+      useCase,
+    );
+
     if (!result.ok) {
       throw this.createFailureToServiceError(result.reason);
     }
@@ -153,7 +159,7 @@ export class ProjectRequestService {
 
   /**
    * Accept a Pending ProjectRequest as the seller. Atomically
-   * transitions Pending→Accepted AND creates exactly one
+   * transitions Pending → Accepted AND creates exactly one
    * Negotiating Deal (ticket #62 acceptance criteria + GS 18 +
    * GS 26).
    */
@@ -161,38 +167,37 @@ export class ProjectRequestService {
     readonly projectRequest: ProjectRequestPublicV1;
     readonly deal: DealPublicV1;
   }> {
-    const existing = await this.repository.findProjectRequestById(input.projectRequestId);
-    if (!existing) {
-      throw new ProjectRequestError("ProjectRequest not found.", "PROJECT_REQUEST_NOT_FOUND");
-    }
-    // GS 17 — only the seller Workspace owning this request may
-    // accept. The acting Workspace MUST match the persisted
-    // sellerWorkspaceId; if it does not, fail closed before touching
-    // the row. The application then revalidates current seller
-    // membership via WorkspaceAuthorizationService before the
-    // repository runs its atomic guarded transition.
-    if (existing.sellerWorkspaceId !== input.actingWorkspaceId) {
-      throw new ProjectRequestError(
-        "You are not authorized to respond to this ProjectRequest.",
-        "PROJECT_REQUEST_FORBIDDEN",
-      );
-    }
-    await this.authz.requireActingMembership({
-      userAccountId: input.userAccountId,
-      workspaceId: input.actingWorkspaceId,
-    });
+    const useCase: RespondProjectRequestUseCase = (
+      ctx: RespondProjectRequestUseCaseContext,
+      tools: RespondProjectRequestUseCaseTools,
+    ): RespondUseCaseOutcome => {
+      const verdict = evaluateSellerAuthority(ctx.sellerAuthority);
+      if (!verdict.ok) {
+        return tools.reject("SELLER_NOT_AUTHORIZED");
+      }
+      return tools.accept({
+        projectRequestId: ctx.projectRequest.id,
+        sellerDecisionByUserId: input.userAccountId,
+        now: this.now(),
+      });
+    };
 
-    const result = await this.repository.acceptProjectRequest({
-      projectRequestId: existing.id,
-      sellerDecisionByUserId: input.userAccountId,
-      now: this.now(),
-    });
+    const result = await this.repository.respondToProjectRequestInTransaction(
+      {
+        projectRequestId: input.projectRequestId,
+        actingWorkspaceId: input.actingWorkspaceId,
+        userAccountId: input.userAccountId,
+        now: this.now(),
+      },
+      useCase,
+    );
     if (!result.ok) {
       throw this.decideErrorToServiceError(result.reason);
     }
+    const accepted = result.value as AcceptProjectRequestResult;
     return {
-      projectRequest: toPublicProjectRequest(result.value.projectRequest),
-      deal: toPublicDeal(result.value.deal),
+      projectRequest: toPublicProjectRequest(accepted.projectRequest),
+      deal: toPublicDeal(accepted.deal),
     };
   }
 
@@ -203,30 +208,35 @@ export class ProjectRequestService {
   async declineProjectRequest(input: DeclineProjectRequestInput): Promise<{
     readonly projectRequest: ProjectRequestPublicV1;
   }> {
-    const existing = await this.repository.findProjectRequestById(input.projectRequestId);
-    if (!existing) {
-      throw new ProjectRequestError("ProjectRequest not found.", "PROJECT_REQUEST_NOT_FOUND");
-    }
-    if (existing.sellerWorkspaceId !== input.actingWorkspaceId) {
-      throw new ProjectRequestError(
-        "You are not authorized to respond to this ProjectRequest.",
-        "PROJECT_REQUEST_FORBIDDEN",
-      );
-    }
-    await this.authz.requireActingMembership({
-      userAccountId: input.userAccountId,
-      workspaceId: input.actingWorkspaceId,
-    });
+    const useCase: RespondProjectRequestUseCase = (
+      ctx: RespondProjectRequestUseCaseContext,
+      tools: RespondProjectRequestUseCaseTools,
+    ): RespondUseCaseOutcome => {
+      const verdict = evaluateSellerAuthority(ctx.sellerAuthority);
+      if (!verdict.ok) {
+        return tools.reject("SELLER_NOT_AUTHORIZED");
+      }
+      return tools.decline({
+        projectRequestId: ctx.projectRequest.id,
+        sellerDecisionByUserId: input.userAccountId,
+        now: this.now(),
+      });
+    };
 
-    const result = await this.repository.declineProjectRequest({
-      projectRequestId: existing.id,
-      sellerDecisionByUserId: input.userAccountId,
-      now: this.now(),
-    });
+    const result = await this.repository.respondToProjectRequestInTransaction(
+      {
+        projectRequestId: input.projectRequestId,
+        actingWorkspaceId: input.actingWorkspaceId,
+        userAccountId: input.userAccountId,
+        now: this.now(),
+      },
+      useCase,
+    );
     if (!result.ok) {
       throw this.decideErrorToServiceError(result.reason);
     }
-    return { projectRequest: toPublicProjectRequest(result.value) };
+    const declined = result.value as PersistedProjectRequest;
+    return { projectRequest: toPublicProjectRequest(declined) };
   }
 
   /**
@@ -247,10 +257,6 @@ export class ProjectRequestService {
     ) {
       throw new ProjectRequestError("ProjectRequest not found.", "PROJECT_REQUEST_NOT_FOUND");
     }
-    await this.authz.requireActingMembership({
-      userAccountId: input.userAccountId,
-      workspaceId: input.actingWorkspaceId,
-    });
     return { projectRequest: toPublicProjectRequest(existing) };
   }
 
@@ -262,10 +268,6 @@ export class ProjectRequestService {
   async listProjectRequests(input: ListProjectRequestsInput): Promise<{
     readonly projectRequests: readonly ProjectRequestPublicV1[];
   }> {
-    await this.authz.requireActingMembership({
-      userAccountId: input.userAccountId,
-      workspaceId: input.actingWorkspaceId,
-    });
     const rows = await this.repository.listProjectRequests({
       workspaceId: input.actingWorkspaceId,
       ...(input.statusFilter ? { statusFilter: input.statusFilter } : {}),
@@ -275,16 +277,20 @@ export class ProjectRequestService {
     };
   }
 
-  /**
-   * Revalidate that the calling user is a current member of the
-   * seller Workspace. WS ownerUserId and any non-membership paths
-   * fail closed with NOT_A_MEMBER; the route maps that to
-   * PROJECT_REQUEST_FORBIDDEN.
-   */
   private createFailureToServiceError(
     reason: CreateProjectRequestFailureReason,
   ): ProjectRequestError {
     switch (reason) {
+      case "BUYER_NOT_AUTHORIZED":
+        return new ProjectRequestError(
+          "You are not authorized to create a ProjectRequest.",
+          "PROJECT_REQUEST_FORBIDDEN",
+        );
+      case "SELLER_INELIGIBLE":
+        return new ProjectRequestError(
+          "The selected ServiceOffering is no longer eligible.",
+          "PROJECT_REQUEST_OFFERING_INELIGIBLE",
+        );
       case "BRIEF_NOT_FOUND":
         return new ProjectRequestError(
           "ProjectBrief not found.",
@@ -296,9 +302,8 @@ export class ProjectRequestService {
           "PROJECT_REQUEST_BRIEF_FORBIDDEN",
         );
       case "OFFERING_NOT_IN_BRIEF":
-      case "OFFERING_INELIGIBLE":
         return new ProjectRequestError(
-          "The selected ServiceOffering is no longer eligible.",
+          "The selected ServiceOffering was not surfaced for this ProjectBrief.",
           "PROJECT_REQUEST_OFFERING_INELIGIBLE",
         );
       case "ALREADY_PENDING":
@@ -309,28 +314,86 @@ export class ProjectRequestService {
     }
   }
 
-  private decideErrorToServiceError(
-    reason: "NOT_FOUND" | "ALREADY_RESPONDED",
-  ): ProjectRequestError {
-    if (reason === "NOT_FOUND") {
-      return new ProjectRequestError("ProjectRequest not found.", "PROJECT_REQUEST_NOT_FOUND");
+  private decideErrorToServiceError(reason: DecideFailureReason): ProjectRequestError {
+    switch (reason) {
+      case "NOT_FOUND":
+        return new ProjectRequestError("ProjectRequest not found.", "PROJECT_REQUEST_NOT_FOUND");
+      case "SELLER_NOT_AUTHORIZED":
+        return new ProjectRequestError(
+          "You are not authorized to respond to this ProjectRequest.",
+          "PROJECT_REQUEST_FORBIDDEN",
+        );
+      case "ALREADY_RESPONDED":
+        return new ProjectRequestError(
+          "This ProjectRequest has already been responded to.",
+          "PROJECT_REQUEST_ALREADY_RESPONDED",
+        );
     }
-    return new ProjectRequestError(
-      "This ProjectRequest has already been responded to.",
-      "PROJECT_REQUEST_ALREADY_RESPONDED",
-    );
   }
+}
+
+// ---------- application-owned use-case evaluators ----------
+
+function evaluateCreateUseCase(
+  ctx: CreateProjectRequestUseCaseContext,
+  tools: CreateProjectRequestUseCaseTools,
+  input: CreateProjectRequestInput,
+): CreateUseCaseOutcome {
+  // Step 1: brief recommendation boundary. Existence + ownership
+  // + Matchmaker provenance must all hold before we evaluate
+  // authority (matches the documented priority so a buyer cannot
+  // probe authority against a brief they do not own).
+  const briefVerdict = evaluateBriefRecommendationBoundary(
+    ctx.briefRecommendations,
+    input.serviceOfferingId,
+    input.actingWorkspaceId,
+  );
+  if (!briefVerdict.ok) {
+    if (briefVerdict.reason === "BRIEF_NOT_FOUND") {
+      return tools.reject("BRIEF_NOT_FOUND");
+    }
+    if (briefVerdict.reason === "BRIEF_FORBIDDEN") {
+      return tools.reject("BRIEF_FORBIDDEN");
+    }
+    return tools.reject("OFFERING_NOT_IN_BRIEF");
+  }
+
+  // Step 2: buyer authority. The repository already loaded +
+  // locked the buyer Workspace / membership / capability rows.
+  const buyerVerdict = evaluateBuyerAuthority(ctx.buyerAuthority);
+  if (!buyerVerdict.ok) {
+    return tools.reject("BUYER_NOT_AUTHORIZED");
+  }
+
+  // Step 3: complete seller / offering eligibility. The repository
+  // already loaded + locked the seller Workspace / membership /
+  // capability rows, the SellerProfile, and the ServiceOffering.
+  const sellerVerdict = evaluateSellerEligibility(ctx.sellerEligibility);
+  if (!sellerVerdict.ok) {
+    return tools.reject("SELLER_INELIGIBLE");
+  }
+
+  // All checks pass. Persist the Pending ProjectRequest with the
+  // seller Workspace id the snapshot surfaced (no second read
+  // required).
+  return tools.persist({
+    userAccountId: input.userAccountId,
+    buyerWorkspaceId: input.actingWorkspaceId,
+    sellerWorkspaceId: sellerVerdict.sellerWorkspaceId,
+    projectBriefId: input.projectBriefId,
+    serviceOfferingId: input.serviceOfferingId,
+  });
 }
 
 // ---------- DTO mapping ----------
 
 export function toPublicProjectRequest(persisted: PersistedProjectRequest): ProjectRequestPublicV1 {
-  // Private human-actor identifiers are intentionally omitted from the
-  // counterparty-visible surface. The persisted columns remain in
-  // PostgreSQL as audit evidence (and are available to internal /
-  // separately-authorized audit presentations), but they MUST NOT
-  // cross this public DTO. See projectRequestPublicV1Schema for the
-  // allow-list contract.
+  // Private human-actor identifiers are intentionally omitted from
+  // the counterparty-visible surface. The persisted columns remain
+  // in PostgreSQL as audit evidence (and are available to internal
+  // / separately-authorized audit presentations), but they MUST
+  // NOT cross this public DTO. See projectRequestPublicV1Schema
+  // for the allow-list contract.
   return {
     projectRequestId: persisted.id,
     buyerWorkspaceId: persisted.buyerWorkspaceId,
@@ -358,12 +421,15 @@ export function toPublicDeal(persisted: PersistedDeal): DealPublicV1 {
   };
 }
 
-// Re-export the AuthorizationError so the route layer can
-// distinguish between ProjectRequestError and an upstream
-// authorization failure without re-importing it.
 // Allow the route to consume the request type directly so the
 // import graph stays small.
 export type { CreateProjectRequestRequestV1 };
-// Allow the ProjectBriefRepository type to be re-imported from this
-// module so the route file does not need to know its path.
+// Allow the ProjectBriefRepository type to be re-imported from
+// this module so the route file does not need to know its path.
 export type { PersistedBrief };
+export type {
+  CreateProjectRequestResult,
+  CreateProjectRequestFailureReason,
+  DecideResult,
+  DecideFailureReason,
+};

@@ -8,30 +8,41 @@
 // directly. Higher layers (service, route) consume the contract
 // exclusively.
 //
-// The contract deliberately exposes the operations the application
-// service needs without leaking Prisma types:
+// The contract deliberately exposes transaction-scoped use cases so
+// the application can run authorization, eligibility, and persistence
+// in one authoritative unit of work:
 //
-//   - createProjectRequestWithRevalidation persists a Pending
-//     request. The brief lookup, brief-ownership check, brief-
-//     recommendation check (P1-001), offering eligibility check,
-//     and the INSERT all run inside a single PostgreSQL
-//     transaction (P1-002). The repository owns every direct
-//     SQL/Prisma read and write — the service does NOT touch
-//     Prisma (P1-003).
-//   - findProjectRequestById loads one (used by view + decide).
-//   - listProjectRequests lists Pending requests for the seller
-//     inbox (and accepted/declined views for audit, though BG4 ships
-//     only the Pending view as the required UI surface).
-//   - acceptProjectRequest atomically transitions Pending→Accepted
-//     AND creates the Negotiating Deal in a single transaction. The
-//     guarded updateMany on the Pending status fails closed if the
-//     request was already responded to (a retry cannot create a
-//     second Deal). The unique constraint on `projectRequestId`
-//     catches any race that bypasses the guarded update.
-//   - declineProjectRequest atomically transitions Pending→Declined
-//     and records the seller decision. No Deal is created.
+//   - createProjectRequestInTransaction runs the FOR UPDATE-locked
+//     buyer authority read, the FOR UPDATE-locked seller / offering
+//     eligibility read, and the FOR UPDATE-locked ProjectBrief
+//     recommendation boundary read, then hands the assembled snapshot
+//     to the application-owned use case. The use case evaluates the
+//     policy helpers in `project-request-authorization-policy.ts`
+//     and either calls the provided `persist` tool or surfaces a
+//     rejection. The repository never decides whether the facts
+//     authorize the command.
+//
+//   - respondToProjectRequestInTransaction does the same for accept /
+//     decline: it FOR UPDATE-locks the request, the seller Workspace
+//     / membership / capability rows, then hands the snapshot to the
+//     application-owned use case, which decides whether to transition
+//     the request and (for accept) create exactly one Negotiating
+//     Deal. The guarded updateMany on Pending status and the unique
+//     index on `deals.projectRequestId` remain the second defenses
+//     against retries creating duplicate decisions.
+//
+//   - findProjectRequestById / listProjectRequests are read-only
+//     surfaces used by view + inbox flows. Membership authorization
+//     is the caller's responsibility; these methods only filter by
+//     workspace.
 
 import type { ProjectRequestStatusV1, DealStatusV1 } from "@soundhub/types";
+import type {
+  BriefRecommendationsSnapshot,
+  BuyerAuthoritySnapshot,
+  SellerAuthoritySnapshot,
+  SellerEligibilitySnapshot,
+} from "./project-request-authorization-policy.js";
 
 export interface PersistedProjectRequest {
   readonly id: string;
@@ -59,26 +70,100 @@ export interface PersistedDeal {
   readonly createdAt: Date;
 }
 
-export interface CreateProjectRequestRevalidatedInput {
+export interface PersistPendingProjectRequestInput {
+  readonly userAccountId: string;
+  readonly buyerWorkspaceId: string;
+  readonly sellerWorkspaceId: string;
+  readonly projectBriefId: string;
+  readonly serviceOfferingId: string;
+}
+
+export interface PersistAcceptProjectRequestInput {
+  readonly projectRequestId: string;
+  readonly sellerDecisionByUserId: string;
+  readonly now: Date;
+}
+
+export interface PersistDeclineProjectRequestInput {
+  readonly projectRequestId: string;
+  readonly sellerDecisionByUserId: string;
+  readonly now: Date;
+}
+
+export type CreateProjectRequestFailureReason =
+  | "BUYER_NOT_AUTHORIZED"
+  | "SELLER_INELIGIBLE"
+  | "BRIEF_NOT_FOUND"
+  | "BRIEF_FORBIDDEN"
+  | "OFFERING_NOT_IN_BRIEF"
+  | "ALREADY_PENDING";
+
+export type DecideFailureReason = "NOT_FOUND" | "ALREADY_RESPONDED" | "SELLER_NOT_AUTHORIZED";
+
+export type CreateProjectRequestResult =
+  | { readonly ok: true; readonly value: PersistedProjectRequest }
+  | { readonly ok: false; readonly reason: CreateProjectRequestFailureReason };
+
+export type DecideResult<T> =
+  | { readonly ok: true; readonly value: T }
+  | { readonly ok: false; readonly reason: DecideFailureReason };
+
+// ---------- create use case ----------
+
+export interface CreateProjectRequestUseCaseContext {
+  readonly buyerAuthority: BuyerAuthoritySnapshot;
+  readonly sellerEligibility: SellerEligibilitySnapshot;
+  readonly briefRecommendations: BriefRecommendationsSnapshot;
+}
+
+export interface CreateProjectRequestUseCaseTools {
+  reject(reason: CreateProjectRequestFailureReason): CreateUseCaseOutcome;
+  persist(input: PersistPendingProjectRequestInput): CreateUseCaseOutcome;
+}
+
+export type CreateUseCaseOutcome =
+  | { readonly kind: "reject"; readonly reason: CreateProjectRequestFailureReason }
+  | { readonly kind: "persist"; readonly input: PersistPendingProjectRequestInput };
+
+export type CreateProjectRequestUseCase = (
+  ctx: CreateProjectRequestUseCaseContext,
+  tools: CreateProjectRequestUseCaseTools,
+) => CreateUseCaseOutcome;
+
+export interface CreateProjectRequestTransactionInput {
   readonly userAccountId: string;
   readonly buyerWorkspaceId: string;
   readonly projectBriefId: string;
   readonly serviceOfferingId: string;
 }
 
-export interface AcceptProjectRequestInput {
-  readonly projectRequestId: string;
-  /** Pre-resolved seller decision actor id. The application service
-   *  has already verified the seller is currently authorized to
-   *  respond; the repository persists this id on the ProjectRequest
-   *  row inside the decision transaction. */
-  readonly sellerDecisionByUserId: string;
-  readonly now: Date;
+// ---------- respond (accept/decline) use case ----------
+
+export interface RespondProjectRequestUseCaseContext {
+  readonly sellerAuthority: SellerAuthoritySnapshot;
+  readonly projectRequest: PersistedProjectRequest;
 }
 
-export interface DeclineProjectRequestInput {
+export interface RespondProjectRequestUseCaseTools {
+  reject(reason: DecideFailureReason): RespondUseCaseOutcome;
+  accept(input: PersistAcceptProjectRequestInput): RespondUseCaseOutcome;
+  decline(input: PersistDeclineProjectRequestInput): RespondUseCaseOutcome;
+}
+
+export type RespondUseCaseOutcome =
+  | { readonly kind: "reject"; readonly reason: DecideFailureReason }
+  | { readonly kind: "accept"; readonly input: PersistAcceptProjectRequestInput }
+  | { readonly kind: "decline"; readonly input: PersistDeclineProjectRequestInput };
+
+export type RespondProjectRequestUseCase = (
+  ctx: RespondProjectRequestUseCaseContext,
+  tools: RespondProjectRequestUseCaseTools,
+) => RespondUseCaseOutcome;
+
+export interface RespondProjectRequestTransactionInput {
   readonly projectRequestId: string;
-  readonly sellerDecisionByUserId: string;
+  readonly actingWorkspaceId: string;
+  readonly userAccountId: string;
   readonly now: Date;
 }
 
@@ -87,66 +172,51 @@ export interface AcceptProjectRequestResult {
   readonly deal: PersistedDeal;
 }
 
-export type DecideFailureReason = "NOT_FOUND" | "ALREADY_RESPONDED";
-
-export type DecideResult<T> =
-  | { readonly ok: true; readonly value: T }
-  | { readonly ok: false; readonly reason: DecideFailureReason };
-
-/**
- * Failure reasons for {@link ProjectRequestRepository.createProjectRequestWithRevalidation}.
- * The repository's transaction runs the brief-ownership, brief-
- * recommendation, and offering-eligibility checks + the INSERT
- * atomically. The buyer / seller authorization policy decision is
- * made by the application service BEFORE this method is called.
- */
-export type CreateProjectRequestFailureReason =
-  | "BRIEF_NOT_FOUND"
-  | "BRIEF_FORBIDDEN"
-  | "OFFERING_NOT_IN_BRIEF"
-  | "OFFERING_INELIGIBLE"
-  | "ALREADY_PENDING";
-
-export type CreateProjectRequestResult =
-  | { readonly ok: true; readonly value: PersistedProjectRequest }
-  | { readonly ok: false; readonly reason: CreateProjectRequestFailureReason };
+// ---------- interface ----------
 
 export interface ProjectRequestRepository {
   /**
-   * Atomically revalidate the brief-ownership, brief-recommendation
-   * boundary, and offering-eligibility chain, then persist a Pending
-   * ProjectRequest. The entire operation runs inside a single
-   * Prisma `$transaction` so a concurrent mutation between any read
-   * and the INSERT cannot produce an ineligible Pending request.
-   * Returns `{ok:false,...}` for any revalidation failure without
-   * leaving a partial ProjectRequest row.
+   * Open one PostgreSQL transaction. Inside the transaction the
+   * adapter acquires `SELECT ... FOR UPDATE` row locks on every
+   * row the buyer authority read depends on (Workspace,
+   * WorkspaceMembership, WorkspaceCapability for the buyer), every
+   * row the seller eligibility read depends on (Workspace,
+   * WorkspaceCapability, SellerProfile, ServiceOffering for the
+   * seller side), and the ProjectBrief row. The adapter then
+   * invokes the supplied `useCase` with the assembled snapshot. The
+   * use case is the application-owned policy: it calls
+   * `evaluateBuyerAuthority`, `evaluateSellerEligibility`, and
+   * `evaluateBriefRecommendationBoundary` (or rejects for any
+   * application-specific reason) and returns either `persist` or
+   * `reject`. The adapter persists when the use case persists;
+   * otherwise the transaction rolls back with no state change.
    *
-   * The application service makes the buyer / seller authorization
-   * policy decision BEFORE calling this method; this method does
-   * NOT re-evaluate authorization. It only persists the brief
-   * relationship + the natural-uniqueness guard.
-   *
-   * Failure reasons:
-   *   - `BRIEF_NOT_FOUND` — the ProjectBrief id does not exist.
-   *   - `BRIEF_FORBIDDEN` — the ProjectBrief is owned by a
-   *      different buyer Workspace than the one the caller is
-   *      acting through.
-   *   - `OFFERING_NOT_IN_BRIEF` — the selected ServiceOffering
-   *      was not returned by the brief's persisted Matchmaker
-   *      recommendations (P1-001). A buyer cannot submit an
-   *      arbitrary eligible offering that the buyer never saw.
-   *   - `OFFERING_INELIGIBLE` — the selected offering was
-   *      archived / deactivated / had its SellerProfile
-   *      unpublished / lost its Workspace's Seller capability
-   *      between the application check and this transaction.
-   *   - `ALREADY_PENDING` — a Pending ProjectRequest already
-   *      exists for the same tuple. The partial unique index
-   *      enforces this; retries return this reason instead of
-   *      creating a duplicate.
+   * Failure reasons returned to the caller map one-to-one onto
+   * the use-case reject reasons. The unique index on Pending
+   * `project_requests` rows remains the second defense against
+   * retries creating inappropriate duplicates.
    */
-  createProjectRequestWithRevalidation(
-    input: CreateProjectRequestRevalidatedInput,
+  createProjectRequestInTransaction(
+    input: CreateProjectRequestTransactionInput,
+    useCase: CreateProjectRequestUseCase,
   ): Promise<CreateProjectRequestResult>;
+
+  /**
+   * Same shape as create, but for accept / decline. The adapter
+   * FOR UPDATE-locks the ProjectRequest row, the seller Workspace,
+   * the seller WorkspaceMembership, and the seller
+   * WorkspaceCapability, then hands the snapshot to the use case.
+   * The use case calls `evaluateSellerAuthority` and returns
+   * `accept`, `decline`, or `reject`. When the use case accepts,
+   * the adapter runs the guarded updateMany on Pending status and
+   * creates the Negotiating Deal atomically; the unique index on
+   * `deals.projectRequestId` is the second defense against retries
+   * creating multiple Deals.
+   */
+  respondToProjectRequestInTransaction(
+    input: RespondProjectRequestTransactionInput,
+    useCase: RespondProjectRequestUseCase,
+  ): Promise<DecideResult<AcceptProjectRequestResult | PersistedProjectRequest>>;
 
   findProjectRequestById(projectRequestId: string): Promise<PersistedProjectRequest | null>;
 
@@ -161,30 +231,4 @@ export interface ProjectRequestRepository {
     readonly workspaceId: string;
     readonly statusFilter?: ProjectRequestStatusV1;
   }): Promise<readonly PersistedProjectRequest[]>;
-
-  /**
-   * Atomically transition the named ProjectRequest from Pending to
-   * Accepted and create the Negotiating Deal — all inside one
-   * Prisma `$transaction` (ticket #62 GS 18). The application
-   * service has already verified the seller is currently
-   * authorized; this method only persists the guarded
-   * transition + Deal creation.
-   *
-   * Failure reasons:
-   *   - `NOT_FOUND` — the row is missing.
-   *   - `ALREADY_RESPONDED` — the row is not in Pending status
-   *      (already Accepted or Declined).
-   */
-  acceptProjectRequest(
-    input: AcceptProjectRequestInput,
-  ): Promise<DecideResult<AcceptProjectRequestResult>>;
-
-  /**
-   * Atomically transition the named ProjectRequest from Pending
-   * to Declined. Same failure reasons as
-   * {@link acceptProjectRequest}. No Deal is created.
-   */
-  declineProjectRequest(
-    input: DeclineProjectRequestInput,
-  ): Promise<DecideResult<PersistedProjectRequest>>;
 }

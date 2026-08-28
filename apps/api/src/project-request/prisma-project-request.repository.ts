@@ -5,44 +5,63 @@
 // `ProjectRequestRepository`; tests can swap in the in-memory
 // adapter without changing the service or route code.
 //
-// The repository owns persistence + transactions; the application
-// service owns the authorization policy (see
-// `./project-request-authorization-policy.ts`). The shared policy
-// helpers are imported here so the repository's atomic transaction
-// can fail closed on a stale snapshot — the application service
-// makes the policy decision FIRST and the transaction re-reads the
-// facts as a second-layer guard.
+// Architectural split:
 //
-// All consequential writes are wrapped in a transaction. Accept uses
-// a guarded updateMany on the Pending status so two concurrent
-// accepts cannot both succeed; the unique index on
-// `deals.projectRequestId` is the second defense against retries
-// creating duplicate Deals (ticket #62 GS 26). The natural
-// uniqueness on `(buyerWorkspaceId, sellerWorkspaceId,
-// serviceOfferingId, projectBriefId) WHERE status = 'Pending'`
-// closes the duplicate-creation race. No explicit
-// serialization-retry framework is required for BG4: the
-// transaction + partial unique index + guarded transition are
-// the proven retry-safety mechanism per ticket #62.
+//   - The application owns the authorization policy (see
+//     `./project-request-authorization-policy.ts`). Every pure
+//     evaluator (buyer authority, seller authority, seller /
+//     offering eligibility, brief recommendation boundary) lives
+//     there and is invoked by the service's use-case closures.
+//
+//   - The repository owns the transaction boundary and the
+//     locked-fact reads. Inside one `$transaction` it acquires
+//     `SELECT ... FOR UPDATE` row locks on every row the policy
+//     depends on, then hands the assembled snapshot to the
+//     application-supplied use case. The use case evaluates the
+//     policy helpers and returns either `persist` or `reject`. The
+//     repository persists only when the use case persists; the
+//     transaction rolls back on any rejection.
+//
+//   - The Prisma adapter never decides whether the facts authorize
+//     the command. The application-owned policy is the only
+//     decision point.
+//
+// All consequential writes are wrapped in the same transaction. The
+// guarded `updateMany WHERE status='Pending'` plus the unique index
+// on `deals.projectRequestId` remain the second defenses against
+// retries creating duplicate decisions (ticket #62 GS 26).
 
 import type { PrismaClient } from "@soundhub/db";
 import { PrismaClientKnownRequestError } from "@soundhub/db/dist/generated/internal/prismaNamespace.js";
 import type { ProjectRequestStatusV1, DealStatusV1 } from "@soundhub/types";
 import type {
-  AcceptProjectRequestInput,
   AcceptProjectRequestResult,
   CreateProjectRequestFailureReason,
   CreateProjectRequestResult,
-  CreateProjectRequestRevalidatedInput,
-  DeclineProjectRequestInput,
+  CreateProjectRequestTransactionInput,
+  CreateProjectRequestUseCase,
+  CreateProjectRequestUseCaseTools,
   DecideResult,
   PersistedDeal,
   PersistedProjectRequest,
   ProjectRequestRepository,
+  RespondProjectRequestTransactionInput,
+  RespondProjectRequestUseCase,
+  RespondProjectRequestUseCaseTools,
 } from "./project-request.repository.js";
+import type {
+  BriefRecommendationsSnapshot,
+  BuyerAuthoritySnapshot,
+  SellerAuthoritySnapshot,
+  SellerEligibilitySnapshot,
+} from "./project-request-authorization-policy.js";
 
-// Cast helper: PG row.status is the Prisma enum string union;
-// the persisted view uses the shared v1 string-union type.
+// Prisma namespace alias used for typed raw queries with FOR UPDATE.
+type PrismaTransaction = Omit<
+  PrismaClient,
+  "$connect" | "$disconnect" | "$on" | "$transaction" | "$use" | "$extends"
+>;
+
 type DbStatus = "Pending" | "Accepted" | "Declined";
 type DbDealStatus = "Negotiating" | "Active";
 
@@ -56,127 +75,422 @@ function toDealStatus(value: DbDealStatus): DealStatusV1 {
 export class PrismaProjectRequestRepository implements ProjectRequestRepository {
   constructor(private readonly prisma: PrismaClient) {}
 
-  async createProjectRequestWithRevalidation(
-    input: CreateProjectRequestRevalidatedInput,
+  // ---------- create ----------
+
+  async createProjectRequestInTransaction(
+    input: CreateProjectRequestTransactionInput,
+    useCase: CreateProjectRequestUseCase,
   ): Promise<CreateProjectRequestResult> {
-    const userAccountId = input.userAccountId;
-    const buyerWorkspaceId = input.buyerWorkspaceId;
-    const projectBriefId = input.projectBriefId;
-    const serviceOfferingId = input.serviceOfferingId;
-
     try {
-      const result = await this.prisma.$transaction(async (tx) => {
-        // Fact check (NOT policy): brief existence + ownership +
-        // brief-recommendation boundary. The application service
-        // makes the buyer / seller authorization policy decision
-        // (see ./project-request-authorization-policy.ts) BEFORE
-        // calling this method. The transaction here is the atomic
-        // guard for the brief relationship (does this brief
-        // belong to the buyer? was this offering returned by
-        // Matchmaker for it? does the offering still exist?) and
-        // runs the natural uniqueness guard (partial unique
-        // index on Pending rows). No policy decision lives in
-        // this transaction — the repository owns persistence +
-        // atomicity only.
-        const brief = await tx.projectBrief.findUnique({
-          where: { id: projectBriefId },
-          select: { id: true, buyerWorkspaceId: true },
-        });
-        if (!brief) {
-          return { ok: false as const, reason: "BRIEF_NOT_FOUND" as const };
-        }
-        if (brief.buyerWorkspaceId !== buyerWorkspaceId) {
-          return { ok: false as const, reason: "BRIEF_FORBIDDEN" as const };
-        }
+      const result = await this.prisma.$transaction(
+        async (tx) => {
+          // Step 1: FOR UPDATE-lock and read the buyer authority
+          // rows. The application-owned policy evaluator consumes
+          // this snapshot. Locking Workspace /
+          // WorkspaceMembership / WorkspaceCapability blocks any
+          // concurrent revoke / suspension / capability removal
+          // from committing until our transaction completes.
+          const buyerAuthority = await this.loadAndLockBuyerAuthority(tx, input);
+          // Step 2: FOR UPDATE-lock and read the seller /
+          // offering eligibility rows. The application-owned
+          // policy evaluator consumes this snapshot.
+          const sellerEligibility = await this.loadAndLockSellerEligibility(tx, input);
+          // Step 3: FOR UPDATE-lock and read the ProjectBrief +
+          // its BriefSearchResult recommendation rows. The brief
+          // recommendation boundary is a buyer-safe provenance
+          // check that the application policy owns.
+          const briefRecommendations = await this.loadAndLockBriefRecommendations(tx, input);
 
-        // Brief-recommendation boundary (P1-001): the selected
-        // offering MUST be a persisted recommendation
-        // (bestOfferingId) OR appear in the additionalOfferingsJson
-        // of any BriefSearchResult for this brief. A buyer cannot
-        // submit an arbitrary eligible offering that Matchmaker
-        // never returned for this brief.
-        const briefResults = await tx.briefSearchResult.findMany({
-          where: { briefId: projectBriefId },
-          select: { bestOfferingId: true, additionalOfferingsJson: true },
-        });
-        const offeringIsInBrief = briefResults.some((row) => {
-          if (row.bestOfferingId === serviceOfferingId) return true;
-          const additional = row.additionalOfferingsJson;
-          if (!Array.isArray(additional)) return false;
-          for (const entry of additional) {
-            if (typeof entry === "string" && entry === serviceOfferingId) return true;
-            if (
-              entry &&
-              typeof entry === "object" &&
-              "offeringId" in entry &&
-              (entry as { offeringId: unknown }).offeringId === serviceOfferingId
-            ) {
-              return true;
-            }
-            if (
-              entry &&
-              typeof entry === "object" &&
-              "id" in entry &&
-              (entry as { id: unknown }).id === serviceOfferingId
-            ) {
-              return true;
-            }
+          // Step 4: hand the snapshots to the application-owned
+          // use case. The repository MUST NOT decide whether the
+          // facts authorize the command.
+          const tools: CreateProjectRequestUseCaseTools = {
+            reject: (reason) => ({ kind: "reject", reason }),
+            persist: (persistInput) => ({ kind: "persist", input: persistInput }),
+          };
+          const outcome = useCase(
+            { buyerAuthority, sellerEligibility, briefRecommendations },
+            tools,
+          );
+
+          if (outcome.kind === "reject") {
+            // The application rejected the command. Roll back
+            // the transaction with no state change.
+            return { ok: false as const, reason: outcome.reason };
           }
-          return false;
-        });
-        if (!offeringIsInBrief) {
-          return { ok: false as const, reason: "OFFERING_NOT_IN_BRIEF" as const };
-        }
 
-        // Offering existence. If the offering was archived /
-        // deleted between the application check and this
-        // transaction, the repository fails closed with
-        // OFFERING_INELIGIBLE. The application service has
-        // already verified the offering is eligible (workspace
-        // active, profile published, seller capability present);
-        // we do NOT re-check those here because they are policy
-        // concerns, not persistence concerns.
-        const offeringOwner = await tx.serviceOffering.findUnique({
-          where: { id: serviceOfferingId },
-          select: { sellerProfile: { select: { workspaceId: true } } },
-        });
-        if (!offeringOwner || !offeringOwner.sellerProfile) {
-          return { ok: false as const, reason: "OFFERING_INELIGIBLE" as const };
-        }
-        const sellerWorkspaceId = offeringOwner.sellerProfile.workspaceId;
-
-        try {
-          const row = await tx.projectRequest.create({
-            data: {
-              buyerWorkspaceId,
-              sellerWorkspaceId,
-              serviceOfferingId,
-              projectBriefId,
-              createdByUserId: userAccountId,
-            },
-          });
-          return { ok: true as const, value: toPersisted(row) };
-        } catch (err) {
-          if (err instanceof PrismaClientKnownRequestError && err.code === "P2002") {
-            return {
-              ok: false as const,
-              reason: "ALREADY_PENDING" as CreateProjectRequestFailureReason,
-            };
+          // Step 5: persist. The unique partial index on Pending
+          // rows is the second defense against retries creating
+          // duplicates; a violation surfaces as ALREADY_PENDING.
+          try {
+            const row = await tx.projectRequest.create({
+              data: {
+                buyerWorkspaceId: outcome.input.buyerWorkspaceId,
+                sellerWorkspaceId: outcome.input.sellerWorkspaceId,
+                serviceOfferingId: outcome.input.serviceOfferingId,
+                projectBriefId: outcome.input.projectBriefId,
+                createdByUserId: outcome.input.userAccountId,
+              },
+            });
+            return { ok: true as const, value: toPersisted(row) };
+          } catch (err) {
+            if (err instanceof PrismaClientKnownRequestError && err.code === "P2002") {
+              return {
+                ok: false as const,
+                reason: "ALREADY_PENDING" as CreateProjectRequestFailureReason,
+              };
+            }
+            throw err;
           }
-          throw err;
-        }
-      });
+        },
+        { isolationLevel: "Serializable" },
+      );
       return result;
     } catch (err) {
-      // Same defense in the rare case the partial unique index
-      // violation escapes the inner catch (e.g. transaction rollback
-      // races).
+      // Defense in depth: the unique index violation can surface
+      // at the outer boundary if the transaction was rolled back
+      // at commit time.
       if (err instanceof PrismaClientKnownRequestError && err.code === "P2002") {
         return { ok: false, reason: "ALREADY_PENDING" };
       }
       throw err;
     }
   }
+
+  private async loadAndLockBuyerAuthority(
+    tx: PrismaTransaction,
+    input: CreateProjectRequestTransactionInput,
+  ): Promise<BuyerAuthoritySnapshot> {
+    // Lock the buyer Workspace row first so a concurrent UPDATE on
+    // `status` blocks until our transaction completes.
+    const wsRows = await tx.$queryRaw<
+      { readonly status: "Active" | "Suspended" }[]
+    >`SELECT status FROM workspaces WHERE id = ${input.buyerWorkspaceId} FOR UPDATE`;
+    const workspaceStatus: "Active" | "Suspended" = wsRows[0]?.status ?? "Suspended";
+
+    // Lock the WorkspaceMembership row. A revoke on the buyer
+    // side must wait for our transaction.
+    const membershipRows = await tx.$queryRaw<{ readonly id: string }[]>`
+      SELECT id FROM workspace_memberships
+      WHERE "userId" = ${input.userAccountId} AND "workspaceId" = ${input.buyerWorkspaceId}
+      FOR UPDATE
+    `;
+    const isMember = membershipRows.length > 0;
+
+    // Lock the Buyer capability row. A capability removal must
+    // wait for our transaction.
+    const capabilityRows = await tx.$queryRaw<{ readonly capability: string }[]>`
+      SELECT capability FROM workspace_capabilities
+      WHERE "workspaceId" = ${input.buyerWorkspaceId} AND capability = 'Buyer'
+      FOR UPDATE
+    `;
+    const hasBuyerCapability = capabilityRows.length > 0;
+
+    return {
+      userAccountId: input.userAccountId,
+      buyerWorkspaceId: input.buyerWorkspaceId,
+      workspaceStatus,
+      isMember,
+      hasBuyerCapability,
+    };
+  }
+
+  private async loadAndLockSellerEligibility(
+    tx: PrismaTransaction,
+    input: CreateProjectRequestTransactionInput,
+  ): Promise<SellerEligibilitySnapshot> {
+    // Lock the ServiceOffering row and read its sellerProfile +
+    // workspaceId in one statement. Returning null on no rows so
+    // the policy evaluator surfaces OFFERING_NOT_FOUND.
+    const offeringRows = await tx.$queryRaw<
+      {
+        readonly id: string;
+        readonly status: "Draft" | "Active" | "Paused" | "Archived";
+        readonly sellerProfileWorkspaceId: string;
+        readonly workspaceStatus: "Active" | "Suspended";
+        readonly profileStatus: "Draft" | "Published" | "Suspended";
+      }[]
+    >`
+      SELECT so.id, so.status,
+             sp."workspaceId" AS "sellerProfileWorkspaceId",
+             w.status AS "workspaceStatus",
+             sp.status AS "profileStatus"
+      FROM service_offerings so
+      JOIN seller_profiles sp ON sp.id = so."sellerProfileId"
+      JOIN workspaces w ON w.id = sp."workspaceId"
+      WHERE so.id = ${input.serviceOfferingId}
+      FOR UPDATE OF so, sp, w
+    `;
+    const offering = offeringRows[0];
+    if (!offering) {
+      return {
+        serviceOfferingId: input.serviceOfferingId,
+        sellerWorkspaceId: null,
+        offeringStatus: null,
+        workspaceStatus: null,
+        workspaceHasSellerCapability: null,
+        profileStatus: null,
+      };
+    }
+
+    // Lock the seller WorkspaceCapability rows. A capability
+    // removal must wait for our transaction.
+    const capabilityRows = await tx.$queryRaw<{ readonly capability: string }[]>`
+      SELECT capability FROM workspace_capabilities
+      WHERE "workspaceId" = ${offering.sellerProfileWorkspaceId} AND capability = 'Seller'
+      FOR UPDATE
+    `;
+    const workspaceHasSellerCapability = capabilityRows.length > 0;
+
+    return {
+      serviceOfferingId: input.serviceOfferingId,
+      sellerWorkspaceId: offering.sellerProfileWorkspaceId,
+      offeringStatus: offering.status,
+      workspaceStatus: offering.workspaceStatus,
+      workspaceHasSellerCapability,
+      profileStatus: offering.profileStatus,
+    };
+  }
+
+  private async loadAndLockBriefRecommendations(
+    tx: PrismaTransaction,
+    input: CreateProjectRequestTransactionInput,
+  ): Promise<BriefRecommendationsSnapshot> {
+    // Lock the ProjectBrief row first. A concurrent Workspace /
+    // buyer-workspace mutation on the brief's parent must wait
+    // for our transaction.
+    const briefRows = await tx.$queryRaw<
+      { readonly id: string; readonly buyerWorkspaceId: string }[]
+    >`SELECT id, "buyerWorkspaceId" FROM project_briefs WHERE id = ${input.projectBriefId} FOR UPDATE`;
+    if (briefRows.length === 0) {
+      return {
+        projectBriefId: input.projectBriefId,
+        buyerWorkspaceId: null,
+        exists: false,
+        offeringIds: [],
+      };
+    }
+    const brief = briefRows[0];
+    if (!brief) {
+      return {
+        projectBriefId: input.projectBriefId,
+        buyerWorkspaceId: null,
+        exists: false,
+        offeringIds: [],
+      };
+    }
+    // Lock the persisted BriefSearchResult rows so a buyer cannot
+    // sneak in an offering via a concurrent insert that the
+    // recommendation boundary would miss.
+    const resultRows = await tx.$queryRaw<
+      { readonly bestOfferingId: string; readonly additionalOfferingsJson: unknown }[]
+    >`
+      SELECT "bestOfferingId", "additionalOfferingsJson"
+      FROM brief_search_results
+      WHERE "briefId" = ${input.projectBriefId}
+      FOR UPDATE
+    `;
+    const offeringIds = new Set<string>();
+    for (const row of resultRows) {
+      offeringIds.add(row.bestOfferingId);
+      const additional = row.additionalOfferingsJson;
+      if (Array.isArray(additional)) {
+        for (const entry of additional) {
+          if (typeof entry === "string") {
+            offeringIds.add(entry);
+          } else if (
+            entry &&
+            typeof entry === "object" &&
+            "offeringId" in entry &&
+            typeof (entry as { offeringId: unknown }).offeringId === "string"
+          ) {
+            offeringIds.add((entry as { offeringId: string }).offeringId);
+          } else if (
+            entry &&
+            typeof entry === "object" &&
+            "id" in entry &&
+            typeof (entry as { id: unknown }).id === "string"
+          ) {
+            offeringIds.add((entry as { id: string }).id);
+          }
+        }
+      }
+    }
+    return {
+      projectBriefId: brief.id,
+      buyerWorkspaceId: brief.buyerWorkspaceId,
+      exists: true,
+      offeringIds: [...offeringIds],
+    };
+  }
+
+  // ---------- respond (accept / decline) ----------
+
+  async respondToProjectRequestInTransaction(
+    input: RespondProjectRequestTransactionInput,
+    useCase: RespondProjectRequestUseCase,
+  ): Promise<DecideResult<AcceptProjectRequestResult | PersistedProjectRequest>> {
+    try {
+      const result = await this.prisma.$transaction(
+        async (tx) => {
+          // Lock the ProjectRequest row first. The guarded
+          // updateMany below re-checks status, but locking the row
+          // up front ensures a concurrent accept / decline waits
+          // for our transaction.
+          const requestRows = await tx.$queryRaw<
+            {
+              readonly id: string;
+              readonly buyerWorkspaceId: string;
+              readonly sellerWorkspaceId: string;
+              readonly serviceOfferingId: string;
+              readonly projectBriefId: string;
+              readonly createdByUserId: string;
+              readonly status: "Pending" | "Accepted" | "Declined";
+              readonly sellerDecisionAt: Date | null;
+              readonly sellerDecisionByUserId: string | null;
+              readonly sellerConsentAt: Date | null;
+              readonly createdAt: Date;
+            }[]
+          >`SELECT * FROM project_requests WHERE id = ${input.projectRequestId} FOR UPDATE`;
+          if (requestRows.length === 0) {
+            return { ok: false as const, reason: "NOT_FOUND" as const };
+          }
+          const requestRow = requestRows[0];
+          if (!requestRow) {
+            return { ok: false as const, reason: "NOT_FOUND" as const };
+          }
+
+          // Lock the seller authority rows. A concurrent revoke
+          // or Workspace suspension must wait.
+          const sellerAuthority = await this.loadAndLockSellerAuthority(
+            tx,
+            input,
+            requestRow.sellerWorkspaceId,
+          );
+
+          // Hand the snapshot to the application-owned use case.
+          const projectRequest: PersistedProjectRequest = toPersisted(requestRow);
+          const tools: RespondProjectRequestUseCaseTools = {
+            reject: (reason) => ({ kind: "reject", reason }),
+            accept: (acceptInput) => ({ kind: "accept", input: acceptInput }),
+            decline: (declineInput) => ({ kind: "decline", input: declineInput }),
+          };
+          const outcome = useCase({ sellerAuthority, projectRequest }, tools);
+
+          if (outcome.kind === "reject") {
+            return { ok: false as const, reason: outcome.reason };
+          }
+
+          if (outcome.kind === "accept") {
+            // Guarded transition: updateMany WHERE status='Pending'.
+            // Two concurrent accepts cannot both succeed; the
+            // second sees count === 0 and surfaces
+            // ALREADY_RESPONDED. The unique index on
+            // `deals.projectRequestId` is the second defense.
+            const guarded = await tx.projectRequest.updateMany({
+              where: { id: outcome.input.projectRequestId, status: "Pending" },
+              data: {
+                status: "Accepted",
+                sellerDecisionAt: outcome.input.now,
+                sellerDecisionByUserId: outcome.input.sellerDecisionByUserId,
+                sellerConsentAt: outcome.input.now,
+              },
+            });
+            if (guarded.count === 0) {
+              return { ok: false as const, reason: "ALREADY_RESPONDED" as const };
+            }
+            const updated = await tx.projectRequest.findUniqueOrThrow({
+              where: { id: outcome.input.projectRequestId },
+            });
+            const deal = await tx.deal.create({
+              data: {
+                buyerWorkspaceId: updated.buyerWorkspaceId,
+                sellerWorkspaceId: updated.sellerWorkspaceId,
+                serviceOfferingId: updated.serviceOfferingId,
+                projectBriefId: updated.projectBriefId,
+                projectRequestId: updated.id,
+              },
+            });
+            return {
+              ok: true as const,
+              value: {
+                projectRequest: toPersisted(updated),
+                deal: toPersistedDeal(deal),
+              },
+            };
+          }
+
+          // Decline branch.
+          const guarded = await tx.projectRequest.updateMany({
+            where: { id: outcome.input.projectRequestId, status: "Pending" },
+            data: {
+              status: "Declined",
+              sellerDecisionAt: outcome.input.now,
+              sellerDecisionByUserId: outcome.input.sellerDecisionByUserId,
+              // sellerConsentAt intentionally null on decline —
+              // explicit consent belongs only to acceptance.
+            },
+          });
+          if (guarded.count === 0) {
+            return { ok: false as const, reason: "ALREADY_RESPONDED" as const };
+          }
+          const updated = await tx.projectRequest.findUniqueOrThrow({
+            where: { id: outcome.input.projectRequestId },
+          });
+          return {
+            ok: true as const,
+            value: toPersisted(updated),
+          };
+        },
+        { isolationLevel: "Serializable" },
+      );
+      return result;
+    } catch (err) {
+      if (err instanceof PrismaClientKnownRequestError && err.code === "P2002") {
+        return { ok: false, reason: "ALREADY_RESPONDED" };
+      }
+      throw err;
+    }
+  }
+
+  private async loadAndLockSellerAuthority(
+    tx: PrismaTransaction,
+    input: RespondProjectRequestTransactionInput,
+    projectRequestSellerWorkspaceId: string,
+  ): Promise<SellerAuthoritySnapshot> {
+    // Lock the seller Workspace row.
+    const wsRows = await tx.$queryRaw<
+      { readonly status: "Active" | "Suspended" }[]
+    >`SELECT status FROM workspaces WHERE id = ${projectRequestSellerWorkspaceId} FOR UPDATE`;
+    const workspaceStatus: "Active" | "Suspended" = wsRows[0]?.status ?? "Suspended";
+
+    // Lock the WorkspaceMembership row for the acting user.
+    const membershipRows = await tx.$queryRaw<{ readonly id: string }[]>`
+      SELECT id FROM workspace_memberships
+      WHERE "userId" = ${input.userAccountId} AND "workspaceId" = ${input.actingWorkspaceId}
+      FOR UPDATE
+    `;
+    const isMember = membershipRows.length > 0;
+
+    // Lock the Seller capability row.
+    const capabilityRows = await tx.$queryRaw<{ readonly capability: string }[]>`
+      SELECT capability FROM workspace_capabilities
+      WHERE "workspaceId" = ${input.actingWorkspaceId} AND capability = 'Seller'
+      FOR UPDATE
+    `;
+    const hasSellerCapability = capabilityRows.length > 0;
+
+    return {
+      userAccountId: input.userAccountId,
+      actingWorkspaceId: input.actingWorkspaceId,
+      projectRequestSellerWorkspaceId,
+      workspaceStatus,
+      isMember,
+      hasSellerCapability,
+    };
+  }
+
+  // ---------- reads ----------
 
   async findProjectRequestById(projectRequestId: string): Promise<PersistedProjectRequest | null> {
     const row = await this.prisma.projectRequest.findUnique({
@@ -198,116 +512,6 @@ export class PrismaProjectRequestRepository implements ProjectRequestRepository 
       orderBy: { createdAt: "desc" },
     });
     return rows.map(toPersisted);
-  }
-
-  async acceptProjectRequest(
-    input: AcceptProjectRequestInput,
-  ): Promise<DecideResult<AcceptProjectRequestResult>> {
-    const projectRequestId = input.projectRequestId;
-    const sellerDecisionByUserId = input.sellerDecisionByUserId;
-    const now = input.now;
-
-    try {
-      const result = await this.prisma.$transaction(async (tx) => {
-        // The application service made the seller authorization
-        // policy decision BEFORE calling this method (see
-        // ./project-request-authorization-policy.ts). The
-        // transaction only runs the guarded transition + Deal
-        // creation atomically. The natural uniqueness on
-        // `deals.projectRequestId` (covered by GS 26) is the second
-        // defense against retries creating multiple Deals.
-
-        // Guarded transition: the WHERE status='Pending' clause is
-        // the gate. A retried accept on an already-Accepted request
-        // updates 0 rows and the service fails closed. A retried
-        // accept on a Declined request behaves the same.
-        const guarded = await tx.projectRequest.updateMany({
-          where: { id: projectRequestId, status: "Pending" },
-          data: {
-            status: "Accepted",
-            sellerDecisionAt: now,
-            sellerDecisionByUserId,
-            sellerConsentAt: now,
-          },
-        });
-        if (guarded.count === 0) {
-          const exists = await tx.projectRequest.findUnique({ where: { id: projectRequestId } });
-          if (!exists) {
-            return { ok: false as const, reason: "NOT_FOUND" as const };
-          }
-          return { ok: false as const, reason: "ALREADY_RESPONDED" as const };
-        }
-        const updated = await tx.projectRequest.findUniqueOrThrow({
-          where: { id: projectRequestId },
-        });
-        const deal = await tx.deal.create({
-          data: {
-            buyerWorkspaceId: updated.buyerWorkspaceId,
-            sellerWorkspaceId: updated.sellerWorkspaceId,
-            serviceOfferingId: updated.serviceOfferingId,
-            projectBriefId: updated.projectBriefId,
-            projectRequestId: updated.id,
-          },
-        });
-        return {
-          ok: true as const,
-          value: {
-            projectRequest: toPersisted(updated),
-            deal: toPersistedDeal(deal),
-          },
-        };
-      });
-      return result;
-    } catch (err) {
-      // The unique index on `deals.projectRequestId` is the second
-      // defense. If a concurrent accept slipped past the guarded
-      // update (theoretically impossible — guarded update uses
-      // PostgreSQL row-locking semantics inside the transaction,
-      // and updateMany acquires the lock before reading the row),
-      // the create would fail with P2002 and we surface it as
-      // ALREADY_RESPONDED so the service fails closed.
-      if (err instanceof PrismaClientKnownRequestError && err.code === "P2002") {
-        return { ok: false, reason: "ALREADY_RESPONDED" };
-      }
-      throw err;
-    }
-  }
-
-  async declineProjectRequest(
-    input: DeclineProjectRequestInput,
-  ): Promise<DecideResult<PersistedProjectRequest>> {
-    const projectRequestId = input.projectRequestId;
-    const sellerDecisionByUserId = input.sellerDecisionByUserId;
-    const now = input.now;
-
-    const result = await this.prisma.$transaction(async (tx) => {
-      // The application service made the seller authorization
-      // policy decision BEFORE calling this method. The transaction
-      // only runs the guarded transition atomically.
-
-      const guarded = await tx.projectRequest.updateMany({
-        where: { id: projectRequestId, status: "Pending" },
-        data: {
-          status: "Declined",
-          sellerDecisionAt: now,
-          sellerDecisionByUserId,
-          // sellerConsentAt is intentionally null on decline —
-          // explicit consent belongs only to acceptance.
-        },
-      });
-      if (guarded.count === 0) {
-        const exists = await tx.projectRequest.findUnique({ where: { id: projectRequestId } });
-        if (!exists) {
-          return { ok: false as const, reason: "NOT_FOUND" as const };
-        }
-        return { ok: false as const, reason: "ALREADY_RESPONDED" as const };
-      }
-      const updated = await tx.projectRequest.findUniqueOrThrow({
-        where: { id: projectRequestId },
-      });
-      return { ok: true as const, value: toPersisted(updated) };
-    });
-    return result;
   }
 }
 

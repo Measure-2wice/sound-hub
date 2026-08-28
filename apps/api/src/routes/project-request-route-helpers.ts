@@ -5,11 +5,11 @@
 // session resolution, body parsing, path / query-param reading,
 // Zod validation of the request body, Zod validation of the
 // response shape, and translation of the typed
-// `ProjectRequestError` / `AuthorizationError` into the safe
-// envelope. Per P2-001 these primitives live here once so the
-// handlers stay focused on their endpoint-specific flow. The route
-// layer still owns untrusted JSON parsing and the safe error
-// envelope; nothing here leaks Prisma models.
+// `ProjectRequestError` into the safe envelope. Per P2-001 these
+// primitives live here once so the handlers stay focused on their
+// endpoint-specific flow. The route layer still owns untrusted JSON
+// parsing and the safe error envelope; nothing here leaks Prisma
+// models.
 
 import type { Request, Response } from "express";
 import { ZodError, type ZodSchema } from "zod";
@@ -21,7 +21,6 @@ import {
   type SafeErrorResponse,
 } from "../lib/errors.js";
 import { SESSION_COOKIE } from "../lib/session-cookie.js";
-import { AuthorizationError } from "../services/workspace-authorization.service.js";
 import { ProjectRequestError } from "../project-request/project-request.service.js";
 
 const MAX_REQUEST_BODY_BYTES = 16 * 1024;
@@ -286,17 +285,6 @@ export function translateProjectRequestServiceError(
     const safe: SafeErrorResponse = buildSafeError(err.code, err.message, undefined, requestId);
     console.error(`[project-requests] requestId=${requestId} code=${err.code}:`, err);
     writeSafeError(res, safe);
-    return true;
-  }
-  if (err instanceof AuthorizationError) {
-    // ProjectRequest is buyer-side; collapse both authorization
-    // errors to PROJECT_REQUEST_FORBIDDEN so the route contract
-    // emits a single safe envelope code for the buyer side. The
-    // seller-side response handlers use the same collapse.
-    writeSafeError(
-      res,
-      buildSafeError("PROJECT_REQUEST_FORBIDDEN", err.message, undefined, requestId),
-    );
     return true;
   }
   return false;

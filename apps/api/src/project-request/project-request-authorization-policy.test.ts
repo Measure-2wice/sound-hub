@@ -5,15 +5,16 @@
 // policy; the repository adapters (Prisma + in-memory) MUST
 // interpret authority identically. These tests pin the policy
 // helpers directly and prove a new adapter cannot redefine the
-// semantics — both adapters consume the same
-// `evaluateBuyerAuthority` / `evaluateSellerAuthority` helpers and
-// must surface the same typed failure reasons.
+// semantics — both adapters consume the same evaluators and must
+// surface the same typed failure reasons.
 
 import assert from "node:assert/strict";
 import { describe, test } from "node:test";
 import {
+  evaluateBriefRecommendationBoundary,
   evaluateBuyerAuthority,
   evaluateSellerAuthority,
+  evaluateSellerEligibility,
 } from "./project-request-authorization-policy.js";
 
 describe("project-request-authorization-policy", () => {
@@ -77,11 +78,168 @@ describe("project-request-authorization-policy", () => {
     });
   });
 
+  describe("evaluateSellerEligibility", () => {
+    test("Active workspace + Seller capability + Published profile + Active offering is ok", () => {
+      const verdict = evaluateSellerEligibility({
+        serviceOfferingId: "of-1",
+        sellerWorkspaceId: "ws-seller",
+        offeringStatus: "Active",
+        workspaceStatus: "Active",
+        workspaceHasSellerCapability: true,
+        profileStatus: "Published",
+      });
+      assert.deepEqual(verdict, { ok: true, sellerWorkspaceId: "ws-seller" });
+    });
+
+    test("missing offering is rejected with OFFERING_NOT_FOUND", () => {
+      const verdict = evaluateSellerEligibility({
+        serviceOfferingId: "of-missing",
+        sellerWorkspaceId: null,
+        offeringStatus: null,
+        workspaceStatus: null,
+        workspaceHasSellerCapability: null,
+        profileStatus: null,
+      });
+      assert.deepEqual(verdict, { ok: false, reason: "OFFERING_NOT_FOUND" });
+    });
+
+    test("Suspended seller Workspace is rejected with WORKSPACE_INELIGIBLE", () => {
+      const verdict = evaluateSellerEligibility({
+        serviceOfferingId: "of-1",
+        sellerWorkspaceId: "ws-seller",
+        offeringStatus: "Active",
+        workspaceStatus: "Suspended",
+        workspaceHasSellerCapability: true,
+        profileStatus: "Published",
+      });
+      assert.deepEqual(verdict, { ok: false, reason: "WORKSPACE_INELIGIBLE" });
+    });
+
+    test("missing Seller capability is rejected with MISSING_CAPABILITY", () => {
+      const verdict = evaluateSellerEligibility({
+        serviceOfferingId: "of-1",
+        sellerWorkspaceId: "ws-seller",
+        offeringStatus: "Active",
+        workspaceStatus: "Active",
+        workspaceHasSellerCapability: false,
+        profileStatus: "Published",
+      });
+      assert.deepEqual(verdict, { ok: false, reason: "MISSING_CAPABILITY" });
+    });
+
+    test("Draft SellerProfile is rejected with PROFILE_NOT_PUBLISHED", () => {
+      const verdict = evaluateSellerEligibility({
+        serviceOfferingId: "of-1",
+        sellerWorkspaceId: "ws-seller",
+        offeringStatus: "Active",
+        workspaceStatus: "Active",
+        workspaceHasSellerCapability: true,
+        profileStatus: "Draft",
+      });
+      assert.deepEqual(verdict, { ok: false, reason: "PROFILE_NOT_PUBLISHED" });
+    });
+
+    test("Paused offering is rejected with OFFERING_NOT_ACTIVE", () => {
+      const verdict = evaluateSellerEligibility({
+        serviceOfferingId: "of-1",
+        sellerWorkspaceId: "ws-seller",
+        offeringStatus: "Paused",
+        workspaceStatus: "Active",
+        workspaceHasSellerCapability: true,
+        profileStatus: "Published",
+      });
+      assert.deepEqual(verdict, { ok: false, reason: "OFFERING_NOT_ACTIVE" });
+    });
+
+    test("Archived offering is rejected with OFFERING_NOT_ACTIVE", () => {
+      const verdict = evaluateSellerEligibility({
+        serviceOfferingId: "of-1",
+        sellerWorkspaceId: "ws-seller",
+        offeringStatus: "Archived",
+        workspaceStatus: "Active",
+        workspaceHasSellerCapability: true,
+        profileStatus: "Published",
+      });
+      assert.deepEqual(verdict, { ok: false, reason: "OFFERING_NOT_ACTIVE" });
+    });
+
+    test("policy ordering — workspace suspension is checked before capability / profile / offering", () => {
+      const verdict = evaluateSellerEligibility({
+        serviceOfferingId: "of-1",
+        sellerWorkspaceId: "ws-seller",
+        offeringStatus: "Archived",
+        workspaceStatus: "Suspended",
+        workspaceHasSellerCapability: false,
+        profileStatus: "Draft",
+      });
+      assert.deepEqual(verdict, { ok: false, reason: "WORKSPACE_INELIGIBLE" });
+    });
+  });
+
+  describe("evaluateBriefRecommendationBoundary", () => {
+    test("an offering surfaced by Matchmaker for this brief is ok", () => {
+      const verdict = evaluateBriefRecommendationBoundary(
+        {
+          projectBriefId: "brief-1",
+          buyerWorkspaceId: "ws-buyer",
+          exists: true,
+          offeringIds: ["of-a", "of-b"],
+        },
+        "of-b",
+        "ws-buyer",
+      );
+      assert.deepEqual(verdict, { ok: true });
+    });
+
+    test("an offering absent from the brief's recommendations is rejected", () => {
+      const verdict = evaluateBriefRecommendationBoundary(
+        {
+          projectBriefId: "brief-1",
+          buyerWorkspaceId: "ws-buyer",
+          exists: true,
+          offeringIds: ["of-a"],
+        },
+        "of-other",
+        "ws-buyer",
+      );
+      assert.deepEqual(verdict, { ok: false, reason: "OFFERING_NOT_IN_BRIEF" });
+    });
+
+    test("a missing brief is rejected with BRIEF_NOT_FOUND", () => {
+      const verdict = evaluateBriefRecommendationBoundary(
+        {
+          projectBriefId: "brief-missing",
+          buyerWorkspaceId: null,
+          exists: false,
+          offeringIds: [],
+        },
+        "of-1",
+        "ws-buyer",
+      );
+      assert.deepEqual(verdict, { ok: false, reason: "BRIEF_NOT_FOUND" });
+    });
+
+    test("a brief owned by another Workspace is rejected with BRIEF_FORBIDDEN", () => {
+      const verdict = evaluateBriefRecommendationBoundary(
+        {
+          projectBriefId: "brief-1",
+          buyerWorkspaceId: "ws-other",
+          exists: true,
+          offeringIds: ["of-a"],
+        },
+        "of-a",
+        "ws-buyer",
+      );
+      assert.deepEqual(verdict, { ok: false, reason: "BRIEF_FORBIDDEN" });
+    });
+  });
+
   describe("evaluateSellerAuthority", () => {
-    test("Active workspace, current member, Seller capability is ok", () => {
+    test("Active workspace, current member, Seller capability, matching seller side is ok", () => {
       const verdict = evaluateSellerAuthority({
         userAccountId: "u-2",
         actingWorkspaceId: "ws-2",
+        projectRequestSellerWorkspaceId: "ws-2",
         workspaceStatus: "Active",
         isMember: true,
         hasSellerCapability: true,
@@ -93,6 +251,7 @@ describe("project-request-authorization-policy", () => {
       const verdict = evaluateSellerAuthority({
         userAccountId: "u-2",
         actingWorkspaceId: "ws-2",
+        projectRequestSellerWorkspaceId: "ws-2",
         workspaceStatus: "Suspended",
         isMember: true,
         hasSellerCapability: true,
@@ -104,6 +263,7 @@ describe("project-request-authorization-policy", () => {
       const verdict = evaluateSellerAuthority({
         userAccountId: "u-2",
         actingWorkspaceId: "ws-2",
+        projectRequestSellerWorkspaceId: "ws-2",
         workspaceStatus: "Active",
         isMember: false,
         hasSellerCapability: true,
@@ -115,21 +275,30 @@ describe("project-request-authorization-policy", () => {
       const verdict = evaluateSellerAuthority({
         userAccountId: "u-2",
         actingWorkspaceId: "ws-2",
+        projectRequestSellerWorkspaceId: "ws-2",
         workspaceStatus: "Active",
         isMember: true,
         hasSellerCapability: false,
       });
       assert.deepEqual(verdict, { ok: false, reason: "MISSING_CAPABILITY" });
     });
+
+    test("mismatched seller workspace is rejected with NOT_A_MEMBER", () => {
+      const verdict = evaluateSellerAuthority({
+        userAccountId: "u-2",
+        actingWorkspaceId: "ws-2",
+        projectRequestSellerWorkspaceId: "ws-other",
+        workspaceStatus: "Active",
+        isMember: true,
+        hasSellerCapability: true,
+      });
+      assert.deepEqual(verdict, { ok: false, reason: "NOT_A_MEMBER" });
+    });
   });
 
-  // P1-003 verification: buyer and seller policies share the same
-  // verdict shape so a new adapter that constructs the snapshots
-  // identically cannot redefine authority semantics. The two verdict
-  // types are identical (`AuthorityVerdict`) and the only difference
-  // is the capability flag name; the repository boundary collapses
-  // both verdict reasons into `BUYER_NOT_AUTHORIZED` /
-  // `SELLER_NOT_AUTHORIZED`.
+  // P1-003 verification: buyer and seller verdicts share the same
+  // shape so a new adapter that constructs the snapshots
+  // identically cannot redefine authority semantics.
   test("buyer and seller verdicts share the same shape so an adapter cannot redefine semantics", () => {
     const cases: Array<{
       label: string;
@@ -153,6 +322,7 @@ describe("project-request-authorization-policy", () => {
       const seller = evaluateSellerAuthority({
         userAccountId: "u",
         actingWorkspaceId: "w",
+        projectRequestSellerWorkspaceId: "w",
         workspaceStatus: c.workspaceStatus,
         isMember: c.isMember,
         hasSellerCapability: c.hasCapability,

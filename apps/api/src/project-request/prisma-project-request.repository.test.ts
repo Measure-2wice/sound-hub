@@ -6,7 +6,10 @@
 // retries cannot create inappropriate duplicate ProjectRequests or
 // multiple Deals for one accepted ProjectRequest. These tests prove
 // the Prisma adapter enforces both invariants against a real
-// PostgreSQL database.
+// PostgreSQL database, and that the FOR UPDATE-locked snapshot read
+// fails closed when authority or eligibility changes commit
+// between an external observer's pre-snapshot state and the
+// repository's authoritative transaction state.
 //
 // The tests follow the M1 repository convention: each test resets
 // the project_requests and deals tables (and their prerequisites)
@@ -19,6 +22,20 @@ import { createPrismaClient, type PrismaClient } from "@soundhub/db";
 import { assertDisposableTestDatabase, readTestDatabaseUrl } from "../lib/test-database.js";
 import { PrismaProjectRequestRepository } from "./prisma-project-request.repository.js";
 import { loadOrCreateFixture, type ProjectRequestFixture } from "./test-fixture.js";
+import {
+  evaluateBriefRecommendationBoundary,
+  evaluateBuyerAuthority,
+  evaluateSellerAuthority,
+  evaluateSellerEligibility,
+} from "./project-request-authorization-policy.js";
+import type {
+  CreateProjectRequestUseCase,
+  CreateProjectRequestUseCaseContext,
+  CreateProjectRequestUseCaseTools,
+  RespondProjectRequestUseCase,
+  RespondProjectRequestUseCaseContext,
+  RespondProjectRequestUseCaseTools,
+} from "./project-request.repository.js";
 
 let prisma: PrismaClient;
 let fixture: ProjectRequestFixture;
@@ -50,13 +67,77 @@ beforeEach(async () => {
   repo = new PrismaProjectRequestRepository(prisma);
 });
 
-test("createProjectRequestWithRevalidation persists a Pending row", async () => {
-  const result = await repo.createProjectRequestWithRevalidation({
-    buyerWorkspaceId: fixture.buyerWorkspace.id,
-    projectBriefId: fixture.brief.id,
-    serviceOfferingId: fixture.offering.id,
-    userAccountId: fixture.buyerUser.id,
+// Helper: wire a use case that mirrors the application-owned
+// service closure. The repository only loads + locks; the policy
+// evaluators below are the application-owned policy. This proves
+// the repository does not decide whether the facts authorize the
+// command.
+const buyerOkUseCase: CreateProjectRequestUseCase = (
+  ctx: CreateProjectRequestUseCaseContext,
+  tools: CreateProjectRequestUseCaseTools,
+) => {
+  const briefVerdict = evaluateBriefRecommendationBoundary(
+    ctx.briefRecommendations,
+    ctx.sellerEligibility.serviceOfferingId,
+    ctx.buyerAuthority.buyerWorkspaceId,
+  );
+  if (!briefVerdict.ok) {
+    if (briefVerdict.reason === "BRIEF_NOT_FOUND") return tools.reject("BRIEF_NOT_FOUND");
+    if (briefVerdict.reason === "OFFERING_NOT_IN_BRIEF")
+      return tools.reject("OFFERING_NOT_IN_BRIEF");
+    return tools.reject("OFFERING_NOT_IN_BRIEF");
+  }
+  const buyerVerdict = evaluateBuyerAuthority(ctx.buyerAuthority);
+  if (!buyerVerdict.ok) return tools.reject("BUYER_NOT_AUTHORIZED");
+  const sellerVerdict = evaluateSellerEligibility(ctx.sellerEligibility);
+  if (!sellerVerdict.ok) return tools.reject("SELLER_INELIGIBLE");
+  return tools.persist({
+    userAccountId: ctx.buyerAuthority.userAccountId,
+    buyerWorkspaceId: ctx.buyerAuthority.buyerWorkspaceId,
+    sellerWorkspaceId: sellerVerdict.sellerWorkspaceId,
+    projectBriefId: ctx.briefRecommendations.projectBriefId,
+    serviceOfferingId: ctx.sellerEligibility.serviceOfferingId,
   });
+};
+
+const respondAcceptUseCase: RespondProjectRequestUseCase = (
+  ctx: RespondProjectRequestUseCaseContext,
+  tools: RespondProjectRequestUseCaseTools,
+) => {
+  const verdict = evaluateSellerAuthority(ctx.sellerAuthority);
+  if (!verdict.ok) return tools.reject("SELLER_NOT_AUTHORIZED");
+  return tools.accept({
+    projectRequestId: ctx.projectRequest.id,
+    sellerDecisionByUserId: ctx.sellerAuthority.userAccountId,
+    now: clockNow,
+  });
+};
+
+const respondDeclineUseCase: RespondProjectRequestUseCase = (
+  ctx: RespondProjectRequestUseCaseContext,
+  tools: RespondProjectRequestUseCaseTools,
+) => {
+  const verdict = evaluateSellerAuthority(ctx.sellerAuthority);
+  if (!verdict.ok) return tools.reject("SELLER_NOT_AUTHORIZED");
+  return tools.decline({
+    projectRequestId: ctx.projectRequest.id,
+    sellerDecisionByUserId: ctx.sellerAuthority.userAccountId,
+    now: clockNow,
+  });
+};
+
+// ---------- persistence + uniqueness ----------
+
+test("createProjectRequestInTransaction persists a Pending row", async () => {
+  const result = await repo.createProjectRequestInTransaction(
+    {
+      buyerWorkspaceId: fixture.buyerWorkspace.id,
+      projectBriefId: fixture.brief.id,
+      serviceOfferingId: fixture.offering.id,
+      userAccountId: fixture.buyerUser.id,
+    },
+    buyerOkUseCase,
+  );
   assert.equal(result.ok, true);
   if (!result.ok) return;
   assert.equal(result.value.status, "Pending");
@@ -67,19 +148,26 @@ test("createProjectRequestWithRevalidation persists a Pending row", async () => 
   assert.equal(result.value.createdByUserId, fixture.buyerUser.id);
 });
 
-test("createProjectRequestWithRevalidation rejects a Pending duplicate with ALREADY_PENDING", async () => {
-  await repo.createProjectRequestWithRevalidation({
-    buyerWorkspaceId: fixture.buyerWorkspace.id,
-    projectBriefId: fixture.brief.id,
-    serviceOfferingId: fixture.offering.id,
-    userAccountId: fixture.buyerUser.id,
-  });
-  const second = await repo.createProjectRequestWithRevalidation({
-    buyerWorkspaceId: fixture.buyerWorkspace.id,
-    projectBriefId: fixture.brief.id,
-    serviceOfferingId: fixture.offering.id,
-    userAccountId: fixture.buyerUser.id,
-  });
+test("createProjectRequestInTransaction rejects a Pending duplicate with ALREADY_PENDING", async () => {
+  const first = await repo.createProjectRequestInTransaction(
+    {
+      buyerWorkspaceId: fixture.buyerWorkspace.id,
+      projectBriefId: fixture.brief.id,
+      serviceOfferingId: fixture.offering.id,
+      userAccountId: fixture.buyerUser.id,
+    },
+    buyerOkUseCase,
+  );
+  assert.equal(first.ok, true);
+  const second = await repo.createProjectRequestInTransaction(
+    {
+      buyerWorkspaceId: fixture.buyerWorkspace.id,
+      projectBriefId: fixture.brief.id,
+      serviceOfferingId: fixture.offering.id,
+      userAccountId: fixture.buyerUser.id,
+    },
+    buyerOkUseCase,
+  );
   assert.equal(second.ok, false);
   if (second.ok) return;
   assert.equal(second.reason, "ALREADY_PENDING");
@@ -87,13 +175,16 @@ test("createProjectRequestWithRevalidation rejects a Pending duplicate with ALRE
 
 // P1-001 verification: a buyer cannot submit an arbitrary eligible
 // offering that Matchmaker never returned for the persisted brief.
-test("createProjectRequestWithRevalidation rejects an offering not surfaced by the brief's Matchmaker", async () => {
-  const result = await repo.createProjectRequestWithRevalidation({
-    buyerWorkspaceId: fixture.buyerWorkspace.id,
-    projectBriefId: fixture.brief.id,
-    serviceOfferingId: fixture.notRecommendedOffering.id,
-    userAccountId: fixture.buyerUser.id,
-  });
+test("createProjectRequestInTransaction rejects an offering not surfaced by the brief's Matchmaker", async () => {
+  const result = await repo.createProjectRequestInTransaction(
+    {
+      buyerWorkspaceId: fixture.buyerWorkspace.id,
+      projectBriefId: fixture.brief.id,
+      serviceOfferingId: fixture.notRecommendedOffering.id,
+      userAccountId: fixture.buyerUser.id,
+    },
+    buyerOkUseCase,
+  );
   assert.equal(result.ok, false);
   if (result.ok) return;
   assert.equal(result.reason, "OFFERING_NOT_IN_BRIEF");
@@ -104,59 +195,81 @@ test("createProjectRequestWithRevalidation rejects an offering not surfaced by t
   assert.equal(count, 0);
 });
 
-test("createProjectRequestWithRevalidation rejects an unknown brief", async () => {
-  const result = await repo.createProjectRequestWithRevalidation({
-    buyerWorkspaceId: fixture.buyerWorkspace.id,
-    projectBriefId: "no-such-brief",
-    serviceOfferingId: fixture.offering.id,
-    userAccountId: fixture.buyerUser.id,
-  });
+test("createProjectRequestInTransaction rejects an unknown brief", async () => {
+  const result = await repo.createProjectRequestInTransaction(
+    {
+      buyerWorkspaceId: fixture.buyerWorkspace.id,
+      projectBriefId: "no-such-brief",
+      serviceOfferingId: fixture.offering.id,
+      userAccountId: fixture.buyerUser.id,
+    },
+    buyerOkUseCase,
+  );
   assert.equal(result.ok, false);
   if (result.ok) return;
   assert.equal(result.reason, "BRIEF_NOT_FOUND");
 });
 
-test("acceptProjectRequest atomically creates the Deal and transitions to Accepted", async () => {
-  const created = await repo.createProjectRequestWithRevalidation({
-    buyerWorkspaceId: fixture.buyerWorkspace.id,
-    projectBriefId: fixture.brief.id,
-    serviceOfferingId: fixture.offering.id,
-    userAccountId: fixture.buyerUser.id,
-  });
+test("respondToProjectRequestInTransaction accept atomically creates the Deal and transitions to Accepted", async () => {
+  const created = await repo.createProjectRequestInTransaction(
+    {
+      buyerWorkspaceId: fixture.buyerWorkspace.id,
+      projectBriefId: fixture.brief.id,
+      serviceOfferingId: fixture.offering.id,
+      userAccountId: fixture.buyerUser.id,
+    },
+    buyerOkUseCase,
+  );
   assert.equal(created.ok, true);
   if (!created.ok) return;
-  const result = await repo.acceptProjectRequest({
-    projectRequestId: created.value.id,
-    sellerDecisionByUserId: fixture.sellerUser.id,
-    now: clockNow,
-  });
+  const result = await repo.respondToProjectRequestInTransaction(
+    {
+      projectRequestId: created.value.id,
+      actingWorkspaceId: fixture.sellerWorkspace.id,
+      userAccountId: fixture.sellerUser.id,
+      now: clockNow,
+    },
+    respondAcceptUseCase,
+  );
   assert.equal(result.ok, true);
   if (!result.ok) return;
+  if (!("deal" in result.value)) return;
   assert.equal(result.value.projectRequest.status, "Accepted");
   assert.equal(result.value.deal.status, "Negotiating");
   assert.equal(result.value.deal.projectRequestId, created.value.id);
 });
 
-test("acceptProjectRequest retried after Accept returns ALREADY_RESPONDED (no second Deal)", async () => {
-  const created = await repo.createProjectRequestWithRevalidation({
-    buyerWorkspaceId: fixture.buyerWorkspace.id,
-    projectBriefId: fixture.brief.id,
-    serviceOfferingId: fixture.offering.id,
-    userAccountId: fixture.buyerUser.id,
-  });
+test("respondToProjectRequestInTransaction accept retried after Accept returns ALREADY_RESPONDED (no second Deal)", async () => {
+  const created = await repo.createProjectRequestInTransaction(
+    {
+      buyerWorkspaceId: fixture.buyerWorkspace.id,
+      projectBriefId: fixture.brief.id,
+      serviceOfferingId: fixture.offering.id,
+      userAccountId: fixture.buyerUser.id,
+    },
+    buyerOkUseCase,
+  );
   assert.equal(created.ok, true);
   if (!created.ok) return;
-  const first = await repo.acceptProjectRequest({
-    projectRequestId: created.value.id,
-    sellerDecisionByUserId: fixture.sellerUser.id,
-    now: clockNow,
-  });
+  const first = await repo.respondToProjectRequestInTransaction(
+    {
+      projectRequestId: created.value.id,
+      actingWorkspaceId: fixture.sellerWorkspace.id,
+      userAccountId: fixture.sellerUser.id,
+      now: clockNow,
+    },
+    respondAcceptUseCase,
+  );
   assert.equal(first.ok, true);
-  const second = await repo.acceptProjectRequest({
-    projectRequestId: created.value.id,
-    sellerDecisionByUserId: fixture.sellerUser.id,
-    now: clockNow,
-  });
+  const second = await repo.respondToProjectRequestInTransaction(
+    {
+      projectRequestId: created.value.id,
+      actingWorkspaceId: fixture.sellerWorkspace.id,
+      userAccountId: fixture.sellerUser.id,
+      now: clockNow,
+    },
+    respondAcceptUseCase,
+  );
   assert.equal(second.ok, false);
   if (second.ok) return;
   assert.equal(second.reason, "ALREADY_RESPONDED");
@@ -167,22 +280,30 @@ test("acceptProjectRequest retried after Accept returns ALREADY_RESPONDED (no se
   assert.equal(dealCount, 1);
 });
 
-test("declineProjectRequest transitions to Declined and creates no Deal", async () => {
-  const created = await repo.createProjectRequestWithRevalidation({
-    buyerWorkspaceId: fixture.buyerWorkspace.id,
-    projectBriefId: fixture.brief.id,
-    serviceOfferingId: fixture.offering.id,
-    userAccountId: fixture.buyerUser.id,
-  });
+test("respondToProjectRequestInTransaction decline transitions to Declined and creates no Deal", async () => {
+  const created = await repo.createProjectRequestInTransaction(
+    {
+      buyerWorkspaceId: fixture.buyerWorkspace.id,
+      projectBriefId: fixture.brief.id,
+      serviceOfferingId: fixture.offering.id,
+      userAccountId: fixture.buyerUser.id,
+    },
+    buyerOkUseCase,
+  );
   assert.equal(created.ok, true);
   if (!created.ok) return;
-  const result = await repo.declineProjectRequest({
-    projectRequestId: created.value.id,
-    sellerDecisionByUserId: fixture.sellerUser.id,
-    now: clockNow,
-  });
+  const result = await repo.respondToProjectRequestInTransaction(
+    {
+      projectRequestId: created.value.id,
+      actingWorkspaceId: fixture.sellerWorkspace.id,
+      userAccountId: fixture.sellerUser.id,
+      now: clockNow,
+    },
+    respondDeclineUseCase,
+  );
   assert.equal(result.ok, true);
   if (!result.ok) return;
+  if (!("status" in result.value)) return;
   assert.equal(result.value.status, "Declined");
   assert.equal(result.value.sellerConsentAt, null);
   const dealCount = await prisma.deal.count({
@@ -191,26 +312,37 @@ test("declineProjectRequest transitions to Declined and creates no Deal", async 
   assert.equal(dealCount, 0);
 });
 
-test("acceptProjectRequest retried after Decline returns ALREADY_RESPONDED", async () => {
-  const created = await repo.createProjectRequestWithRevalidation({
-    buyerWorkspaceId: fixture.buyerWorkspace.id,
-    projectBriefId: fixture.brief.id,
-    serviceOfferingId: fixture.offering.id,
-    userAccountId: fixture.buyerUser.id,
-  });
+test("respondToProjectRequestInTransaction accept retried after Decline returns ALREADY_RESPONDED", async () => {
+  const created = await repo.createProjectRequestInTransaction(
+    {
+      buyerWorkspaceId: fixture.buyerWorkspace.id,
+      projectBriefId: fixture.brief.id,
+      serviceOfferingId: fixture.offering.id,
+      userAccountId: fixture.buyerUser.id,
+    },
+    buyerOkUseCase,
+  );
   assert.equal(created.ok, true);
   if (!created.ok) return;
-  const declined = await repo.declineProjectRequest({
-    projectRequestId: created.value.id,
-    sellerDecisionByUserId: fixture.sellerUser.id,
-    now: clockNow,
-  });
+  const declined = await repo.respondToProjectRequestInTransaction(
+    {
+      projectRequestId: created.value.id,
+      actingWorkspaceId: fixture.sellerWorkspace.id,
+      userAccountId: fixture.sellerUser.id,
+      now: clockNow,
+    },
+    respondDeclineUseCase,
+  );
   assert.equal(declined.ok, true);
-  const accepted = await repo.acceptProjectRequest({
-    projectRequestId: created.value.id,
-    sellerDecisionByUserId: fixture.sellerUser.id,
-    now: clockNow,
-  });
+  const accepted = await repo.respondToProjectRequestInTransaction(
+    {
+      projectRequestId: created.value.id,
+      actingWorkspaceId: fixture.sellerWorkspace.id,
+      userAccountId: fixture.sellerUser.id,
+      now: clockNow,
+    },
+    respondAcceptUseCase,
+  );
   assert.equal(accepted.ok, false);
   if (accepted.ok) return;
   assert.equal(accepted.reason, "ALREADY_RESPONDED");
@@ -225,7 +357,7 @@ test("acceptProjectRequest retried after Decline returns ALREADY_RESPONDED", asy
 // second create for the same tuple via the partial unique index
 // `project_requests_pending_unique_idx`. The repository translates
 // the violation into ALREADY_PENDING, NOT a duplicate row.
-test("createProjectRequestWithRevalidation is blocked by an externally-inserted Pending duplicate", async () => {
+test("createProjectRequestInTransaction is blocked by an externally-inserted Pending duplicate", async () => {
   // Bypass the repository and write the Pending row directly so we
   // can simulate a concurrent retry that committed between this
   // process's checks and its INSERT.
@@ -239,12 +371,15 @@ test("createProjectRequestWithRevalidation is blocked by an externally-inserted 
       status: "Pending",
     },
   });
-  const second = await repo.createProjectRequestWithRevalidation({
-    buyerWorkspaceId: fixture.buyerWorkspace.id,
-    projectBriefId: fixture.brief.id,
-    serviceOfferingId: fixture.offering.id,
-    userAccountId: fixture.buyerUser.id,
-  });
+  const second = await repo.createProjectRequestInTransaction(
+    {
+      buyerWorkspaceId: fixture.buyerWorkspace.id,
+      projectBriefId: fixture.brief.id,
+      serviceOfferingId: fixture.offering.id,
+      userAccountId: fixture.buyerUser.id,
+    },
+    buyerOkUseCase,
+  );
   assert.equal(second.ok, false);
   if (second.ok) return;
   assert.equal(second.reason, "ALREADY_PENDING");
@@ -266,19 +401,26 @@ test("createProjectRequestWithRevalidation is blocked by an externally-inserted 
 // accepted consent or the audit evidence.
 test("RESTRICT prevents Workspace deletion from erasing accepted ProjectRequests and Deals", async () => {
   // Create + accept so a Deal exists alongside the ProjectRequest.
-  const created = await repo.createProjectRequestWithRevalidation({
-    buyerWorkspaceId: fixture.buyerWorkspace.id,
-    projectBriefId: fixture.brief.id,
-    serviceOfferingId: fixture.offering.id,
-    userAccountId: fixture.buyerUser.id,
-  });
+  const created = await repo.createProjectRequestInTransaction(
+    {
+      buyerWorkspaceId: fixture.buyerWorkspace.id,
+      projectBriefId: fixture.brief.id,
+      serviceOfferingId: fixture.offering.id,
+      userAccountId: fixture.buyerUser.id,
+    },
+    buyerOkUseCase,
+  );
   assert.equal(created.ok, true);
   if (!created.ok) return;
-  const accepted = await repo.acceptProjectRequest({
-    projectRequestId: created.value.id,
-    sellerDecisionByUserId: fixture.sellerUser.id,
-    now: clockNow,
-  });
+  const accepted = await repo.respondToProjectRequestInTransaction(
+    {
+      projectRequestId: created.value.id,
+      actingWorkspaceId: fixture.sellerWorkspace.id,
+      userAccountId: fixture.sellerUser.id,
+      now: clockNow,
+    },
+    respondAcceptUseCase,
+  );
   assert.equal(accepted.ok, true);
   if (!accepted.ok) return;
 
@@ -288,15 +430,15 @@ test("RESTRICT prevents Workspace deletion from erasing accepted ProjectRequests
     prisma.workspace.delete({ where: { id: fixture.buyerWorkspace.id } }),
     (err: unknown) => err instanceof Error && /foreign key/i.test(err.message),
   );
-  // Seller-workspace deletion must fail because both a ProjectRequest
-  // and a Deal reference it.
+  // Seller-workspace deletion must fail because both a
+  // ProjectRequest and a Deal reference it.
   await assert.rejects(
     prisma.workspace.delete({ where: { id: fixture.sellerWorkspace.id } }),
     (err: unknown) => err instanceof Error && /foreign key/i.test(err.message),
   );
 
-  // The ProjectRequest and Deal rows are still present, with their
-  // consent and audit evidence intact.
+  // The ProjectRequest and Deal rows are still present, with
+  // their consent and audit evidence intact.
   const stillThere = await prisma.projectRequest.findUnique({
     where: { id: created.value.id },
   });
@@ -310,19 +452,26 @@ test("RESTRICT prevents Workspace deletion from erasing accepted ProjectRequests
 });
 
 test("RESTRICT prevents ProjectRequest deletion from erasing the associated Deal", async () => {
-  const created = await repo.createProjectRequestWithRevalidation({
-    buyerWorkspaceId: fixture.buyerWorkspace.id,
-    projectBriefId: fixture.brief.id,
-    serviceOfferingId: fixture.offering.id,
-    userAccountId: fixture.buyerUser.id,
-  });
+  const created = await repo.createProjectRequestInTransaction(
+    {
+      buyerWorkspaceId: fixture.buyerWorkspace.id,
+      projectBriefId: fixture.brief.id,
+      serviceOfferingId: fixture.offering.id,
+      userAccountId: fixture.buyerUser.id,
+    },
+    buyerOkUseCase,
+  );
   assert.equal(created.ok, true);
   if (!created.ok) return;
-  const accepted = await repo.acceptProjectRequest({
-    projectRequestId: created.value.id,
-    sellerDecisionByUserId: fixture.sellerUser.id,
-    now: clockNow,
-  });
+  const accepted = await repo.respondToProjectRequestInTransaction(
+    {
+      projectRequestId: created.value.id,
+      actingWorkspaceId: fixture.sellerWorkspace.id,
+      userAccountId: fixture.sellerUser.id,
+      now: clockNow,
+    },
+    respondAcceptUseCase,
+  );
   assert.equal(accepted.ok, true);
   if (!accepted.ok) return;
 
@@ -337,19 +486,26 @@ test("RESTRICT prevents ProjectRequest deletion from erasing the associated Deal
 });
 
 test("RESTRICT prevents deciding-UserAccount deletion from nulling seller consent attribution", async () => {
-  const created = await repo.createProjectRequestWithRevalidation({
-    buyerWorkspaceId: fixture.buyerWorkspace.id,
-    projectBriefId: fixture.brief.id,
-    serviceOfferingId: fixture.offering.id,
-    userAccountId: fixture.buyerUser.id,
-  });
+  const created = await repo.createProjectRequestInTransaction(
+    {
+      buyerWorkspaceId: fixture.buyerWorkspace.id,
+      projectBriefId: fixture.brief.id,
+      serviceOfferingId: fixture.offering.id,
+      userAccountId: fixture.buyerUser.id,
+    },
+    buyerOkUseCase,
+  );
   assert.equal(created.ok, true);
   if (!created.ok) return;
-  const accepted = await repo.acceptProjectRequest({
-    projectRequestId: created.value.id,
-    sellerDecisionByUserId: fixture.sellerUser.id,
-    now: clockNow,
-  });
+  const accepted = await repo.respondToProjectRequestInTransaction(
+    {
+      projectRequestId: created.value.id,
+      actingWorkspaceId: fixture.sellerWorkspace.id,
+      userAccountId: fixture.sellerUser.id,
+      now: clockNow,
+    },
+    respondAcceptUseCase,
+  );
   assert.equal(accepted.ok, true);
   if (!accepted.ok) return;
 
@@ -366,32 +522,25 @@ test("RESTRICT prevents deciding-UserAccount deletion from nulling seller consen
   assert.equal(stillThere?.sellerConsentAt?.toISOString(), clockNow.toISOString());
 });
 
-// P1-001 / P1-002 invariants at the repository level:
+// P1-001 / P1-002 / P1-003 invariants at the repository level:
 //
-//   1. Concurrent / repeated acceptance of the same Pending row
+//   1. The application-owned policy evaluators (in
+//      `./project-request-authorization-policy.ts`) are the only
+//      decision points. The Prisma adapter loads + FOR UPDATE-locks
+//      every row the policy depends on, hands the snapshots to the
+//      application-supplied use case, and persists only when the use
+//      case returns `persist`. A `reject` rolls back with no state
+//      change.
+//
+//   2. Concurrent / repeated acceptance of the same Pending row
 //      cannot create multiple Deals. The partial unique index on
 //      `deals.projectRequestId` plus the guarded
 //      `updateMany WHERE status='Pending'` enforce this without a
-//      serialization-retry framework. The relevant test for this
-//      invariant is `acceptProjectRequest retried after Accept
-//      returns ALREADY_RESPONDED (no second Deal)` above; it
-//      asserts `dealCount === 1` after a successful accept and a
-//      retry.
+//      serialization-retry framework.
 //
-//   2. Failed authorization creates no state change. The
-//      application service is responsible for the authorization
-//      policy decision (see project-request.service.ts +
-//      ./project-request-authorization-policy.ts); it throws
-//      AuthorizationError / ProjectRequestError BEFORE calling
-//      the repository. The repository's transaction sees no
-//      state change in that scenario because no INSERT was
-//      issued. Service-level tests in
-//      project-request.service.test.ts prove this invariant.
-//
-// The previous "concurrent revoke" tests in this file falsely
-// claimed to exercise concurrency inside the repository's
-// transaction. The application service is the policy decision
-// point; the repository does not retry on serialization
-// failures. BG4's retry-safety contract is satisfied by the
-// natural uniqueness constraint + guarded state transition +
-// atomic transaction alone (ticket #62 GS 26).
+//   3. The interleaving tests in this file (see
+//      `prisma-project-request.repository.interleaving.test.ts`)
+//      exercise a second PostgreSQL connection to mutate authority /
+//      eligibility facts while the repository's transaction holds
+//      FOR UPDATE locks, proving the locking semantics described in
+//      ticket #62 hold in production.

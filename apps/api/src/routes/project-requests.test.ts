@@ -30,7 +30,6 @@ import {
   ProjectRequestError,
   type ProjectRequestService,
 } from "../project-request/project-request.service.js";
-import { AuthorizationError } from "../services/workspace-authorization.service.js";
 import type { AuthenticationService } from "../services/authentication.service.js";
 import type { Express } from "express";
 
@@ -60,8 +59,8 @@ class FakeProjectRequestService {
   static NEXT_BUYER_REJECTION: "OK" | "NOT_A_MEMBER" | "MISSING_CAPABILITY" | "INVALID" | null =
     null;
 
-  // Toggle for accept: the next call returns OK or throws
-  // AuthorizationError so we can pin the FORBIDDEN envelope path.
+  // Toggle for accept: the next call returns OK or throws a typed
+  // ProjectRequestError so we can pin the FORBIDDEN envelope path.
   static ACCEPT_REJECTION: "OK" | "NOT_FOUND" | "ALREADY_RESPONDED" | "FORBIDDEN" = "OK";
 
   // Counters for asserting call counts and payloads.
@@ -74,10 +73,10 @@ class FakeProjectRequestService {
   async createProjectRequest(input: unknown) {
     this.createCalls.push(input);
     if (FakeProjectRequestService.NEXT_BUYER_REJECTION === "NOT_A_MEMBER") {
-      throw new AuthorizationError("not a member", "NOT_A_MEMBER");
+      throw new ProjectRequestError("not a member", "PROJECT_REQUEST_FORBIDDEN");
     }
     if (FakeProjectRequestService.NEXT_BUYER_REJECTION === "MISSING_CAPABILITY") {
-      throw new AuthorizationError("missing capability", "MISSING_CAPABILITY");
+      throw new ProjectRequestError("missing capability", "PROJECT_REQUEST_FORBIDDEN");
     }
     if (FakeProjectRequestService.NEXT_BUYER_REJECTION === "INVALID") {
       throw new ProjectRequestError("invalid", "PROJECT_REQUEST_INVALID");
@@ -106,7 +105,7 @@ class FakeProjectRequestService {
       throw new ProjectRequestError("already", "PROJECT_REQUEST_ALREADY_RESPONDED");
     }
     if (FakeProjectRequestService.ACCEPT_REJECTION === "FORBIDDEN") {
-      throw new AuthorizationError("not a member", "NOT_A_MEMBER");
+      throw new ProjectRequestError("not a member", "PROJECT_REQUEST_FORBIDDEN");
     }
     return {
       projectRequest: {
@@ -254,7 +253,7 @@ describe("ProjectRequest route contract", () => {
     assert.equal(pr.createCalls.length, 1);
   });
 
-  test("POST /api/project-requests maps AuthorizationError to PROJECT_REQUEST_FORBIDDEN", async () => {
+  test("POST /api/project-requests maps PROJECT_REQUEST_FORBIDDEN to 403", async () => {
     FakeProjectRequestService.NEXT_BUYER_REJECTION = "NOT_A_MEMBER";
     try {
       const response = await request(app).post("/api/project-requests").send({
@@ -354,7 +353,7 @@ describe("ProjectRequest route contract", () => {
     }
   });
 
-  test("POST /api/project-requests/:id/accept maps AuthorizationError to 403", async () => {
+  test("POST /api/project-requests/:id/accept maps PROJECT_REQUEST_FORBIDDEN to 403", async () => {
     FakeProjectRequestService.ACCEPT_REJECTION = "FORBIDDEN";
     try {
       const response = await request(app)

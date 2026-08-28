@@ -21,11 +21,6 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
 import type { ProjectBriefPublicV1 } from "@soundhub/types";
-import {
-  InMemoryAuthRepository,
-  type InMemoryUserSeed,
-} from "../auth-repository/in-memory-auth-repository.js";
-import { WorkspaceAuthorizationService } from "../services/workspace-authorization.service.js";
 import { ProjectRequestService } from "./project-request.service.js";
 import { InMemoryProjectRequestRepository } from "./in-memory-project-request.repository.js";
 
@@ -50,128 +45,102 @@ interface Fixture {
 }
 
 function buildFixture(): Fixture {
-  const buyerSeed: InMemoryUserSeed = {
-    userAccountId: BUYER_USER_ID,
-    email: "buyer@example.com",
-    identityProvider: "deterministic",
-    identitySubject: "buyer-subject",
-    memberships: [
-      {
-        workspaceId: BUYER_WORKSPACE_ID,
-        slug: "buyer",
-        name: "Buyer",
-        workspaceType: "Personal",
-        workspaceStatus: "Active",
-        role: "Owner",
-        capabilities: ["Buyer"],
-      },
-    ],
-  };
-  const otherBuyerSeed: InMemoryUserSeed = {
-    userAccountId: OTHER_BUYER_USER_ID,
-    email: "other-buyer@example.com",
-    identityProvider: "deterministic",
-    identitySubject: "other-buyer-subject",
-    memberships: [
-      {
-        workspaceId: OTHER_BUYER_WORKSPACE_ID,
-        slug: "other-buyer",
-        name: "Other Buyer",
-        workspaceType: "Personal",
-        workspaceStatus: "Active",
-        role: "Owner",
-        capabilities: ["Buyer"],
-      },
-    ],
-  };
-  const sellerSeed: InMemoryUserSeed = {
-    userAccountId: SELLER_USER_ID,
-    email: "seller@example.com",
-    identityProvider: "deterministic",
-    identitySubject: "seller-subject",
-    memberships: [
-      {
-        workspaceId: SELLER_WORKSPACE_ID,
-        slug: "seller",
-        name: "Seller",
-        workspaceType: "Personal",
-        workspaceStatus: "Active",
-        role: "Owner",
-        capabilities: ["Seller"],
-      },
-    ],
-  };
-  const authRepo = new InMemoryAuthRepository([buyerSeed, otherBuyerSeed, sellerSeed]);
-  const authz = new WorkspaceAuthorizationService({ authRepository: authRepo });
-
   const projectRequestRepo = new InMemoryProjectRequestRepository();
-  // The application service owns the buyer / seller authorization
-  // policy decision (see ./project-request-authorization-policy.ts
-  // and the WorkspaceAuthorizationService seeded above). The
-  // repository only persists + enforces atomic guards; we seed the
-  // brief → recommendation mapping + the eligibility snapshot so
-  // the in-memory adapter answers the same way the Prisma adapter
-  // answers from the live Workspace / ProjectBrief /
-  // ServiceOffering / SellerProfile rows.
-  // BRIEF_ID surfaces OFFERING_ID, OFFERING_OTHER_SELLER_ID,
-  // OFFERING_INELIGIBLE_ID; OFFERING_NOT_IN_BRIEF_ID is NOT a
-  // recommendation, so submitting it must fail with
-  // OFFERING_NOT_IN_BRIEF.
-  projectRequestRepo.seedBrief({
-    briefId: BRIEF_ID,
-    buyerWorkspaceId: BUYER_WORKSPACE_ID,
-    offeringIds: [OFFERING_ID, OFFERING_OTHER_SELLER_ID, OFFERING_INELIGIBLE_ID],
+  // Seed the in-memory snapshot state the policy evaluators
+  // consume. The repository loads + locks these snapshots inside
+  // its transaction; the service invokes the pure evaluators in
+  // `project-request-authorization-policy.ts` to decide whether
+  // the facts authorize the command.
+  projectRequestRepo.seedWorkspace({
+    workspaceId: BUYER_WORKSPACE_ID,
+    status: "Active",
+    ownerUserId: BUYER_USER_ID,
+    buyerCapability: true,
+    sellerCapability: false,
   });
-  projectRequestRepo.seedBrief({
-    briefId: OTHER_BRIEF_ID,
-    buyerWorkspaceId: OTHER_BUYER_WORKSPACE_ID,
-    offeringIds: [OFFERING_ID],
+  projectRequestRepo.seedWorkspace({
+    workspaceId: OTHER_BUYER_WORKSPACE_ID,
+    status: "Active",
+    ownerUserId: OTHER_BUYER_USER_ID,
+    buyerCapability: true,
+    sellerCapability: false,
   });
-  // Seed eligibility snapshots. The repository's P1-002 transaction
-  // applies the same chain as the previous Prisma `loadOfferingEligibility`.
-  projectRequestRepo.seedOfferingEligibility({
+  projectRequestRepo.seedWorkspace({
+    workspaceId: SELLER_WORKSPACE_ID,
+    status: "Active",
+    ownerUserId: SELLER_USER_ID,
+    buyerCapability: false,
+    sellerCapability: true,
+  });
+  projectRequestRepo.seedWorkspace({
+    workspaceId: "ws-different-seller",
+    status: "Active",
+    ownerUserId: "user-different-seller",
+    buyerCapability: false,
+    sellerCapability: true,
+  });
+  projectRequestRepo.seedSellerProfile({
+    workspaceId: "ws-different-seller",
+    status: "Published",
+  });
+  projectRequestRepo.seedMembership({
+    userId: "user-different-seller",
+    workspaceId: "ws-different-seller",
+  });
+  projectRequestRepo.seedMembership({
+    userId: BUYER_USER_ID,
+    workspaceId: BUYER_WORKSPACE_ID,
+  });
+  projectRequestRepo.seedMembership({
+    userId: OTHER_BUYER_USER_ID,
+    workspaceId: OTHER_BUYER_WORKSPACE_ID,
+  });
+  projectRequestRepo.seedMembership({
+    userId: SELLER_USER_ID,
+    workspaceId: SELLER_WORKSPACE_ID,
+  });
+
+  projectRequestRepo.seedSellerProfile({
+    workspaceId: SELLER_WORKSPACE_ID,
+    status: "Published",
+  });
+  projectRequestRepo.seedServiceOffering({
     id: OFFERING_ID,
-    status: "Active",
     sellerWorkspaceId: SELLER_WORKSPACE_ID,
-    workspaceStatus: "Active",
-    workspaceHasSellerCapability: true,
-    profileStatus: "Published",
-  });
-  projectRequestRepo.seedOfferingEligibility({
-    id: OFFERING_OTHER_SELLER_ID,
     status: "Active",
-    sellerWorkspaceId: "ws-different-seller",
-    workspaceStatus: "Active",
-    workspaceHasSellerCapability: true,
-    profileStatus: "Published",
   });
-  projectRequestRepo.seedOfferingEligibility({
+  projectRequestRepo.seedServiceOffering({
     id: OFFERING_INELIGIBLE_ID,
-    status: "Paused", // ineligible — Paused, not Active
     sellerWorkspaceId: SELLER_WORKSPACE_ID,
-    workspaceStatus: "Active",
-    workspaceHasSellerCapability: true,
-    profileStatus: "Published",
+    status: "Paused",
   });
-  projectRequestRepo.seedOfferingEligibility({
-    id: OFFERING_NOT_IN_BRIEF_ID,
+  projectRequestRepo.seedServiceOffering({
+    id: OFFERING_OTHER_SELLER_ID,
+    sellerWorkspaceId: "ws-different-seller",
     status: "Active",
+  });
+  projectRequestRepo.seedServiceOffering({
+    id: OFFERING_NOT_IN_BRIEF_ID,
     sellerWorkspaceId: SELLER_WORKSPACE_ID,
-    workspaceStatus: "Active",
-    workspaceHasSellerCapability: true,
-    profileStatus: "Published",
+    status: "Active",
+  });
+
+  projectRequestRepo.seedProjectBrief({
+    id: BRIEF_ID,
+    buyerWorkspaceId: BUYER_WORKSPACE_ID,
+    recommendedOfferingIds: [OFFERING_ID, OFFERING_OTHER_SELLER_ID, OFFERING_INELIGIBLE_ID],
+  });
+  projectRequestRepo.seedProjectBrief({
+    id: OTHER_BRIEF_ID,
+    buyerWorkspaceId: OTHER_BUYER_WORKSPACE_ID,
+    recommendedOfferingIds: [OFFERING_ID],
   });
 
   const clock = { current: new Date("2026-08-27T00:00:00Z") };
   const now = () => clock.current;
 
-  // P1-003: the service has NO Prisma dependency. The fixture wires
-  // the in-memory repository directly. P1-001 / P1-002 are now owned
-  // by the repository — the service no longer holds a brief or
-  // seller-authorization boundary.
   const service = new ProjectRequestService({
     projectRequestRepository: projectRequestRepo,
-    workspaceAuthorizationService: authz,
     now,
   });
 
@@ -203,10 +172,10 @@ test("createProjectRequest persists a Pending request owned by the buyer Workspa
 test("createProjectRequest rejects a non-Buyer actor with PROJECT_REQUEST_FORBIDDEN", async () => {
   const { projectRequestService } = buildFixture();
   // The seller user is NOT a member of the buyer Workspace, so the
-  // application service's upfront
-  // WorkspaceAuthorizationService.requireCapability fails closed
-  // with NOT_A_MEMBER. The route layer translates this to a safe
-  // envelope.
+  // buyer authority snapshot surfaces isMember=false and the
+  // application-owned evaluateBuyerAuthority evaluator fails
+  // closed with NOT_A_MEMBER. The service translates this to
+  // PROJECT_REQUEST_FORBIDDEN.
   await assert.rejects(
     projectRequestService.createProjectRequest({
       userAccountId: SELLER_USER_ID,
@@ -217,8 +186,8 @@ test("createProjectRequest rejects a non-Buyer actor with PROJECT_REQUEST_FORBID
     (err: unknown) => {
       return (
         err instanceof Error &&
-        err.name === "AuthorizationError" &&
-        (err as { code?: string }).code === "NOT_A_MEMBER"
+        err.name === "ProjectRequestError" &&
+        (err as { code?: string }).code === "PROJECT_REQUEST_FORBIDDEN"
       );
     },
   );
@@ -290,9 +259,10 @@ test("createProjectRequest persists the offering's owning Workspace as the selle
   // The buyer is addressing the buyer Workspace, but the offering
   // is owned by a different seller Workspace. The eligibility
   // revalidation returns the offering (Active etc.) and the
-  // sellerWorkspaceId from the lookup is the source of truth for
-  // ownership. This test pins the surface so a future regression
-  // that hard-codes the acting Workspace would be detected.
+  // sellerWorkspaceId from the snapshot is the source of truth
+  // for ownership. This test pins the surface so a future
+  // regression that hard-codes the acting Workspace would be
+  // detected.
   const result = await projectRequestService.createProjectRequest({
     userAccountId: BUYER_USER_ID,
     actingWorkspaceId: BUYER_WORKSPACE_ID,
@@ -362,10 +332,10 @@ test("acceptProjectRequest rejects a buyer Workspace member (only the seller sid
     projectBriefId: BRIEF_ID,
     serviceOfferingId: OFFERING_ID,
   });
-  // The buyer user is not a member of the seller Workspace, so the
-  // application service's upfront
-  // WorkspaceAuthorizationService.requireActingMembership fails
-  // closed with NOT_A_MEMBER. The route layer translates this to
+  // The buyer user is not a member of the seller Workspace, so
+  // the seller authority snapshot surfaces isMember=false and the
+  // application-owned evaluateSellerAuthority evaluator fails
+  // closed with NOT_A_MEMBER. The service translates this to
   // PROJECT_REQUEST_FORBIDDEN.
   await assert.rejects(
     projectRequestService.acceptProjectRequest({
@@ -376,8 +346,8 @@ test("acceptProjectRequest rejects a buyer Workspace member (only the seller sid
     (err: unknown) => {
       return (
         err instanceof Error &&
-        err.name === "AuthorizationError" &&
-        (err as { code?: string }).code === "NOT_A_MEMBER"
+        err.name === "ProjectRequestError" &&
+        (err as { code?: string }).code === "PROJECT_REQUEST_FORBIDDEN"
       );
     },
   );
@@ -452,10 +422,11 @@ test("declineProjectRequest transitions Pending to Declined and creates no Deal"
   assert.equal(result.projectRequest.status, "Declined");
   assert.notEqual(result.projectRequest.sellerDecisionAt, null);
   assert.equal(result.projectRequest.sellerConsentAt, null);
-  // No Deal should have been created. The in-memory repository has
-  // no public listDeals, so we rely on the absence of an accept
-  // call having been issued: the request status is Declined and
-  // the sellerConsentAt is null, which is the contract for decline.
+  // No Deal should have been created. The in-memory repository
+  // has no public listDeals, so we rely on the absence of an
+  // accept call having been issued: the request status is
+  // Declined and the sellerConsentAt is null, which is the
+  // contract for decline.
   const stored = await projectRequestRepo.findProjectRequestById(
     created.projectRequest.projectRequestId,
   );
@@ -581,9 +552,8 @@ test("getProjectRequest rejects a non-member of either side", async () => {
 // test pins the type-level contract so a future regression that
 // re-introduces `prisma` into the constructor would fail to compile.
 test("ProjectRequestService has no Prisma dependency at the type level", () => {
-  // Constructor signature: { projectRequestRepository,
-  // projectBriefRepository, workspaceAuthorizationService, now? }.
-  // No `prisma` field. The next line would NOT compile if `prisma`
+  // Constructor signature: { projectRequestRepository, now? }. No
+  // `prisma` field. The next line would NOT compile if `prisma`
   // were reintroduced.
   type _AssertNoPrisma = ProjectRequestService extends {
     // eslint-disable-next-line @typescript-eslint/no-explicit-any
