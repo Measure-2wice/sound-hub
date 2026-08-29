@@ -77,6 +77,16 @@ pnpm dev
 pnpm dev:web
 pnpm dev:api
 
+# Backend
+cd apps/backend
+cargo contract build
+cargo contract test
+npx pnpm --filter @soundhub/api exec tsx src/services/backend.service.test.ts
+
+# Frontend
+cd apps/web
+pnpm dev
+
 # Quality
 pnpm type-check
 pnpm lint
