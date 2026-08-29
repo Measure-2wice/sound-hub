@@ -1,0 +1,115 @@
+<!--
+  BG1 deployed Supabase magic-link email template.
+
+  This template is the canonical magic-link body the operator MUST
+  configure in the Supabase project for the deployed Golden Slice
+  managed authentication journey (ticket #59 P1-002).
+
+  The template's action link MUST be of the form:
+
+      <AUTH_CALLBACK_URL>?token={{ .TokenHash }}
+
+  so the browser's `MagicLinkVerifier` reads the credential from
+  `?token=...` and POSTs it to `/api/auth/verify-token`. The
+  Supabase default magic-link email does NOT append the raw token
+  hash to the redirect — operators MUST replace the default body
+  with this template (Supabase Studio → Authentication → Email
+  Templates → Magic Link) before declaring the managed path
+  Golden-Slice-ready.
+
+  BG1 only supports magic-link verification. The user-facing
+  product is email magic-link authentication; the serving
+  adapter (`ManagedIdentityAdapter`) pins Supabase's current
+  wire-level verify type `type: "email"` for the
+  `/auth/v1/verify` call (per ticket #59 P0-001). The deployed
+  email template therefore MUST be the Supabase magic-link
+  template (Studio → Authentication → Email Templates → Magic
+  Link) — no runtime switch is exposed and no other verify type
+  is accepted by the BG1 serving adapter.
+
+  Apply this template via one of:
+
+    1. Supabase Studio → Authentication → Email Templates →
+       Magic Link → paste the HTML body below into the
+       "Message (HTML)" editor. Save the template.
+
+    2. `pnpm apply:supabase:magic-link-template` (requires
+       `SUPABASE_PROJECT_REF` + `SUPABASE_MANAGEMENT_TOKEN`
+       env vars; uses the Supabase Management API to update the
+       template configuration).
+-->
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Sign in to SoundHub</title>
+  </head>
+  <body
+    style="
+      font-family:
+        -apple-system, BlinkMacSystemFont, &quot;Segoe UI&quot;, Helvetica, Arial, sans-serif;
+      background: #f9fafb;
+      padding: 24px;
+      color: #111827;
+    "
+  >
+    <table
+      role="presentation"
+      cellpadding="0"
+      cellspacing="0"
+      border="0"
+      style="
+        max-width: 560px;
+        margin: 0 auto;
+        background: #ffffff;
+        border-radius: 8px;
+        padding: 32px;
+      "
+    >
+      <tr>
+        <td>
+          <h1 style="font-size: 24px; line-height: 32px; margin: 0 0 16px 0; color: #111827">
+            Sign in to SoundHub
+          </h1>
+          <p style="font-size: 14px; line-height: 22px; margin: 0 0 24px 0; color: #374151">
+            Click the button below to sign in to SoundHub. This link works once and expires shortly.
+          </p>
+          <p style="margin: 0 0 24px 0">
+            <a
+              href="{{ .SiteURL }}/auth/callback?token={{ .TokenHash }}"
+              style="
+                display: inline-block;
+                background: #2563eb;
+                color: #ffffff;
+                padding: 12px 20px;
+                border-radius: 6px;
+                text-decoration: none;
+                font-weight: 600;
+              "
+            >
+              Sign in to SoundHub
+            </a>
+          </p>
+          <p style="font-size: 12px; line-height: 18px; margin: 0 0 8px 0; color: #6b7280">
+            Or copy and paste this URL into your browser:
+          </p>
+          <p
+            style="
+              font-size: 12px;
+              line-height: 18px;
+              word-break: break-all;
+              color: #2563eb;
+              margin: 0 0 24px 0;
+            "
+          >
+            {{ .SiteURL }}/auth/callback?token={{ .TokenHash }}
+          </p>
+          <p style="font-size: 12px; line-height: 18px; margin: 0; color: #6b7280">
+            If you did not request this sign-in, you can safely ignore this email.
+          </p>
+        </td>
+      </tr>
+    </table>
+  </body>
+</html>

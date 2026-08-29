@@ -53,15 +53,65 @@ function mapStatus(code: ApiErrorCodeV1): number {
   switch (code) {
     case "INVALID_JSON":
     case "INVALID_SEARCH_CRITERIA":
+    case "INVALID_AUTH_REQUEST":
+    case "MATCHMAKER_INVALID_REQUEST":
       return 400;
     case "UNSUPPORTED_MEDIA_TYPE":
       return 415;
     case "SEARCH_RATE_LIMITED":
+    case "AUTH_RATE_LIMITED":
       return 429;
     case "SEARCH_FAILED":
+    case "AUTH_FAILED":
+    case "MATCHMAKER_FAILED":
       return 500;
     case "SEARCH_UNAVAILABLE":
+    case "AUTH_PROVIDER_UNAVAILABLE":
+    case "MATCHMAKER_AI_UNAVAILABLE":
       return 503;
+    // GS 4 / GS 5 authorization rejections. The standard safe envelope
+    // does not include 401/403 by default, so we map the new
+    // authorization codes to status codes that respect the spirit of
+    // those HTTP semantics while preserving the shared envelope
+    // contract (every error response carries the same shape).
+    case "SESSION_INVALID":
+    case "SESSION_EXPIRED":
+      return 401;
+    case "WORKSPACE_NOT_FOUND":
+    case "BRIEF_NOT_FOUND":
+      return 404;
+    case "WORKSPACE_INELIGIBLE":
+    case "NOT_A_MEMBER":
+    case "MISSING_CAPABILITY":
+    case "BRIEF_FORBIDDEN":
+      return 403;
+    // Buildathon Golden Slice 2 (BG2) seller-audio rejection
+    // surfaces. Each code maps to a stable HTTP status that respects
+    // the spirit of the HTTP semantic while preserving the shared
+    // envelope contract.
+    case "AUDIO_OFFERING_NOT_FOUND":
+      return 404;
+    case "AUDIO_OFFERING_INELIGIBLE":
+      return 403;
+    case "AUDIO_SAMPLE_LIMIT_EXCEEDED":
+      return 400;
+    case "AUDIO_CONTENT_TYPE_UNSUPPORTED":
+      return 400;
+    // AUDIO_PAYLOAD_MISSING is a malformed-request rejection, not
+    // a size-cap rejection. The boundary distinguished the two at
+    // the trusted multipart parser; the safe envelope maps them to
+    // distinct statuses so a buyer who omitted the file part sees
+    // 400 Bad Request, not 413 Payload Too Large.
+    case "AUDIO_PAYLOAD_MISSING":
+      return 400;
+    case "AUDIO_PAYLOAD_TOO_LARGE":
+      return 413;
+    case "AUDIO_PROVIDER_UNAVAILABLE":
+      return 503;
+    case "AUDIO_STORAGE_FAILED":
+      return 500;
+    case "AUDIO_SAMPLE_NOT_FOUND":
+      return 404;
   }
 }
 

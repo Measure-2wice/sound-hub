@@ -91,6 +91,31 @@ export function hasUsableCriteria(query: string, filters: RequiredFiltersValue):
   return false;
 }
 
+// Canonical buyer-facing guidance shown when a search submission
+// carries no usable criteria. Surfaced in the page (not the API
+// envelope) so a blank submission never produces the developer-
+// centric "Request body failed schema validation." reply. The
+// wording is fixed here so tests can pin the exact string and any
+// copy change is a single-line edit.
+export const EMPTY_SEARCH_GUIDANCE_MESSAGE =
+  "Add a project description or choose at least one search filter.";
+
+// Pure decision helper for the page-level submit guard. Returns
+// `{ kind: "blocked", message }` when the (query, filters) tuple
+// has no usable criteria so the page can render the friendly
+// guidance and skip the API dispatch; otherwise returns null to
+// signal "go ahead and dispatch as usual". Server-side schema
+// validation (INVALID_SEARCH_CRITERIA, safe envelope) is unchanged
+// for every code path because this helper only fires its `blocked`
+// branch on a tuple that the API would have rejected.
+export function getEmptySearchSubmissionMessage(
+  query: string,
+  filters: RequiredFiltersValue,
+): { message: string } | null {
+  if (hasUsableCriteria(query, filters)) return null;
+  return { message: EMPTY_SEARCH_GUIDANCE_MESSAGE };
+}
+
 // Build a candidate v1 payload that preserves every supplied non-empty
 // field. The candidate is then parsed by the shared schema; the schema
 // is the only thing that decides which of these fields survive.

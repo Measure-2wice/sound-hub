@@ -2,11 +2,16 @@
 
 import { useEffect, useMemo, useState, type FormEvent } from "react";
 import { isRetriableErrorCode, useSearch } from "../hooks/useSearch";
-import { hasUsableCriteria, type RequiredFiltersValue } from "../lib/talent-search-request-builder";
+import {
+  getEmptySearchSubmissionMessage,
+  hasUsableCriteria,
+  type RequiredFiltersValue,
+} from "../lib/talent-search-request-builder";
 import { isControlledRequiredPath } from "../lib/field-error-paths";
 import { Card } from "./ui/Card";
 import { SearchForm } from "./SearchForm";
 import { RequiredFilters } from "./RequiredFilters";
+import { AudioSamplesPanel } from "./AudioSamplesPanel";
 import { formatPricing } from "../lib/pricing";
 import {
   categoryMetadataResponseV1Schema,
@@ -26,6 +31,18 @@ export function SearchPage() {
   });
   const { results, isLoading, error, errorCode, fieldErrors, requestId, search, retry } =
     useSearch();
+
+  // Buyer-facing empty-submission guard. Set when the buyer submits
+  // a (query, filters) tuple that has no usable criteria; cleared on
+  // the next submission that does have usable criteria. The hook's
+  // dispatch is skipped while this is set so no API request is made
+  // for an empty submission (QA finding — the developer-centric
+  // "Request body failed schema validation." envelope used to
+  // surface here). Server-side schema validation, the safe-envelope
+  // mapping, and the form's entered values are all preserved; this
+  // state only controls the page-level guard and a single inline
+  // guidance card.
+  const [emptySearchMessage, setEmptySearchMessage] = useState<string | null>(null);
 
   // Canonical categories are fetched from the public metadata seam
   // (`GET /api/metadata/categories`) so the browser never holds a
@@ -76,6 +93,20 @@ export function SearchPage() {
 
   const handleSubmit = (e: FormEvent) => {
     e.preventDefault();
+    // Page-level empty-submission guard. The pure helper returns
+    // `{ message }` when the (query, filters) tuple has no usable
+    // criteria and `null` otherwise. While `blocked`, the hook's
+    // dispatch is skipped so no API request is made and the
+    // form's entered values are preserved untouched. The shared
+    // Zod schema's server-side validation, the safe envelope
+    // mapping, and every other code path are unaffected because
+    // this branch only fires for tuples the API would reject.
+    const guard = getEmptySearchSubmissionMessage(query, filters);
+    if (guard !== null) {
+      setEmptySearchMessage(guard.message);
+      return;
+    }
+    setEmptySearchMessage(null);
     void search(query, filters);
   };
 
@@ -135,6 +166,8 @@ export function SearchPage() {
           </form>
         </Card.Content>
       </Card>
+
+      <EmptySearchGuidance message={emptySearchMessage} />
 
       {categoriesError && (
         <Card
@@ -420,6 +453,39 @@ function ResultCardImpl({ result }: { result: TalentSearchResultV1 }) {
 // the function name used by `react-dom/server` both stay `ResultCardImpl`.
 export const ResultCard = ResultCardImpl;
 
+// Empty-submission guidance. Renders the buyer-friendly message when
+// the page-level guard has flagged an empty (no-usable-criteria)
+// submission so the developer-centric API envelope
+// (`<root> at least one of query, required, or preferred must contain
+// criteria`) used to surface. Renders nothing on a null message so
+// the form's standard path can render without an extra wrapper.
+//
+// Exported (with the implementation kept private as `EmptySearchGuidanceImpl`)
+// so tests can render it in isolation against a controlled message
+// string without spinning up the parent `SearchPage` (which owns the
+// fetch/state lifecycle and uses effects that have no role in the
+// pure render path).
+function EmptySearchGuidanceImpl({ message }: { readonly message: string | null }) {
+  if (message === null) return null;
+  return (
+    <Card
+      variant="outlined"
+      className="mb-6 border-amber-200 bg-amber-50"
+      data-testid="empty-search-guidance"
+      role="status"
+      aria-live="polite"
+    >
+      <Card.Content>
+        <p className="text-amber-800" data-testid="empty-search-guidance-message">
+          {message}
+        </p>
+      </Card.Content>
+    </Card>
+  );
+}
+
+export const EmptySearchGuidance = EmptySearchGuidanceImpl;
+
 // OfferingDetail: the shared markup that the best and additional
 // offering paths both render — title, description, service category,
 // service mode, and bundle-includes (when present). Extracted so the
@@ -558,6 +624,13 @@ function BestOfferingCard({
           ? "This seller has not advertised pricing. Any pricing discussed later is non-binding until it is incorporated into approved terms."
           : "Advertised pricing is non-binding and not a quote. It binds no one until it is incorporated into approved terms."}
       </p>
+
+      {/* Buyer-discovery audio playback (ticket #61 follow-up P1-002).
+          Loads samples for this offering from the public endpoint and
+          renders a bounded set of audio players. Removed or
+          ineligible samples never appear because the application
+          re-runs eligibility checks on every playback request. */}
+      <AudioSamplesPanel offeringId={offering.offeringId} offeringTitle={offering.title} />
     </div>
   );
 }

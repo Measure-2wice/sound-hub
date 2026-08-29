@@ -1,0 +1,143 @@
+# SoundHub CI — verifies pull requests and pushes to main.
+#
+# Intentional scope:
+#   - format check, lint, type-check, automated tests, production build
+#   - isolated disposable PostgreSQL on the same host:port:db the test
+#     guard already requires (localhost:5433/soundhub_m1_test)
+#   - reuses the existing root scripts (format:check, lint, type-check,
+#     db:test:reset, test, build) rather than duplicating commands
+#
+# Not in scope (left to local acceptance-gate supervision):
+#   - Playwright happy-path suite (`pnpm test:e2e`) — boots API+web,
+#     stops/starts the disposable PostgreSQL container mid-run, and
+#     uses `concurrently` to drive both servers; out of band for this
+#     minimal CI.
+#   - runtime smoke (`scripts/runtime-smoke.mjs`) — same rationale.
+#
+# The disposable PostgreSQL is provisioned via the standard GitHub
+# Actions `services` mechanism. The test-database guard at
+# apps/api/src/lib/test-database.ts refuses anything that is not local
+# on port 5433 with database name `soundhub_m1_test`, so the URL below
+# is the only target the suite can reach. There is no second CI-only
+# database path; the same wrapper scripts a developer runs locally
+# (`pnpm db:test:reset`, `pnpm test`) drive CI.
+
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+# Cancel superseded runs on the same ref to save runner minutes.
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+# Pin the database URL at workflow scope so every job that runs the
+# test suite points at the same disposable target. The URL is identical
+# to the one in `.env.test`; we set it here as well so the test scripts
+# do not depend on `.env.test` being present in the checkout.
+env:
+  TEST_DATABASE_URL: postgresql://soundhub:password@localhost:5433/soundhub_m1_test
+  DATABASE_URL: postgresql://soundhub:password@localhost:5433/soundhub_m1_test
+
+jobs:
+  quality:
+    name: Format, lint, type-check
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup pnpm
+        uses: pnpm/action-setup@v4
+        with:
+          version: 9
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: pnpm
+
+      - name: Install dependencies
+        run: pnpm install --frozen-lockfile
+
+      - name: Format check (Prettier)
+        run: pnpm format:check
+
+      - name: Lint (ESLint flat config)
+        run: pnpm lint
+
+      - name: Type-check (workspace TypeScript)
+        run: pnpm type-check
+
+  test-and-build:
+    name: Test and build
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    # GitHub Actions service container. The runner maps the container
+    # port to the host port declared here; from inside the runner the
+    # database is reachable at `localhost:5433`, which is exactly the
+    # target the test guard accepts. The `options` healthcheck makes
+    # the runner wait until `pg_isready` succeeds before any step
+    # runs, so the DB is guaranteed reachable when `db:test:wait`
+    # (called by `db:test:reset`) executes.
+    services:
+      postgres:
+        image: postgres:16-alpine
+        env:
+          POSTGRES_USER: soundhub
+          POSTGRES_PASSWORD: password
+          POSTGRES_DB: soundhub_m1_test
+          POSTGRES_INITDB_ARGS: --encoding=UTF8 --lc-collate=C --lc-ctype=C
+        ports:
+          - 5433:5432
+        options: >-
+          --health-cmd "pg_isready -U soundhub -d soundhub_m1_test"
+          --health-interval 3s
+          --health-timeout 3s
+          --health-retries 20
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup pnpm
+        uses: pnpm/action-setup@v4
+        with:
+          version: 9
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: pnpm
+
+      - name: Install dependencies
+        run: pnpm install --frozen-lockfile
+
+      # `prisma generate` is not a postinstall hook; the repository
+      # client's types must exist before tests and build run.
+      - name: Generate Prisma client
+        run: pnpm prisma:generate
+
+      # `db:test:reset` drops the public schema and re-applies the
+      # reviewed migration from an empty state via the same
+      # fail-closed wrapper a developer runs locally. It internally
+      # waits for the DB to accept connections, so no separate wait
+      # step is required.
+      - name: Reset disposable test database (drop + migrate)
+        run: pnpm db:test:reset
+
+      # Composes API service + route tests, web unit tests, the
+      # repository test suite (which spawns the seed via
+      # scripts/db-test-seed.mjs before every test), and the
+      # forbidden-dependency scanner.
+      - name: Test
+        run: pnpm test
+
+      - name: Build
+        run: pnpm build

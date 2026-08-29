@@ -408,6 +408,42 @@ export const apiErrorCodeV1Schema = z.enum([
   "SEARCH_RATE_LIMITED",
   "SEARCH_FAILED",
   "SEARCH_UNAVAILABLE",
+  // Buildathon Golden Slice 1 error codes. Each code maps to a stable
+  // HTTP status via buildSafeError's switch table and to a buyer-safe
+  // message. The codes never expose provider subjects, raw tokens,
+  // session ids, or membership internals.
+  "INVALID_AUTH_REQUEST",
+  "AUTH_RATE_LIMITED",
+  "AUTH_FAILED",
+  "AUTH_PROVIDER_UNAVAILABLE",
+  "SESSION_INVALID",
+  "SESSION_EXPIRED",
+  "WORKSPACE_NOT_FOUND",
+  "WORKSPACE_INELIGIBLE",
+  "NOT_A_MEMBER",
+  "MISSING_CAPABILITY",
+  // Buildathon Golden Slice 3 error codes. Matchmaker-specific
+  // codes share the same status-code table; the route layer maps
+  // each to a buyer-safe message that never leaks provider
+  // internals, AI raw output, or session material.
+  "MATCHMAKER_INVALID_REQUEST",
+  "MATCHMAKER_AI_UNAVAILABLE",
+  "MATCHMAKER_FAILED",
+  "BRIEF_NOT_FOUND",
+  "BRIEF_FORBIDDEN",
+  // Buildathon Golden Slice 2 (BG2) error codes. Each code maps to a
+  // stable HTTP status via `mapStatus` and to a buyer-safe message.
+  // They cover the seller-audio slice only; existing codes are
+  // unchanged.
+  "AUDIO_OFFERING_NOT_FOUND",
+  "AUDIO_OFFERING_INELIGIBLE",
+  "AUDIO_SAMPLE_NOT_FOUND",
+  "AUDIO_SAMPLE_LIMIT_EXCEEDED",
+  "AUDIO_CONTENT_TYPE_UNSUPPORTED",
+  "AUDIO_PAYLOAD_TOO_LARGE",
+  "AUDIO_PAYLOAD_MISSING",
+  "AUDIO_PROVIDER_UNAVAILABLE",
+  "AUDIO_STORAGE_FAILED",
 ]);
 export type ApiErrorCodeV1 = z.infer<typeof apiErrorCodeV1Schema>;
 
@@ -499,3 +535,715 @@ export const pricingKindValuesV1 = ["StartingAt", "Fixed", "ContactForQuote"] as
 export type PricingKindV1 = (typeof pricingKindValuesV1)[number];
 export const purchaseModeValuesV1 = ["BundleOnly"] as const;
 export type PurchaseModeV1 = (typeof purchaseModeValuesV1)[number];
+
+// ===========================================================================
+// Buildathon Golden Slice 1 (BG1) shared runtime contracts.
+//
+// These schemas cover the identity, session, and acting-Workspace
+// surfaces. They follow the same patterns as the v1 search contract:
+// shared Zod is the executable contract; TypeScript types are inferred
+// from it; the same schema is consumed by the Express route validator
+// and the browser response parser. No Prisma model or raw provider
+// subject ever crosses a public DTO.
+//
+// Per ticket #59, the GS 1 / GS 2 / GS 3 / GS 4 / GS 5 / GS 6
+// requirements are:
+//
+//   GS 1 — preserve the buildathon-only governance boundary.
+//   GS 2 — deployed managed magic-link auth with the bounded fallback.
+//   GS 3 — both adapters map credentials to persisted UserAccounts and
+//          produce server-validated sessions through the same boundary.
+//   GS 4 — every Golden Slice command names an acting Workspace and
+//          rejects a human without a current qualifying membership.
+//   GS 5 — a matching legacy Workspace.ownerUserId grants no authority
+//          without current membership.
+//   GS 6 — buyer/seller Workspaces, capabilities, and memberships are
+//          persisted (no DealApprover authorization here; BG5 owns it).
+//
+// ===========================================================================
+
+// ---------- Magic link request ----------
+
+// SoundHub always uses neutral responses: the request envelope returns
+// the same shape whether the email is registered or not, so the public
+// surface cannot be used to enumerate accounts. The deterministic
+// adapter adds a non-production `devVerificationUrl` for the
+// integration test and emergency fallback paths; managed providers omit
+// it because the real email delivery happens on the provider side.
+export const bg1MagicLinkRequestV1Schema = z
+  .object({
+    email: z
+      .string()
+      .trim()
+      .toLowerCase()
+      .email("email must be a valid email address")
+      .max(254, "email must be at most 254 characters"),
+    // Optional human-friendly hint carried into the session metadata
+    // for diagnostics. Never returned to other members.
+    displayName: z.string().min(1).max(120).optional(),
+  })
+  .strict();
+export type Bg1MagicLinkRequestV1 = z.infer<typeof bg1MagicLinkRequestV1Schema>;
+
+export const bg1MagicLinkResponseV1Schema = z
+  .object({
+    // Neutral acknowledgement. `ok` is always true on a well-formed
+    // request; rate-limited or otherwise rejected requests produce the
+    // standard safe error envelope instead.
+    ok: z.literal(true),
+    // Public correlation id for the magic-link request (per ticket
+    // #59 P2-001). This value is observability only; it is NOT a
+    // verification credential. The managed adapter returns a
+    // SoundHub-side UUID and never reads it back; the deterministic
+    // adapter returns its own correlation id and keys its pending
+    // request under a separate private `verificationToken`. A browser
+    // that round-trips this value to `/api/auth/verify-token` is
+    // rejected as an unknown credential.
+    requestId: z.string().min(1).max(256),
+    // Deterministic-adapter operator-mode only: a one-time
+    // verification URL that the operator-driven recovery UI can
+    // follow in the absence of email delivery. Production Supabase
+    // magic-link emails render this field absent; the deployed
+    // deterministic fallback also renders it absent so an
+    // unauthenticated browser cannot choose a demo identity by
+    // email. The contract documents the field name verbatim so a
+    // contract-drift detector can catch an adapter that begins
+    // leaking the verification URL to a deployed browser.
+    devVerificationUrl: z.string().min(1).max(2048).optional(),
+  })
+  .strict();
+export type Bg1MagicLinkResponseV1 = z.infer<typeof bg1MagicLinkResponseV1Schema>;
+
+// ---------- Verify token ----------
+//
+// The verify-token request carries the **private one-time verification
+// credential** extracted from the magic-link callback URL — NOT a
+// public correlation id. The BG1 provider-neutral contract requires
+// distinct names for the two values so a future adapter cannot
+// accidentally substitute one for the other (ticket #59 P2-001):
+//
+//   - `requestId` is the **public correlation id** returned in the
+//     magic-link response and carried into logs and observability.
+//     It is never a credential and cannot be used to mint a session.
+//   - `verificationToken` is the **private one-time credential** the
+//     browser extracts from the email callback URL (or the dev
+//     recovery workflow reads from the server log). It is the only
+//     value `verifySignIn` accepts. It MUST NEVER appear in public
+//     DTOs, error envelopes, or log lines.
+export const bg1VerifyTokenRequestV1Schema = z
+  .object({
+    verificationToken: z.string().min(1).max(512),
+  })
+  .strict();
+export type Bg1VerifyTokenRequestV1 = z.infer<typeof bg1VerifyTokenRequestV1Schema>;
+
+// The verify-token response is what the server returns when a magic-link
+// verification succeeds. The HttpOnly session cookie is set on the
+// response side (not part of the body) so the client cannot read the
+// session id; this body contains only allow-listed identity and
+// membership facts the client needs to render the post-sign-in state.
+export const bg1PublicWorkspaceV1Schema = z
+  .object({
+    workspaceId: z.string().min(1).max(128),
+    slug: z.string().min(1).max(120),
+    name: z.string().min(1).max(200),
+    workspaceType: z.enum(["Personal", "Organization"]),
+    workspaceStatus: z.enum(["Active", "Suspended"]),
+    capabilities: z
+      .array(z.enum(["Buyer", "Seller"]))
+      .min(1)
+      .max(8),
+  })
+  .strict();
+export type Bg1PublicWorkspaceV1 = z.infer<typeof bg1PublicWorkspaceV1Schema>;
+
+export const bg1PublicUserV1Schema = z
+  .object({
+    userAccountId: z.string().min(1).max(128),
+    // The primary SoundHub-owned email, when present. May be absent if
+    // the identity provider does not surface an email and the user has
+    // not set one explicitly. Per ADR 0004 the email is private; it
+    // never enters the public seller contract and the workspace UI is
+    // the only place it appears (for the signed-in user themselves).
+    email: z.string().email().nullable(),
+    displayName: z.string().min(1).max(120).nullable(),
+    // The provider key is exposed to the signed-in user so they can
+    // understand how SoundHub authenticated them, but the provider
+    // subject NEVER crosses a public DTO (privacy boundary). Provider
+    // claims, roles, and metadata never identify or authorize a
+    // Workspace — only the server-validated UserAccount does.
+    identityProvider: z.string().min(1).max(64),
+    workspaces: z.array(bg1PublicWorkspaceV1Schema).max(64),
+  })
+  .strict();
+export type Bg1PublicUserV1 = z.infer<typeof bg1PublicUserV1Schema>;
+
+export const bg1VerifyTokenResponseV1Schema = z
+  .object({
+    ok: z.literal(true),
+    user: bg1PublicUserV1Schema,
+  })
+  .strict();
+export type Bg1VerifyTokenResponseV1 = z.infer<typeof bg1VerifyTokenResponseV1Schema>;
+
+// ---------- Current session info ----------
+
+export const bg1SessionInfoV1Schema = z
+  .object({
+    // Null when the request carries no valid session cookie. Otherwise
+    // the user the cookie authenticates, plus the workspaces they
+    // currently belong to. The acting workspace is NOT in this
+    // payload: per GS 4 every consequential command must carry the
+    // acting workspace explicitly, so the UI chooses a workspace and
+    // passes it on the command itself rather than persisting it on the
+    // session.
+    user: bg1PublicUserV1Schema.nullable(),
+  })
+  .strict();
+export type Bg1SessionInfoV1 = z.infer<typeof bg1SessionInfoV1Schema>;
+
+// ---------- Sign out ----------
+
+export const bg1SignOutResponseV1Schema = z
+  .object({
+    ok: z.literal(true),
+  })
+  .strict();
+export type Bg1SignOutResponseV1 = z.infer<typeof bg1SignOutResponseV1Schema>;
+
+// ---------- Sample consequential command (acts as a Workspace) ----------
+//
+// The Buildathon Golden Slice ticket (#59) requires that
+// consequential command contracts identify an acting Workspace and use
+// a reusable current-membership authorization service. This is the
+// minimal sample contract used to demonstrate that property at the
+// HTTP boundary and in the focused authorization tests. Real
+// ProjectRequest, Deal, TermsVersion, and approval commands will be
+// authored against the same pattern in later tickets; this sample is
+// sufficient to satisfy GS 4 / GS 5 / GS 6 today.
+export const bg1ActingWorkspaceRequestV1Schema = z
+  .object({
+    actingWorkspaceId: z.string().min(1).max(128),
+  })
+  .strict();
+export type Bg1ActingWorkspaceRequestV1 = z.infer<typeof bg1ActingWorkspaceRequestV1Schema>;
+
+export const bg1ActingWorkspaceResponseV1Schema = z
+  .object({
+    ok: z.literal(true),
+    actingWorkspace: bg1PublicWorkspaceV1Schema,
+    membership: z
+      .object({
+        role: z.enum(["Owner", "Admin", "Member"]),
+        joinedAt: z.string().datetime(),
+      })
+      .strict(),
+  })
+  .strict();
+export type Bg1ActingWorkspaceResponseV1 = z.infer<typeof bg1ActingWorkspaceResponseV1Schema>;
+
+// ---------- Stable provider keys exposed for runtime validation ----------
+//
+// The provider keys are a closed enum so a future provider can only be
+// added by editing this contract and the adapter factory together.
+// SoundHub owns these keys; provider SDKs never read them.
+export const bg1IdentityProviderV1Values = ["managed-magic-link", "deterministic"] as const;
+export type Bg1IdentityProviderV1 = (typeof bg1IdentityProviderV1Values)[number];
+
+// ---------- Shared deterministic subject derivation ----------
+//
+// The deterministic identity adapter and the seed must agree on the
+// provider subject derived from an email. Otherwise the seeded
+// IdentityProvider row for a demo account never matches the row the
+// adapter looks up at sign-in, and a second UserAccount is created
+// for the same email.
+//
+// The derivation is intentionally opaque (a SHA-256 hash). It is
+// scoped per-provider so a future migration to a different adapter
+// cannot accidentally resolve to the same subject for an unrelated
+// email. The hash function is injected so this contract lives in
+// `@soundhub/types` (no Node-only imports) while every consumer
+// passes Node `crypto.createHash` or an equivalent WebCrypto digest.
+export type Sha256HexFn = (input: string) => string;
+
+export function deriveDeterministicSubject(email: string, sha256Hex: Sha256HexFn): string {
+  return sha256Hex(`deterministic|${email.trim().toLowerCase()}`);
+}
+
+// ===========================================================================
+// Matchmaker shared runtime contracts (introduced by ticket #60
+// / BG3 of the Buildathon Golden Slice).
+//
+// These schemas cover the Matchmaker slice: natural-language
+// ProjectBrief submission, validated search criteria, evidence-
+// grounded recommendations, and the AI provider provenance trail.
+// They follow the same patterns as the v1 search contract: shared
+// Zod is the executable contract; TypeScript types are inferred
+// from it; the same schema is consumed by the API route validator
+// and the browser response parser. No Prisma model, AI raw output,
+// provider subject, or storage key ever crosses a public DTO.
+//
+// Per ticket #60, the GS 13 / GS 14 / GS 15 requirements are:
+//
+//   GS 13 — the required golden brief proceeds directly to runtime-
+//           validated search criteria without clarification.
+//   GS 14 — required constraints are never silently relaxed.
+//   GS 15 — displayed recommendations and explanations refer only to
+//           returned sellers, ServiceOfferings, and factual match
+//           evidence.
+//
+// The Matchmaker never queries Prisma directly; AI output is parsed
+// through a strict schema before use and falls back to a
+// deterministic interpretation that crosses the same validation and
+// TalentSearchService boundaries.
+//
+// ===========================================================================
+
+// ---------- AI provider provenance ----------
+
+// Stable provider keys for the Matchmaker AI boundary. SoundHub
+// owns these keys; provider SDKs never read them. Adding a new
+// provider requires editing this enum and the adapter factory
+// together.
+export const aiProviderV1Values = ["managed", "deterministic-fallback"] as const;
+export type AiProviderV1 = (typeof aiProviderV1Values)[number];
+
+// ---------- Brief submission ----------
+
+// The buyer's raw, natural-language ProjectBrief text. The route
+// layer trims and collapses internal whitespace; the schema only
+// enforces a usability floor (length bounds + at least one
+// letter/digit) so an empty or purely punctuation-only submission
+// is rejected at the trusted boundary rather than reaching the
+// search service.
+const projectBriefTextV1Schema = z
+  .string()
+  .min(8, "Brief text must be at least 8 non-whitespace characters")
+  .max(2000, "Brief text must be at most 2000 characters")
+  .transform((value) => value.trim().replace(/\s+/g, " "))
+  .refine((value) => /[\p{L}\p{N}]/u.test(value), {
+    message: "Brief text must contain at least one letter or digit after normalization",
+  })
+  .refine((value) => value.length >= 8, {
+    message: "Brief text must be at least 8 non-whitespace characters after normalization",
+  });
+
+// Non-search project requirements are a free-form JSON object
+// captured by the AI interpretation but never consumed by
+// TalentSearchService. They carry things like buyer-acknowledged
+// funding deadlines, scope hints, and any other context the brief
+// produced without forcing the search contract to grow new fields.
+// The schema keeps the value as an opaque record; the Matchmaker
+// passes it through verbatim. The `.strict()` modifier rejects
+// arrays/scalars at the trusted boundary so the persistence layer
+// always reads a JSON object.
+export const projectBriefNonSearchRequirementsV1Schema = z
+  .object({})
+  .catchall(z.string().min(1).max(500))
+  .refine((value) => Object.keys(value).length <= 20, {
+    message: "nonSearchRequirements must contain at most 20 entries",
+  })
+  .optional();
+export type ProjectBriefNonSearchRequirementsV1 = z.infer<
+  typeof projectBriefNonSearchRequirementsV1Schema
+>;
+
+// The brief-submission request is the trusted boundary between the
+// browser and the Matchmaker service. It carries the acting
+// Workspace identifier (so the route can revalidate membership),
+// the original brief text, and an optional non-search requirements
+// override. Required + preferred criteria are NOT supplied by the
+// buyer; they are produced by the AI boundary (or its deterministic
+// fallback) and persisted alongside the brief.
+export const submitBriefRequestV1Schema = z
+  .object({
+    actingWorkspaceId: z.string().min(1).max(128),
+    briefText: projectBriefTextV1Schema,
+    // Optional buyer-supplied non-search requirements. When absent
+    // the AI boundary (or fallback) derives them from the brief.
+    nonSearchRequirements: projectBriefNonSearchRequirementsV1Schema,
+  })
+  .strict();
+export type SubmitBriefRequestV1 = z.infer<typeof submitBriefRequestV1Schema>;
+
+// ---------- Matchmaker criteria (AI output, validated) ----------
+
+// The validated search criteria the Matchmaker produces from the
+// buyer's brief. This is the single point where AI output (or the
+// deterministic fallback) is normalized into the existing M1
+// search contract; every field is one of the M1 schema's strict
+// shapes so the validated value flows into TalentSearchService
+// without further transformation. `required` may never be silently
+// relaxed: the schema validates the persisted JSON on read so a
+// stored Brief whose required criteria are empty fails closed
+// instead of producing an unconstrained search.
+function hasHardRequiredAxis(value: TalentSearchRequiredCriteriaV1): boolean {
+  if (value.serviceModes && value.serviceModes.length > 0) return true;
+  if (value.primaryCategoryKeys && value.primaryCategoryKeys.length > 0) return true;
+  if (
+    value.independentlyPurchasableServiceKeys &&
+    value.independentlyPurchasableServiceKeys.length > 0
+  ) {
+    return true;
+  }
+  if (value.basedIn !== undefined) return true;
+  if (value.serviceArea !== undefined) return true;
+  return false;
+}
+
+export const matchmakerCriteriaV1Schema = z
+  .object({
+    query: normalizedQuerySchema.optional(),
+    required: talentSearchRequiredCriteriaV1Schema,
+    preferred: talentSearchPreferredCriteriaV1Schema.optional(),
+    // Optional non-search requirements derived from the brief.
+    nonSearchRequirements: projectBriefNonSearchRequirementsV1Schema,
+  })
+  .strict()
+  .superRefine((value, ctx) => {
+    const hasQuery = typeof value.query === "string" && value.query.length >= 2;
+    const requiredHasValue = isUsable(value.required);
+    const preferredHasValue = value.preferred ? isUsable(value.preferred) : false;
+    // A criteria payload must yield a usable search call so a
+    // malformed AI output cannot reach TalentSearchService with
+    // nothing to do.
+    if (!hasQuery && !requiredHasValue && !preferredHasValue) {
+      ctx.addIssue({
+        code: z.ZodIssueCode.custom,
+        message: "Matchmaker criteria must yield at least one of query, required, or preferred",
+      });
+    }
+    // GS 14: when the buyer DID express a hard constraint, that
+    // constraint must survive the AI boundary. We detect "hard
+    // constraint was expressed" by checking that either the
+    // required block has a hard axis OR the buyer-only non-search
+    // requirements carry a signal that implies a hard axis. In
+    // practice the deterministic fallback always maps the brief
+    // to a hard axis when the buyer's text contains a recognised
+    // phrase; this check only enforces that the AI boundary did
+    // not silently drop it.
+    //
+    // We do NOT force a hard axis when the buyer only supplied a
+    // query — the buyer is entitled to describe the work without
+    // naming a category.
+    if (requiredHasValue && !hasHardRequiredAxis(value.required)) {
+      ctx.addIssue({
+        code: z.ZodIssueCode.custom,
+        message: "Matchmaker criteria.required must contain at least one hard constraint axis",
+      });
+    }
+  });
+export type MatchmakerCriteriaV1 = z.infer<typeof matchmakerCriteriaV1Schema>;
+
+// ---------- Explanation payload (evidence-grounded, never AI-invented) ----------
+
+// A single explanation line refers to one factual match-evidence
+// axis from the eligibility-determined search result. AI cannot
+// invent qualifications, availability, verification, prices, or
+// sample rights; every line cites the evidence that already exists
+// in the search result. The label is human-friendly wording
+// restricted to a small allow-list so the UI cannot render
+// arbitrary agent output.
+export const explanationKindV1Values = [
+  "matched-offering-title",
+  "matched-category-key",
+  "matched-category-name",
+  "preferred-genre",
+  "preferred-category",
+  "preferred-specialty",
+  "preferred-affiliation",
+  "preferred-service-mode",
+  "preferred-included-service",
+  "preferred-locality",
+  "standalone-offering",
+] as const;
+export type ExplanationKindV1 = (typeof explanationKindV1Values)[number];
+
+export const explanationEntryV1Schema = z
+  .object({
+    kind: z.enum(explanationKindV1Values),
+    // The factual label derived from the validated search
+    // result's matched fields (e.g. "matched offering title",
+    // "preferred genre: Dancehall"). The schema restricts the
+    // string to a sane length; the AI boundary never constructs
+    // these values.
+    label: z.string().min(1).max(200),
+  })
+  .strict();
+export type ExplanationEntryV1 = z.infer<typeof explanationEntryV1Schema>;
+
+// ---------- Brief public DTO ----------
+
+// Allow-listed public DTO returned by GET /api/matchmaker/brief/:id.
+// The persisted required/preferred criteria are re-validated against
+// the M1 schema on every read so a tampered or corrupted row cannot
+// leak malformed data into the UI. Provenance (`aiProvider`,
+// `aiModelId`, `aiFallbackUsed`) is exposed so the UI can disclose
+// which path produced the criteria.
+export const projectBriefPublicV1Schema = z
+  .object({
+    briefId: z.string().min(1).max(128),
+    actingWorkspaceId: z.string().min(1).max(128),
+    createdByUserId: z.string().min(1).max(128),
+    briefText: z.string().min(8).max(2000),
+    criteria: matchmakerCriteriaV1Schema,
+    aiProvider: z.enum(aiProviderV1Values),
+    aiModelId: z.string().min(1).max(120).nullable(),
+    aiFallbackUsed: z.boolean(),
+    createdAt: z.string().datetime(),
+    // Allow-listed BuyerWorkspaceView (id + slug + name). The
+    // Workspace's capabilities and status are intentionally NOT
+    // exposed here — the caller already authorised through them.
+    buyerWorkspace: z
+      .object({
+        workspaceId: z.string().min(1).max(128),
+        slug: z.string().min(1).max(120),
+        name: z.string().min(1).max(200),
+      })
+      .strict(),
+  })
+  .strict();
+export type ProjectBriefPublicV1 = z.infer<typeof projectBriefPublicV1Schema>;
+
+// ---------- Recommendation DTO (search results grounded to the brief) ----------
+
+// Allow-listed recommendation entry. Re-uses the public seller /
+// public offering schemas already shipped with the v1 search
+// contract so a Matchmaker response is structurally identical to a
+// direct search response; the only difference is the addition of
+// `explanations`, which is derived from the returned result (never
+// the AI provider).
+export const matchmakerRecommendationV1Schema = z
+  .object({
+    sellerId: z.string().min(1),
+    professionalName: z.string().min(1).max(200),
+    bestMatchingOfferingId: z.string().min(1),
+    relevanceScore: z
+      .number()
+      .min(0, "relevanceScore must be at least 0")
+      .max(1, "relevanceScore must be at most 1")
+      .finite(),
+    // Buyer-facing factual evidence the AI boundary assembled from
+    // the returned result's matched fields + preference atom
+    // coverage + query token coverage. Each entry maps to a
+    // structured allow-listed kind; AI-generated text never crosses
+    // this boundary.
+    explanations: z.array(explanationEntryV1Schema).max(20),
+    matchReason: z.string().min(1).max(500),
+    preferenceCoverage: preferenceCoverageV1Schema.optional(),
+    textCoverage: textCoverageV1Schema.optional(),
+    // Best-matching offering snapshot. The full v1 public offering
+    // summary is inlined so the UI can render without a follow-up
+    // call; the `seller` snapshot follows the same v1 public shape.
+    bestMatchingOffering: publicOfferingSummaryV1Schema,
+    seller: publicSellerSummaryV1Schema,
+    additionalMatchingOfferings: z.array(publicOfferingSummaryV1Schema).max(2),
+  })
+  .strict();
+export type MatchmakerRecommendationV1 = z.infer<typeof matchmakerRecommendationV1Schema>;
+
+// ---------- Matchmaker response ----------
+
+// The submit-brief response returns the persisted brief AND the
+// recommendations produced by the eligibility-determined search in
+// a single round trip, so the buyer can render the results without
+// a follow-up fetch (per the brief+results UI). `totalResults`
+// mirrors the M1 search metadata field so the UI can render a
+// stable count without depending on the v1 metadata envelope shape.
+export const submitBriefResponseV1Schema = z
+  .object({
+    ok: z.literal(true),
+    brief: projectBriefPublicV1Schema,
+    recommendations: z.array(matchmakerRecommendationV1Schema).max(10),
+    totalResults: z.number().int().nonnegative(),
+    strategy: talentSearchStrategyV1Schema,
+    // Surfaced when the AI provider failed and the deterministic
+    // fallback crossed the same boundary. The UI uses this to
+    // disclose the fallback; the field is absent on the managed
+    // path so a misconfigured UI cannot mis-attribute provenance.
+    fallbackNotice: z.string().min(1).max(500).optional(),
+  })
+  .strict();
+export type SubmitBriefResponseV1 = z.infer<typeof submitBriefResponseV1Schema>;
+
+// ---------- Brief fetch response (no recommendations) ----------
+
+export const briefResponseV1Schema = z
+  .object({
+    brief: projectBriefPublicV1Schema,
+  })
+  .strict();
+export type BriefResponseV1 = z.infer<typeof briefResponseV1Schema>;
+
+// ---------- AI adapter contract ----------
+
+// Provider-neutral input handed to the AI adapter. Includes the
+// acting Workspace identifier so the AI boundary cannot be confused
+// about whose brief it is interpreting; the AI never receives raw
+// Prisma models, provider subjects, session tokens, or storage
+// keys.
+export const aiInterpretBriefInputV1Schema = z
+  .object({
+    actingWorkspaceId: z.string().min(1).max(128),
+    briefText: z.string().min(8).max(2000),
+    buyerNonSearchRequirements: projectBriefNonSearchRequirementsV1Schema,
+  })
+  .strict();
+export type AiInterpretBriefInputV1 = z.infer<typeof aiInterpretBriefInputV1Schema>;
+
+// Provider-neutral output the AI adapter returns. The structure is
+// the candidate criteria payload (NOT yet validated) plus
+// provenance metadata the application persists alongside the brief.
+// The application is the only layer that validates the payload
+// against `matchmakerCriteriaV1Schema`; AI output NEVER crosses
+// the validation boundary untyped.
+export const aiInterpretBriefOutputV1Schema = z
+  .object({
+    provider: z.enum(aiProviderV1Values),
+    modelId: z.string().min(1).max(120).nullable(),
+    // The unvalidated candidate payload. The application parses it
+    // through `matchmakerCriteriaV1Schema` and rejects any
+    // adapter that returns malformed JSON. The schema here is a
+    // permissive record because the goal is to catch anything
+    // obviously wrong (top-level type) without re-implementing the
+    // validation that already lives on the M1 side.
+    candidate: z.record(z.string(), z.unknown()),
+  })
+  .strict();
+export type AiInterpretBriefOutputV1 = z.infer<typeof aiInterpretBriefOutputV1Schema>;
+
+// ===========================================================================
+// Buildathon Golden Slice 2 (BG2) shared runtime contracts.
+//
+// These schemas cover the bounded MP3 discovery samples a seller may
+// attach to a ServiceOffering. The contracts follow the same patterns
+// as the v1 search and BG1 contracts: shared Zod is the executable
+// contract; TypeScript types are inferred from it; the same schema is
+// consumed by the Express route validator, the seller management UI,
+// the buyer-facing discovery renderer, and the deterministic browser
+// journey. No Prisma model, storage reference, bucket name, or
+// provider credential ever crosses a public DTO.
+//
+// Per ticket #61 the BG2 slice satisfies the Golden Slice GS 7–GS 12
+// acceptance criteria:
+//
+//   GS 7  — an authorized seller Workspace can upload an MP3 sample
+//           to its own ServiceOffering and list, play, and remove it.
+//   GS 8  — an unrelated Workspace, non-member, or insufficiently
+//           authorized member cannot upload or remove samples.
+//   GS 9  — a successful upload persists buyer-safe metadata and an
+//           opaque storage reference in PostgreSQL only after the
+//           storage operation succeeds.
+//   GS 10 — an Active ServiceOffering exposes zero to three playable
+//           MP3 discovery samples; removal stops a sample from
+//           appearing in buyer-facing discovery.
+//   GS 11 — a fourth sample, a non-MP3 object, or an object larger
+//           than 25 MB is rejected at a trusted boundary; duration
+//           is not an acceptance condition.
+//   GS 12 — Supabase Storage is exercised by a bounded deployed-
+//           provider smoke; deterministic storage fixtures satisfy
+//           the same application-facing contract in tests.
+//
+// ===========================================================================
+
+// ---------- Audio sample DTOs ----------
+
+// The only audio sample shape that ever crosses the public HTTP
+// boundary. The buyer-facing `<audio>` tag renders `playbackUrl`
+// directly; the application server uses the persisted storage ref
+// for upload/remove operations but never serializes it. Storage
+// credentials, bucket names, object keys, and provider subjects
+// never enter this schema. `playbackUrl` resolves to either a
+// narrowly scoped Supabase signed URL or the in-app buyer-safe
+// playback route, depending on which adapter the server wires.
+// Both adapters produce a URL that resolves to actual playable
+// audio without further resolution on the client.
+export const bg2AudioSamplePublicV1Schema = z
+  .object({
+    sampleId: z.string().min(1).max(128),
+    offeringId: z.string().min(1).max(128),
+    label: z.string().min(1).max(120),
+    contentType: z.literal("audio/mpeg"),
+    byteSize: z
+      .number()
+      .int()
+      .nonnegative()
+      .max(25 * 1024 * 1024),
+    displayOrder: z.number().int().min(1).max(3),
+    // Fully-formed URL the browser attaches to the `<audio>` `src`
+    // attribute without inspecting the internals. For Supabase
+    // Storage this is a narrowly scoped signed URL; for the
+    // deterministic adapter this is the in-app
+    // `/api/services/:offeringId/audio-samples/:sampleId/play`
+    // route. Eligibility and removal checks are applied before the
+    // URL is emitted, so an ineligible or removed sample never
+    // appears with a playable handle.
+    playbackUrl: z.string().url(),
+    createdAt: z.string().datetime(),
+  })
+  .strict();
+export type Bg2AudioSamplePublicV1 = z.infer<typeof bg2AudioSamplePublicV1Schema>;
+
+// ---------- Seller list response (one offering's bounded samples) ----------
+
+export const bg2AudioSampleListResponseV1Schema = z
+  .object({
+    offeringId: z.string().min(1).max(128),
+    samples: z.array(bg2AudioSamplePublicV1Schema).max(3),
+  })
+  .strict();
+export type Bg2AudioSampleListResponseV1 = z.infer<typeof bg2AudioSampleListResponseV1Schema>;
+
+// ---------- Upload response ----------
+
+// The upload command returns the persisted buyer-safe sample. The
+// request body itself is multipart/form-data (Content-Disposition:
+// form-data), so the JSON schema is only for the RESPONSE side; the
+// request boundary enforces the file content type and size at the
+// trusted multipart parser.
+export const bg2AudioSampleUploadResponseV1Schema = z
+  .object({
+    ok: z.literal(true),
+    sample: bg2AudioSamplePublicV1Schema,
+  })
+  .strict();
+export type Bg2AudioSampleUploadResponseV1 = z.infer<typeof bg2AudioSampleUploadResponseV1Schema>;
+
+// ---------- Remove response ----------
+
+export const bg2AudioSampleRemoveResponseV1Schema = z
+  .object({
+    ok: z.literal(true),
+    sampleId: z.string().min(1).max(128),
+    offeringId: z.string().min(1).max(128),
+    removedAt: z.string().datetime(),
+  })
+  .strict();
+export type Bg2AudioSampleRemoveResponseV1 = z.infer<typeof bg2AudioSampleRemoveResponseV1Schema>;
+
+// ---------- Stable limits exposed for runtime validation ----------
+//
+// The application uses these constants to enforce the GS 11 / GS 12
+// limits at the trusted boundary. A future contract drift detector
+// can compare them against the values the application service
+// enforces.
+export const BG2_AUDIO_SAMPLE_MAX_PER_OFFERING = 3;
+export const BG2_AUDIO_SAMPLE_MAX_BYTE_SIZE = 25 * 1024 * 1024;
+export const BG2_AUDIO_SAMPLE_CONTENT_TYPE = "audio/mpeg" as const;
+export const BG2_AUDIO_SAMPLE_MAX_LABEL_LENGTH = 120;
+export const BG2_AUDIO_SAMPLE_MAX_DISPLAY_ORDER = 3;
+
+// ===========================================================================
+// BG2 error code additions to the shared safe envelope.
+//
+// Existing codes remain unchanged. The new BG2 codes cover the
+// rejection surfaces unique to the seller-audio slice and round-trip
+// through `mapStatus` in `apps/api/src/lib/errors.ts`. The codes
+// never expose provider subjects, raw tokens, session ids, storage
+// credentials, bucket names, or membership internals.
+// ===========================================================================
+
+// The new codes are appended to the existing enum so a contract-drift
+// detector can compare this list against the runtime error builder.
+// The drift test (`apps/api/src/lib/enum-drift.test.ts`) is the only
+// place that consults this list outside the route layer.
