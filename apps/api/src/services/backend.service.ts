@@ -275,7 +275,10 @@ export async function getState(): Promise<any> {
     const message = abi.messages.find((m: AbiMessage) => m.identifier === 'get_state');
     if (message && message.returnType) {
         const decoded = abi.registry.createTypeUnsafe(message.returnType.type as any, [output.toHex()]);
-        return (decoded.toHuman() as any)?.Ok || "Unknown";
+        const human: any = decoded.toHuman();
+        if (typeof human === 'string') return human;
+        if (human && typeof human === 'object' && 'Ok' in human) return human.Ok;
+        return "Unknown";
     }
     return "Unknown";
 }

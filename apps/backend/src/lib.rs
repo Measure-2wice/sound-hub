@@ -108,12 +108,12 @@ mod escrow {
                 _ => return Err(Error::InvalidState),
             }
 
-            self.state = EscrowState::Released.to_u8();
-
             // Transfer the contract's held balance to the artist
             self.env()
                 .transfer(self.provider, self.amount)
                 .map_err(|_| Error::TransferFailed)?;
+
+            self.state = EscrowState::Released.to_u8();
 
             Ok(())
         }
@@ -142,12 +142,12 @@ mod escrow {
                 _ => return Err(Error::InvalidState),
             }
 
-            self.state = EscrowState::Refunded.to_u8();
-
             // Return the locked funds back to the customer
             self.env()
                 .transfer(self.client, self.amount)
                 .map_err(|_| Error::TransferFailed)?;
+
+            self.state = EscrowState::Refunded.to_u8();
 
             Ok(())
         }
