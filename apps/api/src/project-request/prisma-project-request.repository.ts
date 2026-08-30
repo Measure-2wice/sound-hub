@@ -639,7 +639,13 @@ export class PrismaProjectRequestRepository implements ProjectRequestRepository 
       where: { id: projectRequestId },
     });
     if (!row) return null;
-    return toPersisted(row);
+    const context = await this.loadDisplayContextForRequest({
+      buyerWorkspaceId: row.buyerWorkspaceId,
+      sellerWorkspaceId: row.sellerWorkspaceId,
+      serviceOfferingId: row.serviceOfferingId,
+      projectBriefId: row.projectBriefId,
+    });
+    return toPersisted(row, context);
   }
 
   async listProjectRequests(input: {
@@ -653,25 +659,157 @@ export class PrismaProjectRequestRepository implements ProjectRequestRepository 
       },
       orderBy: { createdAt: "desc" },
     });
-    return rows.map(toPersisted);
+    if (rows.length === 0) return [];
+    // Batch-load the display context for every row in one round trip
+    // so the inbox stays fast even when many Pending requests are
+    // surfaced at once. Each row keeps its own nullable fields; a
+    // missing referenced row yields null (the UI renders a
+    // placeholder).
+    const contextByKey = await this.loadDisplayContextForRequests(rows);
+    return rows.map((row) => {
+      const context =
+        contextByKey.get(contextKey(row.buyerWorkspaceId, row.sellerWorkspaceId, row.serviceOfferingId, row.projectBriefId)) ?? {
+          buyerWorkspaceName: null,
+          sellerWorkspaceName: null,
+          serviceOfferingTitle: null,
+          briefExcerpt: null,
+        };
+      return toPersisted(row, context);
+    });
+  }
+
+  // One round-trip per kind, scoped to the union of ids the
+  // supplied rows reference. A missing referenced row simply yields
+  // no match; the corresponding DTO field is rendered as null.
+  private async loadDisplayContextForRequests(
+    rows: readonly { readonly buyerWorkspaceId: string; readonly sellerWorkspaceId: string; readonly serviceOfferingId: string; readonly projectBriefId: string }[],
+  ): Promise<Map<string, ProjectRequestDisplayContext>> {
+    const workspaceIds = new Set<string>();
+    const offeringIds = new Set<string>();
+    const briefIds = new Set<string>();
+    for (const row of rows) {
+      workspaceIds.add(row.buyerWorkspaceId);
+      workspaceIds.add(row.sellerWorkspaceId);
+      offeringIds.add(row.serviceOfferingId);
+      briefIds.add(row.projectBriefId);
+    }
+    const [workspaces, offerings, briefs] = await Promise.all([
+      this.prisma.workspace.findMany({
+        where: { id: { in: [...workspaceIds] } },
+        select: { id: true, name: true },
+      }),
+      this.prisma.serviceOffering.findMany({
+        where: { id: { in: [...offeringIds] } },
+        select: { id: true, title: true },
+      }),
+      this.prisma.projectBrief.findMany({
+        where: { id: { in: [...briefIds] } },
+        select: { id: true, originalText: true },
+      }),
+    ]);
+    const workspaceNames = new Map(workspaces.map((w) => [w.id, w.name]));
+    const offeringTitles = new Map(offerings.map((o) => [o.id, o.title]));
+    const briefExcerpts = new Map(
+      briefs.map((b) => [b.id, makeBriefExcerpt(b.originalText)] as const),
+    );
+    const out = new Map<string, ProjectRequestDisplayContext>();
+    for (const row of rows) {
+      out.set(contextKey(row.buyerWorkspaceId, row.sellerWorkspaceId, row.serviceOfferingId, row.projectBriefId), {
+        buyerWorkspaceName: workspaceNames.get(row.buyerWorkspaceId) ?? null,
+        sellerWorkspaceName: workspaceNames.get(row.sellerWorkspaceId) ?? null,
+        serviceOfferingTitle: offeringTitles.get(row.serviceOfferingId) ?? null,
+        briefExcerpt: briefExcerpts.get(row.projectBriefId) ?? null,
+      });
+    }
+    return out;
+  }
+
+  // Single-row variant used by findProjectRequestById. Same shape
+  // as the batch loader; separate so we do not allocate per-row
+  // Maps for a single read.
+  private async loadDisplayContextForRequest(input: {
+    readonly buyerWorkspaceId: string;
+    readonly sellerWorkspaceId: string;
+    readonly serviceOfferingId: string;
+    readonly projectBriefId: string;
+  }): Promise<ProjectRequestDisplayContext> {
+    const [buyerWorkspace, sellerWorkspace, offering, brief] = await Promise.all([
+      this.prisma.workspace.findUnique({
+        where: { id: input.buyerWorkspaceId },
+        select: { name: true },
+      }),
+      this.prisma.workspace.findUnique({
+        where: { id: input.sellerWorkspaceId },
+        select: { name: true },
+      }),
+      this.prisma.serviceOffering.findUnique({
+        where: { id: input.serviceOfferingId },
+        select: { title: true },
+      }),
+      this.prisma.projectBrief.findUnique({
+        where: { id: input.projectBriefId },
+        select: { originalText: true },
+      }),
+    ]);
+    return {
+      buyerWorkspaceName: buyerWorkspace?.name ?? null,
+      sellerWorkspaceName: sellerWorkspace?.name ?? null,
+      serviceOfferingTitle: offering?.title ?? null,
+      briefExcerpt: brief ? makeBriefExcerpt(brief.originalText) : null,
+    };
   }
 }
 
 // ---------- helpers ----------
 
-function toPersisted(row: {
-  readonly id: string;
-  readonly buyerWorkspaceId: string;
-  readonly sellerWorkspaceId: string;
-  readonly serviceOfferingId: string;
-  readonly projectBriefId: string;
-  readonly createdByUserId: string;
-  readonly status: DbStatus;
-  readonly sellerDecisionAt: Date | null;
-  readonly sellerDecisionByUserId: string | null;
-  readonly sellerConsentAt: Date | null;
-  readonly createdAt: Date;
-}): PersistedProjectRequest {
+interface ProjectRequestDisplayContext {
+  readonly buyerWorkspaceName: string | null;
+  readonly sellerWorkspaceName: string | null;
+  readonly serviceOfferingTitle: string | null;
+  readonly briefExcerpt: string | null;
+}
+
+function contextKey(
+  buyerWorkspaceId: string,
+  sellerWorkspaceId: string,
+  serviceOfferingId: string,
+  projectBriefId: string,
+): string {
+  return `${buyerWorkspaceId}|${sellerWorkspaceId}|${serviceOfferingId}|${projectBriefId}`;
+}
+
+// Trim + collapse whitespace and cap the brief excerpt so the DTO
+// stays bounded (the schema enforces ≤280 chars). A null/empty
+// input collapses to null so the UI can render a stable
+// placeholder rather than an empty string.
+function makeBriefExcerpt(originalText: string | null | undefined): string | null {
+  if (!originalText) return null;
+  const trimmed = originalText.replace(/\s+/g, " ").trim();
+  if (trimmed.length === 0) return null;
+  return trimmed.length > 280 ? `${trimmed.slice(0, 277)}…` : trimmed;
+}
+
+function toPersisted(
+  row: {
+    readonly id: string;
+    readonly buyerWorkspaceId: string;
+    readonly sellerWorkspaceId: string;
+    readonly serviceOfferingId: string;
+    readonly projectBriefId: string;
+    readonly createdByUserId: string;
+    readonly status: DbStatus;
+    readonly sellerDecisionAt: Date | null;
+    readonly sellerDecisionByUserId: string | null;
+    readonly sellerConsentAt: Date | null;
+    readonly createdAt: Date;
+  },
+  context: ProjectRequestDisplayContext = {
+    buyerWorkspaceName: null,
+    sellerWorkspaceName: null,
+    serviceOfferingTitle: null,
+    briefExcerpt: null,
+  },
+): PersistedProjectRequest {
   return {
     id: row.id,
     buyerWorkspaceId: row.buyerWorkspaceId,
@@ -684,6 +822,10 @@ function toPersisted(row: {
     sellerDecisionByUserId: row.sellerDecisionByUserId,
     sellerConsentAt: row.sellerConsentAt,
     createdAt: row.createdAt,
+    buyerWorkspaceName: context.buyerWorkspaceName,
+    sellerWorkspaceName: context.sellerWorkspaceName,
+    serviceOfferingTitle: context.serviceOfferingTitle,
+    briefExcerpt: context.briefExcerpt,
   };
 }
 

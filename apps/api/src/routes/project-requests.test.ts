@@ -99,6 +99,10 @@ class FakeProjectRequestService {
         sellerDecisionAt: null,
         sellerConsentAt: null,
         createdAt: new Date("2026-08-27T00:00:00Z").toISOString(),
+        buyerWorkspaceName: "Buyer Studio",
+        sellerWorkspaceName: "Seller Studio",
+        serviceOfferingTitle: "House mix",
+        briefExcerpt: "Need a polished house mix for a Caribbean EP.",
       },
     };
   }
@@ -125,6 +129,10 @@ class FakeProjectRequestService {
         sellerDecisionAt: new Date("2026-08-27T00:00:01Z").toISOString(),
         sellerConsentAt: new Date("2026-08-27T00:00:01Z").toISOString(),
         createdAt: new Date("2026-08-27T00:00:00Z").toISOString(),
+        buyerWorkspaceName: "Buyer Studio",
+        sellerWorkspaceName: "Seller Studio",
+        serviceOfferingTitle: "House mix",
+        briefExcerpt: "Need a polished house mix for a Caribbean EP.",
       },
       deal: {
         dealId: "deal-1",
@@ -153,6 +161,10 @@ class FakeProjectRequestService {
         sellerDecisionAt: new Date("2026-08-27T00:00:01Z").toISOString(),
         sellerConsentAt: null,
         createdAt: new Date("2026-08-27T00:00:00Z").toISOString(),
+        buyerWorkspaceName: "Buyer Studio",
+        sellerWorkspaceName: "Seller Studio",
+        serviceOfferingTitle: "House mix",
+        briefExcerpt: "Need a polished house mix for a Caribbean EP.",
       },
     };
   }
@@ -176,6 +188,10 @@ class FakeProjectRequestService {
         sellerDecisionAt: null,
         sellerConsentAt: null,
         createdAt: new Date("2026-08-27T00:00:00Z").toISOString(),
+        buyerWorkspaceName: "Buyer Studio",
+        sellerWorkspaceName: "Seller Studio",
+        serviceOfferingTitle: "House mix",
+        briefExcerpt: "Need a polished house mix for a Caribbean EP.",
       },
     };
   }
@@ -197,6 +213,10 @@ class FakeProjectRequestService {
           sellerDecisionAt: null,
           sellerConsentAt: null,
           createdAt: new Date("2026-08-27T00:00:00Z").toISOString(),
+          buyerWorkspaceName: "Buyer Studio",
+          sellerWorkspaceName: "Seller Studio",
+          serviceOfferingTitle: "House mix",
+          briefExcerpt: "Need a polished house mix for a Caribbean EP.",
         },
       ],
     };

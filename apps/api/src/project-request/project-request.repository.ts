@@ -56,6 +56,17 @@ export interface PersistedProjectRequest {
   readonly sellerDecisionByUserId: string | null;
   readonly sellerConsentAt: Date | null;
   readonly createdAt: Date;
+  // Display-only context for the seller inbox (and the symmetric
+  // buyer audit view). Mirrors the same-named fields on the public
+  // DTO; nullable when the referenced row could not be loaded (e.g.
+  // in tests where the fixture does not seed a ProjectBrief).
+  // The repository populates them on read paths only; transactional
+  // create / accept / decline paths leave them null because the UI
+  // immediately re-lists and re-renders from the read surface.
+  readonly buyerWorkspaceName: string | null;
+  readonly sellerWorkspaceName: string | null;
+  readonly serviceOfferingTitle: string | null;
+  readonly briefExcerpt: string | null;
 }
 
 export interface PersistedDeal {

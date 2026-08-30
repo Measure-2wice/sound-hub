@@ -45,14 +45,6 @@ import type {
 } from "./project-request-authorization-policy.js";
 import type { ProjectRequestStatusV1 } from "@soundhub/types";
 
-export interface WorkspaceSnapshotSeed {
-  readonly workspaceId: string;
-  readonly status: "Active" | "Suspended";
-  readonly ownerUserId: string;
-  readonly buyerCapability: boolean;
-  readonly sellerCapability: boolean;
-}
-
 export interface MembershipSnapshotSeed {
   readonly userId: string;
   readonly workspaceId: string;
@@ -67,12 +59,31 @@ export interface ServiceOfferingSnapshotSeed {
   readonly id: string;
   readonly sellerWorkspaceId: string;
   readonly status: "Active" | "Draft" | "Paused" | "Archived";
+  // Display-only context for the seller inbox (and the symmetric
+  // buyer audit view). Mirrors the same-named fields on the public
+  // DTO. Optional; null when the test fixture does not seed a
+  // title.
+  readonly title?: string;
 }
 
 export interface ProjectBriefSnapshotSeed {
   readonly id: string;
   readonly buyerWorkspaceId: string;
   readonly recommendedOfferingIds: readonly string[];
+  // Display-only excerpt for the seller inbox. Optional; null when
+  // the test fixture does not seed a brief excerpt.
+  readonly originalText?: string;
+}
+
+export interface WorkspaceSnapshotSeed {
+  readonly workspaceId: string;
+  readonly status: "Active" | "Suspended";
+  readonly ownerUserId: string;
+  readonly buyerCapability: boolean;
+  readonly sellerCapability: boolean;
+  // Display-only name for the seller inbox. Optional; null when the
+  // test fixture does not seed a workspace name.
+  readonly name?: string;
 }
 
 export class InMemoryProjectRequestRepository implements ProjectRequestRepository {
@@ -183,6 +194,13 @@ export class InMemoryProjectRequestRepository implements ProjectRequestRepositor
         sellerDecisionByUserId: null,
         sellerConsentAt: null,
         createdAt: new Date(),
+        // Display context for the just-created row. Populated from
+        // the seeded snapshots so a follow-up list call surfaces
+        // the same human-readable fields the Prisma adapter emits.
+        buyerWorkspaceName: this.workspaces.get(outcome.input.buyerWorkspaceId)?.name ?? null,
+        sellerWorkspaceName: this.workspaces.get(outcome.input.sellerWorkspaceId)?.name ?? null,
+        serviceOfferingTitle: this.offerings.get(outcome.input.serviceOfferingId)?.title ?? null,
+        briefExcerpt: makeBriefExcerpt(this.briefs.get(outcome.input.projectBriefId)?.originalText),
       };
       this.requests.set(row.id, row);
       return Promise.resolve({ ok: true, value: row });
@@ -376,4 +394,14 @@ export class InMemoryProjectRequestRepository implements ProjectRequestRepositor
       hasSellerCapability: ws?.sellerCapability ?? false,
     };
   }
+}
+
+// Trim + collapse whitespace and cap the brief excerpt so the DTO
+// stays bounded. Mirrors the same helper used by the Prisma adapter
+// so the in-memory adapter produces identical public DTO shapes.
+function makeBriefExcerpt(originalText: string | null | undefined): string | null {
+  if (!originalText) return null;
+  const trimmed = originalText.replace(/\s+/g, " ").trim();
+  if (trimmed.length === 0) return null;
+  return trimmed.length > 280 ? `${trimmed.slice(0, 277)}…` : trimmed;
 }

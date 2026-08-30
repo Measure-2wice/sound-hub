@@ -1304,6 +1304,17 @@ export const BG2_AUDIO_SAMPLE_MAX_DISPLAY_ORDER = 3;
 // / future activation invariants. It is null for Pending and
 // Declined requests and the timestamp of the accept call for
 // Accepted ones.
+//
+// BG4 seller-inbox UI (ticket #62 acceptance QA, P3-002) requires
+// that a row carries human-readable context — the buyer Workspace
+// name, the ServiceOffering title, and a brief excerpt — so the
+// seller can distinguish multiple Pending requests without seeing
+// raw internal ids as primary user-facing content. The ids remain on
+// the response for client-side keys, audit correlation, and tests,
+// but the UI MUST render the human-readable context as the primary
+// label. The fields are bounded and pulled from the same referenced
+// rows that authorize the request; they do not expose account,
+// membership, embedding, or storage internals.
 export const projectRequestPublicV1Schema = z
   .object({
     projectRequestId: z.string().min(1).max(128),
@@ -1315,6 +1326,15 @@ export const projectRequestPublicV1Schema = z
     sellerDecisionAt: z.string().datetime().nullable(),
     sellerConsentAt: z.string().datetime().nullable(),
     createdAt: z.string().datetime(),
+    // Display-only context for the seller inbox (and the symmetric
+    // buyer audit view). Pulled from the referenced Workspace /
+    // ServiceOffering / ProjectBrief rows at read time. Null when
+    // the referenced row could not be loaded; the UI must render
+    // a stable placeholder rather than fabricating a label.
+    buyerWorkspaceName: z.string().min(1).max(200).nullable(),
+    sellerWorkspaceName: z.string().min(1).max(200).nullable(),
+    serviceOfferingTitle: z.string().min(1).max(200).nullable(),
+    briefExcerpt: z.string().max(280).nullable(),
   })
   .strict();
 export type ProjectRequestPublicV1 = z.infer<typeof projectRequestPublicV1Schema>;

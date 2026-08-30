@@ -285,25 +285,37 @@ function RequestRow({
   readonly onAccept: () => void;
   readonly onDecline: () => void;
 }) {
+  // Render human-readable context as the primary label so the
+  // seller can distinguish multiple Pending requests by the
+  // content of the request, not by opaque internal ids. The
+  // ids remain on the row (data-request-id, data-buyer-id, …)
+  // for test selectors and audit correlation, but they MUST NOT
+  // be the primary user-facing text — that was the P3-002
+  // acceptance QA finding.
+  const buyerWorkspaceLabel = request.buyerWorkspaceName ?? "Unknown buyer Workspace";
+  const offeringLabel = request.serviceOfferingTitle ?? "Unknown ServiceOffering";
+  const briefLabel = request.briefExcerpt ?? "Brief content unavailable.";
   return (
     <li
       className="border border-gray-200 rounded-md p-3 space-y-2"
       data-testid="seller-request-row"
       data-request-id={request.projectRequestId}
     >
-      <div>
-        <p className="text-sm font-medium text-gray-900" data-testid="seller-request-title">
-          Request {request.projectRequestId}
+      <div className="min-w-0">
+        <p className="text-sm font-medium text-gray-900 break-words" data-testid="seller-request-title">
+          From {buyerWorkspaceLabel} — {offeringLabel}
         </p>
-        <p className="text-xs text-gray-600" data-testid="seller-request-detail">
-          Buyer Workspace {request.buyerWorkspaceId} · Offering {request.serviceOfferingId} · Brief{" "}
-          {request.projectBriefId}
+        <p
+          className="text-xs text-gray-600 break-words line-clamp-3"
+          data-testid="seller-request-brief"
+        >
+          {briefLabel}
         </p>
         <p className="text-xs text-gray-500" data-testid="seller-request-created-at">
-          Created {request.createdAt}
+          Received {formatCreatedAt(request.createdAt)}
         </p>
       </div>
-      <div className="flex gap-2">
+      <div className="flex flex-wrap gap-2">
         <button
           type="button"
           onClick={onAccept}
@@ -325,4 +337,15 @@ function RequestRow({
       </div>
     </li>
   );
+}
+
+// Human-readable creation time. The DTO already returns an ISO
+// datetime string; this formatter renders it in the user's locale
+// without requiring a date library. A null/invalid value renders
+// as "unknown time" rather than the raw string so the row stays
+// readable when the timestamp is missing.
+function formatCreatedAt(value: string): string {
+  const parsed = new Date(value);
+  if (Number.isNaN(parsed.getTime())) return "unknown time";
+  return parsed.toLocaleString();
 }

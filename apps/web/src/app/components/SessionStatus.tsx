@@ -27,7 +27,7 @@ export function SessionStatus() {
     return (
       <Link
         href={"/login"}
-        className="text-sm font-medium text-blue-600 hover:text-blue-700"
+        className="text-sm font-medium text-blue-600 hover:text-blue-700 whitespace-nowrap"
         data-testid="nav-sign-in"
       >
         Sign in
@@ -35,8 +35,12 @@ export function SessionStatus() {
     );
   }
   return (
-    <div className="flex items-center gap-3" data-testid="nav-session">
-      <span className="text-sm text-gray-700" data-testid="nav-session-email">
+    <div className="flex items-center gap-3 min-w-0" data-testid="nav-session">
+      <span
+        className="hidden sm:inline text-sm text-gray-700 truncate max-w-[10rem] md:max-w-[16rem]"
+        data-testid="nav-session-email"
+        title={user.email ?? "Signed in"}
+      >
         {user.email ?? "Signed in"}
       </span>
       <button
@@ -46,7 +50,7 @@ export function SessionStatus() {
             await signOutAndRefresh();
           })();
         }}
-        className="text-sm font-medium text-gray-600 hover:text-gray-900"
+        className="text-sm font-medium text-gray-600 hover:text-gray-900 whitespace-nowrap"
         data-testid="nav-sign-out"
       >
         Sign out

@@ -60,6 +60,10 @@ const SUCCESS_RESPONSE: CreateProjectRequestResponseV1 = {
     sellerDecisionAt: null,
     sellerConsentAt: null,
     createdAt: new Date("2026-08-27T00:00:00Z").toISOString(),
+    buyerWorkspaceName: "Buyer Studio",
+    sellerWorkspaceName: "Seller Studio",
+    serviceOfferingTitle: "House mix",
+    briefExcerpt: "Need a polished house mix for a Caribbean EP.",
   },
 };
 

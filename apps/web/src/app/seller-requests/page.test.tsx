@@ -104,4 +104,89 @@ describe("BG4 Seller inbox page source contract", () => {
       "seller inbox must detect the SESSION_INVALID code from the safe envelope",
     );
   });
+
+  // BG4 P3-002 acceptance QA: a row must surface human-readable
+  // context (buyer Workspace name, ServiceOffering title, brief
+  // excerpt, formatted creation time) as the primary user-facing
+  // label. Raw internal ids must NOT be rendered as the primary
+  // content; they may remain only on data-* attributes for test
+  // selectors and React keys.
+  test("seller inbox row renders human-readable buyer Workspace name and offering title as primary labels", () => {
+    const source = readSellerRequestsPage();
+    assert.match(
+      source,
+      /request\.buyerWorkspaceName/,
+      "seller inbox row must render the buyer Workspace name from the DTO",
+    );
+    assert.match(
+      source,
+      /request\.serviceOfferingTitle/,
+      "seller inbox row must render the ServiceOffering title from the DTO",
+    );
+    assert.match(
+      source,
+      /request\.briefExcerpt/,
+      "seller inbox row must render the brief excerpt from the DTO",
+    );
+    // Raw ids must not appear as primary user-facing text. They
+    // may still appear inside data-* attributes (test selectors)
+    // and inside the React key — but the primary label must be
+    // the human-readable context.
+    const titleSection = source.match(
+      /data-testid="seller-request-title"[\s\S]*?<\/p>/,
+    );
+    assert.ok(
+      titleSection,
+      "seller inbox row must render a seller-request-title element",
+    );
+    assert.ok(
+      !/Request\s+\$\{request\.projectRequestId\}/.test(titleSection[0]) &&
+        !/Buyer Workspace \$\{request\.buyerWorkspaceId\}/.test(titleSection[0]) &&
+        !/Offering \$\{request\.serviceOfferingId\}/.test(titleSection[0]) &&
+        !/Brief \$\{request\.projectBriefId\}/.test(titleSection[0]),
+      "seller-request-title MUST NOT render raw internal ids as primary user-facing text",
+    );
+  });
+
+  test("seller inbox row formats the creation time human-readably instead of rendering the raw ISO string", () => {
+    const source = readSellerRequestsPage();
+    assert.match(
+      source,
+      /formatCreatedAt/,
+      "seller inbox row must format the creation time via a human-readable formatter",
+    );
+    assert.match(
+      source,
+      /toLocaleString/,
+      "seller inbox row must use a locale-aware formatter so the timestamp reads naturally",
+    );
+  });
+
+  test("seller inbox row keeps the raw id on data-request-id for test selectors and React keys", () => {
+    const source = readSellerRequestsPage();
+    assert.match(
+      source,
+      /data-request-id=\{request\.projectRequestId\}/,
+      "seller inbox row must keep the raw ProjectRequest id on data-request-id for test selectors and React keys",
+    );
+    assert.match(
+      source,
+      /key=\{request\.projectRequestId\}/,
+      "seller inbox row must keep the raw ProjectRequest id as the React key",
+    );
+  });
+
+  test("seller inbox row keeps Accept and Decline action buttons with stable test ids", () => {
+    const source = readSellerRequestsPage();
+    assert.match(
+      source,
+      /data-testid="seller-request-accept"/,
+      "seller inbox row must render the Accept button with its stable test id",
+    );
+    assert.match(
+      source,
+      /data-testid="seller-request-decline"/,
+      "seller inbox row must render the Decline button with its stable test id",
+    );
+  });
 });

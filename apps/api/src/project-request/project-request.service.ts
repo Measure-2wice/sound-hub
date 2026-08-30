@@ -450,6 +450,14 @@ export function toPublicProjectRequest(persisted: PersistedProjectRequest): Proj
   // / separately-authorized audit presentations), but they MUST
   // NOT cross this public DTO. See projectRequestPublicV1Schema
   // for the allow-list contract.
+  //
+  // Display-only context (buyer Workspace name, seller Workspace
+  // name, ServiceOffering title, brief excerpt) is included so the
+  // seller inbox (and the symmetric buyer audit view) can render
+  // human-readable context instead of raw internal ids. These
+  // fields are populated by the repository's read paths; the
+  // transactional create / accept / decline paths leave them null
+  // because the UI immediately re-lists and re-renders.
   return {
     projectRequestId: persisted.id,
     buyerWorkspaceId: persisted.buyerWorkspaceId,
@@ -460,6 +468,10 @@ export function toPublicProjectRequest(persisted: PersistedProjectRequest): Proj
     sellerDecisionAt: persisted.sellerDecisionAt ? persisted.sellerDecisionAt.toISOString() : null,
     sellerConsentAt: persisted.sellerConsentAt ? persisted.sellerConsentAt.toISOString() : null,
     createdAt: persisted.createdAt.toISOString(),
+    buyerWorkspaceName: persisted.buyerWorkspaceName,
+    sellerWorkspaceName: persisted.sellerWorkspaceName,
+    serviceOfferingTitle: persisted.serviceOfferingTitle,
+    briefExcerpt: persisted.briefExcerpt,
   };
 }
 
