@@ -27,6 +27,16 @@
 //     truncates the email with `truncate` so an unwrapped
 //     `user@…` address cannot blow up the header.
 //
+// Mobile-menu state ownership:
+// The `open` flag for the hamburger panel lives on the nearest
+// shared owner (`Navigation`) so the toggle and the panel read the
+// SAME state instance. Prior to this fix each component owned its
+// own `useState(false)` and the panel never opened when the
+// hamburger was clicked — a BG4 manual-QA finding. The toggle now
+// receives `open` + `onToggle`, the panel receives `open` +
+// `onClose`, and the panel wires its close handlers (Escape,
+// resize-to-desktop, and a per-link click) to that single callback.
+//
 // SessionStatus owns the visible sign-in / sign-out affordance.
 // The Matchmaker, Seller-requests, and Audio-samples links own
 // their own auth-aware visibility because their gating is
@@ -36,11 +46,46 @@
 // ever seeing the link.
 
 import Link from "next/link";
-import { useEffect, useState } from "react";
+import { useCallback, useEffect, useMemo, useState } from "react";
+import type { Bg1PublicUserV1 } from "@soundhub/types";
 import { useSession } from "./SessionProvider";
 import { SessionStatus } from "./SessionStatus";
 
 export function Navigation() {
+  const { user, loading } = useSession();
+
+  // Single source of truth for mobile-menu visibility. Both the
+  // hamburger toggle and the panel below the row read this same
+  // instance, so a click on the toggle is observed by the panel
+  // on the same render pass. See the file-header comment for the
+  // defect this resolves.
+  const [open, setOpen] = useState(false);
+  const onToggle = useCallback(() => {
+    setOpen((value) => !value);
+  }, []);
+  const onClose = useCallback(() => {
+    setOpen(false);
+  }, []);
+
+  const hasBuyerWorkspace = useMemo(
+    () => user?.workspaces.some((w) => w.capabilities.includes("Buyer")) ?? false,
+    [user],
+  );
+  const hasSellerWorkspace = useMemo(
+    () => user?.workspaces.some((w) => w.capabilities.includes("Seller")) ?? false,
+    [user],
+  );
+
+  // Hamburger visibility: only render the toggle when the session
+  // has at least one capability-gated mobile navigation
+  // destination. A signed-out session, or a signed-in session whose
+  // Workspaces carry neither Buyer nor Seller capability, renders
+  // no hamburger and no panel — the brand + sign-in/sign-out row
+  // is enough at small widths. Authorization remains a server/
+  // application concern; this is a presentation-only narrowing.
+  const hasMobileDestination =
+    !loading && user !== null && (hasBuyerWorkspace || hasSellerWorkspace);
+
   return (
     <nav className="bg-white shadow-lg border-b" data-testid="top-nav">
       <div className="max-w-7xl mx-auto px-4 sm:px-6 lg:px-8">
@@ -62,10 +107,17 @@ export function Navigation() {
           </div>
           <div className="flex items-center gap-3 md:hidden min-w-0" data-testid="nav-mobile-bar">
             <SessionStatus />
-            <MobileMenuToggle />
+            {hasMobileDestination && <MobileMenuToggle open={open} onToggle={onToggle} />}
           </div>
         </div>
-        <MobileMenuPanel />
+        <MobileMenuPanel
+          open={open}
+          onClose={onClose}
+          user={user}
+          loading={loading}
+          hasBuyerWorkspace={hasBuyerWorkspace}
+          hasSellerWorkspace={hasSellerWorkspace}
+        />
       </div>
     </nav>
   );
@@ -136,43 +188,90 @@ function SessionAwareAudioSamplesLink() {
   );
 }
 
-// Hamburger button. Visible only on small viewports. Toggles the
-// mobile menu panel and is keyboard-accessible: it is a real
-// `<button>` with `aria-expanded` so screen readers announce the
-// panel state, and `aria-controls` ties it to the panel's id.
-function MobileMenuToggle() {
-  const [open, setOpen] = useState(false);
+// Hamburger button. Visible only on small viewports AND only when
+// the session has at least one capability-gated mobile destination.
+// The toggle is a pure presentation over the lifted `open` state:
+// its `aria-expanded` is always in lock-step with what the panel shows
+// because both read the same `open` value from the parent. It is
+// keyboard-accessible (real `<button>`, focus ring, aria-label that
+// reflects the next action).
+function MobileMenuToggle({
+  open,
+  onToggle,
+}: {
+  readonly open: boolean;
+  readonly onToggle: () => void;
+}) {
   return (
     <button
       type="button"
-      onClick={() => {
-        setOpen((value) => !value);
-      }}
+      onClick={onToggle}
       className="inline-flex items-center justify-center p-2 rounded-md text-gray-700 hover:bg-gray-100 focus:outline-none focus:ring-2 focus:ring-blue-500"
       aria-expanded={open}
       aria-controls="nav-mobile-panel"
       aria-label={open ? "Close menu" : "Open menu"}
       data-testid="nav-mobile-toggle"
     >
-      <span aria-hidden="true" className="block w-5 h-0.5 bg-current relative before:absolute before:left-0 before:-top-1.5 before:w-5 before:h-0.5 before:bg-current after:absolute after:left-0 after:top-1.5 after:w-5 after:h-0.5 after:bg-current"></span>
+      <span
+        aria-hidden="true"
+        className="block w-5 h-0.5 bg-current relative before:absolute before:left-0 before:-top-1.5 before:w-5 before:h-0.5 before:bg-current after:absolute after:left-0 after:top-1.5 after:w-5 after:h-0.5 after:bg-current"
+      ></span>
     </button>
   );
 }
 
 // Stacked mobile panel. Renders only on small viewports; the
 // desktop row already shows the same links at >=md. The panel
-// closes itself when the user resizes the viewport back to
-// desktop so the open hamburger state cannot leak into the
-// desktop layout.
+// reads `open` from the same lifted state as the toggle so its
+// visibility is always synchronized with `aria-expanded`. Each
+// capability-gated link re-runs the same SessionProvider gating
+// logic as the desktop row, so an unauthenticated visitor at a
+// narrow viewport never sees Matchmaker, Seller inbox, or Audio
+// samples — and the panel itself never renders empty link stubs
+// that would otherwise hint at hidden functionality.
 //
-// Each capability-gated link re-runs the same SessionProvider
-// gating logic as the desktop row, so an unauthenticated visitor
-// at a narrow viewport never sees Matchmaker, Seller inbox, or
-// Audio samples — and the panel itself never renders empty link
-// stubs that would otherwise hint at hidden functionality.
-function MobileMenuPanel() {
-  const [open, setOpen] = useState(false);
-  const { user, loading } = useSession();
+// Close behavior (BG4 manual-QA fix):
+//   - clicking any link inside the panel closes it;
+//   - pressing Escape closes it;
+//   - resizing the viewport back to the desktop breakpoint
+//     (`>= md`) closes it.
+//
+// The panel never owns `open`; it only calls `onClose` and reads
+// `open` from the parent.
+function MobileMenuPanel({
+  open,
+  onClose,
+  user,
+  loading,
+  hasBuyerWorkspace,
+  hasSellerWorkspace,
+}: {
+  readonly open: boolean;
+  readonly onClose: () => void;
+  readonly user: Bg1PublicUserV1 | null;
+  readonly loading: boolean;
+  readonly hasBuyerWorkspace: boolean;
+  readonly hasSellerWorkspace: boolean;
+}) {
+  // The session-derived `user` and `loading` are passed as props
+  // so the panel renders the same way whether invoked from
+  // `Navigation` or from a controlled test harness — the panel
+  // remains a pure presentational component over its props.
+
+  // Close on Escape so keyboard users can dismiss the menu without
+  // reaching for the toggle.
+  useEffect(() => {
+    if (typeof window === "undefined") return undefined;
+    const onKeyDown = (event: KeyboardEvent) => {
+      if (event.key === "Escape") {
+        onClose();
+      }
+    };
+    window.addEventListener("keydown", onKeyDown);
+    return () => {
+      window.removeEventListener("keydown", onKeyDown);
+    };
+  }, [onClose]);
 
   // Close on resize to >=md so the panel state does not survive
   // across viewport changes. ResizeObserver is not available in
@@ -182,22 +281,21 @@ function MobileMenuPanel() {
     if (typeof window === "undefined") return undefined;
     const onResize = () => {
       if (window.innerWidth >= mdBreakpointPx) {
-        setOpen(false);
+        onClose();
       }
     };
     window.addEventListener("resize", onResize);
     return () => {
       window.removeEventListener("resize", onResize);
     };
-  }, []);
+  }, [onClose]);
 
-  const hasBuyerWorkspace = user?.workspaces.some((w) => w.capabilities.includes("Buyer")) ?? false;
-  const hasSellerWorkspace =
-    user?.workspaces.some((w) => w.capabilities.includes("Seller")) ?? false;
-
-  // Loading and unauthenticated visitors see no panel links (and
-  // the toggle is still rendered so the SessionStatus sign-in link
-  // is reachable). Authenticated visitors see the gated links.
+  // Render an empty panel fragment when the session has no
+  // capability-gated mobile destinations — even with `open=true`
+  // there are no links to display. The toggle itself is hidden by
+  // the parent's `hasMobileDestination` guard, so this path is
+  // only reached when the panel is opened via Escape/resize
+  // racing a sign-out. Closing via onClose() still runs.
   return (
     <div
       id="nav-mobile-panel"
@@ -209,6 +307,7 @@ function MobileMenuPanel() {
         {!loading && user && hasBuyerWorkspace && (
           <Link
             href="/matchmaker"
+            onClick={onClose}
             className="block px-2 py-2 rounded-md text-sm font-medium text-gray-700 hover:bg-gray-100"
             data-testid="nav-mobile-matchmaker-link"
           >
@@ -218,6 +317,7 @@ function MobileMenuPanel() {
         {!loading && user && hasSellerWorkspace && (
           <Link
             href="/seller-requests"
+            onClick={onClose}
             className="block px-2 py-2 rounded-md text-sm font-medium text-gray-700 hover:bg-gray-100"
             data-testid="nav-mobile-seller-requests-link"
           >
@@ -227,6 +327,7 @@ function MobileMenuPanel() {
         {!loading && user && hasSellerWorkspace && (
           <Link
             href="/dashboard/audio"
+            onClick={onClose}
             className="block px-2 py-2 rounded-md text-sm font-medium text-gray-700 hover:bg-gray-100"
             data-testid="nav-mobile-audio-samples"
           >
@@ -242,3 +343,11 @@ function MobileMenuPanel() {
 // the same threshold so the panel closes at exactly the same
 // viewport at which the desktop row appears.
 const mdBreakpointPx = 768;
+
+// Internal components are exposed as named exports so the runtime
+// interaction tests can mount them with controlled props. The
+// production `Navigation` component still owns the lifted `open`
+// state — these exports do NOT introduce a generalized
+// navigation-state abstraction; they only re-export the pieces
+// that the panel/toggle were always composed of.
+export { MobileMenuToggle, MobileMenuPanel };
