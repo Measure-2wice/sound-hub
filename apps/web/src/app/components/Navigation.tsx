@@ -343,11 +343,3 @@ function MobileMenuPanel({
 // the same threshold so the panel closes at exactly the same
 // viewport at which the desktop row appears.
 const mdBreakpointPx = 768;
-
-// Internal components are exposed as named exports so the runtime
-// interaction tests can mount them with controlled props. The
-// production `Navigation` component still owns the lifted `open`
-// state — these exports do NOT introduce a generalized
-// navigation-state abstraction; they only re-export the pieces
-// that the panel/toggle were always composed of.
-export { MobileMenuToggle, MobileMenuPanel };

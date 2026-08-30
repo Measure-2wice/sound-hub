@@ -2,7 +2,7 @@
 // Navigation tests.
 //
 // Background: the manual acceptance test on
-// feat/bg4-persists-projects surfaced three findings:
+// feat/bg4-persists-projects surfaced four findings:
 //
 //   1. The header overflowed the viewport at ~375px width.
 //   2. The Audio-samples navigation entry was visible to
@@ -15,26 +15,38 @@
 //      instead of human-readable context (covered by
 //      `seller-requests/page.test.tsx`).
 //
-// The first two findings live in the source-pattern tests at the
-// bottom of this file. Finding #3 — the mobile-menu state
-// ownership defect — is pinned by both source-pattern assertions
-// (the state lives on the parent, the toggle/panel receive
-// `open` + callbacks as props) and by rendered interaction tests
-// that drive the production `MobileMenuToggle` and `MobileMenuPanel`
-// components with a controlled harness (the same lifted-state
-// pattern `Navigation` uses) and assert on the rendered HTML.
+// Finding #3 — the mobile-menu state ownership defect — is pinned by
+// two complementary layers in this file:
 //
-// The runtime contract for the auth-aware gating is covered by
+//   - **Runtime interaction tests** mount the real `<Navigation />`
+//     inside the real `<SessionProvider />` through
+//     `react-dom/client` + `act()`. They drive the production
+//     hamburger's actual `onClick`, dispatch real `keydown` and
+//     `resize` events on the JSDOM `window`, click a real mobile
+//     `<a>`, and assert on the production panel's actual rendered
+//     visibility. A deliberate break between the production toggle
+//     and panel makes the click-open test fail; restored wiring
+//     passes every case. This is the runtime contract for the BG4
+//     mobile-menu fix.
+//
+//   - **Source-pattern tests** pin the structural invariants
+//     (lifted state, capability-gated desktop helpers, responsive
+//     class layout, overflow guard) so a refactor that re-introduces
+//     the original defect — by giving the toggle or the panel its
+//     own `useState(false)` — fails the suite immediately, even
+//     before the runtime tests run.
+//
+// The runtime contract for the auth-aware gating is also covered by
 // `SessionProvider.test.tsx`.
 
 import assert from "node:assert/strict";
 import { readFileSync } from "node:fs";
-import { describe, test } from "node:test";
-import { renderToStaticMarkup } from "react-dom/server";
-import type { ReactElement } from "react";
-import { useCallback } from "react";
-import type { Bg1PublicUserV1 } from "@soundhub/types";
-import { MobileMenuPanel, MobileMenuToggle } from "./Navigation";
+import { afterEach, describe, test } from "node:test";
+import { act } from "react";
+import { createRoot, type Root } from "react-dom/client";
+import type { Bg1PublicUserV1, Bg1SessionInfoV1 } from "@soundhub/types";
+import { SessionProvider } from "./SessionProvider";
+import { Navigation } from "./Navigation";
 
 const repoRoot = `${new URL("../../../../", import.meta.url).pathname}web`;
 
@@ -44,10 +56,6 @@ function readNavigation(): string {
 
 // Stable session fixtures. The fields are minimal-but-valid for the
 // public schema; only the ones the navigation reads are populated.
-function signedOutUser(): null {
-  return null;
-}
-
 function buyerOnlyUser(): Bg1PublicUserV1 {
   return {
     userAccountId: "u-buyer",
@@ -86,296 +94,353 @@ function sellerOnlyUser(): Bg1PublicUserV1 {
   };
 }
 
-function hasBuyerCapability(user: Bg1PublicUserV1 | null): boolean {
-  return user?.workspaces.some((w) => w.capabilities.includes("Buyer")) ?? false;
+// Stub `globalThis.fetch` so the real `<SessionProvider />`'s mount
+// effect resolves with the chosen user. This is the minimum external
+// dependency the user explicitly called out — the existing session
+// context/API seam — and avoids reproducing session state inside the
+// test. Any URL the SessionProvider does not fetch is rejected with a
+// 404 so a test that inadvertently exercises another endpoint fails
+// loudly.
+function mockSessionEndpoint(user: Bg1PublicUserV1 | null): void {
+  const sessionInfo: Bg1SessionInfoV1 = { user };
+  const body = JSON.stringify(sessionInfo);
+  globalThis.fetch = (input: RequestInfo | URL): Promise<Response> => {
+    const url = extractUrl(input);
+    if (url.includes("/api/auth/me")) {
+      return Promise.resolve(
+        new Response(body, {
+          status: 200,
+          headers: { "Content-Type": "application/json" },
+        }),
+      );
+    }
+    return Promise.resolve(new Response("not stubbed", { status: 404 }));
+  };
 }
 
-function hasSellerCapability(user: Bg1PublicUserV1 | null): boolean {
-  return user?.workspaces.some((w) => w.capabilities.includes("Seller")) ?? false;
+function extractUrl(input: RequestInfo | URL): string {
+  if (typeof input === "string") return input;
+  if (input instanceof URL) return input.toString();
+  if (input instanceof Request) return input.url;
+  return String(input);
 }
+
+interface MountedNavigation {
+  readonly root: Root;
+  readonly container: HTMLElement;
+}
+
+// Mount the real `<SessionProvider><Navigation /></Navigation />`
+// into a fresh JSDOM container, then flush the mount effects inside
+// `act()` so the panel's `aria-expanded` / `data-open` reflect the
+// initial server-rendered state. Returns the root (so callers can
+// unmount) and the container DOM (so assertions can query rendered
+// nodes).
+async function mountNavigation(args: {
+  readonly user: Bg1PublicUserV1 | null;
+}): Promise<MountedNavigation> {
+  mockSessionEndpoint(args.user);
+  const container = document.createElement("div");
+  document.body.appendChild(container);
+  const root = createRoot(container);
+  await act(async () => {
+    root.render(
+      <SessionProvider>
+        <Navigation />
+      </SessionProvider>,
+    );
+    // Drain the microtask queue so SessionProvider's mount effect
+    // (which awaits `fetchSessionInfo`) commits before we return.
+    await Promise.resolve();
+  });
+  return { root, container };
+}
+
+// Per-test teardown. Unmounts the root (so React's event delegation
+// is released and the next test gets a clean tree), wipes the body,
+// and restores `fetch` so a missing reset cannot leak into another
+// test file's process state.
+const mounted: Root[] = [];
+
+afterEach(() => {
+  while (mounted.length > 0) {
+    const root = mounted.pop();
+    if (root) {
+      act(() => {
+        root.unmount();
+      });
+    }
+  }
+  document.body.innerHTML = "";
+  // @ts-expect-error - intentional: restore Node's built-in fetch.
+  delete globalThis.fetch;
+});
 
 // ----------------------------------------------------------------
-// Rendered interaction tests for the mobile-menu state ownership.
+// Runtime interaction tests for the mobile-menu state ownership.
 // ----------------------------------------------------------------
 //
 // The defect we're guarding against: MobileMenuToggle and
 // MobileMenuPanel previously each owned their own useState(false).
 // Clicking the toggle changed the toggle's local `open` but the
 // panel never observed it. The fix lifts the state to Navigation
-// and passes `open` + callbacks to the children. These tests
-// exercise that contract through a controlled harness that owns
-// the same lifted `open` state pattern Navigation uses, and
-// assert the rendered HTML reflects the actual interaction state.
-//
-// Because `renderToStaticMarkup` returns the initial HTML of a
-// render tree, each interaction is verified by re-rendering the
-// harness in the post-interaction state. The "interaction" here
-// is the exact state transition that a real click / Escape /
-// resize produces — the harness's onToggle and onClose callbacks
-// are the same callbacks Navigation wires to the real events.
+// and passes `open` + callbacks to the children. These tests mount
+// the real Navigation, click the real hamburger, dispatch real
+// window events, and observe the real rendered visibility — so a
+// production event-wiring regression fails the suite immediately.
 
-describe("BG4 navigation: mobile-menu state ownership and interaction (rendered)", () => {
-  test("initial aria-expanded is false and the panel is hidden", () => {
-    const harness = mountInteractionHarness({ user: sellerOnlyUser() });
-    assert.ok(
-      harness.html.includes('aria-expanded="false"'),
-      "hamburger must start with aria-expanded=false",
-    );
-    assert.ok(
-      harness.html.includes('data-open="false"'),
-      "panel must start with data-open=false so the close handlers and screen readers see the closed state",
-    );
-    assert.ok(
-      !/class="block md:hidden/.test(harness.html),
-      "panel must NOT carry the open-state `block` class when the menu is closed",
-    );
-  });
+// Helper: query a node by its stable testid; throw if absent so the
+// assertion message names the missing element.
+function requireNode(container: HTMLElement, testid: string): HTMLElement {
+  const node = container.querySelector(`[data-testid="${testid}"]`);
+  assert.ok(
+    node,
+    `expected rendered node with data-testid="${testid}" inside the mounted Navigation`,
+  );
+  return node as HTMLElement;
+}
 
-  test("clicking the hamburger changes aria-expanded to true and the panel becomes visible", () => {
-    const opened = mountInteractionHarness({ user: sellerOnlyUser() }).clickToggle();
-    assert.ok(
-      opened.html.includes('aria-expanded="true"'),
-      "hamburger must flip aria-expanded to true after a click so the panel state stays synchronized with the toggle",
-    );
-    assert.ok(
-      opened.html.includes('data-open="true"'),
-      "panel must flip data-open to true after a click so its visibility matches the toggle",
-    );
-    assert.ok(
-      /class="block md:hidden/.test(opened.html),
-      "panel must carry the open-state `block` class after a click so it actually becomes visible",
-    );
-  });
-
-  test("clicking the hamburger a second time closes the panel and aria-expanded goes back to false", () => {
-    // Open it first (one click) then close it (second click).
-    const closed = mountInteractionHarness({ user: sellerOnlyUser() }).clickToggle().clickToggle();
-    assert.ok(
-      closed.html.includes('aria-expanded="false"'),
-      "hamburger must flip aria-expanded back to false on a second click — this is the BG4 manual-QA finding that the toggle and panel stayed desynced",
-    );
-    assert.ok(
-      closed.html.includes('data-open="false"'),
-      "panel must flip data-open back to false on a second click so the toggle and the panel stay synchronized",
-    );
-    assert.ok(
-      !/class="block md:hidden/.test(closed.html),
-      "panel must NOT carry the open-state `block` class after the second click",
-    );
-  });
-
-  test("selecting a mobile navigation link closes the panel", () => {
-    // Open the panel first (a link click can only fire when open).
-    const closed = mountInteractionHarness({ user: sellerOnlyUser() }).clickToggle().clickLink();
-    assert.ok(
-      closed.html.includes('aria-expanded="false"'),
-      "hamburger aria-expanded must flip to false when a mobile nav link is selected",
-    );
-    assert.ok(
-      closed.html.includes('data-open="false"'),
-      "panel data-open must flip to false when a mobile nav link is selected so the link-click close works",
-    );
-  });
-
-  test("Escape closes the panel", () => {
-    const closed = mountInteractionHarness({ user: sellerOnlyUser() }).clickToggle().pressEscape();
-    assert.ok(
-      closed.html.includes('aria-expanded="false"'),
-      "Escape must flip aria-expanded to false",
-    );
-    assert.ok(
-      closed.html.includes('data-open="false"'),
-      "Escape must flip data-open to false so the panel state stays synchronized with the toggle",
-    );
-  });
-
-  test("desktop breakpoint transition (resize to >=768px) closes the panel", () => {
-    const closed = mountInteractionHarness({ user: sellerOnlyUser() })
-      .clickToggle()
-      .resizeToDesktop();
-    assert.ok(
-      closed.html.includes('data-open="false"'),
-      "resize to >=768px must close the panel so open state does not leak into the desktop layout",
-    );
-    assert.ok(
-      closed.html.includes('aria-expanded="false"'),
-      "resize to >=768px must also flip aria-expanded to false so the hamburger reflects the closed state",
-    );
-  });
-
-  test("signed-out session does NOT render the hamburger", () => {
-    // The hamburger is only rendered when hasMobileDestination is
-    // true. For a signed-out session the boolean is false because
-    // user === null, so the toggle is not rendered at all.
-    const html = renderToStaticMarkup(<MobileBar user={signedOutUser()} />);
-    assert.ok(
-      !html.includes('data-testid="nav-mobile-toggle"'),
+describe("BG4 navigation: real interaction tests mount the production component", () => {
+  test("signed-out session does NOT render the hamburger", async () => {
+    const { root, container } = await mountNavigation({ user: null });
+    mounted.push(root);
+    const hamburger = container.querySelector('[data-testid="nav-mobile-toggle"]');
+    assert.strictEqual(
+      hamburger,
+      null,
       "hamburger MUST NOT render for a signed-out session because there are no capability-gated mobile destinations",
     );
   });
 
-  test("Buyer-capable session renders the hamburger and exposes Buyer mobile links", () => {
-    const barHtml = renderToStaticMarkup(<MobileBar user={buyerOnlyUser()} />);
-    assert.ok(
-      barHtml.includes('data-testid="nav-mobile-toggle"'),
-      "hamburger MUST render for a Buyer-capable session",
+  test("Buyer-capable session renders the hamburger and clicking it reveals Matchmaker (not Seller inbox / Audio samples)", async () => {
+    const { root, container } = await mountNavigation({ user: buyerOnlyUser() });
+    mounted.push(root);
+    const hamburger = requireNode(container, "nav-mobile-toggle");
+    assert.strictEqual(
+      hamburger.getAttribute("aria-expanded"),
+      "false",
+      "hamburger must start with aria-expanded=false",
     );
-    const panelHtml = renderToStaticMarkup(
-      <MobileMenuPanel
-        open
-        onClose={() => {}}
-        user={buyerOnlyUser()}
-        loading={false}
-        hasBuyerWorkspace
-        hasSellerWorkspace={false}
-      />,
-    );
-    assert.ok(
-      panelHtml.includes('data-testid="nav-mobile-matchmaker-link"'),
-      "Buyer mobile panel MUST render the Matchmaker link",
+    act(() => {
+      hamburger.click();
+    });
+    assert.strictEqual(
+      hamburger.getAttribute("aria-expanded"),
+      "true",
+      "clicking the real hamburger must flip aria-expanded to true",
     );
     assert.ok(
-      !panelHtml.includes('data-testid="nav-mobile-seller-requests-link"'),
-      "Buyer-only panel MUST NOT render Seller-only links",
+      container.querySelector('[data-testid="nav-mobile-matchmaker-link"]'),
+      "Buyer panel MUST render the Matchmaker link after open",
     );
-    assert.ok(
-      !panelHtml.includes('data-testid="nav-mobile-audio-samples"'),
+    assert.strictEqual(
+      container.querySelector('[data-testid="nav-mobile-seller-requests-link"]'),
+      null,
+      "Buyer-only panel MUST NOT render Seller inbox",
+    );
+    assert.strictEqual(
+      container.querySelector('[data-testid="nav-mobile-audio-samples"]'),
+      null,
       "Buyer-only panel MUST NOT render the Seller-gated Audio samples link",
     );
   });
 
-  test("Seller-capable session renders the hamburger and exposes Seller mobile links", () => {
-    const barHtml = renderToStaticMarkup(<MobileBar user={sellerOnlyUser()} />);
+  test("Seller-capable session renders the hamburger and clicking it reveals Seller inbox and Audio samples (not Matchmaker)", async () => {
+    const { root, container } = await mountNavigation({ user: sellerOnlyUser() });
+    mounted.push(root);
+    const hamburger = requireNode(container, "nav-mobile-toggle");
+    act(() => {
+      hamburger.click();
+    });
     assert.ok(
-      barHtml.includes('data-testid="nav-mobile-toggle"'),
-      "hamburger MUST render for a Seller-capable session",
-    );
-    const panelHtml = renderToStaticMarkup(
-      <MobileMenuPanel
-        open
-        onClose={() => {}}
-        user={sellerOnlyUser()}
-        loading={false}
-        hasBuyerWorkspace={false}
-        hasSellerWorkspace
-      />,
+      container.querySelector('[data-testid="nav-mobile-seller-requests-link"]'),
+      "Seller panel MUST render the Seller inbox link after open",
     );
     assert.ok(
-      panelHtml.includes('data-testid="nav-mobile-seller-requests-link"'),
-      "Seller mobile panel MUST render the Seller inbox link",
+      container.querySelector('[data-testid="nav-mobile-audio-samples"]'),
+      "Seller panel MUST render the Audio samples link after open",
+    );
+    assert.strictEqual(
+      container.querySelector('[data-testid="nav-mobile-matchmaker-link"]'),
+      null,
+      "Seller-only panel MUST NOT render Buyer-only Matchmaker",
+    );
+  });
+
+  test("initial aria-expanded is false and the panel is hidden", async () => {
+    const { root, container } = await mountNavigation({ user: sellerOnlyUser() });
+    mounted.push(root);
+    const hamburger = requireNode(container, "nav-mobile-toggle");
+    const panel = requireNode(container, "nav-mobile-panel");
+    assert.strictEqual(
+      hamburger.getAttribute("aria-expanded"),
+      "false",
+      "hamburger must start with aria-expanded=false",
+    );
+    assert.strictEqual(
+      panel.getAttribute("data-open"),
+      "false",
+      "panel must start with data-open=false so the close handlers and screen readers see the closed state",
     );
     assert.ok(
-      panelHtml.includes('data-testid="nav-mobile-audio-samples"'),
-      "Seller mobile panel MUST render the Audio samples link",
+      panel.classList.contains("hidden"),
+      "panel must carry the standalone `hidden` class when closed",
     );
     assert.ok(
-      !panelHtml.includes('data-testid="nav-mobile-matchmaker-link"'),
-      "Seller-only panel MUST NOT render Buyer-only links",
+      !panel.classList.contains("block"),
+      "panel must NOT carry the standalone `block` class when closed",
+    );
+  });
+
+  test("clicking the real hamburger changes aria-expanded to true and the panel becomes visible", async () => {
+    const { root, container } = await mountNavigation({ user: sellerOnlyUser() });
+    mounted.push(root);
+    const hamburger = requireNode(container, "nav-mobile-toggle");
+    const panel = requireNode(container, "nav-mobile-panel");
+    act(() => {
+      hamburger.click();
+    });
+    assert.strictEqual(
+      hamburger.getAttribute("aria-expanded"),
+      "true",
+      "hamburger must flip aria-expanded to true after a real click so the panel state stays synchronized with the toggle",
+    );
+    assert.strictEqual(
+      panel.getAttribute("data-open"),
+      "true",
+      "panel must flip data-open to true after a real click so its visibility matches the toggle",
+    );
+    assert.ok(
+      !panel.classList.contains("hidden"),
+      "panel must NOT carry the standalone `hidden` class when open (the `md:hidden` responsive variant is not the same token)",
+    );
+    assert.ok(
+      panel.classList.contains("block"),
+      "panel must carry the standalone `block` class when open so it actually becomes visible",
+    );
+  });
+
+  test("clicking the hamburger a second time closes the panel and aria-expanded goes back to false", async () => {
+    const { root, container } = await mountNavigation({ user: sellerOnlyUser() });
+    mounted.push(root);
+    const hamburger = requireNode(container, "nav-mobile-toggle");
+    const panel = requireNode(container, "nav-mobile-panel");
+    // Open it first (one click) then close it (second click).
+    act(() => {
+      hamburger.click();
+    });
+    assert.strictEqual(
+      hamburger.getAttribute("aria-expanded"),
+      "true",
+      "precondition: first click must open the panel",
+    );
+    act(() => {
+      hamburger.click();
+    });
+    assert.strictEqual(
+      hamburger.getAttribute("aria-expanded"),
+      "false",
+      "second click must flip aria-expanded back to false — this is the BG4 manual-QA finding that the toggle and panel stayed desynced",
+    );
+    assert.strictEqual(
+      panel.getAttribute("data-open"),
+      "false",
+      "second click must flip data-open back to false so the toggle and the panel stay synchronized",
+    );
+    assert.ok(
+      panel.classList.contains("hidden"),
+      "panel must carry the standalone `hidden` class after the second click",
+    );
+  });
+
+  test("clicking a real mobile navigation link closes the panel", async () => {
+    const { root, container } = await mountNavigation({ user: sellerOnlyUser() });
+    mounted.push(root);
+    const hamburger = requireNode(container, "nav-mobile-toggle");
+    const panel = requireNode(container, "nav-mobile-panel");
+    act(() => {
+      hamburger.click();
+    });
+    const link = requireNode(container, "nav-mobile-seller-requests-link");
+    // Clicking the link fires its production `onClick={onClose}`
+    // handler — the same handler that drives the production
+    // panel-close-on-navigation behaviour. We do not call
+    // `preventDefault()` because Next.js Link's own handler does so
+    // before invoking the router; if Next.js's router call throws
+    // (it does, because no router is mounted) the synchronous
+    // `onClose` still ran first.
+    act(() => {
+      try {
+        link.click();
+      } catch {
+        // Next.js Link calls useRouter().push() which fails without
+        // a mounted Next.js router; the production panel's onClose
+        // already executed before that call, so the close assertion
+        // below is the contract we care about.
+      }
+    });
+    assert.strictEqual(
+      hamburger.getAttribute("aria-expanded"),
+      "false",
+      "mobile nav link click must flip aria-expanded to false",
+    );
+    assert.strictEqual(
+      panel.getAttribute("data-open"),
+      "false",
+      "mobile nav link click must flip data-open to false so the link-click close works",
+    );
+  });
+
+  test("Escape closes the panel", async () => {
+    const { root, container } = await mountNavigation({ user: sellerOnlyUser() });
+    mounted.push(root);
+    const hamburger = requireNode(container, "nav-mobile-toggle");
+    const panel = requireNode(container, "nav-mobile-panel");
+    act(() => {
+      hamburger.click();
+    });
+    act(() => {
+      window.dispatchEvent(new KeyboardEvent("keydown", { key: "Escape" }));
+    });
+    assert.strictEqual(
+      hamburger.getAttribute("aria-expanded"),
+      "false",
+      "Escape must flip aria-expanded to false",
+    );
+    assert.strictEqual(
+      panel.getAttribute("data-open"),
+      "false",
+      "Escape must flip data-open to false so the panel state stays synchronized with the toggle",
+    );
+  });
+
+  test("resize to desktop breakpoint (>=768px) closes the panel", async () => {
+    const { root, container } = await mountNavigation({ user: sellerOnlyUser() });
+    mounted.push(root);
+    const hamburger = requireNode(container, "nav-mobile-toggle");
+    const panel = requireNode(container, "nav-mobile-panel");
+    act(() => {
+      hamburger.click();
+    });
+    // JSDOM's default `window.innerWidth` is 1024; dispatching a
+    // resize event fires the production listener and the production
+    // branch `window.innerWidth >= mdBreakpointPx` (768) is true, so
+    // the panel must close.
+    act(() => {
+      window.dispatchEvent(new Event("resize"));
+    });
+    assert.strictEqual(
+      hamburger.getAttribute("aria-expanded"),
+      "false",
+      "resize to >=768px must also flip aria-expanded to false so the hamburger reflects the closed state",
+    );
+    assert.strictEqual(
+      panel.getAttribute("data-open"),
+      "false",
+      "resize to >=768px must close the panel so open state does not leak into the desktop layout",
     );
   });
 });
-
-// ----------------------------------------------------------------
-// Internal test harness components.
-//
-// The harness owns the lifted `open` state with the same shape
-// Navigation uses: a single `useState` shared between the toggle
-// and the panel, callbacks that close on link-click and Escape
-// and resize. By driving this harness with `renderToStaticMarkup`
-// we exercise the same state machine the production component
-// runs in production.
-//
-// `mountInteractionHarness` returns a controller object that
-// records the latest rendered HTML and exposes the same
-// interaction entry points the production component wires:
-//   - `clickToggle()` invokes the toggle's onClick (which calls
-//     onToggle). The harness flips `open` accordingly.
-//   - `pressEscape()` simulates the keydown listener firing on
-//     the window object; the harness calls onClose.
-//   - `resizeToDesktop()` simulates the resize listener firing
-//     on the window object at >=768px; the harness calls onClose.
-//   - `clickLink()` simulates a link's onClick firing; the
-//     harness calls onClose.
-// Each method returns the new HTML, which is what the production
-// component would render after the same event.
-// ----------------------------------------------------------------
-
-interface InteractionHarness {
-  readonly html: string;
-  readonly clickToggle: () => InteractionHarness;
-  readonly pressEscape: () => InteractionHarness;
-  readonly resizeToDesktop: () => InteractionHarness;
-  readonly clickLink: () => InteractionHarness;
-}
-
-function mountInteractionHarness(args: {
-  readonly user: Bg1PublicUserV1 | null;
-}): InteractionHarness {
-  let open = false;
-  let currentHtml = renderToStaticMarkup(<InteractionHarnessView open={false} user={args.user} />);
-
-  function snapshot(next: boolean): InteractionHarness {
-    currentHtml = renderToStaticMarkup(<InteractionHarnessView open={next} user={args.user} />);
-    open = next;
-    return {
-      html: currentHtml,
-      clickToggle: () => snapshot(!open),
-      pressEscape: () => snapshot(false),
-      resizeToDesktop: () => snapshot(false),
-      clickLink: () => snapshot(false),
-    };
-  }
-  return {
-    html: currentHtml,
-    clickToggle: () => snapshot(!open),
-    pressEscape: () => snapshot(false),
-    resizeToDesktop: () => snapshot(false),
-    clickLink: () => snapshot(false),
-  };
-}
-
-function InteractionHarnessView({
-  open,
-  user,
-}: {
-  readonly open: boolean;
-  readonly user: Bg1PublicUserV1 | null;
-}): ReactElement {
-  const onToggle = useCallback(() => {
-    // The harness's setOpen equivalent is applied by the
-    // controller above; this callback is the same closure shape
-    // Navigation wires to the real <button>'s onClick.
-  }, []);
-  const onClose = useCallback(() => {
-    // Same as onToggle: the controller drives the state.
-  }, []);
-  return (
-    <>
-      <MobileMenuToggle open={open} onToggle={onToggle} />
-      <MobileMenuPanel
-        open={open}
-        onClose={onClose}
-        user={user}
-        loading={false}
-        hasBuyerWorkspace={hasBuyerCapability(user)}
-        hasSellerWorkspace={hasSellerCapability(user)}
-      />
-    </>
-  );
-}
-
-// MobileBar mirrors the conditional rendering in `Navigation`: the
-// hamburger is only rendered when the session has at least one
-// capability-gated mobile destination.
-function MobileBar({ user }: { readonly user: Bg1PublicUserV1 | null }): ReactElement {
-  const hasMobileDestination =
-    user !== null && (hasBuyerCapability(user) || hasSellerCapability(user));
-  return (
-    <div className="flex items-center gap-3 md:hidden min-w-0" data-testid="nav-mobile-bar">
-      {hasMobileDestination && <MobileMenuToggle open={false} onToggle={() => {}} />}
-    </div>
-  );
-}
 
 // ----------------------------------------------------------------
 // Source-pattern tests.
@@ -395,7 +460,7 @@ describe("BG4 navigation: mobile-menu state is lifted to Navigation", () => {
     const match = source.match(
       /\/\/ Hamburger button\.[\s\S]*?(?=\n\n\/\/ Stacked mobile panel\.)/,
     );
-    assert.ok(match, "MobileMenuToggle comment block must exist so the body can be anchored");
+    assert.ok(match, "MobileMenuToggle helper must exist so the body can be anchored");
     return match[0];
   }
 
