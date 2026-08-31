@@ -11,6 +11,15 @@
 // narrow viewport never sees Audio samples and cannot navigate to
 // /dashboard/audio by tapping its link.
 //
+// Both surfaces — the desktop row at >=md and the mobile panel
+// below md — render the SAME navigation destinations derived once
+// from the { user, loading } session state. The desktop row maps
+// the destinations inline; the mobile panel maps them too, with
+// the panel-specific close-on-click and the `nav-mobile-` test-id
+// prefix. This keeps capability gating in lock-step: a change to
+// the rules happens in `deriveNavigationDestinations`, not in
+// three scattered places.
+//
 // The shell is responsive:
 //   - mobile (<md): the inline links collapse into a hamburger
 //     menu that opens a stacked panel below the header. The brand
@@ -38,21 +47,83 @@
 // resize-to-desktop, and a per-link click) to that single callback.
 //
 // SessionStatus owns the visible sign-in / sign-out affordance.
-// The Matchmaker, Seller-requests, and Audio-samples links own
-// their own auth-aware visibility because their gating is
-// capability-specific. Routes themselves also enforce server-side
-// authorization (the audio samples page already does), but the
-// client-side gating here is what prevents a signed-out user from
-// ever seeing the link.
+// The Matchmaker, Seller-requests, and Audio-samples entries share
+// one derived destination list so the desktop row, the hamburger
+// visibility, and the mobile panel all read from the same set.
+// Routes themselves also enforce server-side authorization (the
+// audio samples page already does), but the client-side gating
+// here is what prevents a signed-out user from ever seeing the
+// link.
 
 import Link from "next/link";
+import type { Route } from "next";
 import { useCallback, useEffect, useMemo, useState } from "react";
 import type { Bg1PublicUserV1 } from "@soundhub/types";
 import { useSession } from "./SessionProvider";
 import { SessionStatus } from "./SessionStatus";
 
+type NavigationDestination = {
+  readonly href: Route;
+  readonly label: string;
+  readonly testId: string;
+};
+
+// One authoritative derivation: given the current session, produce
+// the navigation destinations the user is eligible to see. Both
+// the desktop row and the mobile panel render from this same set
+// — there is no per-surface recomputation of capability scans, so
+// a regression that drops a capability check cannot surface in
+// only one of the two surfaces.
+//
+// Authorization remains a server / application concern; this is
+// presentation-only narrowing.
+function deriveNavigationDestinations({
+  user,
+  loading,
+}: {
+  readonly user: Bg1PublicUserV1 | null;
+  readonly loading: boolean;
+}): readonly NavigationDestination[] {
+  if (loading || !user) return [];
+  const hasBuyerWorkspace = user.workspaces.some((w) => w.capabilities.includes("Buyer"));
+  const hasSellerWorkspace = user.workspaces.some((w) => w.capabilities.includes("Seller"));
+  // `as const` narrows each href to its literal string type so the
+  // generated Next.js `RouteImpl<string>` accepts it when the
+  // destination is later handed to `<Link>`. Without `as const` the
+  // variable's widened `string` type fails the Link overload.
+  const out: NavigationDestination[] = [];
+  if (hasBuyerWorkspace) {
+    out.push({
+      href: "/matchmaker",
+      label: "Matchmaker",
+      testId: "nav-matchmaker-link",
+    });
+  }
+  if (hasSellerWorkspace) {
+    out.push({
+      href: "/seller-requests",
+      label: "Seller inbox",
+      testId: "nav-seller-requests-link",
+    });
+    out.push({
+      href: "/dashboard/audio",
+      label: "Audio samples",
+      testId: "nav-audio-samples",
+    });
+  }
+  return out;
+}
+
 export function Navigation() {
   const { user, loading } = useSession();
+
+  // Single source of truth for capability-gated navigation. Both
+  // desktop and mobile render from this same list so a change in
+  // capability rules shows up in both surfaces together.
+  const destinations = useMemo(
+    () => deriveNavigationDestinations({ user, loading }),
+    [user, loading],
+  );
 
   // Single source of truth for mobile-menu visibility. Both the
   // hamburger toggle and the panel below the row read this same
@@ -67,24 +138,11 @@ export function Navigation() {
     setOpen(false);
   }, []);
 
-  const hasBuyerWorkspace = useMemo(
-    () => user?.workspaces.some((w) => w.capabilities.includes("Buyer")) ?? false,
-    [user],
-  );
-  const hasSellerWorkspace = useMemo(
-    () => user?.workspaces.some((w) => w.capabilities.includes("Seller")) ?? false,
-    [user],
-  );
-
-  // Hamburger visibility: only render the toggle when the session
-  // has at least one capability-gated mobile navigation
-  // destination. A signed-out session, or a signed-in session whose
-  // Workspaces carry neither Buyer nor Seller capability, renders
-  // no hamburger and no panel — the brand + sign-in/sign-out row
-  // is enough at small widths. Authorization remains a server/
-  // application concern; this is a presentation-only narrowing.
-  const hasMobileDestination =
-    !loading && user !== null && (hasBuyerWorkspace || hasSellerWorkspace);
+  // The hamburger only renders when at least one mobile destination
+  // exists — a signed-out session, or a signed-in session whose
+  // workspaces carry neither Buyer nor Seller capability, renders
+  // no hamburger and no panel.
+  const hasMobileDestination = destinations.length > 0;
 
   return (
     <nav className="bg-white shadow-lg border-b" data-testid="top-nav">
@@ -100,9 +158,16 @@ export function Navigation() {
             </Link>
           </div>
           <div className="hidden md:flex items-center gap-4 min-w-0" data-testid="nav-desktop-row">
-            <SessionAwareMatchmakerLink />
-            <SessionAwareSellerRequestsLink />
-            <SessionAwareAudioSamplesLink />
+            {destinations.map((destination) => (
+              <Link
+                key={destination.href}
+                href={destination.href}
+                className="text-sm font-medium text-gray-700 hover:text-blue-600 transition-colors"
+                data-testid={destination.testId}
+              >
+                {destination.label}
+              </Link>
+            ))}
             <SessionStatus />
           </div>
           <div className="flex items-center gap-3 md:hidden min-w-0" data-testid="nav-mobile-bar">
@@ -110,81 +175,9 @@ export function Navigation() {
             {hasMobileDestination && <MobileMenuToggle open={open} onToggle={onToggle} />}
           </div>
         </div>
-        <MobileMenuPanel
-          open={open}
-          onClose={onClose}
-          user={user}
-          loading={loading}
-          hasBuyerWorkspace={hasBuyerWorkspace}
-          hasSellerWorkspace={hasSellerWorkspace}
-        />
+        <MobileMenuPanel open={open} onClose={onClose} destinations={destinations} />
       </div>
     </nav>
-  );
-}
-
-// Renders the Matchmaker entry only when the signed-in user has at
-// least one Buyer-capable Workspace. The server component shell
-// never emits the link, so unauthenticated visitors and
-// authenticated users without a Buyer Workspace do not see it.
-function SessionAwareMatchmakerLink() {
-  const { user, loading } = useSession();
-  if (loading || !user) return null;
-  const hasBuyerWorkspace = user.workspaces.some((w) => w.capabilities.includes("Buyer"));
-  if (!hasBuyerWorkspace) return null;
-  return (
-    <Link
-      href="/matchmaker"
-      className="text-sm font-medium text-gray-700 hover:text-blue-600 transition-colors"
-      data-testid="nav-matchmaker-link"
-    >
-      Matchmaker
-    </Link>
-  );
-}
-
-// Renders the Seller-requests inbox entry only when the signed-in
-// user has at least one Seller-capable Workspace. Mirrors the
-// Matchmaker gating pattern so a Buyer-only Workspace never sees
-// the inbox link.
-function SessionAwareSellerRequestsLink() {
-  const { user, loading } = useSession();
-  if (loading || !user) return null;
-  const hasSellerWorkspace = user.workspaces.some((w) => w.capabilities.includes("Seller"));
-  if (!hasSellerWorkspace) return null;
-  return (
-    <Link
-      href="/seller-requests"
-      className="text-sm font-medium text-gray-700 hover:text-blue-600 transition-colors"
-      data-testid="nav-seller-requests-link"
-    >
-      Seller inbox
-    </Link>
-  );
-}
-
-// Renders the Audio-samples management entry only when the
-// signed-in user has at least one Seller-capable Workspace. This
-// mirrors the Matchmaker / Seller-requests gating: an
-// unauthenticated visitor never sees the link, and a
-// Buyer-only Workspace never sees the link either. The route
-// itself (apps/web/src/app/dashboard/audio/page.tsx) still
-// re-checks the session and Seller capability server-side, but
-// client-side gating here is the user-facing fix so a signed-out
-// user at 375px never sees an Audio-samples entry they cannot use.
-function SessionAwareAudioSamplesLink() {
-  const { user, loading } = useSession();
-  if (loading || !user) return null;
-  const hasSellerWorkspace = user.workspaces.some((w) => w.capabilities.includes("Seller"));
-  if (!hasSellerWorkspace) return null;
-  return (
-    <Link
-      href="/dashboard/audio"
-      className="text-sm font-medium text-gray-600 hover:text-gray-900 transition-colors"
-      data-testid="nav-audio-samples"
-    >
-      Audio samples
-    </Link>
   );
 }
 
@@ -220,15 +213,12 @@ function MobileMenuToggle({
   );
 }
 
-// Stacked mobile panel. Renders only on small viewports; the
-// desktop row already shows the same links at >=md. The panel
-// reads `open` from the same lifted state as the toggle so its
-// visibility is always synchronized with `aria-expanded`. Each
-// capability-gated link re-runs the same SessionProvider gating
-// logic as the desktop row, so an unauthenticated visitor at a
-// narrow viewport never sees Matchmaker, Seller inbox, or Audio
-// samples — and the panel itself never renders empty link stubs
-// that would otherwise hint at hidden functionality.
+// Stacked mobile panel. Renders the same destination list as the
+// desktop row so capability gating stays in lock-step — no
+// per-surface recomputation, no duplicated Buyer/Seller capability
+// scans. Each link calls onClose so navigation closes the panel.
+// The mobile test ids swap the `nav-` prefix for `nav-mobile-` so
+// `nav-matchmaker-link` becomes `nav-mobile-matchmaker-link`, etc.
 //
 // Close behavior (BG4 manual-QA fix):
 //   - clicking any link inside the panel closes it;
@@ -241,23 +231,12 @@ function MobileMenuToggle({
 function MobileMenuPanel({
   open,
   onClose,
-  user,
-  loading,
-  hasBuyerWorkspace,
-  hasSellerWorkspace,
+  destinations,
 }: {
   readonly open: boolean;
   readonly onClose: () => void;
-  readonly user: Bg1PublicUserV1 | null;
-  readonly loading: boolean;
-  readonly hasBuyerWorkspace: boolean;
-  readonly hasSellerWorkspace: boolean;
+  readonly destinations: readonly NavigationDestination[];
 }) {
-  // The session-derived `user` and `loading` are passed as props
-  // so the panel renders the same way whether invoked from
-  // `Navigation` or from a controlled test harness — the panel
-  // remains a pure presentational component over its props.
-
   // Close on Escape so keyboard users can dismiss the menu without
   // reaching for the toggle.
   useEffect(() => {
@@ -290,12 +269,6 @@ function MobileMenuPanel({
     };
   }, [onClose]);
 
-  // Render an empty panel fragment when the session has no
-  // capability-gated mobile destinations — even with `open=true`
-  // there are no links to display. The toggle itself is hidden by
-  // the parent's `hasMobileDestination` guard, so this path is
-  // only reached when the panel is opened via Escape/resize
-  // racing a sign-out. Closing via onClose() still runs.
   return (
     <div
       id="nav-mobile-panel"
@@ -304,36 +277,17 @@ function MobileMenuPanel({
       data-open={open ? "true" : "false"}
     >
       <div className="flex flex-col gap-1">
-        {!loading && user && hasBuyerWorkspace && (
+        {destinations.map((destination) => (
           <Link
-            href="/matchmaker"
+            key={destination.href}
+            href={destination.href}
             onClick={onClose}
             className="block px-2 py-2 rounded-md text-sm font-medium text-gray-700 hover:bg-gray-100"
-            data-testid="nav-mobile-matchmaker-link"
+            data-testid={`nav-mobile-${destination.testId.slice("nav-".length)}`}
           >
-            Matchmaker
+            {destination.label}
           </Link>
-        )}
-        {!loading && user && hasSellerWorkspace && (
-          <Link
-            href="/seller-requests"
-            onClick={onClose}
-            className="block px-2 py-2 rounded-md text-sm font-medium text-gray-700 hover:bg-gray-100"
-            data-testid="nav-mobile-seller-requests-link"
-          >
-            Seller inbox
-          </Link>
-        )}
-        {!loading && user && hasSellerWorkspace && (
-          <Link
-            href="/dashboard/audio"
-            onClick={onClose}
-            className="block px-2 py-2 rounded-md text-sm font-medium text-gray-700 hover:bg-gray-100"
-            data-testid="nav-mobile-audio-samples"
-          >
-            Audio samples
-          </Link>
-        )}
+        ))}
       </div>
     </div>
   );

@@ -10,49 +10,36 @@
 //   3. The mobile hamburger menu did not open when clicked — the
 //      toggle and the panel each owned separate useState instances
 //      so the panel never observed the toggle's state changes.
-//      (Addressed in this file.)
 //   4. The seller inbox rows prominently exposed raw internal ids
 //      instead of human-readable context (covered by
 //      `seller-requests/page.test.tsx`).
 //
-// Finding #3 — the mobile-menu state ownership defect — is pinned by
-// two complementary layers in this file:
+// Finding #3 — the mobile-menu state ownership defect — is pinned
+// here by mounting the real `<Navigation />` inside the real
+// `<SessionProvider />` through `react-dom/client` + `act()`. The
+// tests drive the production hamburger's actual `onClick`,
+// dispatch real `keydown` and `resize` events on the JSDOM `window`,
+// click a real mobile `<a>`, and assert on the production panel's
+// actual rendered visibility. A deliberate break between the
+// production toggle and panel makes the click-open test fail;
+// restored wiring passes every case. This is the runtime contract
+// for the BG4 mobile-menu fix.
 //
-//   - **Runtime interaction tests** mount the real `<Navigation />`
-//     inside the real `<SessionProvider />` through
-//     `react-dom/client` + `act()`. They drive the production
-//     hamburger's actual `onClick`, dispatch real `keydown` and
-//     `resize` events on the JSDOM `window`, click a real mobile
-//     `<a>`, and assert on the production panel's actual rendered
-//     visibility. A deliberate break between the production toggle
-//     and panel makes the click-open test fail; restored wiring
-//     passes every case. This is the runtime contract for the BG4
-//     mobile-menu fix.
-//
-//   - **Source-pattern tests** pin the structural invariants
-//     (lifted state, capability-gated desktop helpers, responsive
-//     class layout, overflow guard) so a refactor that re-introduces
-//     the original defect — by giving the toggle or the panel its
-//     own `useState(false)` — fails the suite immediately, even
-//     before the runtime tests run.
+// Capability-gating behavior (signed-out, Buyer-only, Seller-only,
+// mixed-capability, no-capability) is also pinned from the same
+// runtime seam so the destinations one Navigation derives are
+// rendered identically in the desktop row and the mobile panel.
 //
 // The runtime contract for the auth-aware gating is also covered by
 // `SessionProvider.test.tsx`.
 
 import assert from "node:assert/strict";
-import { readFileSync } from "node:fs";
 import { afterEach, describe, test } from "node:test";
 import { act } from "react";
 import { createRoot, type Root } from "react-dom/client";
 import type { Bg1PublicUserV1, Bg1SessionInfoV1 } from "@soundhub/types";
 import { SessionProvider } from "./SessionProvider";
 import { Navigation } from "./Navigation";
-
-const repoRoot = `${new URL("../../../../", import.meta.url).pathname}web`;
-
-function readNavigation(): string {
-  return readFileSync(`${repoRoot}/src/app/components/Navigation.tsx`, "utf8");
-}
 
 // Stable session fixtures. The fields are minimal-but-valid for the
 // public schema; only the ones the navigation reads are populated.
@@ -94,13 +81,55 @@ function sellerOnlyUser(): Bg1PublicUserV1 {
   };
 }
 
+// A user whose single Workspace carries BOTH Buyer and Seller
+// capabilities. Every gated destination should render in both the
+// desktop row and the mobile panel for this session.
+function mixedCapabilityUser(): Bg1PublicUserV1 {
+  return {
+    userAccountId: "u-mixed",
+    email: "mixed@example.test",
+    displayName: "Mixed User",
+    identityProvider: "dev",
+    workspaces: [
+      {
+        workspaceId: "ws-mixed",
+        slug: "mixed-studio",
+        name: "Mixed Studio",
+        workspaceType: "Personal",
+        workspaceStatus: "Active",
+        capabilities: ["Buyer", "Seller"],
+      },
+    ],
+  };
+}
+
+// A signed-in user whose workspaces carry neither Buyer nor Seller
+// capability. The session is authenticated, but no gated
+// destination is eligible, so the hamburger MUST stay hidden and
+// neither desktop nor mobile should render any gated link.
+function noCapabilityUser(): Bg1PublicUserV1 {
+  return {
+    userAccountId: "u-nocap",
+    email: "nocap@example.test",
+    displayName: "No-Capability User",
+    identityProvider: "dev",
+    workspaces: [
+      {
+        workspaceId: "ws-nocap",
+        slug: "nocap-studio",
+        name: "No-Capability Studio",
+        workspaceType: "Personal",
+        workspaceStatus: "Active",
+        capabilities: [],
+      },
+    ],
+  };
+}
+
 // Stub `globalThis.fetch` so the real `<SessionProvider />`'s mount
-// effect resolves with the chosen user. This is the minimum external
-// dependency the user explicitly called out — the existing session
-// context/API seam — and avoids reproducing session state inside the
-// test. Any URL the SessionProvider does not fetch is rejected with a
-// 404 so a test that inadvertently exercises another endpoint fails
-// loudly.
+// effect resolves with the chosen user. Any URL the SessionProvider
+// does not fetch is rejected with a 404 so a test that
+// inadvertently exercises another endpoint fails loudly.
 function mockSessionEndpoint(user: Bg1PublicUserV1 | null): void {
   const sessionInfo: Bg1SessionInfoV1 = { user };
   const body = JSON.stringify(sessionInfo);
@@ -177,17 +206,16 @@ afterEach(() => {
 });
 
 // ----------------------------------------------------------------
-// Runtime interaction tests for the mobile-menu state ownership.
-// ----------------------------------------------------------------
+// Capability-gating behavior.
 //
-// The defect we're guarding against: MobileMenuToggle and
-// MobileMenuPanel previously each owned their own useState(false).
-// Clicking the toggle changed the toggle's local `open` but the
-// panel never observed it. The fix lifts the state to Navigation
-// and passes `open` + callbacks to the children. These tests mount
-// the real Navigation, click the real hamburger, dispatch real
-// window events, and observe the real rendered visibility — so a
-// production event-wiring regression fails the suite immediately.
+// The desktop row, the hamburger, and the mobile panel all derive
+// from one navigation-destination set built in Navigation. Each
+// test below mounts the real production component and asserts on
+// the actual rendered DOM — no source-pattern matching, no
+// implementation-detail scans. The fixtures cover every relevant
+// session shape so a regression that drops a capability check or
+// duplicates one into only one surface fails the suite.
+// ----------------------------------------------------------------
 
 // Helper: query a node by its stable testid; throw if absent so the
 // assertion message names the missing element.
@@ -200,73 +228,202 @@ function requireNode(container: HTMLElement, testid: string): HTMLElement {
   return node as HTMLElement;
 }
 
-describe("BG4 navigation: real interaction tests mount the production component", () => {
-  test("signed-out session does NOT render the hamburger", async () => {
+describe("BG4 navigation: capability gating (desktop + mobile share one destination set)", () => {
+  test("signed-out session exposes no capability-gated navigation anywhere", async () => {
     const { root, container } = await mountNavigation({ user: null });
     mounted.push(root);
-    const hamburger = container.querySelector('[data-testid="nav-mobile-toggle"]');
+    // No hamburger.
     assert.strictEqual(
-      hamburger,
+      container.querySelector('[data-testid="nav-mobile-toggle"]'),
       null,
-      "hamburger MUST NOT render for a signed-out session because there are no capability-gated mobile destinations",
+      "signed-out session MUST NOT render the hamburger because there are no gated mobile destinations",
+    );
+    // No panel.
+    assert.strictEqual(
+      container.querySelector('[data-testid="nav-mobile-panel"]'),
+      null,
+      "signed-out session MUST NOT render the mobile panel because there is nothing to navigate to",
+    );
+    // No desktop gated links.
+    assert.strictEqual(
+      container.querySelector('[data-testid="nav-matchmaker-link"]'),
+      null,
+      "signed-out session MUST NOT render the Matchmaker desktop link",
+    );
+    assert.strictEqual(
+      container.querySelector('[data-testid="nav-seller-requests-link"]'),
+      null,
+      "signed-out session MUST NOT render the Seller inbox desktop link",
+    );
+    assert.strictEqual(
+      container.querySelector('[data-testid="nav-audio-samples"]'),
+      null,
+      "signed-out session MUST NOT render the Audio samples desktop link",
     );
   });
 
-  test("Buyer-capable session renders the hamburger and clicking it reveals Matchmaker (not Seller inbox / Audio samples)", async () => {
+  test("Buyer-only session exposes Matchmaker in the desktop row and the mobile panel", async () => {
     const { root, container } = await mountNavigation({ user: buyerOnlyUser() });
     mounted.push(root);
-    const hamburger = requireNode(container, "nav-mobile-toggle");
-    assert.strictEqual(
-      hamburger.getAttribute("aria-expanded"),
-      "false",
-      "hamburger must start with aria-expanded=false",
+    // Desktop.
+    assert.ok(
+      container.querySelector('[data-testid="nav-matchmaker-link"]'),
+      "Buyer-only desktop row MUST render the Matchmaker link",
     );
+    assert.strictEqual(
+      container.querySelector('[data-testid="nav-seller-requests-link"]'),
+      null,
+      "Buyer-only desktop row MUST NOT render the Seller inbox link",
+    );
+    assert.strictEqual(
+      container.querySelector('[data-testid="nav-audio-samples"]'),
+      null,
+      "Buyer-only desktop row MUST NOT render the Audio samples link",
+    );
+    // Mobile: open the panel and check its contents.
+    const hamburger = requireNode(container, "nav-mobile-toggle");
     act(() => {
       hamburger.click();
     });
-    assert.strictEqual(
-      hamburger.getAttribute("aria-expanded"),
-      "true",
-      "clicking the real hamburger must flip aria-expanded to true",
-    );
     assert.ok(
       container.querySelector('[data-testid="nav-mobile-matchmaker-link"]'),
-      "Buyer panel MUST render the Matchmaker link after open",
+      "Buyer-only mobile panel MUST render the Matchmaker link",
     );
     assert.strictEqual(
       container.querySelector('[data-testid="nav-mobile-seller-requests-link"]'),
       null,
-      "Buyer-only panel MUST NOT render Seller inbox",
+      "Buyer-only mobile panel MUST NOT render the Seller inbox link",
     );
     assert.strictEqual(
       container.querySelector('[data-testid="nav-mobile-audio-samples"]'),
       null,
-      "Buyer-only panel MUST NOT render the Seller-gated Audio samples link",
+      "Buyer-only mobile panel MUST NOT render the Audio samples link",
     );
   });
 
-  test("Seller-capable session renders the hamburger and clicking it reveals Seller inbox and Audio samples (not Matchmaker)", async () => {
+  test("Seller-only session exposes Seller inbox and Audio samples in the desktop row and the mobile panel", async () => {
     const { root, container } = await mountNavigation({ user: sellerOnlyUser() });
     mounted.push(root);
+    // Desktop.
+    assert.strictEqual(
+      container.querySelector('[data-testid="nav-matchmaker-link"]'),
+      null,
+      "Seller-only desktop row MUST NOT render the Matchmaker link",
+    );
+    assert.ok(
+      container.querySelector('[data-testid="nav-seller-requests-link"]'),
+      "Seller-only desktop row MUST render the Seller inbox link",
+    );
+    assert.ok(
+      container.querySelector('[data-testid="nav-audio-samples"]'),
+      "Seller-only desktop row MUST render the Audio samples link",
+    );
+    // Mobile.
+    const hamburger = requireNode(container, "nav-mobile-toggle");
+    act(() => {
+      hamburger.click();
+    });
+    assert.strictEqual(
+      container.querySelector('[data-testid="nav-mobile-matchmaker-link"]'),
+      null,
+      "Seller-only mobile panel MUST NOT render the Matchmaker link",
+    );
+    assert.ok(
+      container.querySelector('[data-testid="nav-mobile-seller-requests-link"]'),
+      "Seller-only mobile panel MUST render the Seller inbox link",
+    );
+    assert.ok(
+      container.querySelector('[data-testid="nav-mobile-audio-samples"]'),
+      "Seller-only mobile panel MUST render the Audio samples link",
+    );
+  });
+
+  test("mixed-capability session exposes every eligible destination in both the desktop row and the mobile panel", async () => {
+    const { root, container } = await mountNavigation({ user: mixedCapabilityUser() });
+    mounted.push(root);
+    // Desktop — all three gated destinations render.
+    assert.ok(
+      container.querySelector('[data-testid="nav-matchmaker-link"]'),
+      "mixed-capability desktop row MUST render the Matchmaker link",
+    );
+    assert.ok(
+      container.querySelector('[data-testid="nav-seller-requests-link"]'),
+      "mixed-capability desktop row MUST render the Seller inbox link",
+    );
+    assert.ok(
+      container.querySelector('[data-testid="nav-audio-samples"]'),
+      "mixed-capability desktop row MUST render the Audio samples link",
+    );
+    // Mobile — same three render after the hamburger opens the panel.
     const hamburger = requireNode(container, "nav-mobile-toggle");
     act(() => {
       hamburger.click();
     });
     assert.ok(
+      container.querySelector('[data-testid="nav-mobile-matchmaker-link"]'),
+      "mixed-capability mobile panel MUST render the Matchmaker link",
+    );
+    assert.ok(
       container.querySelector('[data-testid="nav-mobile-seller-requests-link"]'),
-      "Seller panel MUST render the Seller inbox link after open",
+      "mixed-capability mobile panel MUST render the Seller inbox link",
     );
     assert.ok(
       container.querySelector('[data-testid="nav-mobile-audio-samples"]'),
-      "Seller panel MUST render the Audio samples link after open",
-    );
-    assert.strictEqual(
-      container.querySelector('[data-testid="nav-mobile-matchmaker-link"]'),
-      null,
-      "Seller-only panel MUST NOT render Buyer-only Matchmaker",
+      "mixed-capability mobile panel MUST render the Audio samples link",
     );
   });
 
+  test("signed-in but no-capability session exposes no gated navigation in either surface", async () => {
+    const { root, container } = await mountNavigation({ user: noCapabilityUser() });
+    mounted.push(root);
+    // No hamburger — the session is authenticated but no gated
+    // destination is eligible, so the hamburger must stay hidden
+    // (a regression that re-routes the gating through sign-out
+    // alone would let the hamburger appear for an authenticated
+    // user whose Workspaces carry neither capability).
+    assert.strictEqual(
+      container.querySelector('[data-testid="nav-mobile-toggle"]'),
+      null,
+      "no-capability session MUST NOT render the hamburger because no mobile destination is eligible",
+    );
+    assert.strictEqual(
+      container.querySelector('[data-testid="nav-mobile-panel"]'),
+      null,
+      "no-capability session MUST NOT render the mobile panel because there is nothing to navigate to",
+    );
+    // No desktop gated links.
+    assert.strictEqual(
+      container.querySelector('[data-testid="nav-matchmaker-link"]'),
+      null,
+      "no-capability desktop row MUST NOT render the Matchmaker link",
+    );
+    assert.strictEqual(
+      container.querySelector('[data-testid="nav-seller-requests-link"]'),
+      null,
+      "no-capability desktop row MUST NOT render the Seller inbox link",
+    );
+    assert.strictEqual(
+      container.querySelector('[data-testid="nav-audio-samples"]'),
+      null,
+      "no-capability desktop row MUST NOT render the Audio samples link",
+    );
+  });
+});
+
+// ----------------------------------------------------------------
+// Mobile-menu state ownership behavior.
+//
+// The defect we're guarding against: MobileMenuToggle and
+// MobileMenuPanel previously each owned their own useState(false).
+// Clicking the toggle changed the toggle's local `open` but the
+// panel never observed it. The fix lifts the state to Navigation
+// and passes `open` + callbacks to the children. These tests mount
+// the real Navigation, click the real hamburger, dispatch real
+// window events, and observe the real rendered visibility — so a
+// production event-wiring regression fails the suite immediately.
+// ----------------------------------------------------------------
+
+describe("BG4 navigation: mobile-menu state is lifted to Navigation", () => {
   test("initial aria-expanded is false and the panel is hidden", async () => {
     const { root, container } = await mountNavigation({ user: sellerOnlyUser() });
     mounted.push(root);
@@ -438,268 +595,6 @@ describe("BG4 navigation: real interaction tests mount the production component"
       panel.getAttribute("data-open"),
       "false",
       "resize to >=768px must close the panel so open state does not leak into the desktop layout",
-    );
-  });
-});
-
-// ----------------------------------------------------------------
-// Source-pattern tests.
-// ----------------------------------------------------------------
-
-describe("BG4 navigation: mobile-menu state is lifted to Navigation", () => {
-  // Extract the body of a helper by anchoring on the file-level
-  // section header that precedes it. The header comment block is
-  // stable across refactors and avoids the brittle `}`-matching
-  // approach (the function props type also contains braces).
-  function panelBody(source: string): string {
-    const match = source.match(/\/\/ Stacked mobile panel\.[\s\S]*?(?=\n\n\/\/ Tailwind's)/);
-    assert.ok(match, "MobileMenuPanel comment block must exist so the body can be anchored");
-    return match[0];
-  }
-  function toggleBody(source: string): string {
-    const match = source.match(
-      /\/\/ Hamburger button\.[\s\S]*?(?=\n\n\/\/ Stacked mobile panel\.)/,
-    );
-    assert.ok(match, "MobileMenuToggle helper must exist so the body can be anchored");
-    return match[0];
-  }
-
-  test("Navigation owns the single useState for the mobile menu", () => {
-    const source = readNavigation();
-    assert.ok(toggleBody(source), "MobileMenuToggle helper must exist");
-    assert.ok(panelBody(source), "MobileMenuPanel helper must exist");
-    assert.ok(
-      !/useState\s*\(/.test(toggleBody(source)),
-      "MobileMenuToggle MUST NOT own its own useState — the state must be lifted to Navigation so a click on the toggle is observed by the panel",
-    );
-    assert.ok(
-      !/useState\s*\(/.test(panelBody(source)),
-      "MobileMenuPanel MUST NOT own its own useState — the state must be lifted to Navigation so a click on the toggle is observed by the panel",
-    );
-    assert.ok(
-      /export function Navigation[\s\S]*?useState\(false\)/.test(source),
-      "Navigation MUST own the single useState for the mobile-menu open flag",
-    );
-  });
-
-  test("MobileMenuToggle receives open and onToggle as props from Navigation", () => {
-    const source = readNavigation();
-    assert.match(
-      source,
-      /<MobileMenuToggle\s+open=\{open\}\s+onToggle=\{onToggle\}\s*\/>/,
-      "Navigation MUST pass open and onToggle to MobileMenuToggle so the toggle reads the lifted state",
-    );
-  });
-
-  test("MobileMenuPanel receives open and onClose as props from Navigation", () => {
-    const source = readNavigation();
-    assert.match(
-      source,
-      /<MobileMenuPanel[\s\S]*?open=\{open\}[\s\S]*?onClose=\{onClose\}[\s\S]*?\/>/,
-      "Navigation MUST pass open and onClose to MobileMenuPanel so the panel reads the lifted state",
-    );
-  });
-
-  test("MobileMenuPanel closes on Escape via a window keydown listener", () => {
-    const source = readNavigation();
-    const body = panelBody(source);
-    assert.ok(
-      /addEventListener\(\s*["']keydown["']/.test(body),
-      "MobileMenuPanel MUST register a window keydown listener to close on Escape",
-    );
-    assert.ok(
-      /event\.key\s*===\s*["']Escape["']/.test(body),
-      "MobileMenuPanel MUST branch on event.key === 'Escape'",
-    );
-    assert.ok(
-      /onClose\s*\(\s*\)/.test(body),
-      "MobileMenuPanel MUST call onClose() when Escape is pressed",
-    );
-  });
-
-  test("MobileMenuPanel closes on resize to >=md breakpoint", () => {
-    const source = readNavigation();
-    const body = panelBody(source);
-    assert.ok(
-      /addEventListener\(\s*["']resize["']/.test(body),
-      "MobileMenuPanel MUST register a window resize listener",
-    );
-    assert.ok(
-      /window\.innerWidth\s*>=\s*mdBreakpointPx/.test(body),
-      "MobileMenuPanel MUST call onClose() when the viewport reaches the desktop breakpoint",
-    );
-  });
-
-  test("MobileMenuPanel links call onClose on click", () => {
-    const source = readNavigation();
-    const body = panelBody(source);
-    // The panel renders <Link>...</Link> elements (not self-closing),
-    // so the regex matches an opening <Link ... > and any following
-    // attributes until the closing </Link>.
-    const linkMatches = body.match(/<Link\b[\s\S]*?<\/Link>/g) ?? [];
-    assert.ok(linkMatches.length >= 3, "panel must render at least three capability-gated links");
-    for (const link of linkMatches) {
-      assert.match(
-        link,
-        /onClick=\{onClose\}/,
-        "every Link inside MobileMenuPanel MUST call onClose on click so the panel closes after navigation",
-      );
-    }
-  });
-});
-
-describe("BG4 navigation: hamburger is hidden when no capability-gated mobile destination exists", () => {
-  test("hamburger is conditionally rendered based on hasMobileDestination", () => {
-    const source = readNavigation();
-    assert.match(
-      source,
-      /hasMobileDestination\s*&&\s*<MobileMenuToggle/,
-      "MobileMenuToggle MUST be rendered only when hasMobileDestination is true so signed-out sessions never see the hamburger",
-    );
-    assert.match(
-      source,
-      /hasMobileDestination\s*=\s*!loading\s*&&\s*user\s*!==\s*null\s*&&\s*\(hasBuyerWorkspace\s*\|\|\s*hasSellerWorkspace\)/,
-      "Navigation MUST define hasMobileDestination as the conjunction of !loading, signed-in, and Buyer|Seller capability so the hamburger is gated correctly",
-    );
-  });
-});
-
-describe("BG4 navigation: Audio samples capability gating", () => {
-  test("Audio samples link is wired through a capability-gated helper, NOT a plain Link", () => {
-    const source = readNavigation();
-    assert.match(
-      source,
-      /function SessionAwareAudioSamplesLink/,
-      "navigation MUST define a SessionAwareAudioSamplesLink helper so the Audio samples entry is capability-gated",
-    );
-    assert.match(
-      source,
-      /data-testid="nav-audio-samples"/,
-      "Audio samples link MUST keep the existing data-testid for the search-page embedding",
-    );
-    const sessionAwareHelper = source.match(/function SessionAwareAudioSamplesLink[\s\S]*?\n\}/);
-    assert.ok(sessionAwareHelper, "SessionAwareAudioSamplesLink helper body must be present");
-    assert.match(
-      sessionAwareHelper[0],
-      /href="\/dashboard\/audio"/,
-      "Audio samples link MUST be rendered from inside the capability-gated helper",
-    );
-    assert.match(
-      sessionAwareHelper[0],
-      /capabilities\.includes\("Seller"\)/,
-      "SessionAwareAudioSamplesLink MUST gate on the Seller capability",
-    );
-  });
-
-  test("Audio samples helper returns null for unauthenticated visitors and for non-Seller Workspaces", () => {
-    const source = readNavigation();
-    const sessionAwareHelper = source.match(/function SessionAwareAudioSamplesLink[\s\S]*?\n\}/);
-    assert.ok(sessionAwareHelper, "SessionAwareAudioSamplesLink helper body must be present");
-    assert.match(
-      sessionAwareHelper[0],
-      /loading\s*\|\|[\s\S]*!user/,
-      "SessionAwareAudioSamplesLink MUST short-circuit to null when the session is loading or the user is unauthenticated",
-    );
-    assert.match(
-      sessionAwareHelper[0],
-      /hasSellerWorkspace/,
-      "SessionAwareAudioSamplesLink MUST check for at least one Seller-capable Workspace",
-    );
-    assert.match(
-      sessionAwareHelper[0],
-      /if\s*\(!hasSellerWorkspace\)\s*return\s*null/,
-      "SessionAwareAudioSamplesLink MUST return null when no Workspace carries the Seller capability",
-    );
-  });
-
-  test("Mobile panel mirrors the capability gating for Audio samples (no fallback to a plain Link)", () => {
-    const source = readNavigation();
-    assert.match(
-      source,
-      /nav-mobile-audio-samples/,
-      "mobile menu MUST have a dedicated nav-mobile-audio-samples test id so the gated entry can be asserted",
-    );
-    const mobilePanel = source.match(/\/\/ Stacked mobile panel\.[\s\S]*?(?=\n\n\/\/ Tailwind's)/);
-    assert.ok(mobilePanel, "MobileMenuPanel helper must be present");
-    assert.match(
-      mobilePanel[0],
-      /hasSellerWorkspace\s*&&/,
-      "MobileMenuPanel MUST gate Audio samples on hasSellerWorkspace",
-    );
-  });
-});
-
-describe("BG4 navigation: responsive layout (mobile / tablet / desktop)", () => {
-  test("navigation contains a desktop row and a mobile bar, both gated on Tailwind breakpoints", () => {
-    const source = readNavigation();
-    assert.match(
-      source,
-      /hidden md:flex[^"]*"[^>]*data-testid="nav-desktop-row"/,
-      "desktop row MUST carry the `hidden md:flex` classes so it is hidden below md and visible at md+",
-    );
-    assert.match(
-      source,
-      /data-testid="nav-desktop-row"/,
-      "desktop row MUST keep its stable test id",
-    );
-    assert.match(
-      source,
-      /md:hidden/,
-      "mobile bar / toggle MUST carry the `md:hidden` class so it is hidden at md+",
-    );
-    assert.match(
-      source,
-      /data-testid="nav-mobile-toggle"/,
-      "navigation MUST render a hamburger toggle for mobile viewports",
-    );
-    assert.match(
-      source,
-      /aria-expanded=\{open\}/,
-      "hamburger toggle MUST advertise its expanded state to assistive tech",
-    );
-    assert.match(
-      source,
-      /data-testid="nav-mobile-panel"/,
-      "navigation MUST render the mobile panel that the toggle controls",
-    );
-    assert.match(
-      source,
-      /aria-controls="nav-mobile-panel"/,
-      "hamburger MUST declare aria-controls='nav-mobile-panel' so the panel id relationship is preserved after the state-lift",
-    );
-  });
-
-  test("navigation prevents horizontal overflow at narrow viewports (min-w-0 / truncate / overflow-x-hidden)", () => {
-    const source = readNavigation();
-    assert.match(source, /min-w-0/, "navigation MUST use min-w-0 on flex children");
-    assert.match(source, /truncate/, "navigation MUST use `truncate` on the brand text");
-  });
-
-  test("SessionStatus truncates the email at narrow widths so a long address cannot push the viewport wider", () => {
-    const source = readFileSync(`${repoRoot}/src/app/components/SessionStatus.tsx`, "utf8");
-    assert.match(
-      source,
-      /hidden sm:inline/,
-      "SessionStatus MUST hide the email below sm (640px) so a long address cannot push the viewport wider",
-    );
-    assert.match(
-      source,
-      /truncate max-w-/,
-      "SessionStatus MUST truncate the email at sm+ widths with a bounded max-width",
-    );
-    assert.match(
-      source,
-      /whitespace-nowrap/,
-      "SessionStatus MUST keep the sign-in / sign-out labels on a single line so they remain tappable at any width",
-    );
-  });
-
-  test("global stylesheet prevents page-level horizontal overflow", () => {
-    const source = readFileSync(`${repoRoot}/src/app/globals.css`, "utf8");
-    assert.match(
-      source,
-      /overflow-x:\s*hidden/,
-      "globals.css MUST apply overflow-x:hidden to html and body as a defense in depth",
     );
   });
 });
