@@ -328,12 +328,21 @@ describe("ProjectRequest route contract", () => {
 
   test("GET /api/project-requests returns the listed rows scoped to the acting workspace", async () => {
     const response = await request(app).get(
-      `/api/project-requests?actingWorkspaceId=${BUYER_WORKSPACE_ID}&status=Pending`,
+      `/api/project-requests?actingWorkspaceId=${BUYER_WORKSPACE_ID}&statusFilter=Pending`,
     );
     assert.equal(response.status, 200);
     const parsed = listProjectRequestsResponseV1Schema.safeParse(response.body);
     assert.equal(parsed.success, true);
     assert.equal(pr.listCalls.length, 1);
+    // The handler must surface the filter verbatim to the service so
+    // the seller inbox can scope to Pending. The contract pins the
+    // field name as `statusFilter`; any drift from this point would
+    // silently break the seller inbox.
+    assert.deepEqual(pr.listCalls.at(-1), {
+      userAccountId: BUYER_USER_ID,
+      actingWorkspaceId: BUYER_WORKSPACE_ID,
+      statusFilter: "Pending",
+    });
   });
 
   test("GET /api/project-requests/:id returns one request for a member", async () => {
@@ -375,7 +384,7 @@ describe("ProjectRequest route contract", () => {
     FakeProjectRequestService.NEXT_LIST_REJECTION = "NOT_A_MEMBER";
     try {
       const response = await request(app).get(
-        `/api/project-requests?actingWorkspaceId=${BUYER_WORKSPACE_ID}&status=Pending`,
+        `/api/project-requests?actingWorkspaceId=${BUYER_WORKSPACE_ID}&statusFilter=Pending`,
       );
       assert.equal(response.status, 404);
       assert.equal(
@@ -385,6 +394,126 @@ describe("ProjectRequest route contract", () => {
     } finally {
       FakeProjectRequestService.NEXT_LIST_REJECTION = "OK";
     }
+  });
+
+  // The shared `listProjectRequestsRequestV1Schema` declares the
+  // query field as `statusFilter`. The route must accept each
+  // closed enum value, surface the filter verbatim to the service,
+  // and reject any value outside the enum with the safe envelope.
+  // These tests pin the contract end-to-end through the Express
+  // pipeline so the route cannot drift from the shared schema.
+  describe("GET /api/project-requests statusFilter", () => {
+    // Helper: capture the last service call and reset before each
+    // assertion so individual cases stay independent.
+    function lastListCall(): Record<string, unknown> {
+      const calls = pr.listCalls as ReadonlyArray<Record<string, unknown>>;
+      assert.ok(calls.length > 0, "expected at least one listProjectRequests call");
+      return calls[calls.length - 1] as Record<string, unknown>;
+    }
+
+    test("statusFilter=Pending scopes the list to Pending", async () => {
+      const before = pr.listCalls.length;
+      const response = await request(app).get(
+        `/api/project-requests?actingWorkspaceId=${BUYER_WORKSPACE_ID}&statusFilter=Pending`,
+      );
+      assert.equal(response.status, 200);
+      assert.deepEqual(lastListCall(), {
+        userAccountId: BUYER_USER_ID,
+        actingWorkspaceId: BUYER_WORKSPACE_ID,
+        statusFilter: "Pending",
+      });
+      assert.equal(pr.listCalls.length, before + 1);
+    });
+
+    test("statusFilter=Accepted scopes the list to Accepted", async () => {
+      const before = pr.listCalls.length;
+      const response = await request(app).get(
+        `/api/project-requests?actingWorkspaceId=${BUYER_WORKSPACE_ID}&statusFilter=Accepted`,
+      );
+      assert.equal(response.status, 200);
+      assert.deepEqual(lastListCall(), {
+        userAccountId: BUYER_USER_ID,
+        actingWorkspaceId: BUYER_WORKSPACE_ID,
+        statusFilter: "Accepted",
+      });
+      assert.equal(pr.listCalls.length, before + 1);
+    });
+
+    test("statusFilter=Declined scopes the list to Declined", async () => {
+      const before = pr.listCalls.length;
+      const response = await request(app).get(
+        `/api/project-requests?actingWorkspaceId=${BUYER_WORKSPACE_ID}&statusFilter=Declined`,
+      );
+      assert.equal(response.status, 200);
+      assert.deepEqual(lastListCall(), {
+        userAccountId: BUYER_USER_ID,
+        actingWorkspaceId: BUYER_WORKSPACE_ID,
+        statusFilter: "Declined",
+      });
+      assert.equal(pr.listCalls.length, before + 1);
+    });
+
+    test("omitting statusFilter returns the unfiltered inbox", async () => {
+      // The unfiltered path is what the buyer audit view consumes;
+      // it MUST NOT inject a default filter and MUST NOT include a
+      // `statusFilter` key in the service call. The service
+      // interprets the absence of the key as "list everything for
+      // the acting Workspace".
+      const before = pr.listCalls.length;
+      const response = await request(app).get(
+        `/api/project-requests?actingWorkspaceId=${BUYER_WORKSPACE_ID}`,
+      );
+      assert.equal(response.status, 200);
+      const captured = lastListCall();
+      assert.deepEqual(captured, {
+        userAccountId: BUYER_USER_ID,
+        actingWorkspaceId: BUYER_WORKSPACE_ID,
+      });
+      assert.equal(
+        "statusFilter" in captured,
+        false,
+        "service call must not carry a statusFilter key when the client omitted it",
+      );
+      assert.equal(pr.listCalls.length, before + 1);
+    });
+
+    test("an invalid statusFilter fails safely with PROJECT_REQUEST_INVALID", async () => {
+      const before = pr.listCalls.length;
+      const response = await request(app).get(
+        `/api/project-requests?actingWorkspaceId=${BUYER_WORKSPACE_ID}&statusFilter=NotARealStatus`,
+      );
+      assert.equal(response.status, 400);
+      assert.equal(
+        (response.body as { error: { code: string } }).error.code,
+        "PROJECT_REQUEST_INVALID",
+      );
+      // The service MUST NOT be invoked for an invalid filter — the
+      // route rejects the unsafe query before any data access so a
+      // caller cannot probe the service through a malformed param.
+      assert.equal(pr.listCalls.length, before);
+    });
+
+    test("the legacy status= name is not silently accepted", async () => {
+      // The shared schema is authoritative. Sending `status=Pending`
+      // (the previously accepted name) is now an unknown query
+      // parameter — the route MUST treat it as if no filter was
+      // supplied and let the service run unfiltered. Critically, the
+      // service MUST NOT see a `statusFilter: "Pending"` value
+      // derived from the legacy key. This guarantees there is no
+      // silent alias drifting the contract.
+      const before = pr.listCalls.length;
+      const response = await request(app).get(
+        `/api/project-requests?actingWorkspaceId=${BUYER_WORKSPACE_ID}&status=Pending`,
+      );
+      assert.equal(response.status, 200);
+      const captured = lastListCall();
+      assert.equal(
+        "statusFilter" in captured,
+        false,
+        "service must not derive statusFilter from the legacy `status` query parameter",
+      );
+      assert.equal(pr.listCalls.length, before + 1);
+    });
   });
 
   test("POST /api/project-requests/:id/accept returns 200 + Deal on success", async () => {

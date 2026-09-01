@@ -135,11 +135,19 @@ export function listProjectRequests(deps: ProjectRequestRouteDeps) {
     const actingWorkspaceId = readActingWorkspaceIdFromQuery(res, req, requestId);
     if (!actingWorkspaceId) return;
 
-    const statusFilterRaw = req.query["status"];
+    // The shared request schema (`listProjectRequestsRequestV1Schema`)
+    // is the authoritative source for the filter field name; reading
+    // `req.query["status"]` here would silently accept a request the
+    // contract does not document. The schema declares the field as
+    // `statusFilter`, so the handler matches it. We deliberately do
+    // NOT also accept the legacy `status` name — supporting both
+    // would let old clients bypass the contract and keep an
+    // undocumented query parameter alive past the BG4 cut.
+    const statusFilterRaw = req.query["statusFilter"];
     let statusFilter: "Pending" | "Accepted" | "Declined" | undefined;
     if (typeof statusFilterRaw === "string" && statusFilterRaw.length > 0) {
       if (!(projectRequestStatusValuesV1 as readonly string[]).includes(statusFilterRaw)) {
-        writeProjectRequestQueryError(res, requestId, "status filter is invalid.");
+        writeProjectRequestQueryError(res, requestId, "statusFilter is invalid.");
         return;
       }
       statusFilter = statusFilterRaw as "Pending" | "Accepted" | "Declined";

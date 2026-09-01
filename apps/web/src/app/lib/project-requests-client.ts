@@ -109,7 +109,13 @@ export async function listProjectRequests(
   const params = new URLSearchParams();
   params.set("actingWorkspaceId", input.actingWorkspaceId);
   if (input.statusFilter) {
-    params.set("status", input.statusFilter);
+    // Match the shared `listProjectRequestsRequestV1Schema` field name
+    // exactly. The TypeScript input already exposes this as
+    // `statusFilter`; sending it as `status` would produce a 400
+    // PROJECT_REQUEST_INVALID envelope from the API and a confusing
+    // failure on the seller inbox. The web must mirror the contract
+    // verbatim — no alias.
+    params.set("statusFilter", input.statusFilter);
   }
   const response = await fetch(`/api/project-requests?${params.toString()}`, {
     method: "GET",

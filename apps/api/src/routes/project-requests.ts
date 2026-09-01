@@ -29,8 +29,8 @@
 //     Response: { projectRequest }. Revalidates current membership
 //     on every read.
 //
-//   GET /api/project-requests?actingWorkspaceId=...&status=Pending|...
-//     Response: { projectRequests }. Seller inbox uses status=Pending.
+//   GET /api/project-requests?actingWorkspaceId=...&statusFilter=Pending|...
+//     Response: { projectRequests }. Seller inbox uses statusFilter=Pending.
 //
 //   POST /api/project-requests/:projectRequestId/accept
 //     Body: { actingWorkspaceId }. Response: { ok: true,
