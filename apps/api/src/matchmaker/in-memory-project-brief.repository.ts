@@ -17,6 +17,16 @@ import type {
 export class InMemoryProjectBriefRepository implements ProjectBriefRepository {
   private readonly briefs = new Map<string, PersistedBrief>();
 
+  /**
+   * Seed a persisted brief directly. Used by service-layer tests
+   * that bypass the AI boundary to provision a known-good Brief.
+   * Not part of the contract — kept here so the test seam stays
+   * inside this module rather than leaking into the service file.
+   */
+  seed(brief: PersistedBrief): void {
+    this.briefs.set(brief.id, brief);
+  }
+
   createBrief(input: CreateBriefInput): Promise<PersistedBrief> {
     const id = `brief-${randomUUID()}`;
     const createdAt = new Date();

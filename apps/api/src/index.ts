@@ -11,17 +11,21 @@ import { createAudioSamplesRouter } from "./routes/audio-samples.js";
 import { createOfferingCatalogRouter } from "./routes/offering-catalog.js";
 import { createMatchmakerRouter } from "./routes/matchmaker.js";
 import { PrismaOfferingCatalogRepository } from "./repositories/prisma-offering-catalog.repository.js";
+import { createProjectRequestRouter } from "./routes/project-requests.js";
 import { TalentSearchService } from "./services/talent-search.service.js";
 import { AuthenticationService } from "./services/authentication.service.js";
 import { WorkspaceAuthorizationService } from "./services/workspace-authorization.service.js";
 import { AudioSampleService } from "./services/audio-sample.service.js";
 import { MatchmakerService } from "./services/matchmaker.service.js";
+import { ProjectRequestService } from "./project-request/project-request.service.js";
 import { PrismaTalentSearchRepository } from "./repositories/prisma-talent-search.repository.js";
 import { PrismaMetadataRepository } from "./repositories/prisma-metadata.repository.js";
 import { PrismaAuthRepository } from "./auth-repository/prisma-auth-repository.js";
 import { PrismaAudioRepository } from "./audio-repository/prisma-audio-repository.js";
 import { PrismaProjectBriefRepository } from "./matchmaker/prisma-project-brief.repository.js";
+import { PrismaProjectRequestRepository } from "./project-request/prisma-project-request.repository.js";
 import type { ProjectBriefRepository } from "./matchmaker/project-brief.repository.js";
+import type { ProjectRequestRepository } from "./project-request/project-request.repository.js";
 import type { MetadataRepository } from "./repositories/metadata.repository.js";
 import type { AuthRepository } from "./auth-repository/auth-repository.js";
 import type { AudioRepository } from "./audio-repository/audio-repository.js";
@@ -111,6 +115,8 @@ export interface AppOptions {
    * from the repository and storage adapter.
    */
   readonly audioSampleService?: AudioSampleService;
+  readonly projectRequestRepository?: ProjectRequestRepository;
+  readonly projectRequestService?: ProjectRequestService;
 }
 
 export interface BuiltApp {
@@ -126,6 +132,7 @@ export interface BuiltApp {
   readonly audioSampleService: AudioSampleService;
   readonly storageAdapter: StorageAdapter;
   readonly storageBackend: "supabase" | "deterministic";
+  readonly projectRequestService: ProjectRequestService;
 }
 
 export function buildApp(options: AppOptions = {}): BuiltApp {
@@ -224,6 +231,18 @@ export function buildApp(options: AppOptions = {}): BuiltApp {
       publicApiBaseUrl: process.env.PUBLIC_API_BASE_URL ?? "http://localhost:4000",
     });
 
+  // BG4 ProjectRequest service. The composition root owns the
+  // Prisma adapter; the service is the only boundary the route
+  // and tests depend on.
+  const projectRequestRepository =
+    options.projectRequestRepository ?? new PrismaProjectRequestRepository(prisma);
+  const projectRequestService =
+    options.projectRequestService ??
+    new ProjectRequestService({
+      projectRequestRepository,
+      workspaceAuthorizationService,
+    });
+
   const app: Application = express();
   app.disable("x-powered-by");
   app.use(helmet());
@@ -272,6 +291,13 @@ export function buildApp(options: AppOptions = {}): BuiltApp {
       authenticationService,
     }),
   );
+  app.use(
+    "/api/project-requests",
+    createProjectRequestRouter({
+      authenticationService,
+      projectRequestService,
+    }),
+  );
 
   // 404 fallback
   app.use((req: Request, res: Response) => {
@@ -312,6 +338,7 @@ export function buildApp(options: AppOptions = {}): BuiltApp {
     audioSampleService,
     storageAdapter,
     storageBackend: storageBundle.backend,
+    projectRequestService,
   };
 }
 

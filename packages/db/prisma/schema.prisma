@@ -8,8 +8,16 @@
 // never expose raw Prisma models.
 
 generator client {
-  provider = "prisma-client"
-  output   = "../src/generated"
+  provider        = "prisma-client"
+  output          = "../src/generated"
+  // `partialIndexes` enables the `where:` predicate on @@index /
+  // @@unique declarations. BG4 created the partial unique index
+  // `project_requests_pending_unique_idx` in
+  // 20260827090000_bg4_project_requests/migration.sql; declaring it
+  // here keeps future migration diffs from treating the SQL-created
+  // index as unexplained drift and prevents `prisma migrate dev`
+  // from generating a duplicate CREATE INDEX statement.
+  previewFeatures = ["partialIndexes"]
 }
 
 datasource db {
@@ -84,6 +92,28 @@ enum AudioSampleCleanupStatus {
   Removed
 }
 
+enum ProjectRequestStatus {
+  // Seller has not yet responded.
+  Pending
+  // Seller explicitly accepted; a Negotiating Deal was atomically
+  // created. Terminal.
+  Accepted
+  // Seller explicitly declined. No Deal was created. Terminal.
+  Declined
+}
+
+enum DealStatus {
+  // The seller accepted the ProjectRequest but the parties have not
+  // yet both approved a TermsVersion and the buyer has not initiated
+  // funding. The Deal can transition to Active only via the
+  // deterministic activation invariant owned by a later ticket.
+  Negotiating
+  // Both parties have approved the same current TermsVersion and
+  // the buyer's sandbox funding for that version has been confirmed.
+  // Owned by a later ticket; never set in BG4.
+  Active
+}
+
 // ---------- Identity and authority ----------
 
 model UserAccount {
@@ -98,12 +128,17 @@ model UserAccount {
   createdAt DateTime @default(now())
   updatedAt DateTime @updatedAt
 
-  memberships         WorkspaceMembership[]
-  ownedWorkspaces     Workspace[]            @relation("WorkspaceOwner")
-  identityProviders   IdentityProvider[]
-  authSessions        AuthSession[]
+  memberships             WorkspaceMembership[]
+  ownedWorkspaces         Workspace[]           @relation("WorkspaceOwner")
+  identityProviders       IdentityProvider[]
+  authSessions            AuthSession[]
   // Briefs the human authored as the buyer-side actor (BG3).
-  authoredBriefs      ProjectBrief[]         @relation("BriefCreatedByUser")
+  authoredBriefs          ProjectBrief[]        @relation("BriefCreatedByUser")
+  // BG4 ProjectRequests. Two relations: the buyer-side creator and
+  // the seller-side decision actor. A NULL sellerDecisionByUserId
+  // means the request is still Pending.
+  authoredProjectRequests ProjectRequest[]      @relation("ProjectRequestCreatedBy")
+  decidedProjectRequests  ProjectRequest[]      @relation("ProjectRequestDecidedBy")
 
   @@map("user_accounts")
 }
@@ -165,15 +200,26 @@ model Workspace {
   createdAt   DateTime        @default(now())
   updatedAt   DateTime        @updatedAt
 
-  owner         UserAccount           @relation("WorkspaceOwner", fields: [ownerUserId], references: [id], onDelete: Restrict)
-  memberships   WorkspaceMembership[]
-  capabilities  WorkspaceCapability[]
-  sellerProfile SellerProfile?
+  owner                 UserAccount           @relation("WorkspaceOwner", fields: [ownerUserId], references: [id], onDelete: Restrict)
+  memberships           WorkspaceMembership[]
+  capabilities          WorkspaceCapability[]
+  sellerProfile         SellerProfile?
   // Briefs authored under this Workspace as the buyer (BG3). A
-  // Workspace must hold the Buyer capability at brief-creation time;
-  // a future BG4 ticket will add seller-side ProjectRequests, and
-  // BG5 will add Deal/terms models referencing this same Workspace.
-  buyerBriefs   ProjectBrief[]        @relation("BuyerWorkspaceBriefs")
+  // Workspace must hold the Buyer capability at brief-creation time.
+  buyerBriefs           ProjectBrief[]        @relation("BuyerWorkspaceBriefs")
+  // BG4 ProjectRequests referencing this Workspace as either side.
+  // The buyer side is gated on the Buyer capability at create time;
+  // the seller side is gated on the Seller capability (and a
+  // matching SellerProfile / ServiceOffering ownership) at create
+  // time and on current WorkspaceMembership at accept/decline time.
+  buyerProjectRequests  ProjectRequest[]      @relation("BuyerWorkspaceProjectRequests")
+  sellerProjectRequests ProjectRequest[]      @relation("SellerWorkspaceProjectRequests")
+  // BG4 Deals referencing this Workspace as either side. The
+  // accepted ProjectRequest's buyer/seller workspaces are copied
+  // onto the Deal so authorization can revalidate them without
+  // joining through ProjectRequest.
+  buyerDeals            Deal[]                @relation("BuyerWorkspaceDeals")
+  sellerDeals           Deal[]                @relation("SellerWorkspaceDeals")
 
   @@map("workspaces")
 }
@@ -193,7 +239,7 @@ model WorkspaceMembership {
 }
 
 model WorkspaceCapability {
-  id          String               @id @default(cuid())
+  id          String                @id @default(cuid())
   workspaceId String
   capability  MarketplaceCapability
 
@@ -218,10 +264,10 @@ model SellerProfile {
   createdAt          DateTime            @default(now())
   updatedAt          DateTime            @updatedAt
 
-  workspace              Workspace                   @relation(fields: [workspaceId], references: [id], onDelete: Cascade)
-  specialties            SellerProfileSpecialty[]
-  caribbeanAffiliations  CaribbeanAffiliation[]
-  offerings              ServiceOffering[]
+  workspace             Workspace                @relation(fields: [workspaceId], references: [id], onDelete: Cascade)
+  specialties           SellerProfileSpecialty[]
+  caribbeanAffiliations CaribbeanAffiliation[]
+  offerings             ServiceOffering[]
 
   @@map("seller_profiles")
 }
@@ -272,8 +318,8 @@ model ServiceCategory {
   bundleOnly  Boolean  @default(false)
   createdAt   DateTime @default(now())
 
-  primaryOfferings            ServiceOffering[]      @relation("PrimaryCategory")
-  includedServiceOfferings    IncludedService[]
+  primaryOfferings         ServiceOffering[] @relation("PrimaryCategory")
+  includedServiceOfferings IncludedService[]
 
   @@map("service_categories")
 }
@@ -304,13 +350,19 @@ model ServiceOffering {
   createdAt         DateTime              @default(now())
   updatedAt         DateTime              @updatedAt
 
-  sellerProfile   SellerProfile              @relation(fields: [sellerProfileId], references: [id], onDelete: Cascade)
-  primaryCategory ServiceCategory            @relation("PrimaryCategory", fields: [primaryCategoryId], references: [id], onDelete: Restrict)
-  includedServices IncludedService[]
-  serviceAreas     ServiceOfferingServiceArea[]
-  pricing          ServiceOfferingPricing?
-  audioSamples     ServiceOfferingAudioSample[]
+  sellerProfile        SellerProfile                @relation(fields: [sellerProfileId], references: [id], onDelete: Cascade)
+  primaryCategory      ServiceCategory              @relation("PrimaryCategory", fields: [primaryCategoryId], references: [id], onDelete: Restrict)
+  includedServices     IncludedService[]
+  serviceAreas         ServiceOfferingServiceArea[]
+  pricing              ServiceOfferingPricing?
+  audioSamples         ServiceOfferingAudioSample[]
   orphanedAudioStorage AudioSampleOrphanedStorage[]
+  // BG4 references: a ServiceOffering can be selected by many
+  // ProjectRequests over time and become the basis for many Deals.
+  // RESTRICT on delete prevents an offering from being removed
+  // while it is referenced.
+  projectRequests      ProjectRequest[]
+  deals                Deal[]
 
   @@index([sellerProfileId])
   @@index([primaryCategoryId])
@@ -374,27 +426,27 @@ model ServiceOfferingPricing {
 // step trivially safe (the buyer's intended criteria cannot drift
 // after persistence).
 model ProjectBrief {
-  id           String   @id @default(cuid())
-  buyerWorkspaceId String
+  id                        String   @id @default(cuid())
+  buyerWorkspaceId          String
   // The acting human who authored the brief. Recorded for audit; not
   // an authorization signal (Workspace membership is).
-  createdByUserId String
+  createdByUserId           String
   // The verbatim text the buyer submitted (trimmed + collapsed; full
   // normalisation rules live in @soundhub/types).
-  originalText String
+  originalText              String
   // Validated required criteria, JSON-encoded per the shared Zod
   // TalentSearchRequiredCriteriaV1 schema. Required constraints may
   // never be silently relaxed by AI or fallback behaviour.
-  requiredCriteriaJson Json
+  requiredCriteriaJson      Json
   // Normalised buyer query (per normalizedQuerySchema). Persisted
   // alongside the required/preferred axes so a brief whose criteria
   // surface only a query (e.g. the deterministic fallback when the
   // buyer named no recognised category / location / mode) round-
   // trips through the schema without dropping the axis.
-  criteriaQueryJson Json?
+  criteriaQueryJson         Json?
   // Validated preferred criteria (may be absent when the buyer did
   // not express any preference signal).
-  preferredCriteriaJson Json?
+  preferredCriteriaJson     Json?
   // Non-search project requirements (e.g. funding deadline, scope
   // hints captured by the brief). Persisted as a free-form JSON
   // blob so the brief can carry whatever the buyer asked without
@@ -408,14 +460,19 @@ model ProjectBrief {
   // produced the result. `aiFallbackUsed: true` means the
   // deterministic fallback crossed the same validation +
   // TalentSearchService boundary (per the BG3 ticket).
-  aiProvider String
-  aiModelId  String?
-  aiFallbackUsed Boolean
-  createdAt  DateTime @default(now())
+  aiProvider                String
+  aiModelId                 String?
+  aiFallbackUsed            Boolean
+  createdAt                 DateTime @default(now())
 
-  buyerWorkspace Workspace        @relation("BuyerWorkspaceBriefs", fields: [buyerWorkspaceId], references: [id], onDelete: Cascade)
-  createdByUser  UserAccount      @relation("BriefCreatedByUser", fields: [createdByUserId], references: [id], onDelete: Restrict)
-  searchResults  BriefSearchResult[]
+  buyerWorkspace  Workspace           @relation("BuyerWorkspaceBriefs", fields: [buyerWorkspaceId], references: [id], onDelete: Cascade)
+  createdByUser   UserAccount         @relation("BriefCreatedByUser", fields: [createdByUserId], references: [id], onDelete: Restrict)
+  searchResults   BriefSearchResult[]
+  // BG4 reverse relations: a Brief may be referenced by zero or
+  // more ProjectRequests (and therefore by the Deals that follow
+  // accepted ones).
+  projectRequests ProjectRequest[]
+  deals           Deal[]
 
   @@index([buyerWorkspaceId, createdAt])
   @@map("project_briefs")
@@ -436,7 +493,7 @@ model ProjectBrief {
 // preference atom coverage, query token coverage), never derived from
 // relevanceScore.
 model BriefSearchResult {
-  id                       String   @id @default(cuid())
+  id                       String @id @default(cuid())
   briefId                  String
   // Deterministic ordering position within the brief result list.
   // 1-based; ties on the bounded score are broken by sellerId asc
@@ -456,7 +513,7 @@ model BriefSearchResult {
   // buyer can see the full eligibility evidence without a
   // follow-up search and so the later ProjectRequest step can
   // revalidate against the same context.
-  additionalOfferingsJson   Json
+  additionalOfferingsJson  Json
   relevanceScore           Float
   matchReason              String
   preferenceCoverageJson   Json?
@@ -490,43 +547,43 @@ model BriefSearchResult {
 // the storage adapter alone can resolve it back to a playable
 // reference.
 model ServiceOfferingAudioSample {
-  id            String   @id @default(cuid())
-  offeringId    String
+  id                   String                   @id @default(cuid())
+  offeringId           String
   // Buyer-facing title or label rendered in the discovery UI. Allowed
   // length is bounded; the storage adapter never sees this value.
-  label         String
+  label                String
   // Declared MIME type. The application enforces audio/mpeg at the
   // trusted boundary; the column captures the value the seller
   // declared at upload time.
-  contentType   String
+  contentType          String
   // Observed byte size. The application enforces the 25 MB cap at
   // the trusted boundary so a seller cannot smuggle a larger file by
   // declaring a smaller content type.
-  byteSize      Int
+  byteSize             Int
   // Deterministic seller-owned display order. The seller assigns this
   // value at upload time (e.g. "1, 2, 3") so removal + re-upload does
   // not silently re-order the buyer-facing discovery list.
-  displayOrder  Int
+  displayOrder         Int
   // Opaque storage reference handed back by the StorageAdapter. The
   // application treats it as an opaque string; only the adapter that
   // produced it can resolve it back to a playable reference.
-  storageRef    String
+  storageRef           String
   // Cleanup lifecycle (ticket #61 follow-up review P1-005). Default
   // `Live`. `PendingCleanup` means the seller removed the sample but
   // the bounded object could not be deleted at provider removal time;
   // the row is preserved so a bounded retry can complete the
   // cleanup. `Removed` is a transient state during the row delete.
-  cleanupStatus AudioSampleCleanupStatus @default(Live)
+  cleanupStatus        AudioSampleCleanupStatus @default(Live)
   // Number of storage-removal attempts that have failed for this
   // row while it is in `PendingCleanup`. Bounded by the application
   // (no generalized retry infrastructure).
-  cleanupAttempts Int @default(0)
+  cleanupAttempts      Int                      @default(0)
   // Last cleanup failure timestamp (UTC). Used to surface the most
   // recent provider failure without logging the provider error
   // message.
   cleanupLastFailureAt DateTime?
-  createdAt     DateTime @default(now())
-  updatedAt     DateTime @updatedAt
+  createdAt            DateTime                 @default(now())
+  updatedAt            DateTime                 @updatedAt
 
   offering ServiceOffering @relation(fields: [offeringId], references: [id], onDelete: Cascade)
 
@@ -548,21 +605,149 @@ model ServiceOfferingAudioSample {
 // delete confirms success or the storage object is reported
 // already-gone.
 model AudioSampleOrphanedStorage {
-  storageRef           String   @id
+  storageRef           String    @id
   // Owning offering. Used to scope the bounded retry pass and to
   // cascade when the offering is removed.
   offeringId           String
   // Number of storage-removal attempts that have failed for this
   // orphan. Bounded by the application (no generalized retry
   // infrastructure).
-  cleanupAttempts      Int      @default(0)
+  cleanupAttempts      Int       @default(0)
   // Last cleanup failure timestamp (UTC).
   cleanupLastFailureAt DateTime?
-  createdAt            DateTime @default(now())
-  updatedAt            DateTime @updatedAt
+  createdAt            DateTime  @default(now())
+  updatedAt            DateTime  @updatedAt
 
   offering ServiceOffering @relation(fields: [offeringId], references: [id], onDelete: Cascade)
 
   @@index([offeringId])
   @@map("audio_sample_orphaned_storage")
+}
+
+// ---------- Buildathon Golden Slice 4 (BG4) ----------
+//
+// ProjectRequest is a buyer Workspace's invitation to a seller
+// Workspace to discuss a project. Seller acceptance opens
+// negotiation but does not approve terms or activate paid work
+// (CONTEXT.md: "ProjectRequest — A buyer Workspace's invitation to a
+// seller Workspace to discuss a project. Seller acceptance opens
+// negotiation but does not approve terms or activate paid work.").
+//
+// Required statuses (per ticket #62): `Pending | Accepted | Declined`.
+// Pending is the only non-terminal state; Accepted and Declined are
+// terminal and cannot be reversed in this slice.
+//
+// The unique constraint on `projectRequestId` in the Deal table
+// prevents retries from creating multiple Deals for one accepted
+// ProjectRequest (GS 26). The partial unique index
+// `(buyerWorkspaceId, sellerWorkspaceId, serviceOfferingId,
+// projectBriefId) WHERE status = 'Pending'` prevents inappropriate
+// duplicate Pending ProjectRequests while still allowing the buyer
+// to send a follow-up request after a Decline or a closed Deal.
+//
+// Every consequential reference (buyer / seller Workspace, deciding
+// UserAccount, owning ProjectBrief, owning ServiceOffering) uses
+// `onDelete: Restrict` so deleting a Workspace, deciding user, or
+// referenced record fails closed rather than erasing consent and
+// audit evidence. Workspace removal in the buildathon is
+// out-of-scope; archival semantics will land in a later ticket.
+model ProjectRequest {
+  id                     String               @id @default(cuid())
+  buyerWorkspaceId       String
+  sellerWorkspaceId      String
+  serviceOfferingId      String
+  projectBriefId         String
+  // The acting human who created the request. Recorded for audit;
+  // authorization is decided by WorkspaceMembership, not by this
+  // column.
+  createdByUserId        String
+  status                 ProjectRequestStatus @default(Pending)
+  // Set the moment the seller accepts OR declines. Null while
+  // Pending. Used by the seller inbox to render ordering.
+  sellerDecisionAt       DateTime?
+  // The acting seller human who issued the decision. Null while
+  // Pending. Recorded for audit (the workspace authorization was
+  // revalidated at decision time).
+  sellerDecisionByUserId String?
+  // Set the moment the seller accepts the request. Equivalent to
+  // `sellerDecisionAt` when status = Accepted; null otherwise.
+  // Persisted as a separate column because it is the canonical
+  // "explicit seller consent" evidence referenced by GS 18 and by
+  // every future activation invariant.
+  sellerConsentAt        DateTime?
+  createdAt              DateTime             @default(now())
+
+  buyerWorkspace   Workspace       @relation("BuyerWorkspaceProjectRequests", fields: [buyerWorkspaceId], references: [id], onDelete: Restrict)
+  sellerWorkspace  Workspace       @relation("SellerWorkspaceProjectRequests", fields: [sellerWorkspaceId], references: [id], onDelete: Restrict)
+  serviceOffering  ServiceOffering @relation(fields: [serviceOfferingId], references: [id], onDelete: Restrict)
+  projectBrief     ProjectBrief    @relation(fields: [projectBriefId], references: [id], onDelete: Restrict)
+  createdByUser    UserAccount     @relation("ProjectRequestCreatedBy", fields: [createdByUserId], references: [id], onDelete: Restrict)
+  sellerDecisionBy UserAccount?    @relation("ProjectRequestDecidedBy", fields: [sellerDecisionByUserId], references: [id], onDelete: Restrict)
+
+  deal Deal?
+
+  // Partial unique index mirrors
+  // `project_requests_pending_unique_idx` created in
+  // 20260827090000_bg4_project_requests/migration.sql. The same
+  // column list, index name, and `WHERE status = 'Pending'`
+  // predicate are preserved here so a future `prisma migrate diff`
+  // treats the SQL-created index as expected schema state rather
+  // than as drift to reconcile. The `where:` predicate is the
+  // partial-index preview feature; the `map:` argument pins the
+  // underlying SQL index name. Closing over `status = 'Pending'`
+  // — the only non-terminal state — keeps terminal rows from
+  // blocking legitimate re-engagement.
+  @@unique([buyerWorkspaceId, sellerWorkspaceId, serviceOfferingId, projectBriefId], map: "project_requests_pending_unique_idx", where: { status: "Pending" })
+  @@index([buyerWorkspaceId, status, createdAt])
+  @@index([sellerWorkspaceId, status, createdAt])
+  @@index([serviceOfferingId])
+  @@index([projectBriefId])
+  @@map("project_requests")
+}
+
+// Deal is an accepted commercial engagement between buyer and seller
+// Workspaces (CONTEXT.md: "Deal — An accepted commercial engagement
+// between buyer and seller Workspaces. It becomes Active only after
+// both parties approve the same TermsVersion and escrow funding
+// succeeds.").
+//
+// The BG4 slice creates exactly one Deal in `Negotiating` per accepted
+// ProjectRequest; the (projectRequestId) unique constraint prevents
+// retries from creating a second Deal (GS 26). Transitions to Active
+// are owned by a later ticket (Deal/TermsVersion/approvals) and never
+// happen in BG4.
+//
+// Every consequential reference uses `onDelete: Restrict` so
+// deleting the buyer / seller Workspace, the originating
+// ProjectRequest, the referenced ProjectBrief, or the referenced
+// ServiceOffering fails closed rather than erasing the accepted
+// engagement and its audit evidence.
+model Deal {
+  id                String     @id @default(cuid())
+  buyerWorkspaceId  String
+  sellerWorkspaceId String
+  serviceOfferingId String
+  projectBriefId    String
+  // Natural uniqueness: exactly one Deal per accepted
+  // ProjectRequest. A retried accept on the same already-accepted
+  // request cannot create a second row because the unique index
+  // fails the insert.
+  projectRequestId  String     @unique
+  status            DealStatus @default(Negotiating)
+  // Set when the deterministic activation invariant transitions the
+  // Deal to Active. Always null in BG4 (Active transitions are
+  // owned by a later ticket); included now so the column exists
+  // when the activation invariant lands.
+  activatedAt       DateTime?
+  createdAt         DateTime   @default(now())
+
+  buyerWorkspace  Workspace       @relation("BuyerWorkspaceDeals", fields: [buyerWorkspaceId], references: [id], onDelete: Restrict)
+  sellerWorkspace Workspace       @relation("SellerWorkspaceDeals", fields: [sellerWorkspaceId], references: [id], onDelete: Restrict)
+  serviceOffering ServiceOffering @relation(fields: [serviceOfferingId], references: [id], onDelete: Restrict)
+  projectBrief    ProjectBrief    @relation(fields: [projectBriefId], references: [id], onDelete: Restrict)
+  projectRequest  ProjectRequest  @relation(fields: [projectRequestId], references: [id], onDelete: Restrict)
+
+  @@index([buyerWorkspaceId, status, createdAt])
+  @@index([sellerWorkspaceId, status, createdAt])
+  @@map("deals")
 }
