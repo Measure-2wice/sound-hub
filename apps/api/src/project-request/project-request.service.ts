@@ -28,7 +28,7 @@ import type {
   DealPublicV1,
 } from "@soundhub/types";
 import type { PersistedBrief } from "../matchmaker/project-brief.repository.js";
-import { type WorkspaceAuthorizationService } from "../services/workspace-authorization.service.js";
+import { AuthorizationError, type WorkspaceAuthorizationService } from "../services/workspace-authorization.service.js";
 import type {
   AcceptProjectRequestResult,
   CreateProjectRequestFailureReason,
@@ -271,11 +271,23 @@ export class ProjectRequestService {
         workspaceId: input.actingWorkspaceId,
       });
     } catch (err) {
-      // Reads collapse all authorization failures to the same
+      // Reads collapse ONLY the expected typed authorization
+      // failures (NOT_A_MEMBER / WORKSPACE_INELIGIBLE /
+      // MISSING_CAPABILITY / WORKSPACE_NOT_FOUND) to the same
       // PROJECT_REQUEST_NOT_FOUND envelope so the response
       // contract never reveals whether the record exists.
-      void err;
-      throw new ProjectRequestError("ProjectRequest not found.", "PROJECT_REQUEST_NOT_FOUND");
+      // Unexpected repository / database / infrastructure errors
+      // propagate so the route's safe 5xx path can surface them
+      // — collapsing a real infra failure to NOT_FOUND would
+      // falsely suggest the record does not exist and mask the
+      // incident from operators.
+      if (err instanceof AuthorizationError) {
+        throw new ProjectRequestError(
+          "ProjectRequest not found.",
+          "PROJECT_REQUEST_NOT_FOUND",
+        );
+      }
+      throw err;
     }
     const existing = await this.repository.findProjectRequestById(input.projectRequestId);
     if (!existing) {
@@ -310,10 +322,16 @@ export class ProjectRequestService {
         workspaceId: input.actingWorkspaceId,
       });
     } catch (err) {
-      // Same collapse as getProjectRequest so the safe envelope
-      // does not leak the existence of the Workspace's records.
-      void err;
-      throw new ProjectRequestError("ProjectRequest not found.", "PROJECT_REQUEST_NOT_FOUND");
+      // Same typed-only collapse as getProjectRequest so the safe
+      // envelope does not leak the existence of the Workspace's
+      // records. Unexpected infrastructure errors propagate.
+      if (err instanceof AuthorizationError) {
+        throw new ProjectRequestError(
+          "ProjectRequest not found.",
+          "PROJECT_REQUEST_NOT_FOUND",
+        );
+      }
+      throw err;
     }
     const rows = await this.repository.listProjectRequests({
       workspaceId: input.actingWorkspaceId,

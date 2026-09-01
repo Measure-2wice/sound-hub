@@ -232,8 +232,31 @@ describe("project-request-route-helpers", () => {
         "create",
       );
       assert.equal(written, false);
-      assert.equal(state.status, 400);
-      assert.equal(state.body?.error?.code, "PROJECT_REQUEST_INVALID");
+      // Response-schema drift is an internal server failure, NOT a
+      // malformed request from the buyer / seller. The envelope must
+      // surface as 500 PROJECT_REQUEST_FAILED rather than 400
+      // PROJECT_REQUEST_INVALID, which is reserved for malformed
+      // request payloads.
+      assert.equal(state.status, 500);
+      assert.equal(state.body?.error?.code, "PROJECT_REQUEST_FAILED");
+      // The internal Zod failure detail MUST NOT appear in the
+      // envelope; production can read the server log but the buyer /
+      // seller must not see internal validation detail. The message
+      // MUST be the generic fallback composed by
+      // `writeProjectRequestInternalError` (the context label is
+      // diagnostic, the wording is fixed). Specific Zod phrases
+      // ("invalid_type", "Required", field paths) MUST NOT appear.
+      const envelopeMessage = state.body?.error?.message ?? "";
+      assert.ok(
+        envelopeMessage.startsWith("An unexpected error occurred while "),
+        "envelope must carry the generic context-label fallback",
+      );
+      for (const phrase of ["invalid_type", "invalid_string", "Required", "received"]) {
+        assert.ok(
+          !envelopeMessage.includes(phrase),
+          `envelope message must not echo Zod phrase "${phrase}"`,
+        );
+      }
     });
   });
 
@@ -339,6 +362,59 @@ describe("project-request-route-helpers", () => {
       const parsed = await parsedPromise;
       assert.equal(parsed, null);
       assert.equal(state.body?.error?.code, "PROJECT_REQUEST_INVALID");
+    });
+
+    test("drains the request stream when the body exceeds the cap so the connection can close", async () => {
+      // The 16 KiB body cap branch MUST NOT leave the request
+      // stream paused indefinitely — a paused readable holds the
+      // underlying connection open. The fix is to switch the data
+      // handler into drain mode (no further accumulation) and call
+      // req.resume() so the remaining bytes flow through the
+      // handler (and are dropped) until the stream emits 'end' /
+      // 'close'. This test exercises that contract: pause() and
+      // resume() must be paired in the same microtask burst so
+      // the stream is never left paused / unconsumed.
+      const calls: string[] = [];
+      const handlers: Record<string, (chunk?: Buffer) => void> = {};
+      const { res, state } = makeMockResponse();
+      const req = {
+        body: undefined,
+        on(event: string, cb: (chunk?: Buffer) => void) {
+          handlers[event] = cb;
+          return this;
+        },
+        pause: () => {
+          calls.push("pause");
+        },
+        resume: () => {
+          calls.push("resume");
+        },
+      } as unknown as Parameters<typeof readJsonBodyForProjectRequest>[0];
+      const parsedPromise = readJsonBodyForProjectRequest(req, res, "req-1");
+      // Emit chunks that cross the 16 KiB cap so the oversized-
+      // body branch fires. 8 KiB + 8 KiB + 8 KiB = 24 KiB > 16 KiB.
+      queueMicrotask(() => {
+        handlers["data"]?.(Buffer.alloc(8 * 1024));
+        handlers["data"]?.(Buffer.alloc(8 * 1024));
+        handlers["data"]?.(Buffer.alloc(8 * 1024));
+      });
+      const parsed = await parsedPromise;
+      assert.equal(parsed, null);
+      // The bounded-body error envelope is preserved.
+      assert.equal(state.status, 400);
+      assert.equal(state.body?.error?.code, "PROJECT_REQUEST_INVALID");
+      // The cap-branch MUST call req.pause() to halt accumulation
+      // AND req.resume() so the stream can drain and close. A
+      // pause without a resume would leave the connection open
+      // indefinitely.
+      const pauseIdx = calls.indexOf("pause");
+      const resumeIdx = calls.indexOf("resume");
+      assert.ok(pauseIdx !== -1, "oversized-body branch must call req.pause()");
+      assert.ok(resumeIdx !== -1, "oversized-body branch must call req.resume()");
+      assert.ok(
+        resumeIdx > pauseIdx,
+        "req.resume() must be paired with req.pause() so the stream is never left paused",
+      );
     });
   });
 });

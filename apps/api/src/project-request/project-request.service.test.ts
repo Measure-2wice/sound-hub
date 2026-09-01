@@ -934,6 +934,84 @@ test("acceptProjectRequest maps CONCURRENCY_RETRY_EXHAUSTED to PROJECT_REQUEST_U
   );
 });
 
+// Anti-enumeration-vs-infra-leak contract:
+//   - Expected typed `AuthorizationError` (NOT_A_MEMBER /
+//     WORKSPACE_INELIGIBLE / MISSING_CAPABILITY /
+//     WORKSPACE_NOT_FOUND) MUST collapse to PROJECT_REQUEST_NOT_FOUND
+//     on reads so the safe envelope never reveals whether the
+//     record exists.
+//   - Unexpected infrastructure / database errors MUST propagate
+//     unchanged so the route's safe 5xx path can surface them;
+//     collapsing such an error to NOT_FOUND would falsely suggest
+//     the record does not exist and mask a real incident from
+//     operators.
+
+test("getProjectRequest does not collapse unexpected infrastructure errors to PROJECT_REQUEST_NOT_FOUND", async () => {
+  const { projectRequestRepo } = buildFixture();
+  // A database / repository failure inside the membership lookup
+  // MUST propagate. We model it by handing the authz service an
+  // auth repository whose findCurrentMembership rejects with a
+  // plain Error — NOT an AuthorizationError — so the service
+  // narrows the catch correctly.
+  const authz = new WorkspaceAuthorizationService({
+    authRepository: {
+      findCurrentMembership: () => Promise.reject(new Error("database connection lost")),
+    } as never,
+  });
+  const service = new ProjectRequestService({
+    projectRequestRepository: projectRequestRepo,
+    workspaceAuthorizationService: authz,
+  });
+  await assert.rejects(
+    service.getProjectRequest({
+      userAccountId: BUYER_USER_ID,
+      actingWorkspaceId: BUYER_WORKSPACE_ID,
+      projectRequestId: "pr-any",
+    }),
+    (err: unknown) => {
+      // The infrastructure error MUST propagate unchanged, not be
+      // remapped into a ProjectRequestError with code
+      // PROJECT_REQUEST_NOT_FOUND. The catch narrows on
+      // AuthorizationError; a plain Error instance has a distinct
+      // constructor and falls through unchanged.
+      return (
+        err instanceof Error &&
+        err.name === "Error" &&
+        err.message === "database connection lost" &&
+        !((err as { code?: string }).code === "PROJECT_REQUEST_NOT_FOUND")
+      );
+    },
+  );
+});
+
+test("listProjectRequests does not collapse unexpected infrastructure errors to PROJECT_REQUEST_NOT_FOUND", async () => {
+  const { projectRequestRepo } = buildFixture();
+  const authz = new WorkspaceAuthorizationService({
+    authRepository: {
+      findCurrentMembership: () => Promise.reject(new Error("database connection lost")),
+    } as never,
+  });
+  const service = new ProjectRequestService({
+    projectRequestRepository: projectRequestRepo,
+    workspaceAuthorizationService: authz,
+  });
+  await assert.rejects(
+    service.listProjectRequests({
+      userAccountId: BUYER_USER_ID,
+      actingWorkspaceId: BUYER_WORKSPACE_ID,
+      statusFilter: "Pending",
+    }),
+    (err: unknown) => {
+      return (
+        err instanceof Error &&
+        err.name === "Error" &&
+        err.message === "database connection lost" &&
+        !((err as { code?: string }).code === "PROJECT_REQUEST_NOT_FOUND")
+      );
+    },
+  );
+});
+
 test("declineProjectRequest maps CONCURRENCY_RETRY_EXHAUSTED to PROJECT_REQUEST_UNAVAILABLE", async () => {
   const { workspaceAuthorizationService } = buildFixture();
   const stubRepository = {

@@ -150,11 +150,30 @@ export async function readJsonBodyForProjectRequest(
   const chunks: Buffer[] = [];
   let total = 0;
   const limit = MAX_REQUEST_BODY_BYTES;
+  // After the size cap fires we must not leave the request stream
+  // paused indefinitely — a paused readable holds the underlying
+  // connection open and prevents Node from closing the socket. We
+  // switch the data handler into a drain mode (skip accumulation)
+  // and call req.resume() so the remaining bytes flow through the
+  // handler (and are dropped) until the stream emits 'end' /
+  // 'close'. This is the smallest correct Node behaviour
+  // consistent with this codebase; we deliberately do NOT call
+  // req.destroy() so the client can finish sending the oversized
+  // body and the connection can close cleanly.
+  let drainingAfterCap = false;
   try {
     await new Promise<void>((resolve, reject) => {
       req.on("data", (chunk: Buffer) => {
+        if (drainingAfterCap) {
+          // The body has already been rejected as too large; keep
+          // consuming so the stream emits 'end' / 'close' and the
+          // underlying connection can close. We never accumulate
+          // or interpret these chunks.
+          return;
+        }
         total += chunk.length;
         if (total > limit) {
+          drainingAfterCap = true;
           req.pause();
           writeSafeError(
             res,
@@ -165,6 +184,11 @@ export async function readJsonBodyForProjectRequest(
               requestId,
             ),
           );
+          // Resume the stream so the remaining bytes drain and
+          // the stream can emit 'end' / 'close'. Without this the
+          // stream would remain paused indefinitely and keep the
+          // connection open.
+          req.resume();
           reject(new BodyReadError("payload-too-large"));
           return;
         }
@@ -239,8 +263,13 @@ export function validateProjectRequestBody<T>(
 /**
  * Validate the assembled response against a Zod schema and write it.
  * On drift the safe envelope is written instead so the contract is
- * never violated in production. Returns `true` if the response was
- * written, `false` if the envelope fallback was used.
+ * never violated in production. Response-schema drift is an internal
+ * server failure, not a malformed request from the buyer / seller,
+ * so the fallback is the PROJECT_REQUEST_FAILED / 500 envelope (NOT
+ * PROJECT_REQUEST_INVALID / 400). The Zod error is logged
+ * server-side; the safe envelope never echoes internal validation
+ * detail. Returns `true` if the response was written, `false` if
+ * the envelope fallback was used.
  */
 export function validateProjectRequestResponse<T>(
   res: Response,
@@ -252,18 +281,11 @@ export function validateProjectRequestResponse<T>(
 ): boolean {
   const validated = schema.safeParse(body);
   if (!validated.success) {
-    console.error(
-      `[project-requests] requestId=${requestId} ${contextLabel}-response-schema-drift:`,
-      validated.error,
-    );
-    writeSafeError(
+    writeProjectRequestInternalError(
       res,
-      buildSafeError(
-        "PROJECT_REQUEST_INVALID",
-        "An unexpected error occurred while preparing the response.",
-        undefined,
-        requestId,
-      ),
+      validated.error,
+      requestId,
+      `${contextLabel}-response-schema-drift`,
     );
     return false;
   }
