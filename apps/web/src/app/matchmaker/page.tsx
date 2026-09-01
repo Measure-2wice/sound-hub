@@ -338,7 +338,11 @@ function BriefResults({
                   key={rec.bestMatchingOfferingId}
                   recommendation={rec}
                   index={index + 1}
-                  disabled={!actingWorkspaceId}
+                  // Disable every invite button while any invite is in
+ // flight so a buyer cannot fire concurrent ProjectRequest writes
+ // against the same brief. The in-flight row still renders the
+ // "Inviting…" label so the buyer can see which row is in flight.
+                  disabled={!actingWorkspaceId || invitingRecommendationId !== null}
                   submitting={invitingRecommendationId === rec.bestMatchingOffering.offeringId}
                   onInvite={() => onInvite(rec)}
                 />

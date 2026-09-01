@@ -291,8 +291,11 @@ export function translateProjectRequestServiceError(
 }
 
 /**
- * Write a generic 400 fallback safe envelope. The caller logs the
- * underlying error so production can debug without leaking it.
+ * Write a generic 500 fallback safe envelope for an unexpected
+ * exception that escaped the typed ProjectRequestError surface. The
+ * underlying exception is logged server-side so production can debug
+ * without leaking it; the envelope carries the generic
+ * `PROJECT_REQUEST_FAILED` message and the request id only.
  */
 export function writeProjectRequestInternalError(
   res: Response,
@@ -304,7 +307,7 @@ export function writeProjectRequestInternalError(
   writeSafeError(
     res,
     buildSafeError(
-      "PROJECT_REQUEST_INVALID",
+      "PROJECT_REQUEST_FAILED",
       `An unexpected error occurred while ${contextLabel}.`,
       undefined,
       requestId,

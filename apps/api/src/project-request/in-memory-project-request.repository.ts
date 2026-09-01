@@ -308,7 +308,12 @@ export class InMemoryProjectRequestRepository implements ProjectRequestRepositor
       )
       .filter((row) => (input.statusFilter ? row.status === input.statusFilter : true))
       .sort((a, b) => b.createdAt.getTime() - a.createdAt.getTime());
-    return Promise.resolve(all);
+    // Mirror the Prisma adapter's `take: 200` so the in-memory
+    // adapter cannot diverge from the public response contract
+    // maximum of 200 rows. The schema enforces 200 on the way out;
+    // this prevents the adapter from returning more rows than the
+    // envelope can carry.
+    return Promise.resolve(all.slice(0, 200));
   }
 
   // ---------- snapshot helpers ----------

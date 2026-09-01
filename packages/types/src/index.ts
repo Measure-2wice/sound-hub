@@ -458,6 +458,14 @@ export const apiErrorCodeV1Schema = z.enum([
   "PROJECT_REQUEST_FORBIDDEN",
   "PROJECT_REQUEST_ALREADY_PENDING",
   "PROJECT_REQUEST_ALREADY_RESPONDED",
+  // Transient marketplace-busy envelope. Maps to 503 so the buyer or
+  // seller can retry the request without changing the payload.
+  "PROJECT_REQUEST_UNAVAILABLE",
+  // Generic ProjectRequest internal-failure envelope. Maps to 500.
+  // Used only when the handler catches an exception that does not
+  // match a typed ProjectRequestError; the underlying message is
+  // never echoed.
+  "PROJECT_REQUEST_FAILED",
 ]);
 export type ApiErrorCodeV1 = z.infer<typeof apiErrorCodeV1Schema>;
 

@@ -133,6 +133,18 @@ function mapStatus(code: ApiErrorCodeV1): number {
       // transition rejected the duplicate. The caller can read the
       // current state via GET /api/project-requests/:id.
       return 409;
+    case "PROJECT_REQUEST_UNAVAILABLE":
+      // 503 Service Unavailable. The bounded P2034 retry budget was
+      // exhausted; the marketplace is briefly unable to authorise
+      // the write. The caller can retry the same payload without
+      // changing the request.
+      return 503;
+    case "PROJECT_REQUEST_FAILED":
+      // 500 Internal Server Error. Used only when the handler
+      // catches an exception outside the typed ProjectRequestError
+      // surface. The underlying exception message is logged server
+      // side but never echoed to the response envelope.
+      return 500;
   }
 }
 

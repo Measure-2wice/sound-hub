@@ -65,7 +65,8 @@ export class ProjectRequestError extends Error {
       | "PROJECT_REQUEST_NOT_FOUND"
       | "PROJECT_REQUEST_FORBIDDEN"
       | "PROJECT_REQUEST_ALREADY_PENDING"
-      | "PROJECT_REQUEST_ALREADY_RESPONDED",
+      | "PROJECT_REQUEST_ALREADY_RESPONDED"
+      | "PROJECT_REQUEST_UNAVAILABLE",
   ) {
     super(message);
     this.name = "ProjectRequestError";
@@ -358,9 +359,14 @@ export class ProjectRequestService {
           "PROJECT_REQUEST_ALREADY_PENDING",
         );
       case "CONCURRENCY_RETRY_EXHAUSTED":
+        // Bounded P2034 retry budget exhausted in the Prisma
+        // adapter. Surface as the marketplace-busy transient
+        // envelope (503) rather than masking it as an offering
+        // ineligibility — the buyer / seller can retry the same
+        // payload once the marketplace is free again.
         return new ProjectRequestError(
           "The marketplace is busy; please retry.",
-          "PROJECT_REQUEST_OFFERING_INELIGIBLE",
+          "PROJECT_REQUEST_UNAVAILABLE",
         );
     }
   }
@@ -380,9 +386,15 @@ export class ProjectRequestService {
           "PROJECT_REQUEST_ALREADY_RESPONDED",
         );
       case "CONCURRENCY_RETRY_EXHAUSTED":
+        // Bounded P2034 retry budget exhausted in the Prisma
+        // adapter. Surface as the marketplace-busy transient
+        // envelope (503) so the seller can retry the same
+        // accept/decline payload once the marketplace is free
+        // again, rather than masking it as an already-responded
+        // state.
         return new ProjectRequestError(
           "The marketplace is busy; please retry.",
-          "PROJECT_REQUEST_ALREADY_RESPONDED",
+          "PROJECT_REQUEST_UNAVAILABLE",
         );
     }
   }

@@ -46,6 +46,10 @@ interface Fixture {
   projectRequestService: ProjectRequestService;
   projectRequestRepo: InMemoryProjectRequestRepository;
   authRepo: InMemoryAuthRepository;
+  // The WorkspaceAuthorizationService instance the fixture built so
+  // focused tests can build additional services against the same
+  // in-memory authority state without rebuilding it.
+  workspaceAuthorizationService: WorkspaceAuthorizationService;
   now: () => Date;
   clock: { current: Date };
 }
@@ -213,6 +217,7 @@ function buildFixture(): Fixture {
     projectRequestService: service,
     projectRequestRepo,
     authRepo,
+    workspaceAuthorizationService: authz,
     now,
     clock,
   };
@@ -858,6 +863,105 @@ test("ProjectRequestService has no Prisma dependency at the type level", () => {
     : false;
   const assertFalse: _AssertNoPrisma = false;
   void assertFalse;
+});
+
+// Concurrency-retry-exhaustion mapping: when the Prisma adapter's
+// bounded P2034 retry budget runs out, the repository returns
+// `CONCURRENCY_RETRY_EXHAUSTED`. The service MUST surface that as
+// the marketplace-busy transient envelope
+// (PROJECT_REQUEST_UNAVAILABLE → 503) rather than masking it as an
+// offering ineligibility or an already-responded state. The buyer
+// and seller can retry the same payload once the marketplace is
+// free again.
+test("createProjectRequest maps CONCURRENCY_RETRY_EXHAUSTED to PROJECT_REQUEST_UNAVAILABLE", async () => {
+  const { workspaceAuthorizationService } = buildFixture();
+  const stubRepository = {
+    createProjectRequestInTransaction: () =>
+      Promise.resolve({ ok: false, reason: "CONCURRENCY_RETRY_EXHAUSTED" as const }),
+    respondToProjectRequestInTransaction: () =>
+      Promise.reject(new Error("not used in this test")),
+    findProjectRequestById: () => Promise.resolve(null),
+    listProjectRequests: () => Promise.resolve([]),
+  };
+  const service = new ProjectRequestService({
+    projectRequestRepository: stubRepository as never,
+    workspaceAuthorizationService,
+  });
+  await assert.rejects(
+    service.createProjectRequest({
+      userAccountId: BUYER_USER_ID,
+      actingWorkspaceId: BUYER_WORKSPACE_ID,
+      projectBriefId: BRIEF_ID,
+      serviceOfferingId: OFFERING_ID,
+    }),
+    (err: unknown) => {
+      return (
+        err instanceof Error &&
+        err.name === "ProjectRequestError" &&
+        (err as { code?: string }).code === "PROJECT_REQUEST_UNAVAILABLE"
+      );
+    },
+  );
+});
+
+test("acceptProjectRequest maps CONCURRENCY_RETRY_EXHAUSTED to PROJECT_REQUEST_UNAVAILABLE", async () => {
+  const { workspaceAuthorizationService } = buildFixture();
+  const stubRepository = {
+    createProjectRequestInTransaction: () =>
+      Promise.reject(new Error("not used in this test")),
+    respondToProjectRequestInTransaction: () =>
+      Promise.resolve({ ok: false, reason: "CONCURRENCY_RETRY_EXHAUSTED" as const }),
+    findProjectRequestById: () => Promise.resolve(null),
+    listProjectRequests: () => Promise.resolve([]),
+  };
+  const service = new ProjectRequestService({
+    projectRequestRepository: stubRepository as never,
+    workspaceAuthorizationService,
+  });
+  await assert.rejects(
+    service.acceptProjectRequest({
+      userAccountId: SELLER_USER_ID,
+      actingWorkspaceId: SELLER_WORKSPACE_ID,
+      projectRequestId: "pr-any",
+    }),
+    (err: unknown) => {
+      return (
+        err instanceof Error &&
+        err.name === "ProjectRequestError" &&
+        (err as { code?: string }).code === "PROJECT_REQUEST_UNAVAILABLE"
+      );
+    },
+  );
+});
+
+test("declineProjectRequest maps CONCURRENCY_RETRY_EXHAUSTED to PROJECT_REQUEST_UNAVAILABLE", async () => {
+  const { workspaceAuthorizationService } = buildFixture();
+  const stubRepository = {
+    createProjectRequestInTransaction: () =>
+      Promise.reject(new Error("not used in this test")),
+    respondToProjectRequestInTransaction: () =>
+      Promise.resolve({ ok: false, reason: "CONCURRENCY_RETRY_EXHAUSTED" as const }),
+    findProjectRequestById: () => Promise.resolve(null),
+    listProjectRequests: () => Promise.resolve([]),
+  };
+  const service = new ProjectRequestService({
+    projectRequestRepository: stubRepository as never,
+    workspaceAuthorizationService,
+  });
+  await assert.rejects(
+    service.declineProjectRequest({
+      userAccountId: SELLER_USER_ID,
+      actingWorkspaceId: SELLER_WORKSPACE_ID,
+      projectRequestId: "pr-any",
+    }),
+    (err: unknown) => {
+      return (
+        err instanceof Error &&
+        err.name === "ProjectRequestError" &&
+        (err as { code?: string }).code === "PROJECT_REQUEST_UNAVAILABLE"
+      );
+    },
+  );
 });
 
 // Make the typed import survive the strict TS settings.

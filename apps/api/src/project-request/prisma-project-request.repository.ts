@@ -658,6 +658,12 @@ export class PrismaProjectRequestRepository implements ProjectRequestRepository 
         ...(input.statusFilter ? { status: input.statusFilter } : {}),
       },
       orderBy: { createdAt: "desc" },
+      // Bound the inbox to the public response contract maximum so
+      // a runaway Workspace cannot blow past the allow-listed row
+      // cap. The schema enforces 200 on the way out; this prevents
+      // the database from returning more rows than the envelope can
+      // carry.
+      take: 200,
     });
     if (rows.length === 0) return [];
     // Batch-load the display context for every row in one round trip
