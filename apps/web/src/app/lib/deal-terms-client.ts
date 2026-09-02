@@ -51,7 +51,8 @@ async function parseErrorResponse(response: Response): Promise<DealTermsClientEr
   return {
     status: response.status,
     code: candidate?.error?.code ?? "BG5_DEAL_INTERNAL_FAILED",
-    message: candidate?.error?.message ?? "Deal terms request failed. Please try again in a moment.",
+    message:
+      candidate?.error?.message ?? "Deal terms request failed. Please try again in a moment.",
     requestId: candidate?.error?.requestId ?? null,
   };
 }
@@ -69,14 +70,11 @@ export async function fetchDeal(
 ): Promise<Bg5GetDealResponseV1> {
   const params = new URLSearchParams();
   params.set("actingWorkspaceId", actingWorkspaceId);
-  const response = await fetch(
-    `/api/deals/${encodeURIComponent(dealId)}?${params.toString()}`,
-    {
-      method: "GET",
-      credentials: "include",
-      headers: { Accept: "application/json" },
-    },
-  );
+  const response = await fetch(`/api/deals/${encodeURIComponent(dealId)}?${params.toString()}`, {
+    method: "GET",
+    credentials: "include",
+    headers: { Accept: "application/json" },
+  });
   if (!response.ok) {
     throw ensureError(null, await parseErrorResponse(response));
   }

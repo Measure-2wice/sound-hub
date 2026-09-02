@@ -76,6 +76,8 @@ function makeDraftInput(
     aiModelId?: string | null;
     aiFallbackUsed?: boolean;
     proposedTerms?: PersistDraftTermsInput["proposedTerms"];
+    actingWorkspaceId?: string;
+    actingUserAccountId?: string;
   },
 ) {
   return {
@@ -84,6 +86,8 @@ function makeDraftInput(
     aiProvider: overrides?.aiProvider ?? "deterministic-fallback",
     aiModelId: overrides?.aiModelId ?? null,
     aiFallbackUsed: overrides?.aiFallbackUsed ?? true,
+    actingWorkspaceId: overrides?.actingWorkspaceId ?? fx.buyerWorkspaceId,
+    actingUserAccountId: overrides?.actingUserAccountId ?? fx.buyerUserId,
   };
 }
 
@@ -130,8 +134,10 @@ function makeApprovalUseCase(): RecordApprovalUseCase {
     if (!verdict.ok) {
       if (verdict.reason === "DEAL_NOT_FOUND") return tools.reject("DEAL_NOT_FOUND");
       if (verdict.reason === "DEAL_NOT_NEGOTIATING") return tools.reject("DEAL_NOT_NEGOTIATING");
-      if (verdict.reason === "TERMS_VERSION_NOT_FOUND") return tools.reject("TERMS_VERSION_NOT_FOUND");
-      if (verdict.reason === "TERMS_VERSION_NOT_CURRENT") return tools.reject("TERMS_VERSION_NOT_CURRENT");
+      if (verdict.reason === "TERMS_VERSION_NOT_FOUND")
+        return tools.reject("TERMS_VERSION_NOT_FOUND");
+      if (verdict.reason === "TERMS_VERSION_NOT_CURRENT")
+        return tools.reject("TERMS_VERSION_NOT_CURRENT");
       return tools.reject("APPROVAL_FORBIDDEN");
     }
     if (ctx.approvalAuthority.dealApproverId === null) return tools.reject("APPROVAL_FORBIDDEN");
@@ -436,16 +442,14 @@ test("buyer + seller approvals are independent rows for the same current TermsVe
   await createDeal(fx);
   await seedDealApprover(fx.buyerWorkspaceId, fx.buyerUserId);
   await seedDealApprover(fx.sellerWorkspaceId, fx.sellerUserId);
-  const draft = await repo.draftTermsInTransaction(
-    makeDraftInput(fx),
-    makeDraftUseCaseDefault(fx),
-  );
+  const draft = await repo.draftTermsInTransaction(makeDraftInput(fx), makeDraftUseCaseDefault(fx));
   assert.equal(draft.ok, true);
   const tvId = draft.ok ? draft.value.id : "";
   const approvalUseCase = makeApprovalUseCase();
 
   const buyerApproval = await repo.recordApprovalInTransaction(
     {
+      dealId: fx.dealId,
       termsVersionId: tvId,
       actingWorkspaceId: fx.buyerWorkspaceId,
       userAccountId: fx.buyerUserId,
@@ -455,6 +459,7 @@ test("buyer + seller approvals are independent rows for the same current TermsVe
   );
   const sellerApproval = await repo.recordApprovalInTransaction(
     {
+      dealId: fx.dealId,
       termsVersionId: tvId,
       actingWorkspaceId: fx.sellerWorkspaceId,
       userAccountId: fx.sellerUserId,
@@ -481,15 +486,13 @@ test("duplicate approval for the same (termsVersionId, workspaceId) creates exac
   const fx = await loadFixture();
   await createDeal(fx);
   await seedDealApprover(fx.buyerWorkspaceId, fx.buyerUserId);
-  const draft = await repo.draftTermsInTransaction(
-    makeDraftInput(fx),
-    makeDraftUseCaseDefault(fx),
-  );
+  const draft = await repo.draftTermsInTransaction(makeDraftInput(fx), makeDraftUseCaseDefault(fx));
   assert.equal(draft.ok, true);
   const tvId = draft.ok ? draft.value.id : "";
   const approvalUseCase = makeApprovalUseCase();
   const first = await repo.recordApprovalInTransaction(
     {
+      dealId: fx.dealId,
       termsVersionId: tvId,
       actingWorkspaceId: fx.buyerWorkspaceId,
       userAccountId: fx.buyerUserId,
@@ -501,6 +504,7 @@ test("duplicate approval for the same (termsVersionId, workspaceId) creates exac
 
   const second = await repo.recordApprovalInTransaction(
     {
+      dealId: fx.dealId,
       termsVersionId: tvId,
       actingWorkspaceId: fx.buyerWorkspaceId,
       userAccountId: fx.buyerUserId,
@@ -564,6 +568,7 @@ test("approving a stale TermsVersion fails with TERMS_VERSION_NOT_CURRENT", asyn
 
   const stale = await repo.recordApprovalInTransaction(
     {
+      dealId: fx.dealId,
       termsVersionId: v1.ok ? v1.value.id : "",
       actingWorkspaceId: fx.buyerWorkspaceId,
       userAccountId: fx.buyerUserId,
@@ -582,14 +587,12 @@ test("approving a stale TermsVersion fails with TERMS_VERSION_NOT_CURRENT", asyn
 test("approve without an explicit DealApprover authorization fails with APPROVAL_FORBIDDEN", async () => {
   const fx = await loadFixture();
   await createDeal(fx);
-  const draft = await repo.draftTermsInTransaction(
-    makeDraftInput(fx),
-    makeDraftUseCaseDefault(fx),
-  );
+  const draft = await repo.draftTermsInTransaction(makeDraftInput(fx), makeDraftUseCaseDefault(fx));
   assert.equal(draft.ok, true);
   const tvId = draft.ok ? draft.value.id : "";
   const result = await repo.recordApprovalInTransaction(
     {
+      dealId: fx.dealId,
       termsVersionId: tvId,
       actingWorkspaceId: fx.buyerWorkspaceId,
       userAccountId: fx.buyerUserId,
@@ -610,13 +613,11 @@ test("findDealView returns the current TermsVersion and current approvals", asyn
   await createDeal(fx);
   await seedDealApprover(fx.buyerWorkspaceId, fx.buyerUserId);
   await seedDealApprover(fx.sellerWorkspaceId, fx.sellerUserId);
-  const draft = await repo.draftTermsInTransaction(
-    makeDraftInput(fx),
-    makeDraftUseCaseDefault(fx),
-  );
+  const draft = await repo.draftTermsInTransaction(makeDraftInput(fx), makeDraftUseCaseDefault(fx));
   const tvId = draft.ok ? draft.value.id : "";
   await repo.recordApprovalInTransaction(
     {
+      dealId: fx.dealId,
       termsVersionId: tvId,
       actingWorkspaceId: fx.buyerWorkspaceId,
       userAccountId: fx.buyerUserId,
@@ -629,4 +630,165 @@ test("findDealView returns the current TermsVersion and current approvals", asyn
   assert.equal(view.currentTermsVersion?.id, tvId);
   assert.equal(view.currentApprovals.length, 1);
   assert.equal(view.currentApprovals[0]?.workspaceId, fx.buyerWorkspaceId);
+});
+
+// ---------------------------------------------------------------------------
+// P1-002: draft honors the EXACT commanded actingWorkspaceId
+// ---------------------------------------------------------------------------
+
+test("P1-002: a dual-party member explicitly choosing the BUYER Workspace drafts under that Workspace", async () => {
+  const fx = await loadFixture();
+  await createDeal(fx);
+  const useCase = makeDraftUseCase(fx, {
+    aiProvider: "deterministic-fallback",
+    aiModelId: null,
+    aiFallbackUsed: true,
+    proposedTerms: DEFAULT_PROPOSED_TERMS,
+  });
+  const v = await repo.draftTermsInTransaction(
+    makeDraftInput(fx, {
+      actingWorkspaceId: fx.buyerWorkspaceId,
+      actingUserAccountId: fx.buyerUserId,
+    }),
+    useCase,
+  );
+  assert.equal(v.ok, true);
+  if (v.ok) {
+    const row = await prisma.termsVersion.findUnique({ where: { id: v.value.id } });
+    assert.ok(row);
+    assert.equal(row.draftedByUserId, fx.buyerUserId);
+  }
+});
+
+test("P1-002: a dual-party member explicitly choosing the SELLER Workspace drafts under that Workspace", async () => {
+  const fx = await loadFixture();
+  await createDeal(fx);
+  const useCase = makeDraftUseCase(fx, {
+    aiProvider: "deterministic-fallback",
+    aiModelId: null,
+    aiFallbackUsed: true,
+    proposedTerms: DEFAULT_PROPOSED_TERMS,
+  });
+  const v = await repo.draftTermsInTransaction(
+    makeDraftInput(fx, {
+      actingWorkspaceId: fx.sellerWorkspaceId,
+      actingUserAccountId: fx.sellerUserId,
+    }),
+    useCase,
+  );
+  assert.equal(v.ok, true);
+});
+
+test("P1-002: a buyer member claiming the SELLER Workspace fails closed (DRAFT_FORBIDDEN) — no row", async () => {
+  const fx = await loadFixture();
+  await createDeal(fx);
+  // Remove the seller from the buyer Workspace to make this a pure
+  // seller-membership scenario. The buyer user is then a member
+  // of buyerWorkspace only.
+  await prisma.workspaceMembership.deleteMany({
+    where: { userId: fx.sellerUserId, workspaceId: fx.buyerWorkspaceId },
+  });
+  const useCase = makeDraftUseCase(fx, {
+    aiProvider: "deterministic-fallback",
+    aiModelId: null,
+    aiFallbackUsed: true,
+    proposedTerms: DEFAULT_PROPOSED_TERMS,
+  });
+  // The seller user now claims the buyerWorkspace (they are NOT a
+  // member of it). The repository locks the exact (sellerUserId,
+  // buyerWorkspaceId) tuple, finds no membership, and the policy
+  // evaluator fails closed.
+  const v = await repo.draftTermsInTransaction(
+    makeDraftInput(fx, {
+      actingWorkspaceId: fx.buyerWorkspaceId,
+      actingUserAccountId: fx.sellerUserId,
+    }),
+    useCase,
+  );
+  assert.equal(v.ok, false);
+  if (!v.ok) assert.equal(v.reason, "DRAFT_FORBIDDEN");
+  assert.equal((await prisma.termsVersion.findMany({ where: { dealId: fx.dealId } })).length, 0);
+});
+
+test("P1-002: an arbitrary Workspace id fails closed (DRAFT_FORBIDDEN) — no row", async () => {
+  const fx = await loadFixture();
+  await createDeal(fx);
+  const useCase = makeDraftUseCase(fx, {
+    aiProvider: "deterministic-fallback",
+    aiModelId: null,
+    aiFallbackUsed: true,
+    proposedTerms: DEFAULT_PROPOSED_TERMS,
+  });
+  const v = await repo.draftTermsInTransaction(
+    makeDraftInput(fx, {
+      actingWorkspaceId: "ws-arbitrary-not-in-deal",
+      actingUserAccountId: fx.buyerUserId,
+    }),
+    useCase,
+  );
+  assert.equal(v.ok, false);
+  if (!v.ok) assert.equal(v.reason, "DRAFT_FORBIDDEN");
+});
+
+// ---------------------------------------------------------------------------
+// P1-003: approval binds to the commanded Deal
+// ---------------------------------------------------------------------------
+
+test("P1-003: approval with a cross-Deal TermsVersion id fails closed (TERMS_VERSION_NOT_FOUND) — no approval row", async () => {
+  // Seed two separate Deals with separate ProjectRequests so the FK
+  // is satisfiable. Draft a TermsVersion on Deal A, then attempt to
+  // approve it via the Deal B transaction input.
+  const fx = await loadFixture();
+  await createDeal(fx, { status: "Negotiating" });
+  await seedDealApprover(fx.buyerWorkspaceId, fx.buyerUserId);
+  const useCase = makeDraftUseCaseDefault(fx);
+  const v = await repo.draftTermsInTransaction(makeDraftInput(fx), useCase);
+  assert.equal(v.ok, true);
+  const tvId = v.ok ? v.value.id : "";
+
+  // Create a second Deal (Deal B) referencing a different
+  // ProjectRequest so the FK is satisfiable.
+  const requestB = await prisma.projectRequest.upsert({
+    where: { id: "pr-bg5-dealB" },
+    create: {
+      id: "pr-bg5-dealB",
+      buyerWorkspaceId: fx.buyerWorkspaceId,
+      sellerWorkspaceId: fx.sellerWorkspaceId,
+      serviceOfferingId: fx.serviceOfferingId,
+      projectBriefId: fx.briefId,
+      createdByUserId: fx.buyerUserId,
+      status: "Accepted",
+      sellerConsentAt: new Date("2026-09-01T00:00:00Z"),
+      sellerDecisionByUserId: fx.sellerUserId,
+    },
+    update: { status: "Accepted" },
+  });
+  await prisma.deal.deleteMany({ where: { id: "deal-bg5-B" } });
+  await prisma.deal.create({
+    data: {
+      id: "deal-bg5-B",
+      buyerWorkspaceId: fx.buyerWorkspaceId,
+      sellerWorkspaceId: fx.sellerWorkspaceId,
+      serviceOfferingId: fx.serviceOfferingId,
+      projectBriefId: fx.briefId,
+      projectRequestId: requestB.id,
+      status: "Negotiating",
+    },
+  });
+
+  // Attempt to approve the V1 from Deal A via the Deal B transaction.
+  const result = await repo.recordApprovalInTransaction(
+    {
+      dealId: "deal-bg5-B",
+      termsVersionId: tvId,
+      actingWorkspaceId: fx.buyerWorkspaceId,
+      userAccountId: fx.buyerUserId,
+      now: new Date("2026-09-02T00:00:00Z"),
+    },
+    makeApprovalUseCase(),
+  );
+  assert.equal(result.ok, false);
+  if (!result.ok) assert.equal(result.reason, "TERMS_VERSION_NOT_FOUND");
+  const stored = await prisma.dealApproval.findMany({ where: { termsVersionId: tvId } });
+  assert.equal(stored.length, 0, "no approval row inserted for cross-Deal mismatch");
 });

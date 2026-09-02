@@ -28,6 +28,11 @@ import type {
   DraftTermsUseCase,
   DraftTermsUseCaseOutcome,
   DraftTermsUseCaseTools,
+  FindDealViewResult,
+  FindDealViewTransactionInput,
+  FindDealViewUseCase,
+  FindDealViewUseCaseOutcome,
+  FindDealViewUseCaseTools,
   PersistedDealApproval,
   PersistedDealSummary,
   PersistedTermsVersion,
@@ -149,39 +154,24 @@ export class InMemoryDealTermsRepository implements DealTermsRepository {
       if (!deal) {
         return Promise.resolve({ ok: false, reason: "DEAL_NOT_FOUND" });
       }
-      const actingWs = this.workspaces.get(
-        // The acting Workspace id is implicit in the use-case snapshot
-        // — pull it from the use-case closure's input. We re-read it
-        // from the seeded memberships by inspecting the use-case
-        // result; the cleanest path is to derive it from the actor
-        // user id. For now, the in-memory adapter expects the
-        // application service to thread the actingWorkspaceId
-        // separately; we surface a NOT_A_MEMBER fallback if missing.
-        // The simplest deterministic helper: pick the first
-        // membership for the acting user that exists in our seeded
-        // workspaces — this is consistent with the in-memory
-        // adapter's role as a focused unit-test surface.
-        (() => {
-          for (const m of this.memberships.values()) {
-            if (m.userId === input.draftedByUserId) return m.workspaceId;
-          }
-          return "";
-        })(),
-      );
-      if (!actingWs) {
-        return Promise.resolve({ ok: false, reason: "DRAFT_FORBIDDEN" });
-      }
+      // P1-002: lock the EXACT commanded (actingUserAccountId,
+      // actingWorkspaceId) tuple, not the first qualifying
+      // membership. Membership in a different Workspace is irrelevant.
+      const actingWs = this.workspaces.get(input.actingWorkspaceId);
+      const isMember =
+        actingWs !== undefined &&
+        this.memberships.has(
+          this.membershipKey(input.actingUserAccountId, input.actingWorkspaceId),
+        );
 
       const snapshot: DraftingAuthoritySnapshot = {
         dealId: input.dealId,
         dealStatus: deal.status,
         buyerWorkspaceId: deal.buyerWorkspaceId,
         sellerWorkspaceId: deal.sellerWorkspaceId,
-        actingWorkspaceId: actingWs.workspaceId,
-        actingWorkspaceStatus: actingWs.status,
-        actingUserIsMember: this.memberships.has(
-          this.membershipKey(input.draftedByUserId ?? "", actingWs.workspaceId),
-        ),
+        actingWorkspaceId: input.actingWorkspaceId,
+        actingWorkspaceStatus: actingWs?.status ?? "Suspended",
+        actingUserIsMember: isMember,
       };
 
       const tools: DraftTermsUseCaseTools = {
@@ -254,19 +244,30 @@ export class InMemoryDealTermsRepository implements DealTermsRepository {
           reason: "TERMS_VERSION_NOT_FOUND",
         });
       }
+      // P1-003: enforce that the TermsVersion belongs to the commanded
+      // Deal. The Deal is loaded from the TermsVersion so that the
+      // contract stays single-source-of-truth for the TV→Deal link.
       const deal = this.deals.get(tv.dealId);
       if (!deal) {
         return Promise.resolve({ ok: false, reason: "DEAL_NOT_FOUND" });
+      }
+      if (deal.id !== input.dealId) {
+        // Cross-Deal mismatch — collapse to TERMS_VERSION_NOT_FOUND so
+        // the safe envelope does not leak the cross-Deal existence.
+        return Promise.resolve({
+          ok: false,
+          reason: "TERMS_VERSION_NOT_FOUND",
+        });
       }
       // Compute current version (MAX) under the mutex.
       const dealVersions = [...this.termsVersions.values()].filter((row) => row.dealId === deal.id);
       const currentVersionId =
         dealVersions.length === 0
           ? null
-          : dealVersions.reduce(
+          : (dealVersions.reduce(
               (acc, row) => (acc === null || row.version > acc.version ? row : acc),
               dealVersions[0] ?? null,
-            )?.id ?? null;
+            )?.id ?? null);
 
       const actingWs = this.workspaces.get(input.actingWorkspaceId);
       if (!actingWs) {
@@ -346,6 +347,71 @@ export class InMemoryDealTermsRepository implements DealTermsRepository {
 
   // ---------- Reads ----------
 
+  findDealViewInTransaction(
+    input: FindDealViewTransactionInput,
+    useCase: FindDealViewUseCase,
+  ): Promise<FindDealViewResult> {
+    // Single-flight mutex: every read inside a transaction also runs
+    // synchronously against the in-memory state. The in-memory
+    // adapter does NOT replicate PostgreSQL MVCC; the service layer
+    // is the only arbiter of authority.
+    if (this.inflight) {
+      return Promise.reject(
+        new Error(
+          "In-memory DealTermsRepository already has an inflight transaction; " +
+            "the in-memory adapter does not serialize concurrent transactions.",
+        ),
+      );
+    }
+    this.inflight = true;
+    try {
+      const deal = this.deals.get(input.dealId);
+      const actingWs = this.workspaces.get(input.actingWorkspaceId);
+      const isMember =
+        actingWs !== undefined &&
+        this.memberships.has(
+          this.membershipKey(input.actingUserAccountId, input.actingWorkspaceId),
+        );
+
+      const snapshot = {
+        dealId: input.dealId,
+        dealExists: deal !== undefined,
+        dealStatus: deal?.status ?? null,
+        buyerWorkspaceId: deal?.buyerWorkspaceId ?? null,
+        sellerWorkspaceId: deal?.sellerWorkspaceId ?? null,
+        actingWorkspaceId: input.actingWorkspaceId,
+        actingWorkspaceStatus: actingWs?.status ?? null,
+        actingUserIsMember: isMember,
+      };
+      const tools: FindDealViewUseCaseTools = {
+        reject: (reason): FindDealViewUseCaseOutcome => ({ kind: "reject", reason }),
+        accept: (): FindDealViewUseCaseOutcome => ({ kind: "accept" }),
+      };
+      const outcome = useCase({ snapshot }, tools);
+      if (outcome.kind === "reject") {
+        return Promise.resolve({ ok: false, reason: outcome.reason });
+      }
+      // outcome.kind === "accept" — the locked snapshot is
+      // authorized; assemble the view from in-memory state.
+      const versions = [...this.termsVersions.values()]
+        .filter((row) => row.dealId === input.dealId)
+        .sort((a, b) => b.version - a.version);
+      const current = versions[0] ?? null;
+      const approvals = current
+        ? [...this.dealApprovals.values()].filter((row) => row.termsVersionId === current.id)
+        : [];
+      const view: DealViewSnapshot = {
+        deal: dealSummaryToPersisted(deal as DealSeed),
+        projectRequest: null,
+        currentTermsVersion: current,
+        currentApprovals: approvals,
+      };
+      return Promise.resolve({ ok: true, value: view });
+    } finally {
+      this.inflight = false;
+    }
+  }
+
   findDealView(dealId: string): Promise<DealViewSnapshot | null> {
     const deal = this.deals.get(dealId);
     if (!deal) return Promise.resolve(null);
@@ -354,9 +420,7 @@ export class InMemoryDealTermsRepository implements DealTermsRepository {
       .sort((a, b) => b.version - a.version);
     const current = versions[0] ?? null;
     const approvals = current
-      ? [...this.dealApprovals.values()].filter(
-          (row) => row.termsVersionId === current.id,
-        )
+      ? [...this.dealApprovals.values()].filter((row) => row.termsVersionId === current.id)
       : [];
     return Promise.resolve({
       deal: dealSummaryToPersisted(deal),

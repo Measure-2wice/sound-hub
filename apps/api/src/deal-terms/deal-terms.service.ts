@@ -44,14 +44,21 @@ import type {
   ProjectRequestPublicV1,
   DealPublicV1,
 } from "@soundhub/types";
+import { bg5ProposedTermsV1Schema } from "@soundhub/types";
+import {
+  AuthorizationError,
+  type WorkspaceAuthorizationService,
+} from "../services/workspace-authorization.service.js";
 import {
   evaluateApprovalAuthority,
+  evaluateDealReadAuthority,
   evaluateDraftingAuthority,
   type ApprovalAuthoritySnapshot,
   type DraftingAuthoritySnapshot,
 } from "./deal-terms-authorization-policy.js";
 import type {
   DealTermsRepository,
+  DealReadAuthoritySnapshot,
   DealViewSnapshot,
   DraftTermsFailureReason,
   DraftTermsResult,
@@ -60,6 +67,8 @@ import type {
   DraftTermsUseCaseContext,
   DraftTermsUseCaseOutcome,
   DraftTermsUseCaseTools,
+  FindDealViewUseCaseTools,
+  FindDealViewUseCaseOutcome,
   PersistApprovalInput,
   PersistDraftTermsInput,
   PersistedDealApproval,
@@ -98,6 +107,7 @@ export class DealTermsError extends Error {
 
 export interface DealTermsServiceDeps {
   readonly dealTermsRepository: DealTermsRepository;
+  readonly workspaceAuthorizationService: WorkspaceAuthorizationService;
   readonly aiAdapter?: DealTermsAiAdapter;
   readonly deterministicAiAdapter?: DealTermsAiAdapter;
   readonly now?: () => Date;
@@ -133,12 +143,14 @@ export interface GetDealInput {
 
 export class DealTermsService {
   private readonly repository: DealTermsRepository;
+  private readonly authz: WorkspaceAuthorizationService;
   private readonly aiAdapter: DealTermsAiAdapter;
   private readonly fallbackAiAdapter: DealTermsAiAdapter;
   private readonly now: () => Date;
 
   constructor(deps: DealTermsServiceDeps) {
     this.repository = deps.dealTermsRepository;
+    this.authz = deps.workspaceAuthorizationService;
     this.fallbackAiAdapter = deps.deterministicAiAdapter ?? new DeterministicDealTermsAiAdapter();
     this.aiAdapter = deps.aiAdapter ?? this.fallbackAiAdapter;
     this.now = deps.now ?? (() => new Date());
@@ -173,7 +185,16 @@ export class DealTermsService {
   }> {
     const now = input.now ?? this.now();
 
-    // Step 1: produce a validated candidate proposal.
+    // P1-004: pre-authorize BEFORE invoking AI. The pre-check
+    // verifies current membership, exact acting Workspace, Deal
+    // party relationship, and Negotiating status. If any check
+    // fails, the AI adapter is NEVER called and no TermsVersion is
+    // written. The transaction below re-reads / re-locks the same
+    // facts to close any revocation / state-change race.
+    await this.preAuthorizeDraft(input);
+
+    // Step 1: produce a validated candidate proposal. AI is invoked
+    // only after the pre-authorization above has passed.
     const proposed = input.callerProposedTerms
       ? input.callerProposedTerms
       : await this.produceProposedTerms(input.dealId);
@@ -181,9 +202,16 @@ export class DealTermsService {
     const draftInput: DraftTermsTransactionInput = {
       dealId: input.dealId,
       draftedByUserId: input.userAccountId,
-      aiProvider: this.aiAdapter.key === "deterministic-fallback" ? "deterministic-fallback" : "managed",
+      aiProvider:
+        this.aiAdapter.key === "deterministic-fallback" ? "deterministic-fallback" : "managed",
       aiModelId: null,
       aiFallbackUsed: this.aiAdapter.key === "deterministic-fallback",
+      // P1-002: thread the EXACT commanded acting tuple into the
+      // transaction. The repository FOR UPDATE-locks that exact
+      // (userAccountId, actingWorkspaceId) tuple and evaluates the
+      // policy against it.
+      actingWorkspaceId: input.actingWorkspaceId,
+      actingUserAccountId: input.userAccountId,
     };
 
     // Step 2-4: transaction + use case. The use case closure carries
@@ -228,6 +256,12 @@ export class DealTermsService {
 
     const result = await this.repository.recordApprovalInTransaction(
       {
+        // P1-003: bind the commanded Deal to the TermsVersion. The
+        // repository FOR UPDATE-locks the TermsVersion + the Deal
+        // and rejects if the two do not match — a POST to
+        // /deals/A/approvals containing a TV for Deal B cannot
+        // persist an approval.
+        dealId: input.dealId,
         termsVersionId: input.termsVersionId,
         actingWorkspaceId: input.actingWorkspaceId,
         userAccountId: input.userAccountId,
@@ -247,34 +281,96 @@ export class DealTermsService {
 
   /**
    * Read the Deal view (Deal + current TermsVersion + current
-   * approvals). Membership authorization is the route's responsibility
-   * — the service surfaces typed NOT_FOUND when the Deal does not
-   * exist; the route's getDeal revalidates current membership against
-   * the Deal's buyer/seller Workspace before calling this method.
+   * approvals). P0-001: the route must supply the exact
+   * authenticated userAccountId + actingWorkspaceId; this service
+   * verifies current membership against the EXACT acting Workspace
+   * atomically with the read under a Serializable transaction.
+   * Authorization ownership stays in the application layer (the
+   * repository never decides policy); the persistence + locking stay
+   * in the repository layer.
    */
-  async getDeal(_input: GetDealInput): Promise<{
+  async getDeal(input: GetDealInput): Promise<{
     readonly deal: DealPublicV1;
     readonly currentTermsVersion: Bg5TermsVersionPublicV1 | null;
     readonly currentApprovals: readonly Bg5DealApprovalPublicV1[];
     readonly projectRequest: ProjectRequestPublicV1 | null;
   }> {
-    const view = await this.repository.findDealView(_input.dealId);
-    if (!view) {
+    const view = await this.repository.findDealViewInTransaction(
+      {
+        dealId: input.dealId,
+        actingWorkspaceId: input.actingWorkspaceId,
+        actingUserAccountId: input.userAccountId,
+      },
+      (ctx, tools) => evaluateReadUseCase(ctx, tools),
+    );
+    if (!view.ok) {
       throw new DealTermsError("Deal not found.", "BG5_DEAL_NOT_FOUND");
     }
     return {
-      deal: dealSummaryToPublic(view.deal),
-      currentTermsVersion: view.currentTermsVersion
-        ? toPublicTermsVersion(view.currentTermsVersion, true)
+      deal: dealSummaryToPublic(view.value.deal),
+      currentTermsVersion: view.value.currentTermsVersion
+        ? toPublicTermsVersion(view.value.currentTermsVersion, true)
         : null,
-      currentApprovals: view.currentApprovals.map(toPublicApproval),
-      projectRequest: view.projectRequest,
+      currentApprovals: view.value.currentApprovals.map(toPublicApproval),
+      projectRequest: view.value.projectRequest,
     };
   }
 
   // -----------------------------------------------------------------------
   // AI boundary helpers
   // -----------------------------------------------------------------------
+
+  private async preAuthorizeDraft(input: DraftTermsInput): Promise<void> {
+    // P1-004: pre-authorize BEFORE invoking AI.
+    //
+    // 1. Current WorkspaceMembership for the EXACT commanded
+    //    (userAccountId, actingWorkspaceId) tuple. Fail-closed for
+    //    unrelated Workspaces, revoked members, and buyer members
+    //    claiming the seller Workspace.
+    try {
+      await this.authz.requireActingMembership({
+        userAccountId: input.userAccountId,
+        workspaceId: input.actingWorkspaceId,
+      });
+    } catch (err) {
+      if (err instanceof AuthorizationError) {
+        throw new DealTermsError(
+          "You are not authorized to draft terms for this Deal.",
+          "BG5_TERMS_DRAFT_FORBIDDEN",
+        );
+      }
+      throw err;
+    }
+    // 2. Deal must exist + be a Negotiating Deal + the acting
+    //    Workspace must be the buyer or seller side. The Deal
+    //    summary is sufficient for this read (no version / approvals
+    //    data is exposed); the transaction below re-reads and
+    //    re-locks the same facts to close the race.
+    const summary = await this.repository.findDealSummary(input.dealId);
+    if (!summary) {
+      throw new DealTermsError("Deal not found.", "BG5_DEAL_NOT_FOUND");
+    }
+    if (summary.status !== "Negotiating") {
+      throw new DealTermsError(
+        "Terms may only be drafted for a Negotiating Deal.",
+        "BG5_DEAL_NOT_NEGOTIATING",
+      );
+    }
+    if (
+      summary.buyerWorkspaceId !== input.actingWorkspaceId &&
+      summary.sellerWorkspaceId !== input.actingWorkspaceId
+    ) {
+      // The acting Workspace is not a party to this Deal. Collapse
+      // to BG5_TERMS_DRAFT_FORBIDDEN because the caller's
+      // commanded Workspace + Deal is the only context the safe
+      // envelope can disambiguate; the cross-Deal existence
+      // question is handled by getDeal's BG5_DEAL_NOT_FOUND.
+      throw new DealTermsError(
+        "You are not authorized to draft terms for this Deal.",
+        "BG5_TERMS_DRAFT_FORBIDDEN",
+      );
+    }
+  }
 
   private async produceProposedTerms(
     dealId: string,
@@ -283,35 +379,32 @@ export class DealTermsService {
     if (!summary) {
       throw new DealTermsError("Deal not found.", "BG5_DEAL_NOT_FOUND");
     }
-    // Try the configured adapter first; on failure fall back to the
-    // deterministic adapter. The fallback is invoked through the same
-    // validation boundary (see `validateCandidate`) so neither path
-    // bypasses the strict schema.
-    let attempted = false;
-    for (const adapter of [this.aiAdapter, this.fallbackAiAdapter]) {
-      if (attempted && adapter === this.fallbackAiAdapter) continue;
-      attempted = true;
-      try {
-        const output = await adapter.draftProposedTerms({
-          dealId: summary.id,
-          buyerWorkspaceId: summary.buyerWorkspaceId,
-          sellerWorkspaceId: summary.sellerWorkspaceId,
-          serviceOfferingId: summary.serviceOfferingId,
-          projectBriefId: summary.projectBriefId,
-        });
-        return validateCandidate(output.candidate, output.provider);
-      } catch {
-        // continue to the next adapter
-      }
+    // P1-001: invoke the active adapter, strictly validate the
+    // candidate, and fail closed on malformed output. The deterministic
+    // fallback adapter is the buildathon adapter; it is the same
+    // shape as the active adapter for BG5. We do NOT silently swap
+    // to a different adapter on validation failure — a malformed
+    // candidate must not produce a TermsVersion.
+    const output = await this.aiAdapter.draftProposedTerms({
+      dealId: summary.id,
+      buyerWorkspaceId: summary.buyerWorkspaceId,
+      sellerWorkspaceId: summary.sellerWorkspaceId,
+      serviceOfferingId: summary.serviceOfferingId,
+      projectBriefId: summary.projectBriefId,
+    });
+    try {
+      return validateCandidate(output.candidate, output.provider);
+    } catch (err) {
+      // The deterministic adapter itself returns a shape that
+      // satisfies `bg5ProposedTermsV1Schema`; any validation failure
+      // indicates a malformed AI output that MUST NOT reach
+      // persistence. Surface as the typed BG5 AI envelope.
+      const detail = err instanceof Error ? err.message : String(err);
+      throw new DealTermsError(
+        `AI provider returned a malformed candidate (${detail}).`,
+        "BG5_TERMS_DRAFT_INVALID",
+      );
     }
-    // Last-resort: return the deterministic shape directly. The
-    // caller-side validation rejects the attempt if the shape is
-    // malformed; this branch is unreachable because the
-    // deterministic adapter always returns a valid candidate.
-    throw new DealTermsError(
-      "AI provider unavailable; deterministic fallback failed.",
-      "BG5_TERMS_DRAFT_INVALID",
-    );
   }
 
   // -----------------------------------------------------------------------
@@ -338,10 +431,7 @@ export class DealTermsService {
           "BG5_TERMS_DRAFT_INVALID",
         );
       case "CONCURRENCY_RETRY_EXHAUSTED":
-        return new DealTermsError(
-          "The marketplace is busy; please retry.",
-          "BG5_DEAL_UNAVAILABLE",
-        );
+        return new DealTermsError("The marketplace is busy; please retry.", "BG5_DEAL_UNAVAILABLE");
     }
   }
 
@@ -372,15 +462,27 @@ export class DealTermsService {
           "BG5_APPROVAL_ALREADY_RECORDED",
         );
       case "CONCURRENCY_RETRY_EXHAUSTED":
-        return new DealTermsError(
-          "The marketplace is busy; please retry.",
-          "BG5_DEAL_UNAVAILABLE",
-        );
+        return new DealTermsError("The marketplace is busy; please retry.", "BG5_DEAL_UNAVAILABLE");
     }
   }
 }
 
 // ---------- application-owned use-case evaluators ----------
+
+function evaluateReadUseCase(
+  ctx: { readonly snapshot: DealReadAuthoritySnapshot },
+  tools: FindDealViewUseCaseTools,
+): FindDealViewUseCaseOutcome {
+  const verdict = evaluateDealReadAuthority(ctx.snapshot);
+  if (!verdict.ok) {
+    return tools.reject(verdict.reason);
+  }
+  // The repository assembled the view from the locked snapshot
+  // before invoking the use case; on accept, the repository returns
+  // it directly. The use case carries no persisted data — it is
+  // policy-only.
+  return tools.accept();
+}
 
 function evaluateDraftUseCase(
   ctx: DraftTermsUseCaseContext,
@@ -456,63 +558,43 @@ function validateCandidate(
   candidate: unknown,
   provider: string,
 ): PersistDraftTermsInput["proposedTerms"] {
-  // The application owns the boundary. The deterministic adapter
-  // returns a value that already matches `bg5ProposedTermsV1`; we
-  // re-shape it here so any future managed adapter that returns a
-  // malformed candidate is rejected.
-  if (!candidate || typeof candidate !== "object") {
-    throw new Error("AI candidate must be an object");
+  // P1-001: strict runtime validation. The candidate must satisfy
+  // the shared strict Zod schema. We do NOT manufacture any
+  // required field — a missing or wrong-type field rejects the
+  // candidate. The adapter may return unknown; the application
+  // boundary validates it.
+  const parsed = bg5ProposedTermsV1Schema.safeParse(candidate);
+  if (!parsed.success) {
+    throw new Error(
+      `AI candidate from provider "${provider}" failed strict validation: ${parsed.error.issues
+        .map((i) => `${i.path.join(".")}: ${i.message}`)
+        .join("; ")}`,
+    );
   }
-  // The schema at the public boundary is `z.record(z.string(),
-  // z.unknown())`, so any object satisfies the assignment without a
-  // double cast.
-  const c = candidate as Record<string, unknown>;
-  const stringOrEmpty = (v: unknown): string => (typeof v === "string" ? v : "");
-  const numberOrZero = (v: unknown): number => (typeof v === "number" ? v : 0);
-  const scope = stringOrEmpty(c["scope"]);
-  const rightsSummary = stringOrEmpty(c["rightsSummary"]);
-  const revisionAllowance = numberOrZero(c["revisionAllowance"]);
-  const deliverablesRaw = c["deliverables"];
-  const deliverables: PersistDraftTermsInput["proposedTerms"]["deliverables"] = Array.isArray(
-    deliverablesRaw,
-  )
-    ? deliverablesRaw.map((d) => ({
-        title: stringOrEmpty((d as Record<string, unknown>)?.title),
-        description: stringOrEmpty((d as Record<string, unknown>)?.description),
-      }))
-    : [];
-  const scheduleRaw = c["schedule"];
-  const schedule: PersistDraftTermsInput["proposedTerms"]["schedule"] =
-    scheduleRaw && typeof scheduleRaw === "object"
-      ? {
-          startDate: stringOrEmpty((scheduleRaw as Record<string, unknown>)["startDate"]) || "2026-01-01",
-          endDate: stringOrEmpty((scheduleRaw as Record<string, unknown>)["endDate"]) || "2026-01-01",
-          deliveryDays: numberOrZero((scheduleRaw as Record<string, unknown>)["deliveryDays"]) || 1,
-        }
-      : { startDate: "2026-01-01", endDate: "2026-01-01", deliveryDays: 1 };
-  const priceRaw = c["price"];
-  const price: PersistDraftTermsInput["proposedTerms"]["price"] =
-    priceRaw && typeof priceRaw === "object"
-      ? {
-          amountMinor:
-            numberOrZero((priceRaw as Record<string, unknown>)["amountMinor"]) || 0,
-          currency: "USD",
-        }
-      : { amountMinor: 0, currency: "USD" };
-  const fundingDeadlineAt =
-    typeof c["fundingDeadlineAt"] === "string" ? c["fundingDeadlineAt"] : undefined;
-  // The deterministic adapter does not need a provider-keyed
-  // distinction here; the application service stamps aiProvider
-  // based on which adapter produced the candidate.
-  void provider;
+  // The Zod schema does not preserve the `fundingDeadlineAt` shape
+  // through the public type cleanly when it is absent; coerce the
+  // optional ISO string back to the application's exact input
+  // shape. No coercion of required fields occurs here.
   return {
-    scope,
-    deliverables,
-    schedule,
-    price,
-    revisionAllowance,
-    rightsSummary,
-    ...(fundingDeadlineAt !== undefined ? { fundingDeadlineAt } : {}),
+    scope: parsed.data.scope,
+    deliverables: parsed.data.deliverables.map((d) => ({
+      title: d.title,
+      description: d.description,
+    })),
+    schedule: {
+      startDate: parsed.data.schedule.startDate,
+      endDate: parsed.data.schedule.endDate,
+      deliveryDays: parsed.data.schedule.deliveryDays,
+    },
+    price: {
+      amountMinor: parsed.data.price.amountMinor,
+      currency: parsed.data.price.currency,
+    },
+    revisionAllowance: parsed.data.revisionAllowance,
+    rightsSummary: parsed.data.rightsSummary,
+    ...(parsed.data.fundingDeadlineAt !== undefined
+      ? { fundingDeadlineAt: parsed.data.fundingDeadlineAt }
+      : {}),
   };
 }
 

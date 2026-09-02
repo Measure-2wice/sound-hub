@@ -12,7 +12,10 @@
 //     response contract; no Prisma models cross this boundary.
 
 import { Router } from "express";
-import { createDealTermsRouter as buildHandler, type DealTermsRouteDeps } from "./deal-terms-handlers.js";
+import {
+  createDealTermsRouter as buildHandler,
+  type DealTermsRouteDeps,
+} from "./deal-terms-handlers.js";
 
 export type { DealTermsRouteDeps };
 

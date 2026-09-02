@@ -21,6 +21,8 @@ import { test } from "node:test";
 import assert from "node:assert/strict";
 import { DealTermsService, DealTermsError } from "./deal-terms.service.js";
 import { InMemoryDealTermsRepository } from "./in-memory-deal-terms.repository.js";
+import { WorkspaceAuthorizationService } from "../services/workspace-authorization.service.js";
+import { InMemoryAuthRepository } from "../auth-repository/in-memory-auth-repository.js";
 
 const BUYER_USER_ID = "user-buyer";
 const BUYER_WORKSPACE_ID = "ws-buyer";
@@ -46,12 +48,11 @@ const VALID_PROPOSED = {
 interface Fixture {
   service: DealTermsService;
   repo: InMemoryDealTermsRepository;
+  authz: WorkspaceAuthorizationService;
   clock: { current: Date };
 }
 
-function buildFixture(opts?: {
-  dealStatus?: "Negotiating" | "Active";
-}): Fixture {
+function buildFixture(opts?: { dealStatus?: "Negotiating" | "Active" }): Fixture {
   const repo = new InMemoryDealTermsRepository();
   repo.seedWorkspace({ workspaceId: BUYER_WORKSPACE_ID, status: "Active" });
   repo.seedWorkspace({ workspaceId: SELLER_WORKSPACE_ID, status: "Active" });
@@ -59,6 +60,68 @@ function buildFixture(opts?: {
   repo.seedMembership({ userId: BUYER_USER_ID, workspaceId: BUYER_WORKSPACE_ID });
   repo.seedMembership({ userId: SELLER_USER_ID, workspaceId: SELLER_WORKSPACE_ID });
   repo.seedMembership({ userId: OTHER_USER_ID, workspaceId: OTHER_WORKSPACE_ID });
+  // Build a real WorkspaceAuthorizationService backed by the same
+  // membership state the in-memory deal-terms repo uses. P1-004
+  // requires the service to enforce current membership before
+  // invoking AI; the test fixture must therefore provide a real
+  // (not stubbed) authorization service so the pre-check fires.
+  const authRepo = new InMemoryAuthRepository(
+    [
+      {
+        userAccountId: BUYER_USER_ID,
+        email: "buyer@example.com",
+        identityProvider: "deterministic",
+        identitySubject: `buyer-${BUYER_USER_ID}`,
+        memberships: [
+          {
+            workspaceId: BUYER_WORKSPACE_ID,
+            slug: "buyer",
+            name: "Buyer",
+            workspaceType: "Personal",
+            workspaceStatus: "Active",
+            role: "Owner",
+            capabilities: ["Buyer"],
+          },
+        ],
+      },
+      {
+        userAccountId: SELLER_USER_ID,
+        email: "seller@example.com",
+        identityProvider: "deterministic",
+        identitySubject: `seller-${SELLER_USER_ID}`,
+        memberships: [
+          {
+            workspaceId: SELLER_WORKSPACE_ID,
+            slug: "seller",
+            name: "Seller",
+            workspaceType: "Personal",
+            workspaceStatus: "Active",
+            role: "Owner",
+            capabilities: ["Seller"],
+          },
+        ],
+      },
+      {
+        userAccountId: OTHER_USER_ID,
+        email: "other@example.com",
+        identityProvider: "deterministic",
+        identitySubject: `other-${OTHER_USER_ID}`,
+        memberships: [
+          {
+            workspaceId: OTHER_WORKSPACE_ID,
+            slug: "other",
+            name: "Other",
+            workspaceType: "Personal",
+            workspaceStatus: "Active",
+            role: "Owner",
+            capabilities: [],
+          },
+        ],
+      },
+    ],
+    () => 0,
+  );
+  const authz = new WorkspaceAuthorizationService({ authRepository: authRepo });
   repo.seedDeal({
     id: DEAL_ID,
     buyerWorkspaceId: BUYER_WORKSPACE_ID,
@@ -86,10 +149,11 @@ function buildFixture(opts?: {
   const clock = { current: new Date("2026-09-01T00:00:00Z") };
   const service = new DealTermsService({
     dealTermsRepository: repo,
+    workspaceAuthorizationService: authz,
     now: () => clock.current,
   });
 
-  return { service, repo, clock };
+  return { service, repo, clock, authz };
 }
 
 // ---------------------------------------------------------------------------
@@ -122,9 +186,7 @@ test("draftTerms persists draftedAt from the service clock, ignoring any caller-
   });
   assert.equal(view.currentTermsVersion?.draftedAt, "2026-09-01T00:00:00.000Z");
   // Internal sanity: the repository recorded the timestamp too.
-  const persisted = [...repo["termsVersions"].values()].find(
-    (row) => row.dealId === DEAL_ID,
-  );
+  const persisted = [...repo["termsVersions"].values()].find((row) => row.dealId === DEAL_ID);
   assert.ok(persisted, "the in-memory repo must hold a TermsVersion row");
   assert.equal(persisted.draftedAt.toISOString(), "2026-09-01T00:00:00.000Z");
 });

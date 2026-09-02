@@ -35,6 +35,7 @@
 // New evaluators added here must remain pure and additive.
 
 import type { DealStatusV1 } from "@soundhub/types";
+import type { DealReadAuthoritySnapshot } from "./deal-terms.repository.js";
 
 // --------------------------------------------------------------------------
 // Drafting authorization
@@ -81,7 +82,9 @@ export interface DraftingAuthoritySnapshot {
  *      buyer or seller Workspaces.
  *   4. That Workspace must be Active.
  */
-export function evaluateDraftingAuthority(snapshot: DraftingAuthoritySnapshot): DraftingAuthorityVerdict {
+export function evaluateDraftingAuthority(
+  snapshot: DraftingAuthoritySnapshot,
+): DraftingAuthorityVerdict {
   if (snapshot.dealStatus === null) {
     return { ok: false, reason: "DEAL_NOT_FOUND" };
   }
@@ -103,6 +106,54 @@ export function evaluateDraftingAuthority(snapshot: DraftingAuthoritySnapshot): 
   }
   if (!snapshot.actingUserIsMember) {
     return { ok: false, reason: "NOT_A_MEMBER" };
+  }
+  return { ok: true };
+}
+
+// --------------------------------------------------------------------------
+// Deal-read authorization (P0-001)
+// --------------------------------------------------------------------------
+
+export type DealReadAuthorityVerdict =
+  | { readonly ok: true }
+  | { readonly ok: false; readonly reason: "DEAL_NOT_FOUND" };
+
+/**
+ * Pure evaluator for the BG5 Deal read path. The repository opens
+ * one transaction, FOR UPDATE-locks the Deal + buyer/seller
+ * Workspaces + the acting user's WorkspaceMembership for the EXACT
+ * commanded Workspace, then hands the locked snapshot to this
+ * function. The verdict decides whether the locked facts authorize
+ * returning the Deal view.
+ *
+ * Rule (per ticket #63 P0-001):
+ *   1. The Deal must exist.
+ *   2. The acting Workspace must be Active.
+ *   3. The acting user must be a current member of that EXACT
+ *      Workspace (no other-Workspace membership grants read).
+ *   4. The acting Workspace must be the Deal's buyer or seller side.
+ *
+ * All rejections collapse to `DEAL_NOT_FOUND` so an unauthorized
+ * caller cannot distinguish "no such Deal" from "Deal exists but
+ * you are not a party".
+ */
+export function evaluateDealReadAuthority(
+  snapshot: DealReadAuthoritySnapshot,
+): DealReadAuthorityVerdict {
+  if (!snapshot.dealExists || snapshot.dealStatus === null) {
+    return { ok: false, reason: "DEAL_NOT_FOUND" };
+  }
+  if (
+    snapshot.buyerWorkspaceId !== snapshot.actingWorkspaceId &&
+    snapshot.sellerWorkspaceId !== snapshot.actingWorkspaceId
+  ) {
+    return { ok: false, reason: "DEAL_NOT_FOUND" };
+  }
+  if (snapshot.actingWorkspaceStatus !== "Active") {
+    return { ok: false, reason: "DEAL_NOT_FOUND" };
+  }
+  if (!snapshot.actingUserIsMember) {
+    return { ok: false, reason: "DEAL_NOT_FOUND" };
   }
   return { ok: true };
 }
@@ -184,7 +235,9 @@ export interface ApprovalAuthoritySnapshot {
  *      (Workspace, user) tuple. The repository loads the row under
  *      FOR UPDATE so a concurrent revocation fails the approval.
  */
-export function evaluateApprovalAuthority(snapshot: ApprovalAuthoritySnapshot): ApprovalAuthorityVerdict {
+export function evaluateApprovalAuthority(
+  snapshot: ApprovalAuthoritySnapshot,
+): ApprovalAuthorityVerdict {
   if (snapshot.dealStatus === null) {
     return { ok: false, reason: "DEAL_NOT_FOUND" };
   }

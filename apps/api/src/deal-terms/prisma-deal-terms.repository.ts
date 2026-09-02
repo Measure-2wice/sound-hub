@@ -59,6 +59,10 @@ import type {
   DraftTermsTransactionInput,
   DraftTermsUseCase,
   DraftTermsUseCaseTools,
+  FindDealViewResult,
+  FindDealViewTransactionInput,
+  FindDealViewUseCase,
+  FindDealViewUseCaseTools,
   PersistedDealApproval,
   PersistedDealSummary,
   PersistedTermsVersion,
@@ -68,7 +72,10 @@ import type {
   RecordApprovalUseCase,
   RecordApprovalUseCaseTools,
 } from "./deal-terms.repository.js";
-import type { ApprovalAuthoritySnapshot, DraftingAuthoritySnapshot } from "./deal-terms-authorization-policy.js";
+import type {
+  ApprovalAuthoritySnapshot,
+  DraftingAuthoritySnapshot,
+} from "./deal-terms-authorization-policy.js";
 
 // Small fixed maximum. Mirrors the BG4 retry budget; not a generalized
 // framework — it exists only because PostgreSQL's Serializable
@@ -122,10 +129,7 @@ export class PrismaDealTermsRepository implements DealTermsRepository {
     input: DraftTermsTransactionInput,
     useCase: DraftTermsUseCase,
   ): Promise<DraftTermsResult> {
-    const envelope = await runWithBoundedP2034Retry<
-      DraftTermsResult,
-      DraftTermsFailureReason
-    >(
+    const envelope = await runWithBoundedP2034Retry<DraftTermsResult, DraftTermsFailureReason>(
       () => this.runDraftTransactionOnce(input, useCase),
       () => CONCURRENCY_RETRY_EXHAUSTED_DRAFT,
     );
@@ -156,13 +160,15 @@ export class PrismaDealTermsRepository implements DealTermsRepository {
             return { ok: false as const, reason: "DEAL_NOT_FOUND" as DraftTermsFailureReason };
           }
 
-          // Step 2: load the snapshot. The application service
-          // supplies `draftedByUserId` (= the acting human, when
-          // known) on the transaction input. We FOR UPDATE-lock
-          // the buyer + seller WorkspaceMembership rows so a
-          // concurrent revoke cannot commit between this read and
-          // the BG5 write.
-          const actingUserId = input.draftedByUserId ?? "__none__";
+          // Step 2: load the snapshot. P1-002: the acting Workspace is the
+          // EXACT commanded Workspace, not the first qualifying
+          // membership in the buyer/seller set. The application
+          // service pre-authorized the (userAccountId,
+          // actingWorkspaceId) tuple outside the transaction; we
+          // re-read and FOR UPDATE-lock the same tuple here so a
+          // concurrent revoke / suspension cannot commit between
+          // the pre-check and the BG5 write.
+          const actingUserId = input.actingUserAccountId;
           const memberRows = await tx.$queryRaw<
             {
               readonly workspaceId: string;
@@ -173,7 +179,7 @@ export class PrismaDealTermsRepository implements DealTermsRepository {
             FROM workspace_memberships m
             JOIN workspaces w ON w.id = m."workspaceId"
             WHERE m."userId" = ${actingUserId}
-              AND m."workspaceId" IN (${dealRow.buyerWorkspaceId}, ${dealRow.sellerWorkspaceId})
+              AND m."workspaceId" = ${input.actingWorkspaceId}
             FOR UPDATE OF w, m
           `;
           const member = memberRows[0];
@@ -182,7 +188,7 @@ export class PrismaDealTermsRepository implements DealTermsRepository {
             dealStatus: dealRow.status,
             buyerWorkspaceId: dealRow.buyerWorkspaceId,
             sellerWorkspaceId: dealRow.sellerWorkspaceId,
-            actingWorkspaceId: member?.workspaceId ?? "",
+            actingWorkspaceId: input.actingWorkspaceId,
             actingWorkspaceStatus: member?.status ?? "Suspended",
             actingUserIsMember: member !== undefined,
           };
@@ -292,6 +298,18 @@ export class PrismaDealTermsRepository implements DealTermsRepository {
               reason: "TERMS_VERSION_NOT_FOUND" as RecordApprovalFailureReason,
             };
           }
+          // P1-003: enforce that the commanded dealId matches the
+          // TermsVersion's owning Deal. A path-/body-mismatch
+          // (e.g. POST /deals/A/approvals containing a TV for Deal
+          // B) must fail closed and insert no approval. The
+          // TERMS_VERSION_NOT_FOUND envelope does not leak the
+          // cross-Deal existence.
+          if (tvRow.dealId !== input.dealId) {
+            return {
+              ok: false as const,
+              reason: "TERMS_VERSION_NOT_FOUND" as RecordApprovalFailureReason,
+            };
+          }
 
           const dealRows = await tx.$queryRaw<
             {
@@ -324,8 +342,7 @@ export class PrismaDealTermsRepository implements DealTermsRepository {
           const actingWsRows = await tx.$queryRaw<
             { readonly status: "Active" | "Suspended" }[]
           >`SELECT status FROM workspaces WHERE id = ${input.actingWorkspaceId} FOR UPDATE`;
-          const actingWsStatus: "Active" | "Suspended" =
-            actingWsRows[0]?.status ?? "Suspended";
+          const actingWsStatus: "Active" | "Suspended" = actingWsRows[0]?.status ?? "Suspended";
 
           const membershipRows = await tx.$queryRaw<{ readonly id: string }[]>`
             SELECT id FROM workspace_memberships
@@ -411,6 +428,93 @@ export class PrismaDealTermsRepository implements DealTermsRepository {
   }
 
   // ---------- reads ----------
+
+  async findDealViewInTransaction(
+    input: FindDealViewTransactionInput,
+    useCase: FindDealViewUseCase,
+  ): Promise<FindDealViewResult> {
+    // Open one transaction. Inside the transaction we FOR UPDATE-lock
+    // the Deal + the EXACT commanded Workspace row + the acting
+    // user's WorkspaceMembership for that Workspace, then hand the
+    // locked snapshot to the application-owned use case. The use
+    // case decides whether the locked facts authorize returning the
+    // view; this method never returns a DealViewSnapshot that the
+    // policy rejected.
+    return await this.prisma.$transaction(async (tx) => {
+      const dealRows = await tx.$queryRaw<
+        {
+          readonly id: string;
+          readonly buyerWorkspaceId: string;
+          readonly sellerWorkspaceId: string;
+          readonly status: "Negotiating" | "Active";
+        }[]
+      >`SELECT id, "buyerWorkspaceId", "sellerWorkspaceId", status FROM deals WHERE id = ${input.dealId} FOR UPDATE`;
+      const dealRow = dealRows[0];
+
+      const actingWsRows = await tx.$queryRaw<
+        { readonly status: "Active" | "Suspended" }[]
+      >`SELECT status FROM workspaces WHERE id = ${input.actingWorkspaceId} FOR UPDATE`;
+      const actingWsStatus: "Active" | "Suspended" | null = actingWsRows[0]?.status ?? null;
+
+      const memberRows = await tx.$queryRaw<{ readonly id: string }[]>`
+        SELECT id FROM workspace_memberships
+        WHERE "userId" = ${input.actingUserAccountId}
+          AND "workspaceId" = ${input.actingWorkspaceId}
+        FOR UPDATE
+      `;
+      const actingUserIsMember = memberRows.length > 0;
+
+      const snapshot = {
+        dealId: input.dealId,
+        dealExists: dealRow !== undefined,
+        dealStatus: dealRow?.status ?? null,
+        buyerWorkspaceId: dealRow?.buyerWorkspaceId ?? null,
+        sellerWorkspaceId: dealRow?.sellerWorkspaceId ?? null,
+        actingWorkspaceId: input.actingWorkspaceId,
+        actingWorkspaceStatus: actingWsStatus,
+        actingUserIsMember,
+      };
+      const tools: FindDealViewUseCaseTools = {
+        reject: (reason) => ({ kind: "reject" as const, reason }),
+        accept: () => ({ kind: "accept" as const }),
+      };
+      const outcome = useCase({ snapshot }, tools);
+      if (outcome.kind === "reject") {
+        return { ok: false as const, reason: outcome.reason };
+      }
+      // outcome.kind === "accept" — the locked snapshot is
+      // authorized; assemble the view from the locked snapshot +
+      // a single round-trip per related table.
+      const versions = await tx.termsVersion.findMany({
+        where: { dealId: input.dealId },
+        orderBy: { version: "desc" },
+        take: 50,
+      });
+      const current = versions[0] ?? null;
+      const approvals = current
+        ? await tx.dealApproval.findMany({ where: { termsVersionId: current.id } })
+        : [];
+      const view: DealViewSnapshot = {
+        deal: toPersistedDealSummary(
+          dealRow as {
+            id: string;
+            buyerWorkspaceId: string;
+            sellerWorkspaceId: string;
+            serviceOfferingId: string;
+            projectBriefId: string;
+            projectRequestId: string;
+            status: "Negotiating" | "Active";
+            activatedAt: Date | null;
+            createdAt: Date;
+          },
+        ),
+        projectRequest: null,
+        currentTermsVersion: current ? toPersistedTermsVersion(current) : null,
+        currentApprovals: approvals.map(toPersistedApproval),
+      };
+      return { ok: true as const, value: view };
+    });
+  }
 
   async findDealView(dealId: string): Promise<DealViewSnapshot | null> {
     const deal = await this.prisma.deal.findUnique({ where: { id: dealId } });

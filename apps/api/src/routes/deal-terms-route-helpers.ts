@@ -121,12 +121,7 @@ export function readDealTermsQueryParam(
   if (typeof value !== "string" || value.length === 0 || value.length > MAX_PATH_PARAM_LENGTH) {
     writeSafeError(
       res,
-      buildSafeError(
-        "BG5_TERMS_DRAFT_INVALID",
-        `${name} is required.`,
-        undefined,
-        requestId,
-      ),
+      buildSafeError("BG5_TERMS_DRAFT_INVALID", `${name} is required.`, undefined, requestId),
     );
     return null;
   }

@@ -172,14 +172,6 @@ export type DraftTermsUseCase = (
   tools: DraftTermsUseCaseTools,
 ) => DraftTermsUseCaseOutcome;
 
-export interface DraftTermsTransactionInput {
-  readonly dealId: string;
-  readonly draftedByUserId: string | null;
-  readonly aiProvider: string;
-  readonly aiModelId: string | null;
-  readonly aiFallbackUsed: boolean;
-}
-
 // ---------- Approval use case ----------
 
 export interface RecordApprovalUseCaseContext {
@@ -201,11 +193,67 @@ export type RecordApprovalUseCase = (
 ) => RecordApprovalUseCaseOutcome;
 
 export interface RecordApprovalTransactionInput {
+  readonly dealId: string;
   readonly termsVersionId: string;
   readonly actingWorkspaceId: string;
   readonly userAccountId: string;
   readonly now: Date;
 }
+
+export interface DraftTermsTransactionInput {
+  readonly dealId: string;
+  readonly draftedByUserId: string | null;
+  readonly aiProvider: string;
+  readonly aiModelId: string | null;
+  readonly aiFallbackUsed: boolean;
+  readonly actingWorkspaceId: string;
+  readonly actingUserAccountId: string;
+}
+
+// ---------- Read transaction ----------
+
+export interface FindDealViewTransactionInput {
+  readonly dealId: string;
+  readonly actingWorkspaceId: string;
+  readonly actingUserAccountId: string;
+}
+
+export type FindDealViewFailureReason = "DEAL_NOT_FOUND";
+
+export type FindDealViewResult =
+  | { readonly ok: true; readonly value: DealViewSnapshot }
+  | { readonly ok: false; readonly reason: FindDealViewFailureReason };
+
+export interface DealReadAuthoritySnapshot {
+  readonly dealId: string;
+  readonly dealExists: boolean;
+  readonly dealStatus: DealStatusV1 | null;
+  readonly buyerWorkspaceId: string | null;
+  readonly sellerWorkspaceId: string | null;
+  readonly actingWorkspaceId: string;
+  readonly actingWorkspaceStatus: "Active" | "Suspended" | null;
+  readonly actingUserIsMember: boolean;
+}
+
+export interface FindDealViewUseCaseTools {
+  reject(reason: FindDealViewFailureReason): FindDealViewUseCaseOutcome;
+  /**
+   * The use case acknowledges that the locked snapshot is
+   * authorized. The repository assembles the view from the locked
+   * snapshot it holds; the use case does not pass a view through
+   * (the use case is policy-only, never carries persisted data).
+   */
+  accept(): FindDealViewUseCaseOutcome;
+}
+
+export type FindDealViewUseCaseOutcome =
+  | { readonly kind: "reject"; readonly reason: FindDealViewFailureReason }
+  | { readonly kind: "accept" };
+
+export type FindDealViewUseCase = (
+  ctx: { readonly snapshot: DealReadAuthoritySnapshot },
+  tools: FindDealViewUseCaseTools,
+) => FindDealViewUseCaseOutcome;
 
 // ---------- Read shape ----------
 
@@ -234,6 +282,22 @@ export interface DealTermsRepository {
     input: DraftTermsTransactionInput,
     useCase: DraftTermsUseCase,
   ): Promise<DraftTermsResult>;
+
+  /**
+   * Authorized read of a Deal view. Opens one transaction, FOR
+   * UPDATE-locks the Deal row + both Workspace rows + the acting
+   * user's WorkspaceMembership for the EXACT commanded Workspace,
+   * then hands the snapshot to the application-owned use case. The
+   * use case decides whether the locked facts authorize returning
+   * the view (current party + current member of the EXACT acting
+   * Workspace) or reject with `BG5_DEAL_NOT_FOUND` so an
+   * unauthorized caller cannot distinguish "no such Deal" from
+   * "Deal exists but you are not a party".
+   */
+  findDealViewInTransaction(
+    input: FindDealViewTransactionInput,
+    useCase: FindDealViewUseCase,
+  ): Promise<FindDealViewResult>;
 
   /**
    * Same shape as draft, but for approvals. The adapter FOR
@@ -265,4 +329,9 @@ export interface DealTermsRepository {
 }
 
 // Re-exports for service layer convenience.
-export type { Bg5DealApprovalPublicV1, Bg5TermsVersionPublicV1, ProjectRequestStatusV1, DealPublicV1 };
+export type {
+  Bg5DealApprovalPublicV1,
+  Bg5TermsVersionPublicV1,
+  ProjectRequestStatusV1,
+  DealPublicV1,
+};

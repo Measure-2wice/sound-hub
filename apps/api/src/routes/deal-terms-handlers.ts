@@ -99,7 +99,13 @@ export function createDealTermsRouter(deps: DealTermsRouteDeps) {
 
 function draftTerms(
   deps: DealTermsRouteDeps,
-): (req: Request, res: Response, userAccountId: string, dealId: string, requestId: string) => Promise<void> {
+): (
+  req: Request,
+  res: Response,
+  userAccountId: string,
+  dealId: string,
+  requestId: string,
+) => Promise<void> {
   return async (req, res, userAccountId, dealId, requestId) => {
     const rawBody = await readDealTermsJsonBody(req, res, requestId);
     if (rawBody === null) return;
@@ -136,7 +142,13 @@ function draftTerms(
 
 function approveTerms(
   deps: DealTermsRouteDeps,
-): (req: Request, res: Response, userAccountId: string, dealId: string, requestId: string) => Promise<void> {
+): (
+  req: Request,
+  res: Response,
+  userAccountId: string,
+  dealId: string,
+  requestId: string,
+) => Promise<void> {
   return async (req, res, userAccountId, dealId, requestId) => {
     const rawBody = await readDealTermsJsonBody(req, res, requestId);
     if (rawBody === null) return;
@@ -174,7 +186,13 @@ function approveTerms(
 
 function getDeal(
   deps: DealTermsRouteDeps,
-): (req: Request, res: Response, userAccountId: string, dealId: string, requestId: string) => Promise<void> {
+): (
+  req: Request,
+  res: Response,
+  userAccountId: string,
+  dealId: string,
+  requestId: string,
+) => Promise<void> {
   return async (req, res, userAccountId, dealId, requestId) => {
     const actingWorkspaceId = readDealTermsQueryParam(res, req, "actingWorkspaceId", requestId);
     if (!actingWorkspaceId) return;

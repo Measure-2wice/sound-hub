@@ -264,12 +264,12 @@ export function buildApp(options: AppOptions = {}): BuiltApp {
   // adapter; the service is the only boundary the route and tests
   // depend on. The deterministic AI adapter is the buildathon-only
   // AI path; no managed provider integration is wired.
-  const dealTermsRepository =
-    options.dealTermsRepository ?? new PrismaDealTermsRepository(prisma);
+  const dealTermsRepository = options.dealTermsRepository ?? new PrismaDealTermsRepository(prisma);
   const dealTermsService =
     options.dealTermsService ??
     new DealTermsService({
       dealTermsRepository,
+      workspaceAuthorizationService,
     });
 
   const app: Application = express();

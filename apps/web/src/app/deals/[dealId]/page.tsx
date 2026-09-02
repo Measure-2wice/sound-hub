@@ -33,11 +33,7 @@ import type {
 } from "@soundhub/types";
 import { useSession } from "../../components/SessionProvider";
 import { Card } from "../../components/ui/Card";
-import {
-  approveTerms,
-  draftTerms,
-  fetchDeal,
-} from "../../lib/deal-terms-client";
+import { approveTerms, draftTerms, fetchDeal } from "../../lib/deal-terms-client";
 
 interface DealPageProps {
   // Next.js 15's `PageProps.params` is a Promise; await it in the
@@ -233,8 +229,8 @@ export default function DealPage({ params }: DealPageProps): JSX.Element {
   const capabilityRequired: MarketplaceCapabilityV1 | null = isBuyerSide
     ? "Buyer"
     : isSellerSide
-    ? "Seller"
-    : null;
+      ? "Seller"
+      : null;
   const alreadyApproved =
     currentTermsVersion !== null &&
     currentApprovals.some((a) => a.workspaceId === actingWorkspaceId);

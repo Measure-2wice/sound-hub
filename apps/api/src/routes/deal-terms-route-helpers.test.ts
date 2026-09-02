@@ -147,10 +147,6 @@ test("translateDealTermsServiceError translates BG5_DEAL_UNAVAILABLE to 503", ()
 
 test("translateDealTermsServiceError returns false for non-DealTermsError inputs", () => {
   const mock = makeRes();
-  const handled = translateDealTermsServiceError(
-    mock.res,
-    new Error("not ours"),
-    "rid-8",
-  );
+  const handled = translateDealTermsServiceError(mock.res, new Error("not ours"), "rid-8");
   assert.equal(handled, false);
 });

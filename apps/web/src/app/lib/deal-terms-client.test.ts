@@ -10,25 +10,19 @@
 import assert from "node:assert/strict";
 import { describe, test, beforeEach, afterEach } from "node:test";
 import type { Bg5DealApprovalPublicV1, Bg5TermsVersionPublicV1 } from "@soundhub/types";
-import {
-  approveTerms,
-  draftTerms,
-  fetchDeal,
-} from "./deal-terms-client.js";
+import { approveTerms, draftTerms, fetchDeal } from "./deal-terms-client.js";
 
 const originalFetch = globalThis.fetch;
 let lastRequest: { url: string; init?: RequestInit } | null = null;
 
 function mockFetch(
-  response: { status: number; body: unknown } | ((url: string, init?: RequestInit) => { status: number; body: unknown }),
+  response:
+    | { status: number; body: unknown }
+    | ((url: string, init?: RequestInit) => { status: number; body: unknown }),
 ): void {
-  globalThis.fetch = ((input: RequestInfo | URL, init?: RequestInit) => {
+  globalThis.fetch = (input: RequestInfo | URL, init?: RequestInit) => {
     const url =
-      typeof input === "string"
-        ? input
-        : input instanceof URL
-        ? input.toString()
-        : input.url;
+      typeof input === "string" ? input : input instanceof URL ? input.toString() : input.url;
     lastRequest = { url, init };
     const r = typeof response === "function" ? response(url, init) : response;
     return Promise.resolve(
@@ -37,7 +31,7 @@ function mockFetch(
         headers: { "Content-Type": "application/json" },
       }),
     );
-  });
+  };
 }
 
 beforeEach(() => {
