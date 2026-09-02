@@ -150,3 +150,54 @@ test("translateDealTermsServiceError returns false for non-DealTermsError inputs
   const handled = translateDealTermsServiceError(mock.res, new Error("not ours"), "rid-8");
   assert.equal(handled, false);
 });
+
+// ---------------------------------------------------------------------------
+// P1-002: AI validation failures must produce a typed
+// BG5_TERMS_DRAFT_INVALID envelope with a generic public-safe
+// message. The public envelope must NOT carry the provider key,
+// the Zod issue path, the expected/received type, or any raw
+// candidate detail. Detailed diagnostics live only in the
+// existing `console.error` server logging seam (asserted in the
+// service test, not here).
+// ---------------------------------------------------------------------------
+
+test("P1-002: AI validation failure → 400 BG5_TERMS_DRAFT_INVALID with generic public-safe message", () => {
+  const mock = makeRes();
+  const handled = translateDealTermsServiceError(
+    mock.res,
+    new DealTermsError("The drafted terms were invalid.", "BG5_TERMS_DRAFT_INVALID"),
+    "rid-9",
+  );
+  assert.equal(handled, true);
+  assert.equal(mock.status, 400);
+  // The body is a single field per the safe envelope schema: code
+  // + message + requestId. The message must be the public-safe
+  // string and must NOT include provider identity, Zod terminology,
+  // field paths, or raw candidate values.
+  const body = mock.body as { error: { code: string; message: string; requestId: string } };
+  assert.equal(body.error.code, "BG5_TERMS_DRAFT_INVALID");
+  assert.equal(body.error.message, "The drafted terms were invalid.");
+  assert.equal(body.error.requestId, "rid-9");
+  // The serialized body must contain only the public-safe fields;
+  // nothing else.
+  const json = JSON.stringify(body);
+  for (const forbidden of [
+    "provider",
+    "impala",
+    "deterministic-fallback",
+    "ZodError",
+    "expected",
+    "received",
+    "scope:",
+    "deliverables:",
+    "price:",
+    "rogueField",
+    "actual",
+  ]) {
+    assert.equal(
+      json.includes(forbidden),
+      false,
+      `public envelope must not contain "${forbidden}"`,
+    );
+  }
+});

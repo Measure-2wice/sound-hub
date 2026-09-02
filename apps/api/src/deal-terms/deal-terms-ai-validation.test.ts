@@ -234,3 +234,86 @@ test("a valid candidate still persists; sanity check the harness", async () => {
   assert.equal(result.termsVersion.version, 1);
   assert.equal(repo["termsVersions"].size, 1);
 });
+
+// ---------------------------------------------------------------------------
+// P1-002: AI validation failure must (a) be rejected, (b) persist
+// nothing, (c) carry a generic public-safe message, and (d) emit
+// the detailed diagnostic to the EXISTING `console.error` server
+// logging seam (without leaking any of it to the public error
+// envelope). The route-helper test asserts (c); this test asserts
+// (a), (b), and (d).
+// ---------------------------------------------------------------------------
+
+test("P1-002: a malformed candidate is rejected, persists nothing, and the public error message is generic", async () => {
+  const originalConsoleError = console.error;
+  const captured: unknown[][] = [];
+  console.error = (...args: unknown[]) => {
+    captured.push(args);
+  };
+  try {
+    const harness = buildHarness({
+      scope: "x",
+      deliverables: [{ title: "t", description: "d" }],
+      schedule: { startDate: "2026-01-01", endDate: "2026-01-02", deliveryDays: 1 },
+      price: { amountMinor: 100, currency: "USD" },
+      revisionAllowance: 0,
+      rightsSummary: "x",
+      rogueField: "leakage-attempt",
+      provider: "impala-1.2-fake-managed",
+    });
+    // `rogueField` is unknown to the strict Zod schema, so the
+    // adapter delivers a malformed candidate. The public-safe
+    // envelope must surface ONLY a generic message + typed code;
+    // the diagnostic carries provider / path / raw candidate in
+    // the existing `console.error` seam only.
+    await assert.rejects(
+      () => harness.service.draftTerms(draftInput),
+      (err: unknown) => {
+        assert.ok(err instanceof DealTermsError);
+        assert.equal(err.code, "BG5_TERMS_DRAFT_INVALID");
+        // The public message must be the generic, user-safe string.
+        assert.equal(err.message, "The drafted terms were invalid.");
+        return true;
+      },
+    );
+    // No TermsVersion row was persisted.
+    assert.equal(harness.repo["termsVersions"].size, 0);
+    // The detailed diagnostic was logged via `console.error`
+    // (the existing server logging seam). The captured args must
+    // include the diagnostic shape with the offending field path
+    // + the rogue field name (server-side only).
+    const flattened = JSON.stringify(captured);
+    assert.ok(
+      flattened.includes("rogueField"),
+      "diagnostic must surface the offending field path to the server log",
+    );
+    // But the public message + err.message must NOT include
+    // provider identity, rogue field, etc. (asserted by the
+    // route-helper test; this test re-asserts the err shape).
+    const err = await (async () => {
+      try {
+        await harness.service.draftTerms(draftInput);
+        return null;
+      } catch (e) {
+        return e;
+      }
+    })();
+    assert.ok(err instanceof DealTermsError);
+    const errJson = JSON.stringify({
+      code: err.code,
+      message: err.message,
+    });
+    assert.equal(
+      errJson.includes("rogueField"),
+      false,
+      "err.message must NOT carry rogue field name (server log only)",
+    );
+    assert.equal(
+      errJson.includes("impala"),
+      false,
+      "err.message must NOT carry provider/model identity",
+    );
+  } finally {
+    console.error = originalConsoleError;
+  }
+});

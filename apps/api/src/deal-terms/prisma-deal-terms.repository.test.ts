@@ -28,11 +28,14 @@ import { PrismaDealTermsRepository } from "./prisma-deal-terms.repository.js";
 import {
   evaluateDraftingAuthority,
   evaluateApprovalAuthority,
+  evaluateDealReadAuthority,
 } from "./deal-terms-authorization-policy.js";
 import type {
   DraftTermsUseCase,
   DraftTermsUseCaseTools,
   DraftTermsUseCaseOutcome,
+  FindDealViewUseCaseTools,
+  FindDealViewUseCaseOutcome,
   PersistDraftTermsInput,
   RecordApprovalUseCase,
   RecordApprovalUseCaseTools,
@@ -791,4 +794,189 @@ test("P1-003: approval with a cross-Deal TermsVersion id fails closed (TERMS_VER
   if (!result.ok) assert.equal(result.reason, "TERMS_VERSION_NOT_FOUND");
   const stored = await prisma.dealApproval.findMany({ where: { termsVersionId: tvId } });
   assert.equal(stored.length, 0, "no approval row inserted for cross-Deal mismatch");
+});
+
+// ---------------------------------------------------------------------------
+// P1-001: authorized Prisma Deal read returns a complete Deal summary.
+// Every field the public DTO mapper / contract relies on must be
+// present and equal to its seeded concrete value (NOT undefined).
+// ---------------------------------------------------------------------------
+
+test("P1-001: authorized Prisma Deal read returns every required Deal summary field with its concrete value", async () => {
+  const fx = await loadFixture();
+  await createDeal(fx);
+  // Add a seeded buyer-side DealApprover so the snapshot
+  // authorization path is satisfied.
+  await seedDealApprover(fx.buyerWorkspaceId, fx.buyerUserId);
+
+  // Capture the exact Deal fields BEFORE the read so we can assert
+  // every required field is preserved across the locked read +
+  // mapping.
+  const persistedDeal = await prisma.deal.findUnique({ where: { id: fx.dealId } });
+  assert.ok(persistedDeal, "seeded Deal must exist");
+
+  // Build an authorized use case that simply accepts.
+  const readUseCase = (): {
+    (
+      ctx: { snapshot: { dealId: string; dealExists: boolean } },
+      tools: FindDealViewUseCaseTools,
+    ): FindDealViewUseCaseOutcome;
+  } => {
+    return (_ctx, tools) => tools.accept();
+  };
+
+  const result = await repo.findDealViewInTransaction(
+    {
+      dealId: fx.dealId,
+      actingWorkspaceId: fx.buyerWorkspaceId,
+      actingUserAccountId: fx.buyerUserId,
+    },
+    readUseCase(),
+  );
+  assert.equal(result.ok, true);
+  if (!result.ok) {
+    return;
+  }
+  // Every required field must be the concrete seeded value —
+  // NOT undefined.
+  assert.equal(result.value.deal.id, persistedDeal.id, "id must match");
+  assert.equal(
+    result.value.deal.buyerWorkspaceId,
+    persistedDeal.buyerWorkspaceId,
+    "buyerWorkspaceId must match",
+  );
+  assert.equal(
+    result.value.deal.sellerWorkspaceId,
+    persistedDeal.sellerWorkspaceId,
+    "sellerWorkspaceId must match",
+  );
+  assert.equal(
+    result.value.deal.serviceOfferingId,
+    persistedDeal.serviceOfferingId,
+    "serviceOfferingId must match (no widening cast)",
+  );
+  assert.equal(
+    result.value.deal.projectBriefId,
+    persistedDeal.projectBriefId,
+    "projectBriefId must match (no widening cast)",
+  );
+  assert.equal(
+    result.value.deal.projectRequestId,
+    persistedDeal.projectRequestId,
+    "projectRequestId must match (no widening cast)",
+  );
+  assert.equal(result.value.deal.status, persistedDeal.status, "status must match");
+  // activatedAt is nullable; normalize null → null for comparison.
+  assert.equal(
+    result.value.deal.activatedAt ?? null,
+    persistedDeal.activatedAt ?? null,
+    "activatedAt must match (no widening cast)",
+  );
+  assert.equal(
+    result.value.deal.createdAt.toISOString(),
+    persistedDeal.createdAt.toISOString(),
+    "createdAt must be a real Date (no widening cast)",
+  );
+  // No field on the public DTO may be undefined.
+  for (const [key, value] of Object.entries(result.value.deal)) {
+    assert.notEqual(value, undefined, `${key} must not be undefined`);
+  }
+});
+
+test("P1-001: authorized Prisma Deal read on a SETTLED (Active) Deal surfaces the activatedAt field", async () => {
+  const fx = await loadFixture();
+  await createDeal(fx, { status: "Active" });
+  await seedDealApprover(fx.buyerWorkspaceId, fx.buyerUserId);
+  const persistedDeal = await prisma.deal.findUnique({ where: { id: fx.dealId } });
+  assert.ok(persistedDeal);
+  // The Prisma adapter's authorization rule for getDeal is "Deal
+  // exists + acting Workspace is a party + current member". The
+  // service pre-authorize rule is "Deal is Negotiating". A read of
+  // an Active Deal is the read path (P0-001); for the repository
+  // test we bypass the service pre-authorize and call the
+  // repository use case directly.
+  const readUseCase = (): {
+    (
+      ctx: { snapshot: { dealId: string; dealExists: boolean } },
+      tools: FindDealViewUseCaseTools,
+    ): FindDealViewUseCaseOutcome;
+  } => {
+    return (_ctx, tools) => tools.accept();
+  };
+  const result = await repo.findDealViewInTransaction(
+    {
+      dealId: fx.dealId,
+      actingWorkspaceId: fx.buyerWorkspaceId,
+      actingUserAccountId: fx.buyerUserId,
+    },
+    readUseCase(),
+  );
+  assert.equal(result.ok, true);
+  if (result.ok) {
+    assert.equal(result.value.deal.activatedAt ?? null, persistedDeal.activatedAt ?? null);
+    assert.equal(result.value.deal.status, "Active");
+  }
+});
+
+// P1-001: negative coverage — unauthorized reads fail closed with
+// the safe envelope. The repository itself enforces the
+// authorization policy via the use case evaluator; an
+// unauthorized caller receives a typed rejection, no DealViewSnapshot.
+
+test("P1-001: revoked former member cannot read a known Deal", async () => {
+  const fx = await loadFixture();
+  await createDeal(fx);
+  // Revoke the buyer's current membership of the buyer Workspace so
+  // the acting tuple (buyer, buyerWorkspace) is no longer a member.
+  await prisma.workspaceMembership.deleteMany({
+    where: { userId: fx.buyerUserId, workspaceId: fx.buyerWorkspaceId },
+  });
+  const result = await repo.findDealViewInTransaction(
+    {
+      dealId: fx.dealId,
+      actingWorkspaceId: fx.buyerWorkspaceId,
+      actingUserAccountId: fx.buyerUserId,
+    },
+    (ctx, tools) => {
+      const verdict = evaluateDealReadAuthority(ctx.snapshot);
+      return verdict.ok ? tools.accept() : tools.reject(verdict.reason);
+    },
+  );
+  assert.equal(result.ok, false);
+  if (!result.ok) assert.equal(result.reason, "DEAL_NOT_FOUND");
+});
+
+test("P1-001: an arbitrary acting Workspace id cannot read a known Deal", async () => {
+  const fx = await loadFixture();
+  await createDeal(fx);
+  const result = await repo.findDealViewInTransaction(
+    {
+      dealId: fx.dealId,
+      actingWorkspaceId: "ws-arbitrary-not-a-deal-party",
+      actingUserAccountId: fx.buyerUserId,
+    },
+    (ctx, tools) => {
+      const verdict = evaluateDealReadAuthority(ctx.snapshot);
+      return verdict.ok ? tools.accept() : tools.reject(verdict.reason);
+    },
+  );
+  assert.equal(result.ok, false);
+  if (!result.ok) assert.equal(result.reason, "DEAL_NOT_FOUND");
+});
+
+test("P1-001: a known Deal that does not exist returns DEAL_NOT_FOUND", async () => {
+  const fx = await loadFixture();
+  const result = await repo.findDealViewInTransaction(
+    {
+      dealId: "deal-does-not-exist-bg5",
+      actingWorkspaceId: fx.buyerWorkspaceId,
+      actingUserAccountId: fx.buyerUserId,
+    },
+    (ctx, tools) => {
+      const verdict = evaluateDealReadAuthority(ctx.snapshot);
+      return verdict.ok ? tools.accept() : tools.reject(verdict.reason);
+    },
+  );
+  assert.equal(result.ok, false);
+  if (!result.ok) assert.equal(result.reason, "DEAL_NOT_FOUND");
 });

@@ -441,14 +441,25 @@ export class PrismaDealTermsRepository implements DealTermsRepository {
     // view; this method never returns a DealViewSnapshot that the
     // policy rejected.
     return await this.prisma.$transaction(async (tx) => {
+      // P1-001: select every column that `PersistedDealSummary`
+      // exposes. The downstream public DTO mapper calls
+      // `createdAt.toISOString()`, so every field must be present
+      // and non-undefined for an authorized read. No unsafe widening
+      // cast — the Prisma row is shaped to `PersistedDealSummary` by
+      // an explicit mapper.
       const dealRows = await tx.$queryRaw<
         {
           readonly id: string;
           readonly buyerWorkspaceId: string;
           readonly sellerWorkspaceId: string;
+          readonly serviceOfferingId: string;
+          readonly projectBriefId: string;
+          readonly projectRequestId: string;
           readonly status: "Negotiating" | "Active";
+          readonly activatedAt: Date | null;
+          readonly createdAt: Date;
         }[]
-      >`SELECT id, "buyerWorkspaceId", "sellerWorkspaceId", status FROM deals WHERE id = ${input.dealId} FOR UPDATE`;
+      >`SELECT id, "buyerWorkspaceId", "sellerWorkspaceId", "serviceOfferingId", "projectBriefId", "projectRequestId", status, "activatedAt", "createdAt" FROM deals WHERE id = ${input.dealId} FOR UPDATE`;
       const dealRow = dealRows[0];
 
       const actingWsRows = await tx.$queryRaw<
@@ -495,19 +506,15 @@ export class PrismaDealTermsRepository implements DealTermsRepository {
         ? await tx.dealApproval.findMany({ where: { termsVersionId: current.id } })
         : [];
       const view: DealViewSnapshot = {
-        deal: toPersistedDealSummary(
-          dealRow as {
-            id: string;
-            buyerWorkspaceId: string;
-            sellerWorkspaceId: string;
-            serviceOfferingId: string;
-            projectBriefId: string;
-            projectRequestId: string;
-            status: "Negotiating" | "Active";
-            activatedAt: Date | null;
-            createdAt: Date;
-          },
-        ),
+        // P1-001: explicit mapping of the locked Prisma row to the
+        // domain `PersistedDealSummary` shape. The `dealRow` is
+        // non-null here because `outcome.kind === "accept"` only
+        // happens when the policy evaluator sees a non-null Deal
+        // status + non-null buyer/seller Workspace ids; the
+        // type assertion to `PersistedDealSummary` is a contract
+        // assertion, not a widening cast (the field set is
+        // exhaustive — see the SELECT above).
+        deal: toPersistedDealSummary(dealRow as PersistedDealSummary),
         projectRequest: null,
         currentTermsVersion: current ? toPersistedTermsVersion(current) : null,
         currentApprovals: approvals.map(toPersistedApproval),

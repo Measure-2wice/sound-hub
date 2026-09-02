@@ -395,15 +395,26 @@ export class DealTermsService {
     try {
       return validateCandidate(output.candidate, output.provider);
     } catch (err) {
-      // The deterministic adapter itself returns a shape that
-      // satisfies `bg5ProposedTermsV1Schema`; any validation failure
-      // indicates a malformed AI output that MUST NOT reach
-      // persistence. Surface as the typed BG5 AI envelope.
-      const detail = err instanceof Error ? err.message : String(err);
-      throw new DealTermsError(
-        `AI provider returned a malformed candidate (${detail}).`,
-        "BG5_TERMS_DRAFT_INVALID",
+      // P1-002: keep the strict-validation contract, but do NOT leak
+      // the provider key, the model id, the Zod path, the expected
+      // / received type, or the raw candidate into the public error
+      // envelope. The detailed diagnostic lives only on the existing
+      // `console.error` server logging seam (the same pattern used
+      // by the route helper's `translateDealTermsServiceError`).
+      // The public envelope receives the typed code
+      // `BG5_TERMS_DRAFT_INVALID` with a generic, public-safe
+      // message. No raw AI output, no provider identity, no Zod
+      // terminology, no field paths.
+      const diagnostic =
+        err instanceof Error
+          ? (err as Error & { __bg5AiDiagnostic?: unknown }).__bg5AiDiagnostic
+          : undefined;
+      const modelId = output.modelId;
+      console.error(
+        "[deal-terms] AI validation failed (diagnostic only, never surfaced to client):",
+        { diagnostic, modelId },
       );
+      throw new DealTermsError("The drafted terms were invalid.", "BG5_TERMS_DRAFT_INVALID");
     }
   }
 
@@ -556,20 +567,40 @@ function evaluateApprovalUseCase(
 
 function validateCandidate(
   candidate: unknown,
-  provider: string,
+  _provider: string,
 ): PersistDraftTermsInput["proposedTerms"] {
-  // P1-001: strict runtime validation. The candidate must satisfy
-  // the shared strict Zod schema. We do NOT manufacture any
-  // required field — a missing or wrong-type field rejects the
-  // candidate. The adapter may return unknown; the application
-  // boundary validates it.
+  // P1-001 (strict AI runtime validation) + P1-002 (safe envelope):
+  // the candidate must satisfy the shared strict Zod schema. We do
+  // NOT manufacture any required field — a missing or wrong-type
+  // field rejects the candidate. The public error envelope never
+  // surfaces the provider key, the model id, the Zod issue path, the
+  // expected/received type, or the raw candidate. The detailed
+  // diagnostic is attached to the Error as a non-enumerable
+  // `__bg5AiDiagnostic` field and is read by the existing
+  // `console.error` server logging seam in `produceProposedTerms`.
   const parsed = bg5ProposedTermsV1Schema.safeParse(candidate);
   if (!parsed.success) {
-    throw new Error(
-      `AI candidate from provider "${provider}" failed strict validation: ${parsed.error.issues
-        .map((i) => `${i.path.join(".")}: ${i.message}`)
-        .join("; ")}`,
-    );
+    const diagnostic = {
+      provider: _provider,
+      issueCount: parsed.error.issues.length,
+      // The full Zod issues are kept on a separate property so
+      // `console.error(err)` surfaces the path/message/code in the
+      // server log but `err.message` (which crosses the public
+      // envelope) is a fixed, generic, public-safe string.
+      issues: parsed.error.issues.map((i) => ({
+        path: i.path.join("."),
+        code: i.code,
+        message: i.message,
+      })),
+    };
+    const err = new Error("AI validation failed.");
+    Object.defineProperty(err, "__bg5AiDiagnostic", {
+      value: diagnostic,
+      enumerable: false,
+      writable: false,
+      configurable: false,
+    });
+    throw err;
   }
   // The Zod schema does not preserve the `fundingDeadlineAt` shape
   // through the public type cleanly when it is absent; coerce the
