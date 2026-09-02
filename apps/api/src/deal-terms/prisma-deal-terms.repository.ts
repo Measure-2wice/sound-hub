@@ -505,16 +505,34 @@ export class PrismaDealTermsRepository implements DealTermsRepository {
       const approvals = current
         ? await tx.dealApproval.findMany({ where: { termsVersionId: current.id } })
         : [];
+      // P1-001: explicitly guard the selected row. An injected use
+      // case can call `accept()` independently of the policy
+      // evaluator; the SQL may also legitimately return no row
+      // (unknown Deal id). Either way we MUST fail closed with the
+      // repository's exact typed failure shape, not dereference an
+      // undefined row into the mapper.
+      if (!dealRow) {
+        return { ok: false as const, reason: "DEAL_NOT_FOUND" as const };
+      }
+      // Map the locked Prisma row field-by-field into the
+      // `PersistedDealSummary` domain shape. No `as
+      // PersistedDealSummary` widening assertion: every required
+      // field is copied explicitly so a future schema change that
+      // adds a column to the SELECT but not to the mapper fails
+      // at the type level rather than silently propagating
+      // undefined into the public DTO.
       const view: DealViewSnapshot = {
-        // P1-001: explicit mapping of the locked Prisma row to the
-        // domain `PersistedDealSummary` shape. The `dealRow` is
-        // non-null here because `outcome.kind === "accept"` only
-        // happens when the policy evaluator sees a non-null Deal
-        // status + non-null buyer/seller Workspace ids; the
-        // type assertion to `PersistedDealSummary` is a contract
-        // assertion, not a widening cast (the field set is
-        // exhaustive — see the SELECT above).
-        deal: toPersistedDealSummary(dealRow as PersistedDealSummary),
+        deal: {
+          id: dealRow.id,
+          buyerWorkspaceId: dealRow.buyerWorkspaceId,
+          sellerWorkspaceId: dealRow.sellerWorkspaceId,
+          serviceOfferingId: dealRow.serviceOfferingId,
+          projectBriefId: dealRow.projectBriefId,
+          projectRequestId: dealRow.projectRequestId,
+          status: dealRow.status,
+          activatedAt: dealRow.activatedAt,
+          createdAt: dealRow.createdAt,
+        },
         projectRequest: null,
         currentTermsVersion: current ? toPersistedTermsVersion(current) : null,
         currentApprovals: approvals.map(toPersistedApproval),

@@ -980,3 +980,29 @@ test("P1-001: a known Deal that does not exist returns DEAL_NOT_FOUND", async ()
   assert.equal(result.ok, false);
   if (!result.ok) assert.equal(result.reason, "DEAL_NOT_FOUND");
 });
+
+// P1-001 follow-up: when an injected use case incorrectly calls
+// `accept()` for a missing Deal, the repository must still fail
+// closed with the typed `DEAL_NOT_FOUND` rather than throw or
+// dereference an undefined row. The repository's guard is the
+// last line of defense — the application policy cannot catch a
+// missing Deal after `accept()` is mis-issued.
+
+test("P1-001 follow-up: injected accept() for a missing Deal fails closed with DEAL_NOT_FOUND (no throw)", async () => {
+  const fx = await loadFixture();
+  const result = await repo.findDealViewInTransaction(
+    {
+      dealId: "deal-does-not-exist-bg5",
+      actingWorkspaceId: fx.buyerWorkspaceId,
+      actingUserAccountId: fx.buyerUserId,
+    },
+    // Injected use case that incorrectly accepts even though the
+    // locked snapshot has `dealExists: false`. The repository must
+    // still return a typed `DEAL_NOT_FOUND` failure.
+    (_ctx, tools) => tools.accept(),
+  );
+  assert.equal(result.ok, false);
+  if (!result.ok) {
+    assert.equal(result.reason, "DEAL_NOT_FOUND");
+  }
+});
