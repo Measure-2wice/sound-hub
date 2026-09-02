@@ -145,6 +145,53 @@ function mapStatus(code: ApiErrorCodeV1): number {
       // surface. The underlying exception message is logged server
       // side but never echoed to the response envelope.
       return 500;
+    // Buildathon Golden Slice 5 (BG5) Deal / TermsVersion /
+    // DealApprover / DealApproval status mapping. The codes mirror
+    // the BG4 pattern: 403 for authorization rejections, 404 for
+    // unknown ids, 409 for retry-detected duplicates, 422 for
+    // semantic-but-well-formed rejections (non-Negotiating,
+    // non-current version), 400 for malformed requests, 500 for
+    // unexpected internal failures, 503 for transient marketplace
+    // unavailability.
+    case "BG5_DEAL_NOT_FOUND":
+    case "BG5_TERMS_VERSION_NOT_FOUND":
+      return 404;
+    case "BG5_TERMS_DRAFT_FORBIDDEN":
+    case "BG5_APPROVAL_FORBIDDEN":
+      return 403;
+    case "BG5_DEAL_NOT_NEGOTIATING":
+      // Semantic rejection: the Deal is Active or otherwise past
+      // Negotiating. The Golden Slice does NOT support drafting
+      // terms for an Active Deal.
+      return 422;
+    case "BG5_APPROVAL_NOT_CURRENT_VERSION":
+      // Semantic rejection: the requested termsVersionId is not the
+      // Deal's current (MAX(version)) TermsVersion. The approval is
+      // rejected; the caller may re-issue against the new current
+      // version. A retry that re-sends the stale version is rejected
+      // for the same reason — the application policy is the only
+      // arbiter.
+      return 422;
+    case "BG5_APPROVAL_ALREADY_RECORDED":
+      // 409 Conflict. A retry would have produced a duplicate
+      // DealApproval; the unique index + guarded insert rejected the
+      // duplicate.
+      return 409;
+    case "BG5_TERMS_DRAFT_INVALID":
+    case "BG5_APPROVAL_INVALID":
+      return 400;
+    case "BG5_DEAL_INTERNAL_FAILED":
+      // 500 Internal Server Error. Used only when the handler
+      // catches an exception outside the typed DealTermsError
+      // surface. The underlying exception message is logged server
+      // side but never echoed to the response envelope.
+      return 500;
+    case "BG5_DEAL_UNAVAILABLE":
+      // 503 Service Unavailable. The bounded P2034 retry budget was
+      // exhausted; the marketplace is briefly unable to authorise
+      // the write. The caller can retry the same payload without
+      // changing the request.
+      return 503;
   }
 }
 

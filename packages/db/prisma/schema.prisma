@@ -139,6 +139,22 @@ model UserAccount {
   // means the request is still Pending.
   authoredProjectRequests ProjectRequest[]      @relation("ProjectRequestCreatedBy")
   decidedProjectRequests  ProjectRequest[]      @relation("ProjectRequestDecidedBy")
+  // BG5 DealApprover authorizations. A UserAccount can be granted
+  // the DealApprover authorization for one or more Workspaces
+  // (each grants one explicit permission).
+  dealApproverAuthorizations DealApprover[]      @relation("DealApproverUser")
+  // Audit attribution for who granted the DealApprover authorization.
+  // Always populated; the row's invariant (`grantedByUserId` cannot
+  // be NULL) is enforced in the migration.
+  dealApproverGrants        DealApprover[]      @relation("DealApproverGrantedBy")
+  // BG5 TermsVersion drafter attribution. Optional because pure-AI
+  // drafts may carry a NULL user id when the application cannot
+  // attribute the proposal to a single human.
+  draftedTermsVersions       TermsVersion[]      @relation("TermsVersionDraftedBy")
+  // BG5 DealApproval attribution. The acting human who clicked
+  // "approve" — recorded for audit; the authorization column
+  // (`dealApproverId`) is what permits the approval.
+  approvedDealApprovals      DealApproval[]      @relation("DealApprovalApprovedBy")
 
   @@map("user_accounts")
 }
@@ -220,6 +236,17 @@ model Workspace {
   // joining through ProjectRequest.
   buyerDeals            Deal[]                @relation("BuyerWorkspaceDeals")
   sellerDeals           Deal[]                @relation("SellerWorkspaceDeals")
+  // BG5 DealApprover authorizations. A Workspace may grant one or
+  // more explicit DealApprover authorizations; each row binds the
+  // Workspace to a single (current) member who may approve an
+  // immutable TermsVersion on the Workspace's behalf. Being
+  // authenticated, being an Owner, or possessing Buyer/Seller
+  // capability does NOT record approval — only this row does.
+  dealApprovers         DealApprover[]
+  // BG5 DealApproval records. Convenience reverse relation; the
+  // approval's authorization is determined by the joined DealApprover
+  // row, not by this relation.
+  approvals             DealApproval[]
 
   @@map("workspaces")
 }
@@ -746,8 +773,191 @@ model Deal {
   serviceOffering ServiceOffering @relation(fields: [serviceOfferingId], references: [id], onDelete: Restrict)
   projectBrief    ProjectBrief    @relation(fields: [projectBriefId], references: [id], onDelete: Restrict)
   projectRequest  ProjectRequest  @relation(fields: [projectRequestId], references: [id], onDelete: Restrict)
+  // BG5: every Deal owns zero or more append-only TermsVersions.
+  termsVersions   TermsVersion[]
 
   @@index([buyerWorkspaceId, status, createdAt])
   @@index([sellerWorkspaceId, status, createdAt])
   @@map("deals")
+}
+
+// ===========================================================================
+// Buildathon Golden Slice 5 (BG5) — DealApprover, TermsVersion, DealApproval
+//
+// BG5 introduces the minimum explicit DealApprover authorization required
+// by the Golden Slice (GS 6 / DealApprover portion) and the immutable
+// TermsVersion + independent DealApproval slice (GS 19-21, GS 26).
+//
+// CONTEXT.md ("DealApprover — A Workspace member explicitly authorized to
+// approve an immutable TermsVersion for that Workspace.") makes the
+// authorization an explicit row rather than inferred from Workspace
+// capability, role, or membership. The (workspaceId, userId) natural
+// uniqueness makes a single human's grant idempotent at the DB boundary.
+//
+// TermsVersions are append-only. A material change creates a new row with
+// a monotonically incremented `version`; existing rows are never mutated.
+// The unique (dealId, version) index is the second defense against
+// retries creating duplicate version rows.
+//
+// DealApprovals are independent durable records bound to (Workspace,
+// human actor, explicit DealApprover authorization, exact TermsVersion,
+// timestamp). The unique (termsVersionId, workspaceId) index is the
+// second defense against retries creating duplicate approvals for the
+// same Workspace on the same version.
+//
+// All consequential references use onDelete: Restrict per CONTEXT.md
+// ("Preserve immutable terms, approvals, delivery versions, and audit
+// evidence in later milestones.").
+// ===========================================================================
+
+// DealApprover is the explicit authorization a Workspace grants to one
+// of its current members to approve an immutable TermsVersion on the
+// Workspace's behalf. A single Workspace may grant multiple
+// authorizations (one per member), but the (workspaceId, userId)
+// unique constraint prevents accidental duplicates. The authorization
+// is recorded separately from WorkspaceCapability (Buyer/Seller) and
+// from WorkspaceMembershipRole (Owner/Admin/Member); being a member, an
+// Owner, or Buyer/Seller-capable does NOT record approval — only this
+// row does.
+model DealApprover {
+  id                String   @id @default(cuid())
+  workspaceId       String
+  userId            String
+  // The acting human who granted this authorization. Recorded for
+  // audit; NOT an authorization source for the approval itself.
+  grantedByUserId   String
+  grantedAt         DateTime @default(now())
+
+  workspace       Workspace   @relation(fields: [workspaceId], references: [id], onDelete: Restrict)
+  user            UserAccount @relation("DealApproverUser", fields: [userId], references: [id], onDelete: Restrict)
+  grantedBy       UserAccount @relation("DealApproverGrantedBy", fields: [grantedByUserId], references: [id], onDelete: Restrict)
+  // Reverse relation: every DealApproval that cites this DealApprover.
+  approvals DealApproval[]
+
+  // One explicit authorization per (Workspace, user) tuple. A future
+  // ticket that re-grants after revocation can either insert a new row
+  // (with revokedAt/regrantedAt semantics not yet defined) or scope a
+  // separate revokedAt column; BG5 ships idempotency only.
+  @@unique([workspaceId, userId], map: "deal_approvers_workspace_user_unique_idx")
+  @@index([workspaceId])
+  @@index([userId])
+  @@map("deal_approvers")
+}
+
+// TermsVersion is an immutable proposal covering scope, deliverables,
+// schedule, USD price in minor units, revision allowance, rights
+// summary, and an optional funding deadline (display only). A material
+// change creates a NEW row with a monotonically incremented `version`;
+// existing rows are never mutated (CONTEXT.md: "A material edit creates
+// a new version and invalidates prior approvals."). AI may draft the
+// proposal but the row is visibly labeled as unapproved and the draft
+// never synthesizes approval.
+//
+// The (dealId, version) unique index is the second defense against
+// retries creating duplicate version rows; the service computes the
+// next version under a transaction-scoped FOR UPDATE-locked max() so
+// the gap-free monotonic invariant holds.
+model TermsVersion {
+  id                String   @id @default(cuid())
+  dealId            String
+  // Monotonically increasing per Deal. The first proposal is 1.
+  // Computed under FOR UPDATE-lock by the service from MAX(version)+1;
+  // a retry that re-uses the same version is rejected by the unique
+  // index as a duplicate.
+  version           Int
+  // Free-form scope text the parties review. Persisted verbatim from
+  // the validated AI output (or deterministic fallback).
+  scope             String
+  // One or more structured deliverable requirements.
+  // JSON-encoded per `bg5DeliverableRequirementV1` in packages/types.
+  deliverablesJson  Json
+  // Start / end / deliveryDays structured schedule.
+  // JSON-encoded per `bg5ScheduleV1` in packages/types.
+  scheduleJson      Json
+  // USD price in minor units (e.g. cents). Currency is fixed at USD for
+  // BG5 per the Golden Slice spec.
+  priceAmountMinor  Int
+  priceCurrency     String
+  // Maximum number of revision rounds the seller will deliver before
+  // additional fees apply. Zero means no revisions.
+  revisionAllowance Int
+  // Short rights summary (e.g. "Buyer receives non-exclusive worldwide
+  // rights for the commissioned work").
+  rightsSummary     String
+  // Optional funding deadline for display. The Golden Slice does NOT
+  // enforce its passage; the application never reads this column as
+  // an authorization source.
+  fundingDeadlineAt DateTime?
+  // AI provenance (mirrors the BG3 Matchmaker pattern). The values
+  // document which AI adapter produced the candidate proposal; the
+  // draft is never approved automatically.
+  aiProvider        String
+  aiModelId         String?
+  aiFallbackUsed    Boolean
+  // The acting human who triggered the draft (when known). Null when
+  // the AI produced a purely background proposal that no human
+  // explicitly requested; the column is optional so the service can
+  // persist pure-AI drafts without inventing a user id.
+  draftedByUserId   String?
+  // When the proposal was first persisted. Recorded for audit and
+  // displayed in the UI; this is NOT a deadline — the proposal is
+  // immutable and persists until a replacement is created.
+  draftedAt         DateTime
+  createdAt         DateTime @default(now())
+
+  deal            Deal              @relation(fields: [dealId], references: [id], onDelete: Restrict)
+  draftedByUser   UserAccount?      @relation("TermsVersionDraftedBy", fields: [draftedByUserId], references: [id], onDelete: Restrict)
+  // Reverse relation: every independent DealApproval that targets
+  // this TermsVersion.
+  approvals       DealApproval[]
+
+  // Natural uniqueness: a Deal has at most one row per version. A
+  // retried draft that re-uses the same version is rejected as a
+  // duplicate.
+  @@unique([dealId, version], map: "terms_versions_deal_version_unique_idx")
+  @@index([dealId, createdAt])
+  @@map("terms_versions")
+}
+
+// DealApproval is an independent durable record that a Workspace, via
+// an explicitly authorized DealApprover member, has approved an exact
+// immutable TermsVersion. Buyer and seller approvals are separate rows;
+// one party's approval does NOT synthesize the other party's approval.
+//
+// The row binds:
+//   - TermsVersion (immutable target)
+//   - Workspace (which side approved)
+//   - approvedByUserId (the acting human — recorded for audit; NOT the
+//     authorization source on its own)
+//   - dealApproverId (the explicit authorization that permits the
+//     approval; REQUIRED, not optional)
+//   - approvedAt (post-persist timestamp supplied by the use case)
+//
+// The (termsVersionId, workspaceId) unique index is the second defense
+// against retries creating duplicate approvals for the same Workspace
+// on the same version; the service also checks the row's current-
+// version invariant before persisting.
+model DealApproval {
+  id              String   @id @default(cuid())
+  termsVersionId  String
+  workspaceId     String
+  // The explicit DealApprover authorization that permitted the
+  // approval. REQUIRED — a missing authorization fails the approval
+  // at the policy layer; the schema also enforces NOT NULL.
+  dealApproverId  String
+  approvedByUserId String
+  approvedAt      DateTime
+
+  termsVersion  TermsVersion @relation(fields: [termsVersionId], references: [id], onDelete: Restrict)
+  workspace     Workspace    @relation(fields: [workspaceId], references: [id], onDelete: Restrict)
+  dealApprover  DealApprover @relation(fields: [dealApproverId], references: [id], onDelete: Restrict)
+  approvedBy    UserAccount  @relation("DealApprovalApprovedBy", fields: [approvedByUserId], references: [id], onDelete: Restrict)
+
+  // Natural uniqueness: one approval per (TermsVersion, Workspace)
+  // tuple. A retry on the same workspace + same version is rejected
+  // by this index; the service also rejects it via a guarded insert.
+  @@unique([termsVersionId, workspaceId], map: "deal_approvals_terms_workspace_unique_idx")
+  @@index([workspaceId])
+  @@index([dealApproverId])
+  @@map("deal_approvals")
 }

@@ -962,6 +962,28 @@ async function applySellerGraph(
     });
   }
 
+  // BG5: every canonical seller's Workspace Owner is granted an
+  // explicit DealApprover authorization. The
+  // (workspaceId, userId) unique constraint makes the operation
+  // idempotent across re-runs. The Owner is the only authorized
+  // approver per demo Workspace; the BG5 integration journey tests
+  // the approve flow through the same identity that authenticated
+  // through the magic-link adapter.
+  await tx.dealApprover.upsert({
+    where: {
+      workspaceId_userId: {
+        workspaceId: workspace.id,
+        userId: owner.id,
+      },
+    },
+    create: {
+      workspaceId: workspace.id,
+      userId: owner.id,
+      grantedByUserId: owner.id,
+    },
+    update: {},
+  });
+
   for (const offering of seller.offerings) {
     const category = await tx.serviceCategory.findUnique({
       where: { key: offering.primaryCategoryKey },
@@ -1130,6 +1152,25 @@ async function applyDemoBuyerGraph(tx: Prisma.TransactionClient): Promise<void> 
   await tx.workspaceCapability.deleteMany({ where: { workspaceId: workspace.id } });
   await tx.workspaceCapability.create({
     data: { workspaceId: workspace.id, capability: "Buyer" },
+  });
+
+  // BG5 demo buyer DealApprover authorization. The Owner is the
+  // only authorized approver for the demo Workspace. The
+  // (workspaceId, userId) uniqueness makes the operation idempotent
+  // across re-runs.
+  await tx.dealApprover.upsert({
+    where: {
+      workspaceId_userId: {
+        workspaceId: workspace.id,
+        userId: buyer.id,
+      },
+    },
+    create: {
+      workspaceId: workspace.id,
+      userId: buyer.id,
+      grantedByUserId: buyer.id,
+    },
+    update: {},
   });
 }
 

@@ -1,0 +1,575 @@
+/* eslint-disable @typescript-eslint/no-floating-promises */
+// DealTermsService unit tests (BG5).
+//
+// Background: ticket #63 acceptance criteria require the service to:
+//   - enforce drafting authorization (current member + Workspace is
+//     a party + Deal is Negotiating)
+//   - enforce approval authorization (current membership + explicit
+//     DealApprover row + exact current TermsVersion)
+//   - persist TermsVersion via the in-memory repository with the
+//     same application-policy contract the Prisma adapter enforces
+//   - reject duplicate approvals for the same (termsVersionId,
+//     workspaceId) tuple
+//   - reject approval of a stale TermsVersionId after a material
+//     replacement
+//
+// These tests use the InMemoryDealTermsRepository so they run without
+// a database. The Prisma adapter's equivalence is proven by the
+// integration tests against the disposable PostgreSQL target.
+
+import { test } from "node:test";
+import assert from "node:assert/strict";
+import { DealTermsService, DealTermsError } from "./deal-terms.service.js";
+import { InMemoryDealTermsRepository } from "./in-memory-deal-terms.repository.js";
+
+const BUYER_USER_ID = "user-buyer";
+const BUYER_WORKSPACE_ID = "ws-buyer";
+const SELLER_USER_ID = "user-seller";
+const SELLER_WORKSPACE_ID = "ws-seller";
+const OTHER_USER_ID = "user-other";
+const OTHER_WORKSPACE_ID = "ws-other";
+const DEAL_ID = "deal-1";
+const OFFERING_ID = "of-1";
+const BRIEF_ID = "brief-1";
+const PROJECT_REQUEST_ID = "pr-1";
+
+const VALID_PROPOSED = {
+  scope: "Produce the commissioned work described in the brief.",
+  deliverables: [{ title: "Primary", description: "Mix-ready master." }],
+  schedule: { startDate: "2026-01-01", endDate: "2026-01-22", deliveryDays: 21 },
+  price: { amountMinor: 75000, currency: "USD" as const },
+  revisionAllowance: 1,
+  rightsSummary: "Non-exclusive worldwide rights.",
+  fundingDeadlineAt: undefined,
+};
+
+interface Fixture {
+  service: DealTermsService;
+  repo: InMemoryDealTermsRepository;
+  clock: { current: Date };
+}
+
+function buildFixture(opts?: {
+  dealStatus?: "Negotiating" | "Active";
+}): Fixture {
+  const repo = new InMemoryDealTermsRepository();
+  repo.seedWorkspace({ workspaceId: BUYER_WORKSPACE_ID, status: "Active" });
+  repo.seedWorkspace({ workspaceId: SELLER_WORKSPACE_ID, status: "Active" });
+  repo.seedWorkspace({ workspaceId: OTHER_WORKSPACE_ID, status: "Active" });
+  repo.seedMembership({ userId: BUYER_USER_ID, workspaceId: BUYER_WORKSPACE_ID });
+  repo.seedMembership({ userId: SELLER_USER_ID, workspaceId: SELLER_WORKSPACE_ID });
+  repo.seedMembership({ userId: OTHER_USER_ID, workspaceId: OTHER_WORKSPACE_ID });
+  repo.seedDeal({
+    id: DEAL_ID,
+    buyerWorkspaceId: BUYER_WORKSPACE_ID,
+    sellerWorkspaceId: SELLER_WORKSPACE_ID,
+    serviceOfferingId: OFFERING_ID,
+    projectBriefId: BRIEF_ID,
+    projectRequestId: PROJECT_REQUEST_ID,
+    status: opts?.dealStatus ?? "Negotiating",
+    activatedAt: null,
+    createdAt: new Date("2026-01-01T00:00:00Z"),
+  });
+  repo.seedDealApprover({
+    id: "da-buyer",
+    workspaceId: BUYER_WORKSPACE_ID,
+    userId: BUYER_USER_ID,
+    grantedAt: new Date("2026-01-01T00:00:00Z"),
+  });
+  repo.seedDealApprover({
+    id: "da-seller",
+    workspaceId: SELLER_WORKSPACE_ID,
+    userId: SELLER_USER_ID,
+    grantedAt: new Date("2026-01-01T00:00:00Z"),
+  });
+
+  const clock = { current: new Date("2026-09-01T00:00:00Z") };
+  const service = new DealTermsService({
+    dealTermsRepository: repo,
+    now: () => clock.current,
+  });
+
+  return { service, repo, clock };
+}
+
+// ---------------------------------------------------------------------------
+// approvedAt + draftedAt are server-generated, NOT authoritative from request
+// ---------------------------------------------------------------------------
+
+test("draftTerms persists draftedAt from the service clock, ignoring any caller-supplied value", async () => {
+  const { service, repo } = buildFixture();
+  // Callers MUST NOT be able to influence `draftedAt` through the
+  // request payload. The route schema accepts only
+  // `actingWorkspaceId`; the service supplies `draftedAt` from its
+  // own clock. We assert that the persisted row carries the service
+  // clock value, not a hypothetical caller-supplied one.
+  const result = await service.draftTerms({
+    userAccountId: BUYER_USER_ID,
+    actingWorkspaceId: BUYER_WORKSPACE_ID,
+    dealId: DEAL_ID,
+    callerProposedTerms: VALID_PROPOSED,
+  });
+  assert.equal(
+    result.termsVersion.draftedAt,
+    "2026-09-01T00:00:00.000Z",
+    "draftedAt must equal the service clock",
+  );
+  // The DealTerms view must also expose the same draftedAt.
+  const view = await service.getDeal({
+    userAccountId: BUYER_USER_ID,
+    actingWorkspaceId: BUYER_WORKSPACE_ID,
+    dealId: DEAL_ID,
+  });
+  assert.equal(view.currentTermsVersion?.draftedAt, "2026-09-01T00:00:00.000Z");
+  // Internal sanity: the repository recorded the timestamp too.
+  const persisted = [...repo["termsVersions"].values()].find(
+    (row) => row.dealId === DEAL_ID,
+  );
+  assert.ok(persisted, "the in-memory repo must hold a TermsVersion row");
+  assert.equal(persisted.draftedAt.toISOString(), "2026-09-01T00:00:00.000Z");
+});
+
+test("approveTerms persists approvedAt from the service clock", async () => {
+  const { service } = buildFixture();
+  const draft = await service.draftTerms({
+    userAccountId: BUYER_USER_ID,
+    actingWorkspaceId: BUYER_WORKSPACE_ID,
+    dealId: DEAL_ID,
+    callerProposedTerms: VALID_PROPOSED,
+  });
+  // Advance the clock.
+  const { service: service2, clock } = buildFixture();
+  // Re-draft with the second fixture's seeded state (the first draft
+  // lives only in the first fixture).
+  void service;
+  const draft2 = await service2.draftTerms({
+    userAccountId: BUYER_USER_ID,
+    actingWorkspaceId: BUYER_WORKSPACE_ID,
+    dealId: DEAL_ID,
+    callerProposedTerms: VALID_PROPOSED,
+  });
+  clock.current = new Date("2026-09-02T00:00:00Z");
+  const approval = await service2.approveTerms({
+    userAccountId: SELLER_USER_ID,
+    actingWorkspaceId: SELLER_WORKSPACE_ID,
+    dealId: DEAL_ID,
+    termsVersionId: draft2.termsVersion.termsVersionId,
+  });
+  assert.equal(
+    approval.approval.approvedAt,
+    "2026-09-02T00:00:00.000Z",
+    "approvedAt must equal the service clock",
+  );
+  void draft;
+});
+
+// ---------------------------------------------------------------------------
+// Creating TermsVersion N+1 leaves TermsVersion N immutable; prior approvals
+// are insufficient because only approvals for current MAX(version) count.
+// ---------------------------------------------------------------------------
+
+test("drafting TermsVersion 2 leaves TermsVersion 1 immutable; a prior approval of V1 is insufficient", async () => {
+  const { service, repo } = buildFixture();
+  const v1 = await service.draftTerms({
+    userAccountId: BUYER_USER_ID,
+    actingWorkspaceId: BUYER_WORKSPACE_ID,
+    dealId: DEAL_ID,
+    callerProposedTerms: VALID_PROPOSED,
+  });
+  // Buyer approves V1.
+  await service.approveTerms({
+    userAccountId: BUYER_USER_ID,
+    actingWorkspaceId: BUYER_WORKSPACE_ID,
+    dealId: DEAL_ID,
+    termsVersionId: v1.termsVersion.termsVersionId,
+  });
+  // Now seller drafts V2.
+  const v2 = await service.draftTerms({
+    userAccountId: SELLER_USER_ID,
+    actingWorkspaceId: SELLER_WORKSPACE_ID,
+    dealId: DEAL_ID,
+    callerProposedTerms: VALID_PROPOSED,
+  });
+  assert.equal(v2.termsVersion.version, 2);
+  // V1 row is immutable: the deal view's approvals list still references V1's termsVersionId.
+  const view = await service.getDeal({
+    userAccountId: BUYER_USER_ID,
+    actingWorkspaceId: BUYER_WORKSPACE_ID,
+    dealId: DEAL_ID,
+  });
+  assert.equal(view.currentTermsVersion?.version, 2);
+  // The buyer's earlier V1 approval is still in the repo (immutable
+  // audit), but it is NOT in the current-version approvals list.
+  assert.equal(view.currentApprovals.length, 0);
+  // The in-memory repo still has 1 approval row attached to V1.
+  const allApprovals = [...repo["dealApprovals"].values()];
+  assert.equal(allApprovals.length, 1, "earlier approval row remains in storage");
+  assert.equal(allApprovals[0]!.termsVersionId, v1.termsVersion.termsVersionId);
+});
+
+test("approve against a stale TermsVersion id fails with TERMS_VERSION_NOT_CURRENT", async () => {
+  const { service } = buildFixture();
+  const v1 = await service.draftTerms({
+    userAccountId: BUYER_USER_ID,
+    actingWorkspaceId: BUYER_WORKSPACE_ID,
+    dealId: DEAL_ID,
+    callerProposedTerms: VALID_PROPOSED,
+  });
+  await service.draftTerms({
+    userAccountId: SELLER_USER_ID,
+    actingWorkspaceId: SELLER_WORKSPACE_ID,
+    dealId: DEAL_ID,
+    callerProposedTerms: VALID_PROPOSED,
+  });
+  // Seller tries to approve V1 (now stale because V2 is current).
+  await assert.rejects(
+    () =>
+      service.approveTerms({
+        userAccountId: SELLER_USER_ID,
+        actingWorkspaceId: SELLER_WORKSPACE_ID,
+        dealId: DEAL_ID,
+        termsVersionId: v1.termsVersion.termsVersionId,
+      }),
+    (err: unknown) => {
+      assert.ok(err instanceof DealTermsError);
+      assert.equal(err.code, "BG5_APPROVAL_NOT_CURRENT_VERSION");
+      return true;
+    },
+  );
+});
+
+// ---------------------------------------------------------------------------
+// Public DTOs never expose approvedByUserId, draftedByUserId, or dealApproverId
+// ---------------------------------------------------------------------------
+
+test("public TermsVersion DTO carries no draftedByUserId / approvedByUserId / dealApproverId", async () => {
+  const { service } = buildFixture();
+  const result = await service.draftTerms({
+    userAccountId: BUYER_USER_ID,
+    actingWorkspaceId: BUYER_WORKSPACE_ID,
+    dealId: DEAL_ID,
+    callerProposedTerms: VALID_PROPOSED,
+  });
+  const dto = result.termsVersion;
+  assert.equal((dto as unknown as Record<string, unknown>)["draftedByUserId"], undefined);
+  assert.equal((dto as unknown as Record<string, unknown>)["approvedByUserId"], undefined);
+  assert.equal((dto as unknown as Record<string, unknown>)["dealApproverId"], undefined);
+  assert.equal((dto as unknown as Record<string, unknown>)["grantedByUserId"], undefined);
+  // Every public DTO must carry the schema-mandated badge literal.
+  assert.equal(dto.aiDraftedUnapprovedBadge, true);
+});
+
+test("public DealApproval DTO carries no approvedByUserId / dealApproverId / draftedByUserId", async () => {
+  const { service } = buildFixture();
+  const draft = await service.draftTerms({
+    userAccountId: BUYER_USER_ID,
+    actingWorkspaceId: BUYER_WORKSPACE_ID,
+    dealId: DEAL_ID,
+    callerProposedTerms: VALID_PROPOSED,
+  });
+  const approval = await service.approveTerms({
+    userAccountId: BUYER_USER_ID,
+    actingWorkspaceId: BUYER_WORKSPACE_ID,
+    dealId: DEAL_ID,
+    termsVersionId: draft.termsVersion.termsVersionId,
+  });
+  const dto = approval.approval;
+  assert.equal((dto as unknown as Record<string, unknown>)["approvedByUserId"], undefined);
+  assert.equal((dto as unknown as Record<string, unknown>)["dealApproverId"], undefined);
+  assert.equal((dto as unknown as Record<string, unknown>)["draftedByUserId"], undefined);
+  assert.equal((dto as unknown as Record<string, unknown>)["grantedByUserId"], undefined);
+});
+
+// ---------------------------------------------------------------------------
+// Buyer and seller approvals are independent durable records for the same
+// current TermsVersion.
+// ---------------------------------------------------------------------------
+
+test("buyer approval and seller approval are independent records; both can coexist for the current version", async () => {
+  const { service } = buildFixture();
+  const draft = await service.draftTerms({
+    userAccountId: BUYER_USER_ID,
+    actingWorkspaceId: BUYER_WORKSPACE_ID,
+    dealId: DEAL_ID,
+    callerProposedTerms: VALID_PROPOSED,
+  });
+  const buyerApproval = await service.approveTerms({
+    userAccountId: BUYER_USER_ID,
+    actingWorkspaceId: BUYER_WORKSPACE_ID,
+    dealId: DEAL_ID,
+    termsVersionId: draft.termsVersion.termsVersionId,
+  });
+  const sellerApproval = await service.approveTerms({
+    userAccountId: SELLER_USER_ID,
+    actingWorkspaceId: SELLER_WORKSPACE_ID,
+    dealId: DEAL_ID,
+    termsVersionId: draft.termsVersion.termsVersionId,
+  });
+  assert.notEqual(buyerApproval.approval.dealApprovalId, sellerApproval.approval.dealApprovalId);
+  assert.equal(buyerApproval.approval.workspaceId, BUYER_WORKSPACE_ID);
+  assert.equal(sellerApproval.approval.workspaceId, SELLER_WORKSPACE_ID);
+  const view = await service.getDeal({
+    userAccountId: BUYER_USER_ID,
+    actingWorkspaceId: BUYER_WORKSPACE_ID,
+    dealId: DEAL_ID,
+  });
+  assert.equal(view.currentApprovals.length, 2);
+});
+
+// ---------------------------------------------------------------------------
+// Duplicate approval retry for the same (termsVersionId, workspaceId) creates
+// exactly one approval.
+// ---------------------------------------------------------------------------
+
+test("duplicate approval for the same Workspace + TermsVersion is rejected; only one approval row exists", async () => {
+  const { service, repo } = buildFixture();
+  const draft = await service.draftTerms({
+    userAccountId: BUYER_USER_ID,
+    actingWorkspaceId: BUYER_WORKSPACE_ID,
+    dealId: DEAL_ID,
+    callerProposedTerms: VALID_PROPOSED,
+  });
+  await service.approveTerms({
+    userAccountId: BUYER_USER_ID,
+    actingWorkspaceId: BUYER_WORKSPACE_ID,
+    dealId: DEAL_ID,
+    termsVersionId: draft.termsVersion.termsVersionId,
+  });
+  await assert.rejects(
+    () =>
+      service.approveTerms({
+        userAccountId: BUYER_USER_ID,
+        actingWorkspaceId: BUYER_WORKSPACE_ID,
+        dealId: DEAL_ID,
+        termsVersionId: draft.termsVersion.termsVersionId,
+      }),
+    (err: unknown) => {
+      assert.ok(err instanceof DealTermsError);
+      assert.equal(err.code, "BG5_APPROVAL_ALREADY_RECORDED");
+      return true;
+    },
+  );
+  const approvals = [...repo["dealApprovals"].values()].filter(
+    (a) =>
+      a.termsVersionId === draft.termsVersion.termsVersionId &&
+      a.workspaceId === BUYER_WORKSPACE_ID,
+  );
+  assert.equal(approvals.length, 1, "exactly one approval row for the same workspace + version");
+});
+
+// ---------------------------------------------------------------------------
+// Drafting a non-Negotiating Deal fails closed.
+// ---------------------------------------------------------------------------
+
+test("draftTerms on an Active Deal fails closed", async () => {
+  const { service } = buildFixture({ dealStatus: "Active" });
+  await assert.rejects(
+    () =>
+      service.draftTerms({
+        userAccountId: BUYER_USER_ID,
+        actingWorkspaceId: BUYER_WORKSPACE_ID,
+        dealId: DEAL_ID,
+        callerProposedTerms: VALID_PROPOSED,
+      }),
+    (err: unknown) => {
+      assert.ok(err instanceof DealTermsError);
+      assert.equal(err.code, "BG5_DEAL_NOT_NEGOTIATING");
+      return true;
+    },
+  );
+});
+
+test("approveTerms on an Active Deal fails closed", async () => {
+  const { service, repo } = buildFixture({ dealStatus: "Active" });
+  // Seed a TermsVersion so approve has a real id to look up.
+  const tvId = "tv-existing";
+  repo["termsVersions"].set(tvId, {
+    id: tvId,
+    dealId: DEAL_ID,
+    version: 1,
+    scope: "Scope",
+    deliverablesJson: [{ title: "t", description: "d" }],
+    scheduleJson: VALID_PROPOSED.schedule,
+    priceAmountMinor: 75000,
+    priceCurrency: "USD",
+    revisionAllowance: 1,
+    rightsSummary: "Rights",
+    fundingDeadlineAt: null,
+    aiProvider: "deterministic-fallback",
+    aiModelId: null,
+    aiFallbackUsed: true,
+    draftedByUserId: null,
+    draftedAt: new Date("2026-09-01T00:00:00Z"),
+    createdAt: new Date("2026-09-01T00:00:00Z"),
+  });
+  await assert.rejects(
+    () =>
+      service.approveTerms({
+        userAccountId: BUYER_USER_ID,
+        actingWorkspaceId: BUYER_WORKSPACE_ID,
+        dealId: DEAL_ID,
+        termsVersionId: tvId,
+      }),
+    (err: unknown) => {
+      assert.ok(err instanceof DealTermsError);
+      assert.equal(err.code, "BG5_DEAL_NOT_NEGOTIATING");
+      return true;
+    },
+  );
+});
+
+// ---------------------------------------------------------------------------
+// Approval without current membership, DealApprover authorization, or current
+// TermsVersion fails closed.
+// ---------------------------------------------------------------------------
+
+test("approveTerms by a user with no current membership fails closed", async () => {
+  const { service } = buildFixture();
+  const draft = await service.draftTerms({
+    userAccountId: BUYER_USER_ID,
+    actingWorkspaceId: BUYER_WORKSPACE_ID,
+    dealId: DEAL_ID,
+    callerProposedTerms: VALID_PROPOSED,
+  });
+  // OTHER_USER_ID has no membership in BUYER_WORKSPACE_ID.
+  await assert.rejects(
+    () =>
+      service.approveTerms({
+        userAccountId: OTHER_USER_ID,
+        actingWorkspaceId: BUYER_WORKSPACE_ID,
+        dealId: DEAL_ID,
+        termsVersionId: draft.termsVersion.termsVersionId,
+      }),
+    (err: unknown) => {
+      assert.ok(err instanceof DealTermsError);
+      assert.equal(err.code, "BG5_APPROVAL_FORBIDDEN");
+      return true;
+    },
+  );
+});
+
+test("approveTerms without an explicit DealApprover authorization fails closed", async () => {
+  const { service, repo } = buildFixture();
+  // OTHER_WORKSPACE_ID has no DealApprover row for OTHER_USER_ID.
+  repo.seedMembership({ userId: OTHER_USER_ID, workspaceId: OTHER_WORKSPACE_ID });
+  repo.seedDeal({
+    id: "deal-no-approver",
+    buyerWorkspaceId: BUYER_WORKSPACE_ID,
+    sellerWorkspaceId: OTHER_WORKSPACE_ID,
+    serviceOfferingId: OFFERING_ID,
+    projectBriefId: BRIEF_ID,
+    projectRequestId: "pr-2",
+    status: "Negotiating",
+    activatedAt: null,
+    createdAt: new Date("2026-01-01T00:00:00Z"),
+  });
+  const draft = await service.draftTerms({
+    userAccountId: BUYER_USER_ID,
+    actingWorkspaceId: BUYER_WORKSPACE_ID,
+    dealId: "deal-no-approver",
+    callerProposedTerms: VALID_PROPOSED,
+  });
+  await assert.rejects(
+    () =>
+      service.approveTerms({
+        userAccountId: OTHER_USER_ID,
+        actingWorkspaceId: OTHER_WORKSPACE_ID,
+        dealId: "deal-no-approver",
+        termsVersionId: draft.termsVersion.termsVersionId,
+      }),
+    (err: unknown) => {
+      assert.ok(err instanceof DealTermsError);
+      assert.equal(err.code, "BG5_APPROVAL_FORBIDDEN");
+      return true;
+    },
+  );
+});
+
+test("approveTerms with a non-current TermsVersion fails closed", async () => {
+  const { service, repo } = buildFixture();
+  // Seed an older TermsVersion that is NOT the current version.
+  repo["termsVersions"].set("tv-stale", {
+    id: "tv-stale",
+    dealId: DEAL_ID,
+    version: 1,
+    scope: "Old scope",
+    deliverablesJson: [{ title: "t", description: "d" }],
+    scheduleJson: VALID_PROPOSED.schedule,
+    priceAmountMinor: 75000,
+    priceCurrency: "USD",
+    revisionAllowance: 1,
+    rightsSummary: "Old",
+    fundingDeadlineAt: null,
+    aiProvider: "deterministic-fallback",
+    aiModelId: null,
+    aiFallbackUsed: true,
+    draftedByUserId: null,
+    draftedAt: new Date("2026-01-01T00:00:00Z"),
+    createdAt: new Date("2026-01-01T00:00:00Z"),
+  });
+  // Draft a newer version (current = V2).
+  await service.draftTerms({
+    userAccountId: BUYER_USER_ID,
+    actingWorkspaceId: BUYER_WORKSPACE_ID,
+    dealId: DEAL_ID,
+    callerProposedTerms: VALID_PROPOSED,
+  });
+  await assert.rejects(
+    () =>
+      service.approveTerms({
+        userAccountId: BUYER_USER_ID,
+        actingWorkspaceId: BUYER_WORKSPACE_ID,
+        dealId: DEAL_ID,
+        termsVersionId: "tv-stale",
+      }),
+    (err: unknown) => {
+      assert.ok(err instanceof DealTermsError);
+      assert.equal(err.code, "BG5_APPROVAL_NOT_CURRENT_VERSION");
+      return true;
+    },
+  );
+});
+
+// ---------------------------------------------------------------------------
+// Funding deadline remains display-only and causes no state transition.
+// ---------------------------------------------------------------------------
+
+test("funding deadline is persisted as display-only and never gates approval state", async () => {
+  const { service } = buildFixture();
+  const futureDeadline = new Date("2099-12-31T00:00:00.000Z").toISOString();
+  const pastDeadline = new Date("2000-01-01T00:00:00.000Z").toISOString();
+
+  // Future deadline: approval succeeds.
+  const futureDraft = await service.draftTerms({
+    userAccountId: BUYER_USER_ID,
+    actingWorkspaceId: BUYER_WORKSPACE_ID,
+    dealId: DEAL_ID,
+    callerProposedTerms: { ...VALID_PROPOSED, fundingDeadlineAt: futureDeadline },
+  });
+  await service.approveTerms({
+    userAccountId: BUYER_USER_ID,
+    actingWorkspaceId: BUYER_WORKSPACE_ID,
+    dealId: DEAL_ID,
+    termsVersionId: futureDraft.termsVersion.termsVersionId,
+  });
+
+  // Past deadline: still approves successfully (no state effect).
+  const pastDraft = await service.draftTerms({
+    userAccountId: BUYER_USER_ID,
+    actingWorkspaceId: BUYER_WORKSPACE_ID,
+    dealId: DEAL_ID,
+    callerProposedTerms: { ...VALID_PROPOSED, fundingDeadlineAt: pastDeadline },
+  });
+  const pastApproval = await service.approveTerms({
+    userAccountId: SELLER_USER_ID,
+    actingWorkspaceId: SELLER_WORKSPACE_ID,
+    dealId: DEAL_ID,
+    termsVersionId: pastDraft.termsVersion.termsVersionId,
+  });
+  assert.equal(pastApproval.approval.termsVersionId, pastDraft.termsVersion.termsVersionId);
+  assert.equal(
+    pastDraft.termsVersion.fundingDeadlineAt,
+    pastDeadline,
+    "deadline persists verbatim for display",
+  );
+});
