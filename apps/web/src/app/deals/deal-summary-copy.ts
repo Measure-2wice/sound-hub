@@ -1,4 +1,9 @@
-import type { Bg5DealApprovalPublicV1, DealStatusV1 } from "@soundhub/types";
+import type {
+  Bg5DealApprovalPublicV1,
+  Bg6PublicFundingFailureReasonCodeV1,
+  Bg6PublicFundingStatusV1,
+  DealStatusV1,
+} from "@soundhub/types";
 
 export type DealPartySide = "Buyer" | "Seller";
 
@@ -11,10 +16,30 @@ export function buildDealSummaryCopy(status: DealStatusV1): {
   readonly title: string;
   readonly description: string;
 } {
+  if (status === "Active") {
+    return {
+      title: "Deal Active",
+      description: "Escrow funded; commissioned work may begin.",
+    };
+  }
   return {
     title: "Deal terms",
     description: `Status: ${status}. Created from an accepted project request.`,
   };
+}
+
+export function buildFundingBadgeLabel(): string {
+  return "Sandbox · simulated";
+}
+
+export function buildPublicFundingStatusCopy(
+  status: Bg6PublicFundingStatusV1,
+  sanitizedReason: Bg6PublicFundingFailureReasonCodeV1 | null,
+): string {
+  if (status === "Confirmed") return "Funding confirmed (sandbox)";
+  if (status === "AwaitingConfirmation") return "Awaiting sandbox confirmation";
+  // Failed — render the closed sanitized code only; never raw text.
+  return sanitizedReason ? `Funding failed (${sanitizedReason})` : "Funding failed";
 }
 
 export function getDealPartySide(input: {

@@ -482,6 +482,33 @@ export const apiErrorCodeV1Schema = z.enum([
   "BG5_APPROVAL_ALREADY_RECORDED",
   "BG5_DEAL_INTERNAL_FAILED",
   "BG5_DEAL_UNAVAILABLE",
+  // Buildathon Golden Slice 6 (BG6) — PaymentIntent + activation codes.
+  // 404 — the Deal id is unknown to the acting Workspace.
+  "BG6_DEAL_NOT_FOUND",
+  // 403 — the acting Workspace is not the buyer side, is not a
+  // current member, lacks the Buyer capability, or another
+  // authorization rejection (safe envelope collapses them).
+  "BG6_FUNDING_FORBIDDEN",
+  // 400 — the request body failed runtime validation.
+  "BG6_FUNDING_INVALID",
+  // 422 — the Deal is past Negotiating (typically already Active).
+  "BG6_DEAL_NOT_NEGOTIATING",
+  // 422 — both parties have not approved the current TermsVersion.
+  "BG6_APPROVALS_INCOMPLETE",
+  // 422 — the current TermsVersion moved under us between preauth
+  // and Phase 3; retry-safe.
+  "BG6_TERMS_VERSION_NOT_CURRENT",
+  // 422 — the provider confirmation's amount/currency/termsVersionId
+  // did not match the locked TermsVersion snapshot.
+  "BG6_FUNDING_CONFIRMATION_MISMATCH",
+  // 503 — provider outage; Deal stays Negotiating; intent transitions
+  // to Failed on the SAME row.
+  "BG6_ESCROW_UNAVAILABLE",
+  // 409 — guarded activation UPDATE returned 0 rows; concurrent
+  // activation already happened.
+  "BG6_DEAL_ALREADY_ACTIVE",
+  // 500 — unexpected internal failure outside the typed surfaces.
+  "BG6_FUNDING_INTERNAL_FAILED",
 ]);
 export type ApiErrorCodeV1 = z.infer<typeof apiErrorCodeV1Schema>;
 
@@ -1560,10 +1587,7 @@ export const bg5ProposedTermsV1Schema = z
     rightsSummary: z.string().min(1).max(2000),
     // Optional, display-only. The application never reads this as a
     // state-transition source.
-    fundingDeadlineAt: z
-      .string()
-      .datetime({ offset: true })
-      .optional(),
+    fundingDeadlineAt: z.string().datetime({ offset: true }).optional(),
   })
   .strict();
 export type Bg5ProposedTermsV1 = z.infer<typeof bg5ProposedTermsV1Schema>;
@@ -1629,10 +1653,7 @@ export const bg5TermsVersionPublicV1Schema = z
     price: bg5UsdMoneyV1Schema,
     revisionAllowance: bg5RevisionAllowanceV1Schema,
     rightsSummary: z.string().min(1).max(2000),
-    fundingDeadlineAt: z
-      .string()
-      .datetime({ offset: true })
-      .nullable(),
+    fundingDeadlineAt: z.string().datetime({ offset: true }).nullable(),
     aiProvider: z.enum(bg5AiProviderV1Values),
     aiModelId: z.string().min(1).max(120).nullable(),
     aiFallbackUsed: z.boolean(),
@@ -1728,6 +1749,119 @@ export const bg5GetDealResponseV1Schema = z
   })
   .strict();
 export type Bg5GetDealResponseV1 = z.infer<typeof bg5GetDealResponseV1Schema>;
+
+// ===========================================================================
+// Buildathon Golden Slice 6 (BG6) — PaymentIntent + deterministic activation
+//
+// Per ticket #64 the buyer's authorized human explicitly requests
+// funding for the current TermsVersion after both parties have
+// approved it. The MockEscrowProvider is the only provider the
+// buildathon wires; the confirmation carries an opaque reference, the
+// exact amount the TermsVersion bound, the asset/network labels the
+// mock returned, the current TermsVersion id, and a confirmation
+// timestamp. The Deal becomes Active atomically with the
+// confirmation persistence.
+//
+// Persistence is private: paymentIntentId, correlationId, raw
+// providerReference, raw failureDetail, and internal providerState
+// NEVER cross the public DTO. The single allow-listed public surface
+// is bg6FundingConfirmationPublicV1Schema, which carries only
+// product-safe status, amount, truthful provider/asset/network/
+// environment labels, confirmation time, the sanitized failure code,
+// and the schema-mandated sandboxSimulatedBadge literal.
+// ===========================================================================
+
+// ---------- Closed label / status / reason tuples ----------
+
+// The fixed buildathon sandbox asset labels. The mock provider returns
+// exactly this value; the application surfaces it in the UI so the
+// sandbox / production distinction is unmistakable.
+export const bg6SandboxAssetLabelsV1 = ["sandbox-USDC"] as const;
+export type Bg6SandboxAssetLabelV1 = (typeof bg6SandboxAssetLabelsV1)[number];
+
+// The fixed buildathon simulated network label. Unmistakably
+// simulated ("simulated-" prefix) so a real Polkadot network
+// connection is never claimed.
+export const bg6SimulatedNetworkLabelsV1 = ["simulated-polkadot-asset-hub-testnet"] as const;
+export type Bg6SimulatedNetworkLabelV1 = (typeof bg6SimulatedNetworkLabelsV1)[number];
+
+export const bg6EnvironmentLabelsV1 = ["sandbox"] as const;
+export type Bg6EnvironmentLabelV1 = (typeof bg6EnvironmentLabelsV1)[number];
+
+export const bg6ProviderKeysV1 = ["mock-escrow-deterministic"] as const;
+export type Bg6ProviderKeyV1 = (typeof bg6ProviderKeysV1)[number];
+
+// Public product-safe status enum. Mapped from internal
+// PaymentIntentProviderState at the DTO boundary.
+export const bg6PublicFundingStatusesV1 = ["AwaitingConfirmation", "Confirmed", "Failed"] as const;
+export type Bg6PublicFundingStatusV1 = (typeof bg6PublicFundingStatusesV1)[number];
+
+// Closed sanitized reason codes that may appear in the public DTO.
+// Matches the persisted PaymentIntentFailureReasonCode enum.
+export const bg6PublicFundingFailureReasonCodesV1 = [
+  "EscrowProviderUnavailable",
+  "EscrowConfirmationAmountMismatch",
+  "EscrowConfirmationCurrencyMismatch",
+  "EscrowConfirmationVersionMismatch",
+] as const;
+export type Bg6PublicFundingFailureReasonCodeV1 =
+  (typeof bg6PublicFundingFailureReasonCodesV1)[number];
+
+// ---------- Public DTOs ----------
+
+// Minimal allow-listed public funding-status DTO. Carries ONLY
+// product-safe fields. EXCLUDED from this schema:
+//   - paymentIntentId        (internal audit id)
+//   - correlationId          (SoundHub-owned opaque identity)
+//   - providerReference      (provider-side handle)
+//   - raw failureDetail      (server-only)
+//   - internal providerState (mapped onto `status` here)
+//
+// `sandboxSimulatedBadge: z.literal(true)` is schema-mandated so a
+// future refactor cannot silently drop the badge from the UI.
+export const bg6FundingConfirmationPublicV1Schema = z
+  .object({
+    status: z.enum(bg6PublicFundingStatusesV1),
+    expectedAmount: bg5UsdMoneyV1Schema,
+    confirmedAmount: bg5UsdMoneyV1Schema.nullable(),
+    providerKey: z.enum(bg6ProviderKeysV1),
+    assetLabel: z.enum(bg6SandboxAssetLabelsV1),
+    networkLabel: z.enum(bg6SimulatedNetworkLabelsV1),
+    environmentLabel: z.enum(bg6EnvironmentLabelsV1),
+    confirmationTime: z.string().datetime().nullable(),
+    sanitizedFailureReason: z.enum(bg6PublicFundingFailureReasonCodesV1).nullable(),
+    sandboxSimulatedBadge: z.literal(true),
+  })
+  .strict();
+export type Bg6FundingConfirmationPublicV1 = z.infer<typeof bg6FundingConfirmationPublicV1Schema>;
+
+// Funding request body. The actingWorkspaceId is required so the
+// route can revalidate current membership + the Buyer capability.
+// The Deal id comes from the URL path; no TermsVersion id from the
+// client — the service derives the current version from the locked
+// snapshot, so a stale client cannot force funding against a
+// superseded version.
+export const bg6FundDealRequestV1Schema = z
+  .object({
+    actingWorkspaceId: z.string().min(1).max(128),
+  })
+  .strict();
+export type Bg6FundDealRequestV1 = z.infer<typeof bg6FundDealRequestV1Schema>;
+
+// Funding response. Wraps the BG5 Deal view + the public funding
+// status DTO. After a successful fund, the Deal view's
+// `deal.status` carries "Active" and `activatedAt` the activation
+// timestamp. The single allow-listed public funding surface is
+// `fundingStatus` — no separate paymentIntent / fundingConfirmation
+// members.
+export const bg6FundDealResponseV1Schema = z
+  .object({
+    ok: z.literal(true),
+    deal: bg5DealViewV1Schema,
+    fundingStatus: bg6FundingConfirmationPublicV1Schema,
+  })
+  .strict();
+export type Bg6FundDealResponseV1 = z.infer<typeof bg6FundDealResponseV1Schema>;
 
 // ---------- BG5 error codes (appended to the shared safe envelope) ----------
 //

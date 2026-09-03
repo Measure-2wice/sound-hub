@@ -114,6 +114,29 @@ enum DealStatus {
   Active
 }
 
+// Buildathon Golden Slice 6 (BG6) — PaymentIntent closed lifecycle.
+// See ticket #64. The providerState field tracks whether SoundHub has
+// durably persisted the intent, the provider has returned a matching
+// confirmation, or the provider threw or returned a non-matching
+// confirmation. Failed is durable; a buyer retry on the SAME intent
+// row transitions Failed → Confirmed.
+enum PaymentIntentProviderState {
+  Created
+  Confirmed
+  Failed
+}
+
+// Closed set of sanitized reason codes persisted on a Failed
+// PaymentIntent. The persisted column carries ONLY this enum value;
+// the raw exception text lives in the server-only PaymentIntent.
+// failureDetail column and never crosses any public DTO.
+enum PaymentIntentFailureReasonCode {
+  EscrowProviderUnavailable
+  EscrowConfirmationAmountMismatch
+  EscrowConfirmationCurrencyMismatch
+  EscrowConfirmationVersionMismatch
+}
+
 // ---------- Identity and authority ----------
 
 model UserAccount {
@@ -155,6 +178,10 @@ model UserAccount {
   // "approve" — recorded for audit; the authorization column
   // (`dealApproverId`) is what permits the approval.
   approvedDealApprovals      DealApproval[]      @relation("DealApprovalApprovedBy")
+  // BG6 PaymentIntent attribution. The acting human who initiated
+  // the funding call (recorded for audit; the Buyer capability +
+  // WorkspaceMembership are the authorization sources).
+  createdPaymentIntents      PaymentIntent[]     @relation("PaymentIntentCreatedBy")
 
   @@map("user_accounts")
 }
@@ -247,6 +274,11 @@ model Workspace {
   // approval's authorization is determined by the joined DealApprover
   // row, not by this relation.
   approvals             DealApproval[]
+  // BG6 reverse relation: every durable PaymentIntent whose intent
+  // (provider.call, preauth, or activation) was initiated by this
+  // Workspace. Always the buyer Workspace; the activation invariant
+  // rejects seller-side intents at the service layer.
+  paymentIntents        PaymentIntent[]
 
   @@map("workspaces")
 }
@@ -775,6 +807,12 @@ model Deal {
   projectRequest  ProjectRequest  @relation(fields: [projectRequestId], references: [id], onDelete: Restrict)
   // BG5: every Deal owns zero or more append-only TermsVersions.
   termsVersions   TermsVersion[]
+  // BG6: every durable PaymentIntent anchored to this Deal. The
+  // natural (dealId, termsVersionId) uniqueness accommodates one
+  // intent per pinned (Deal, current TermsVersion) tuple; a
+  // replacement TermsVersion creates a NEW intent and leaves the
+  // stale one durable but activation-insufficient.
+  paymentIntents  PaymentIntent[]
 
   @@index([buyerWorkspaceId, status, createdAt])
   @@index([sellerWorkspaceId, status, createdAt])
@@ -910,6 +948,11 @@ model TermsVersion {
   // Reverse relation: every independent DealApproval that targets
   // this TermsVersion.
   approvals       DealApproval[]
+  // BG6 reverse relation: every durable PaymentIntent that pinned
+  // this version. The activation invariant re-checks
+  // current-version, so a historical funding row pointing at a
+  // superseded version is expected and harmless.
+  paymentIntents  PaymentIntent[]
 
   // Natural uniqueness: a Deal has at most one row per version. A
   // retried draft that re-uses the same version is rejected as a
@@ -960,4 +1003,113 @@ model DealApproval {
   @@index([workspaceId])
   @@index([dealApproverId])
   @@map("deal_approvals")
+}
+
+// ===========================================================================
+// Buildathon Golden Slice 6 (BG6) — PaymentIntent + deterministic activation
+//
+// Per ticket #64 a PaymentIntent is a private PostgreSQL-authoritative
+// record that durably exists BEFORE the escrow provider is called. The
+// intent carries the exact Deal, the pinned current TermsVersion, the
+// expected amount/currency, truthful asset/environment metadata, the
+// provider state, and a SoundHub-owned opaque durable correlation
+// identifier. The provider reference is added separately after the
+// provider interaction.
+//
+// Lifecycle (providerState):
+//   Created   — preauthorized + durably persisted; provider not called.
+//   Confirmed — provider returned a matching confirmation; reference persisted.
+//   Failed    — provider threw or returned a non-matching confirmation.
+//
+// (dealId, termsVersionId) is the natural-uniqueness key. A replacement
+// TermsVersion (material change) may create a NEW intent; the stale one
+// remains durable (immutable audit) but is no longer the CURRENT-version
+// intent and therefore cannot satisfy the GS-25 condition 4 inside the
+// activation transaction. Retries for the same (dealId, termsVersionId)
+// converge on the SAME row — the find-or-create semantics inside the
+// service guarantee this.
+//
+// All consequential references use ON DELETE RESTRICT per CONTEXT.md.
+// ===========================================================================
+
+model PaymentIntent {
+  id                String                    @id @default(cuid())
+  dealId            String
+  termsVersionId    String
+  // The acting Workspace that initiated funding. Recorded for audit;
+  // the buyer's Workspace membership is what authorizes the command,
+  // not this column. Always the Deal's buyerWorkspaceId.
+  actingWorkspaceId String
+  // The acting human who triggered funding. Recorded for audit; not
+  // an authorization source on its own.
+  createdByUserId   String
+  // Exact USD amount in minor units the buyer expected to fund. Pinned
+  // at intent creation time; the activation invariant re-verifies the
+  // provider's confirmation matches this value bit-for-bit.
+  expectedAmountMinor Int
+  // Currency the buyer expected to fund. Fixed at "USD" for BG6; the
+  // column is open for future currencies.
+  expectedCurrency  String
+  // Truthful asset label. The mock provider returns "sandbox-USDC";
+  // the public DTO and UI surface this exact value so a real asset is
+  // never claimed.
+  assetLabel        String
+  // Truthful network label. The mock provider returns
+  // "simulated-polkadot-asset-hub-testnet" — unmistakably simulated
+  // so a real Polkadot connection is never claimed.
+  networkLabel      String
+  // The provider key that owns this intent. Fixed at
+  // "mock-escrow-deterministic" for BG6.
+  providerKey       String
+  // The environment label. Fixed at "sandbox" for the deterministic
+  // mock; the UI surfaces this on every funding element.
+  environmentLabel  String
+  // SoundHub-owned opaque durable correlation identifier. Generated
+  // by the application when the intent is first created; the provider
+  // does NOT see this value (it is not an input). Persisted with
+  // providerState = "Created" and never changes.
+  correlationId     String                    @unique
+  // The provider's own reference for the funding interaction. NULL
+  // while providerState = "Created"; set when the provider returns a
+  // matching or non-matching confirmation. The unique index is a
+  // partial unique so the column is nullable.
+  providerReference String?
+  // When the provider returned the confirmation. NULL while
+  // providerState = "Created".
+  confirmedAt       DateTime?
+  // When the SoundHub application accepted the confirmation. Same as
+  // confirmedAt for the deterministic mock; kept separate for future
+  // providers whose confirmation arrives asynchronously.
+  acceptedAt        DateTime?
+  // Closed sanitized reason code persisted when the intent transitions
+  // to Failed. The raw exception text is captured in `failureDetail`
+  // (server-only, never crosses any public DTO).
+  failureReasonCode PaymentIntentFailureReasonCode?
+  // Server-only raw provider exception text. NEVER returned in any
+  // public DTO; logged alongside the closed `failureReasonCode`.
+  failureDetail     String?
+  // Closed lifecycle state. Defaults to "Created" so the row is
+  // semantically meaningful immediately after persistence.
+  providerState     PaymentIntentProviderState @default(Created)
+  createdAt         DateTime                  @default(now())
+  updatedAt         DateTime                  @updatedAt
+
+  deal            Deal         @relation(fields: [dealId], references: [id], onDelete: Restrict)
+  termsVersion    TermsVersion @relation(fields: [termsVersionId], references: [id], onDelete: Restrict)
+  actingWorkspace Workspace    @relation(fields: [actingWorkspaceId], references: [id], onDelete: Restrict)
+  createdByUser   UserAccount  @relation("PaymentIntentCreatedBy", fields: [createdByUserId], references: [id], onDelete: Restrict)
+
+  // Natural uniqueness: one durable PaymentIntent per (Deal, pinned
+  // current TermsVersion). A retried fundDeal command for the same
+  // (dealId, termsVersionId) converges on this row via find-or-create.
+  // A replacement TermsVersion creates a NEW intent; the stale one
+  // remains durable and is activation-insufficient.
+  @@unique([dealId, termsVersionId], map: "payment_intents_deal_version_unique_idx")
+  // Provider reference uniqueness — partial so the column is nullable
+  // while providerState = "Created".
+  @@unique([providerReference], map: "payment_intents_provider_reference_unique_idx", where: { providerReference: { not: null } })
+  @@index([dealId, createdAt])
+  @@index([termsVersionId])
+  @@index([actingWorkspaceId])
+  @@map("payment_intents")
 }
