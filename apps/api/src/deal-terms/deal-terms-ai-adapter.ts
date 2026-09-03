@@ -81,28 +81,21 @@ export class DeterministicDealTermsAiAdapter implements DealTermsAiAdapter {
 }
 
 function buildScope(input: DealTermsAiDraftInputV1): string {
+  void input;
   return (
-    "Produce the commissioned work described in ProjectBrief " +
-    input.projectBriefId +
-    " for buyer Workspace " +
-    input.buyerWorkspaceId +
-    " via seller Workspace " +
-    input.sellerWorkspaceId +
-    " under ServiceOffering " +
-    input.serviceOfferingId +
-    ". Scope, deliverables, schedule, revisions, rights, and price below."
+    "Produce the commissioned work described in the accepted project brief under the selected " +
+    "service offering. Scope, deliverables, schedule, revisions, rights, and price appear below."
   );
 }
 
 function buildDeliverables(input: DealTermsAiDraftInputV1): Bg5ProposedTermsV1["deliverables"] {
+  void input;
   return [
     {
       title: "Primary deliverable",
       description:
-        "One final mix-ready or master-ready file (or live performance) per the " +
-        "ServiceOffering " +
-        input.serviceOfferingId +
-        " selected for this Deal.",
+        "One final mix-ready or master-ready file (or live performance) under the selected " +
+        "service offering.",
     },
     {
       title: "Stems",

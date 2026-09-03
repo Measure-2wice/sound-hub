@@ -23,7 +23,7 @@
 //   - No Navigation destination. The existing workflow links to
 //     /deals/:dealId directly.
 
-import { useCallback, useEffect, useMemo, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import Link from "next/link";
 import type {
   Bg5DealApprovalPublicV1,
@@ -34,6 +34,14 @@ import type {
 import { useSession } from "../../components/SessionProvider";
 import { Card } from "../../components/ui/Card";
 import { approveTerms, draftTerms, fetchDeal } from "../../lib/deal-terms-client";
+import {
+  buildApprovalStatusRows,
+  buildApprovalSuccessCopy,
+  buildAiDraftStatusLabel,
+  buildDealSummaryCopy,
+  getDealPartySide,
+} from "../deal-summary-copy";
+import { findVisibleDeal } from "../find-visible-deal";
 
 interface DealPageProps {
   // Next.js 15's `PageProps.params` is a Promise; await it in the
@@ -61,6 +69,8 @@ export default function DealPage({ params }: DealPageProps): JSX.Element {
   );
   const [currentApprovals, setCurrentApprovals] = useState<readonly Bg5DealApprovalPublicV1[]>([]);
   const [loadingDeal, setLoadingDeal] = useState<boolean>(false);
+  const [bootstrapComplete, setBootstrapComplete] = useState<boolean>(false);
+  const bootstrapKeyRef = useRef<string | null>(null);
   const [submitting, setSubmitting] = useState<"draft" | "approve" | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [success, setSuccess] = useState<string | null>(null);
@@ -123,6 +133,53 @@ export default function DealPage({ params }: DealPageProps): JSX.Element {
     void reload(actingWorkspaceId);
   }, [actingWorkspaceId, reload]);
 
+  useEffect(() => {
+    if (!user || !dealId || deal || actingWorkspaceId) return;
+    const bootstrapKey = `${dealId}:${user.userAccountId}`;
+    if (bootstrapKeyRef.current === bootstrapKey) return;
+    bootstrapKeyRef.current = bootstrapKey;
+    setBootstrapComplete(false);
+    setLoadingDeal(true);
+    setError(null);
+
+    let cancelled = false;
+    void findVisibleDeal({
+      dealId,
+      workspaceIds: user.workspaces.map((workspace) => workspace.workspaceId),
+      fetchDeal,
+    })
+      .then((result) => {
+        if (cancelled) return;
+        setActingWorkspaceId(result.actingWorkspaceId);
+        setDeal(result.response.deal.deal);
+        setCurrentTermsVersion(result.response.deal.currentTermsVersion);
+        setCurrentApprovals(result.response.deal.currentApprovals);
+      })
+      .catch((err: unknown) => {
+        if (cancelled) return;
+        if (
+          err instanceof Error &&
+          ((err as { code?: string }).code === "SESSION_INVALID" ||
+            (err as { code?: string }).code === "AUTH_FAILED" ||
+            (err as { code?: string }).code === "SESSION_EXPIRED")
+        ) {
+          void refresh();
+          return;
+        }
+        setError(err instanceof Error ? err.message : "Could not load the Deal.");
+      })
+      .finally(() => {
+        if (!cancelled) {
+          setLoadingDeal(false);
+          setBootstrapComplete(true);
+        }
+      });
+
+    return () => {
+      cancelled = true;
+    };
+  }, [actingWorkspaceId, deal, dealId, refresh, user]);
+
   const onDraft = useCallback(async () => {
     if (!actingWorkspaceId) return;
     setSubmitting("draft");
@@ -149,18 +206,22 @@ export default function DealPage({ params }: DealPageProps): JSX.Element {
   }, [actingWorkspaceId, dealId, reload, refresh]);
 
   const onApprove = useCallback(async () => {
-    if (!actingWorkspaceId || !currentTermsVersion) return;
+    if (!actingWorkspaceId || !currentTermsVersion || !deal) return;
+    const approvalSide = getDealPartySide({
+      workspaceId: actingWorkspaceId,
+      buyerWorkspaceId: deal.buyerWorkspaceId,
+      sellerWorkspaceId: deal.sellerWorkspaceId,
+    });
+    if (!approvalSide) return;
     setSubmitting("approve");
     setError(null);
     setSuccess(null);
     try {
-      const result = await approveTerms(dealId, {
+      await approveTerms(dealId, {
         actingWorkspaceId,
         termsVersionId: currentTermsVersion.termsVersionId,
       });
-      setSuccess(
-        `Approved — Workspace ${result.approval.workspaceId} on TermsVersion ${currentTermsVersion.version}.`,
-      );
+      setSuccess(buildApprovalSuccessCopy(approvalSide, currentTermsVersion.version));
       await reload(actingWorkspaceId);
     } catch (err) {
       if (
@@ -176,7 +237,7 @@ export default function DealPage({ params }: DealPageProps): JSX.Element {
     } finally {
       setSubmitting(null);
     }
-  }, [actingWorkspaceId, currentTermsVersion, dealId, reload, refresh]);
+  }, [actingWorkspaceId, currentTermsVersion, deal, dealId, reload, refresh]);
 
   if (loading) {
     return (
@@ -204,6 +265,14 @@ export default function DealPage({ params }: DealPageProps): JSX.Element {
             </p>
           </Card.Content>
         </Card>
+      </div>
+    );
+  }
+
+  if (!deal && (loadingDeal || !bootstrapComplete)) {
+    return (
+      <div className="max-w-3xl mx-auto px-6 py-12" data-testid="deal-loading">
+        <p className="text-gray-600">Loading Deal…</p>
       </div>
     );
   }
@@ -239,15 +308,14 @@ export default function DealPage({ params }: DealPageProps): JSX.Element {
     currentTermsVersion !== null &&
     !alreadyApproved &&
     currentTermsVersion.isCurrentVersion;
+  const dealSummaryCopy = buildDealSummaryCopy(deal.status);
 
   return (
     <div className="max-w-3xl mx-auto px-6 py-12 space-y-6" data-testid="deal-page">
       <Card data-testid="deal-header">
         <Card.Header>
-          <Card.Title>Deal {deal.dealId}</Card.Title>
-          <Card.Description>
-            Status: {deal.status}. Project request {deal.projectRequestId} originated this Deal.
-          </Card.Description>
+          <Card.Title>{dealSummaryCopy.title}</Card.Title>
+          <Card.Description>{dealSummaryCopy.description}</Card.Description>
         </Card.Header>
       </Card>
 
@@ -332,6 +400,8 @@ export default function DealPage({ params }: DealPageProps): JSX.Element {
             <TermsVersionView
               tv={currentTermsVersion}
               approvals={currentApprovals}
+              buyerWorkspaceId={deal.buyerWorkspaceId}
+              sellerWorkspaceId={deal.sellerWorkspaceId}
               onDraft={() => {
                 void onDraft();
               }}
@@ -371,6 +441,8 @@ export default function DealPage({ params }: DealPageProps): JSX.Element {
 function TermsVersionView({
   tv,
   approvals,
+  buyerWorkspaceId,
+  sellerWorkspaceId,
   onDraft,
   onApprove,
   submitting,
@@ -379,12 +451,21 @@ function TermsVersionView({
 }: {
   readonly tv: Bg5TermsVersionPublicV1;
   readonly approvals: readonly Bg5DealApprovalPublicV1[];
+  readonly buyerWorkspaceId: string;
+  readonly sellerWorkspaceId: string;
   readonly onDraft: () => void;
   readonly onApprove: () => void;
   readonly submitting: "draft" | "approve" | null;
   readonly showDraftButton: boolean;
   readonly showApproveButton: boolean;
 }): JSX.Element {
+  const approvalRows = buildApprovalStatusRows({
+    buyerWorkspaceId,
+    sellerWorkspaceId,
+    approvals,
+  });
+  const aiDraftStatusLabel = buildAiDraftStatusLabel(approvalRows);
+  const bothPartiesApproved = approvalRows.every((row) => row.approvedAt !== null);
   return (
     <div className="space-y-4" data-testid="deal-terms-view">
       <div className="flex items-center justify-between">
@@ -392,10 +473,12 @@ function TermsVersionView({
           TermsVersion {tv.version}
         </p>
         <span
-          className="text-xs uppercase tracking-wide bg-amber-100 text-amber-800 px-2 py-1 rounded"
+          className={`text-xs uppercase tracking-wide px-2 py-1 rounded ${
+            bothPartiesApproved ? "bg-green-100 text-green-800" : "bg-amber-100 text-amber-800"
+          }`}
           data-testid="deal-terms-ai-badge"
         >
-          AI-drafted · unapproved
+          {aiDraftStatusLabel}
         </span>
       </div>
       <div>
@@ -448,19 +531,14 @@ function TermsVersionView({
       </div>
       <div>
         <p className="text-xs font-medium text-gray-500 uppercase">Recorded approvals</p>
-        {approvals.length === 0 ? (
-          <p className="text-sm text-gray-700" data-testid="deal-no-approvals">
-            Neither side has approved this TermsVersion yet.
-          </p>
-        ) : (
-          <ul className="text-sm text-gray-900" data-testid="deal-approvals">
-            {approvals.map((a) => (
-              <li key={a.dealApprovalId} data-testid="deal-approval">
-                Workspace {a.workspaceId} approved at {formatDatetime(a.approvedAt)}
-              </li>
-            ))}
-          </ul>
-        )}
+        <ul className="text-sm text-gray-900" data-testid="deal-approvals">
+          {approvalRows.map((row) => (
+            <li key={row.side} data-testid="deal-approval">
+              {row.side}:{" "}
+              {row.approvedAt ? `Approved at ${formatDatetime(row.approvedAt)}` : "Pending"}
+            </li>
+          ))}
+        </ul>
       </div>
       <div className="flex flex-wrap gap-2">
         {showDraftButton && (

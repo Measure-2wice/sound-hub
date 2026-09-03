@@ -51,3 +51,29 @@ test("deterministic adapter output is stable across calls (no AI randomness)", a
   // byte-stable across calls; AI cannot introduce non-determinism.
   assert.equal(JSON.stringify(a.candidate), JSON.stringify(b.candidate));
 });
+
+test("deterministic adapter never places database identifiers in user-facing terms", async () => {
+  const identifiers = [
+    "deal-private-1",
+    "ws-private-buyer",
+    "ws-private-seller",
+    "of-private-1",
+    "brief-private-1",
+  ];
+  const output = await adapter.draftProposedTerms({
+    dealId: identifiers[0]!,
+    buyerWorkspaceId: identifiers[1]!,
+    sellerWorkspaceId: identifiers[2]!,
+    serviceOfferingId: identifiers[3]!,
+    projectBriefId: identifiers[4]!,
+  });
+  const visibleTerms = JSON.stringify(output.candidate);
+
+  for (const identifier of identifiers) {
+    assert.equal(
+      visibleTerms.includes(identifier),
+      false,
+      `user-facing proposed terms must not expose ${identifier}`,
+    );
+  }
+});
