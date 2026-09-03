@@ -195,17 +195,22 @@ export class DealTermsService {
 
     // Step 1: produce a validated candidate proposal. AI is invoked
     // only after the pre-authorization above has passed.
-    const proposed = input.callerProposedTerms
-      ? input.callerProposedTerms
+    const produced = input.callerProposedTerms
+      ? {
+          proposedTerms: input.callerProposedTerms,
+          aiProvider:
+            this.aiAdapter.key === "deterministic-fallback" ? "deterministic-fallback" : "managed",
+          aiModelId: null,
+          aiFallbackUsed: this.aiAdapter.key === "deterministic-fallback",
+        }
       : await this.produceProposedTerms(input.dealId);
 
     const draftInput: DraftTermsTransactionInput = {
       dealId: input.dealId,
       draftedByUserId: input.userAccountId,
-      aiProvider:
-        this.aiAdapter.key === "deterministic-fallback" ? "deterministic-fallback" : "managed",
-      aiModelId: null,
-      aiFallbackUsed: this.aiAdapter.key === "deterministic-fallback",
+      aiProvider: produced.aiProvider,
+      aiModelId: produced.aiModelId,
+      aiFallbackUsed: produced.aiFallbackUsed,
       // P1-002: thread the EXACT commanded acting tuple into the
       // transaction. The repository FOR UPDATE-locks that exact
       // (userAccountId, actingWorkspaceId) tuple and evaluates the
@@ -221,7 +226,15 @@ export class DealTermsService {
     const useCase: DraftTermsUseCase = (
       ctx: DraftTermsUseCaseContext,
       tools: DraftTermsUseCaseTools,
-    ) => evaluateDraftUseCase(ctx, tools, { ...input, now, proposedTerms: proposed });
+    ) =>
+      evaluateDraftUseCase(ctx, tools, {
+        ...input,
+        now,
+        proposedTerms: produced.proposedTerms,
+        aiProvider: produced.aiProvider,
+        aiModelId: produced.aiModelId,
+        aiFallbackUsed: produced.aiFallbackUsed,
+      });
 
     const result = await this.repository.draftTermsInTransaction(draftInput, useCase);
     if (!result.ok) {
@@ -374,7 +387,9 @@ export class DealTermsService {
 
   private async produceProposedTerms(
     dealId: string,
-  ): Promise<PersistDraftTermsInput["proposedTerms"]> {
+  ): Promise<
+    Pick<PersistDraftTermsInput, "proposedTerms" | "aiProvider" | "aiModelId" | "aiFallbackUsed">
+  > {
     const summary = await this.repository.findDealSummary(dealId);
     if (!summary) {
       throw new DealTermsError("Deal not found.", "BG5_DEAL_NOT_FOUND");
@@ -393,7 +408,12 @@ export class DealTermsService {
       projectBriefId: summary.projectBriefId,
     });
     try {
-      return validateCandidate(output.candidate, output.provider);
+      return {
+        proposedTerms: validateCandidate(output.candidate, output.provider),
+        aiProvider: output.provider,
+        aiModelId: output.modelId,
+        aiFallbackUsed: output.provider === "deterministic-fallback",
+      };
     } catch (err) {
       // P1-002: keep the strict-validation contract, but do NOT leak
       // the provider key, the model id, the Zod path, the expected
@@ -501,6 +521,9 @@ function evaluateDraftUseCase(
   input: DraftTermsInput & {
     readonly now: Date;
     readonly proposedTerms: PersistDraftTermsInput["proposedTerms"];
+    readonly aiProvider: string;
+    readonly aiModelId: string | null;
+    readonly aiFallbackUsed: boolean;
   },
 ): DraftTermsUseCaseOutcome {
   const verdict = evaluateDraftingAuthority(ctx.draftingAuthority);
@@ -516,9 +539,9 @@ function evaluateDraftUseCase(
   return tools.persistDraft({
     dealId: input.dealId,
     draftedByUserId: input.userAccountId,
-    aiProvider: "deterministic-fallback",
-    aiModelId: null,
-    aiFallbackUsed: true,
+    aiProvider: input.aiProvider,
+    aiModelId: input.aiModelId,
+    aiFallbackUsed: input.aiFallbackUsed,
     proposedTerms: input.proposedTerms,
     now: input.now,
   });

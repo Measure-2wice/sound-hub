@@ -232,7 +232,15 @@ test("a valid candidate still persists; sanity check the harness", async () => {
   const { service, repo } = buildHarness(VALID_CANDIDATE);
   const result = await service.draftTerms(draftInput);
   assert.equal(result.termsVersion.version, 1);
+  assert.equal(result.termsVersion.aiProvider, "managed");
+  assert.equal(result.termsVersion.aiModelId, "impala-1.2");
+  assert.equal(result.termsVersion.aiFallbackUsed, false);
   assert.equal(repo["termsVersions"].size, 1);
+  const persisted = [...repo["termsVersions"].values()][0];
+  assert.ok(persisted);
+  assert.equal(persisted.aiProvider, "managed");
+  assert.equal(persisted.aiModelId, "impala-1.2");
+  assert.equal(persisted.aiFallbackUsed, false);
 });
 
 // ---------------------------------------------------------------------------
