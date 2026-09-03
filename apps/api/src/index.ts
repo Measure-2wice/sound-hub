@@ -12,6 +12,7 @@ import { createOfferingCatalogRouter } from "./routes/offering-catalog.js";
 import { createMatchmakerRouter } from "./routes/matchmaker.js";
 import { PrismaOfferingCatalogRepository } from "./repositories/prisma-offering-catalog.repository.js";
 import { createProjectRequestRouter } from "./routes/project-requests.js";
+import { createDealTermsRouter } from "./routes/deal-terms.js";
 import { TalentSearchService } from "./services/talent-search.service.js";
 import { AuthenticationService } from "./services/authentication.service.js";
 import { WorkspaceAuthorizationService } from "./services/workspace-authorization.service.js";
@@ -24,10 +25,13 @@ import { PrismaAuthRepository } from "./auth-repository/prisma-auth-repository.j
 import { PrismaAudioRepository } from "./audio-repository/prisma-audio-repository.js";
 import { PrismaProjectBriefRepository } from "./matchmaker/prisma-project-brief.repository.js";
 import { PrismaProjectRequestRepository } from "./project-request/prisma-project-request.repository.js";
+import { PrismaDealTermsRepository } from "./deal-terms/prisma-deal-terms.repository.js";
+import { DealTermsService } from "./deal-terms/deal-terms.service.js";
 import type { ProjectBriefRepository } from "./matchmaker/project-brief.repository.js";
 import type { ProjectRequestRepository } from "./project-request/project-request.repository.js";
 import type { MetadataRepository } from "./repositories/metadata.repository.js";
 import type { AuthRepository } from "./auth-repository/auth-repository.js";
+import type { DealTermsRepository } from "./deal-terms/deal-terms.repository.js";
 import type { AudioRepository } from "./audio-repository/audio-repository.js";
 import type { IdentityAdapter } from "./identity/identity-adapter.js";
 import type { AiAdapter } from "./matchmaker/ai-adapter.js";
@@ -117,6 +121,18 @@ export interface AppOptions {
   readonly audioSampleService?: AudioSampleService;
   readonly projectRequestRepository?: ProjectRequestRepository;
   readonly projectRequestService?: ProjectRequestService;
+  /**
+   * Override for the DealTerms repository. When supplied, the
+   * composition root does NOT construct the Prisma adapter; the
+   * override is served directly. Tests pass the in-memory adapter.
+   */
+  readonly dealTermsRepository?: DealTermsRepository;
+  /**
+   * Override for the DealTerms service. When supplied, the
+   * composition root uses this service instead of constructing one
+   * from the repository.
+   */
+  readonly dealTermsService?: DealTermsService;
 }
 
 export interface BuiltApp {
@@ -133,6 +149,7 @@ export interface BuiltApp {
   readonly storageAdapter: StorageAdapter;
   readonly storageBackend: "supabase" | "deterministic";
   readonly projectRequestService: ProjectRequestService;
+  readonly dealTermsService: DealTermsService;
 }
 
 export function buildApp(options: AppOptions = {}): BuiltApp {
@@ -243,6 +260,18 @@ export function buildApp(options: AppOptions = {}): BuiltApp {
       workspaceAuthorizationService,
     });
 
+  // BG5 DealTerms service. The composition root owns the Prisma
+  // adapter; the service is the only boundary the route and tests
+  // depend on. The deterministic AI adapter is the buildathon-only
+  // AI path; no managed provider integration is wired.
+  const dealTermsRepository = options.dealTermsRepository ?? new PrismaDealTermsRepository(prisma);
+  const dealTermsService =
+    options.dealTermsService ??
+    new DealTermsService({
+      dealTermsRepository,
+      workspaceAuthorizationService,
+    });
+
   const app: Application = express();
   app.disable("x-powered-by");
   app.use(helmet());
@@ -298,6 +327,13 @@ export function buildApp(options: AppOptions = {}): BuiltApp {
       projectRequestService,
     }),
   );
+  app.use(
+    "/api/deals",
+    createDealTermsRouter({
+      authenticationService,
+      dealTermsService,
+    }),
+  );
 
   // 404 fallback
   app.use((req: Request, res: Response) => {
@@ -339,6 +375,7 @@ export function buildApp(options: AppOptions = {}): BuiltApp {
     storageAdapter,
     storageBackend: storageBundle.backend,
     projectRequestService,
+    dealTermsService,
   };
 }
 

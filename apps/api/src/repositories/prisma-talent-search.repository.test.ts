@@ -446,6 +446,12 @@ describe("PrismaTalentSearchRepository", () => {
       await prisma.sellerProfile.deleteMany({ where: { workspaceId: target.id } });
       await prisma.workspaceMembership.deleteMany({ where: { workspaceId: target.id } });
       await prisma.workspaceCapability.deleteMany({ where: { workspaceId: target.id } });
+      // BG5: clear the explicit DealApprover authorization rows
+      // before the FK-protected Workspace removal so the test's
+      // beforeEach reset can recreate the demo Workspace from the
+      // seed. The seed itself is unchanged; this is purely the
+      // test's cleanup ordering for the BG5-introduced table.
+      await prisma.dealApprover.deleteMany({ where: { workspaceId: target.id } });
       await prisma.workspace.delete({ where: { id: target.id } });
     } finally {
       await prisma.$disconnect();
