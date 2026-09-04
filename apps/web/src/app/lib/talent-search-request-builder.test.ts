@@ -18,6 +18,8 @@ import { describe, test } from "node:test";
 import { talentSearchRequestV1Schema } from "@soundhub/types";
 import {
   buildCandidatePayload,
+  EMPTY_SEARCH_GUIDANCE_MESSAGE,
+  getEmptySearchSubmissionMessage,
   hasUsableCriteria,
   isLocationFilterValueNonEmpty,
   toLocationFilterPayload,
@@ -362,5 +364,145 @@ describe("hasUsableCriteria", () => {
     assert.equal(hasUsableCriteria("", withServiceArea({ countryCode: "  " })), false);
     assert.equal(hasUsableCriteria("", withServiceArea({ region: "  " })), false);
     assert.equal(hasUsableCriteria("", withServiceArea({ city: "  " })), false);
+  });
+});
+
+// QA finding — empty search submissions previously surfaced a
+// developer-centric API envelope (`<root> at least one of query,
+// required, or preferred must contain criteria`) because the page
+// dispatched every submit, including empty ones. The page-level
+// guard now intercepts an empty submission before any API request
+// is made and renders a buyer-friendly message instead. The pure
+// `getEmptySearchSubmissionMessage` decision helper that drives
+// that guard has to stay in lock-step with `hasUsableCriteria`
+// because the API contract still treats an empty tuple as
+// schema-invalid — any divergence would let a tuple the page lets
+// through reach the server unchanged, where the rejection would
+// once again surface the developer-centric envelope.
+describe("getEmptySearchSubmissionMessage (page-level empty-submission guard)", () => {
+  test("returns null when the tuple has a usable query or any usable structured filter", () => {
+    // Usable query — 2+ characters.
+    assert.equal(getEmptySearchSubmissionMessage("ab", emptyFilters), null);
+    // Usable structured filter — every shape from `hasUsableCriteria`.
+    assert.equal(
+      getEmptySearchSubmissionMessage("", {
+        ...emptyFilters,
+        primaryCategoryKey: "music-production",
+      }),
+      null,
+    );
+    assert.equal(
+      getEmptySearchSubmissionMessage("", {
+        ...emptyFilters,
+        independentlyPurchasableServiceKey: "mixing",
+      }),
+      null,
+    );
+    assert.equal(
+      getEmptySearchSubmissionMessage("", { ...emptyFilters, serviceModes: ["Remote"] }),
+      null,
+    );
+    assert.equal(getEmptySearchSubmissionMessage("", withBasedIn({ countryCode: "JM" })), null);
+    assert.equal(getEmptySearchSubmissionMessage("", withBasedIn({ region: "NY" })), null);
+    assert.equal(getEmptySearchSubmissionMessage("", withBasedIn({ city: "Brooklyn" })), null);
+    assert.equal(getEmptySearchSubmissionMessage("", withServiceArea({ countryCode: "GB" })), null);
+    assert.equal(getEmptySearchSubmissionMessage("", withServiceArea({ region: "LDN" })), null);
+    assert.equal(getEmptySearchSubmissionMessage("", withServiceArea({ city: "London" })), null);
+  });
+
+  test("returns null on a query-only valid search (2+ characters with no filters)", () => {
+    // Pins the "valid query-only searches still work" requirement
+    // from the QA fix: a query alone is enough to dispatch.
+    assert.equal(getEmptySearchSubmissionMessage("dancehall", emptyFilters), null);
+  });
+
+  test("returns null on a structured-filter-only valid search (any single filter set, no query)", () => {
+    // Pins the "valid structured-filter-only searches still work"
+    // requirement from the QA fix: any single populated filter is
+    // enough to dispatch.
+    assert.equal(
+      getEmptySearchSubmissionMessage("", { ...emptyFilters, serviceModes: ["Remote"] }),
+      null,
+    );
+    assert.equal(
+      getEmptySearchSubmissionMessage("", {
+        ...emptyFilters,
+        primaryCategoryKey: "music-production",
+        basedIn: { city: "", region: "NY", countryCode: "" },
+      }),
+      null,
+    );
+  });
+
+  test("returns the buyer-friendly guidance message when query and filters are both empty", () => {
+    // Both empty — guard fires, no API request is dispatched.
+    assert.deepEqual(getEmptySearchSubmissionMessage("", emptyFilters), {
+      message: EMPTY_SEARCH_GUIDANCE_MESSAGE,
+    });
+    assert.equal(
+      getEmptySearchSubmissionMessage("", emptyFilters)?.message,
+      "Add a project description or choose at least one search filter.",
+    );
+  });
+
+  test("returns the buyer-friendly guidance message when only whitespace is supplied", () => {
+    // A 1-character query is below the schema-level minimum of 2;
+    // whitespace-only values stay empty after trimming, so the
+    // tuple has no usable criteria. Each of these would reach the
+    // API unchanged and trigger the developer-centric envelope
+    // without the guard.
+    assert.deepEqual(getEmptySearchSubmissionMessage("a", emptyFilters), {
+      message: EMPTY_SEARCH_GUIDANCE_MESSAGE,
+    });
+    assert.deepEqual(getEmptySearchSubmissionMessage("   ", emptyFilters), {
+      message: EMPTY_SEARCH_GUIDANCE_MESSAGE,
+    });
+    assert.deepEqual(getEmptySearchSubmissionMessage("a", withBasedIn({ countryCode: "   " })), {
+      message: EMPTY_SEARCH_GUIDANCE_MESSAGE,
+    });
+  });
+
+  test("the guard's tuples align with the schema's empty-tuple rejection (no tuple reaches an API unchanged)", () => {
+    // Cross-check: every tuple the page intercepts as `blocked` is
+    // also a tuple the shared Zod schema rejects today. Any tuple
+    // the helper returns null for must, by construction, build a
+    // schema-valid candidate via `buildCandidatePayload`. This
+    // pins the contract that the page guard never lets a tuple
+    // through to the server that would still trigger the
+    // developer-centric envelope.
+    const cases: ReadonlyArray<{
+      readonly query: string;
+      readonly filters: RequiredFiltersValue;
+    }> = [
+      { query: "", filters: emptyFilters },
+      { query: "a", filters: emptyFilters },
+      { query: "   ", filters: emptyFilters },
+      {
+        query: "",
+        filters: { ...emptyFilters, basedIn: { city: "", region: "", countryCode: "" } },
+      },
+      { query: "dancehall", filters: emptyFilters },
+      { query: "", filters: { ...emptyFilters, serviceModes: ["Remote"] } },
+      { query: "", filters: withBasedIn({ countryCode: "JM" }) },
+      { query: "ab", filters: withBasedIn({ city: "Brooklyn" }) },
+    ];
+    for (const { query, filters } of cases) {
+      const guard = getEmptySearchSubmissionMessage(query, filters);
+      const candidate = buildCandidatePayload(query, filters);
+      const schema = talentSearchRequestV1Schema.safeParse(candidate);
+      if (guard !== null) {
+        assert.equal(
+          schema.success,
+          false,
+          `guard fired for tuple that the schema accepted: ${JSON.stringify(candidate)}`,
+        );
+      } else {
+        assert.equal(
+          schema.success,
+          true,
+          `guard let tuple through that the schema rejects: ${JSON.stringify(candidate)}`,
+        );
+      }
+    }
   });
 });

@@ -1,11 +1,44 @@
-# Disposable PostgreSQL service for Milestone 1 repository integration tests and the
-# Playwright happy-path tracer. Distinct from the developer `docker-compose.yml`
-# service (which is bound to 5432 with a named volume) and strictly isolated.
+# Disposable PostgreSQL service for Milestone 1 repository integration tests,
+# the Playwright happy-path tracer, AND the manual-QA session.
+#
+# Distinct from the developer `docker-compose.yml` service (which is bound to
+# 5432 with a named volume) and strictly isolated.
 #
 # - PostgreSQL only; Redis is not a Milestone 1 dependency.
-# - Database name must end in `_test` so the test harness guard accepts it.
+# - Two databases on the same instance:
+#     * `soundhub_m1_test` — the destructive test target. Repository tests
+#       (PrismaProjectBriefRepository etc.) drop and re-migrate this DB
+#       on every run. The fail-closed `assertNotQaDatabase` guard in
+#       apps/api/src/lib/test-database.ts refuses to run any destructive
+#       script against the QA database by name.
+#     * `soundhub_qa` — the manual-QA target. The dev server / QA session
+#       reads this DB. Tests must NEVER touch it; the guard ensures
+#       that even an accidental copy-paste of TEST_DATABASE_URL cannot
+#       cause destructive scripts to drop the QA database.
+# - `soundhub_m1_test` is created by `POSTGRES_DB`. `soundhub_qa` is
+#   created by the bind-mounted initdb hook under
+#   `docker/postgres-initdb.d/01-create-qa-database.sql` (the official
+#   `postgres` image runs every `*.sql` file in
+#   `/docker-entrypoint-initdb.d/` on first startup of an empty data
+#   directory).
 # - Ephemeral volume: data is destroyed when the test service is taken down.
 # - Healthcheck and explicit readiness gate the migrate/seed/test commands.
+#
+# Manual QA runs the dev API against the QA database via:
+#
+#   pnpm db:test:up
+#   pnpm db:qa:migrate
+#   pnpm db:qa:seed
+#   pnpm dev:qa
+#
+# Destructive repository tests run against the test database via:
+#
+#   pnpm db:test:up
+#   pnpm test:repository
+#
+# The two databases never share a name, so the guard refuses to run
+# destructive scripts against the QA database even if the URL is
+# misconfigured.
 services:
   postgres_test:
     image: postgres:16-alpine
@@ -14,9 +47,13 @@ services:
       POSTGRES_USER: soundhub
       POSTGRES_PASSWORD: password
       POSTGRES_DB: soundhub_m1_test
-      POSTGRES_INITDB_ARGS: "--encoding=UTF8 --lc-collate=C --lc-ctype=C"
     ports:
       - "5433:5432"
+    volumes:
+      # Initdb hooks create sibling databases that POSTGRES_DB alone
+      # does not. Files in this directory are executed in lexical
+      # order on the first startup of an empty data directory.
+      - ./docker/postgres-initdb.d:/docker-entrypoint-initdb.d:ro
     tmpfs:
       - /var/lib/postgresql/data
     healthcheck:

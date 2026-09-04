@@ -73,6 +73,27 @@ _Avoid_: MusicTrack, deliverable
 
 ## Engagement and deals
 
+**MatchmakerConversation**:
+A private, buyer-Workspace-owned exchange that develops a project brief before a ProjectRequest.
+Its human participants act through current WorkspaceMembership authority.
+_Avoid_: User conversation, cross-Workspace chat
+
+**ProjectBrief**:
+A buyer Workspace's structured description of desired work, separating searchable required
+constraints, searchable preferences, and project requirements that a seller must review. A
+confirmed brief informs a ProjectRequest but is not approved deal terms.
+_Avoid_: Prompt, ProjectRequest, TermsVersion
+
+**WorkspaceBlock**:
+A private boundary through which one Workspace prevents another Workspace from initiating new
+marketplace contact. It is distinct from a platform report or enforcement action.
+_Avoid_: User block, suspension, report
+
+**MarketplaceReport**:
+A participant's request for authorized human review of marketplace content or conduct. A report
+preserves review evidence but is not itself a block, finding, or enforcement action.
+_Avoid_: Complaint verdict, automatic suspension
+
 **ProjectRequest**:
 A buyer Workspace's invitation to a seller Workspace to discuss a project. Seller acceptance
 opens negotiation but does not approve terms or activate paid work.
