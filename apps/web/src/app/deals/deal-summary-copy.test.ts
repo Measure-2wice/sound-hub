@@ -6,6 +6,7 @@ import {
   buildApprovalSuccessCopy,
   buildAiDraftStatusLabel,
   buildDealSummaryCopy,
+  shouldShowDraftTermsControl,
 } from "./deal-summary-copy.js";
 
 describe("BG5 Deal summary presentation", () => {
@@ -20,6 +21,12 @@ describe("BG5 Deal summary presentation", () => {
 });
 
 describe("BG5 approval presentation", () => {
+  test("draft terms control requires both Negotiating status and an authorized drafter", () => {
+    assert.equal(shouldShowDraftTermsControl("Negotiating", true), true);
+    assert.equal(shouldShowDraftTermsControl("Active", true), false);
+    assert.equal(shouldShowDraftTermsControl("Negotiating", false), false);
+  });
+
   test("shows independent buyer and seller state without exposing Workspace IDs", () => {
     const rows = buildApprovalStatusRows({
       buyerWorkspaceId: "ws-private-buyer",

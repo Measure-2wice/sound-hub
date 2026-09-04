@@ -32,6 +32,13 @@ export function buildFundingBadgeLabel(): string {
   return "Sandbox · simulated";
 }
 
+export function shouldShowDraftTermsControl(
+  status: DealStatusV1,
+  isAuthorizedDrafter: boolean,
+): boolean {
+  return status === "Negotiating" && isAuthorizedDrafter;
+}
+
 export function buildPublicFundingStatusCopy(
   status: Bg6PublicFundingStatusV1,
   sanitizedReason: Bg6PublicFundingFailureReasonCodeV1 | null,

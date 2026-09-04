@@ -56,6 +56,7 @@ import {
   buildFundingBadgeLabel,
   buildPublicFundingStatusCopy,
   getDealPartySide,
+  shouldShowDraftTermsControl,
 } from "../deal-summary-copy";
 import { findVisibleDeal } from "../find-visible-deal";
 
@@ -90,6 +91,9 @@ export default function DealPage({ params }: DealPageProps): JSX.Element {
   const [submitting, setSubmitting] = useState<"draft" | "approve" | "fund" | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [success, setSuccess] = useState<string | null>(null);
+  const [fundingStatus, setFundingStatus] = useState<Bg6FundingConfirmationPublicV1 | null>(null);
+  const [fundingError, setFundingError] = useState<string | null>(null);
+  const [fundingSuccess, setFundingSuccess] = useState<string | null>(null);
 
   const candidateWorkspaces = useMemo(() => {
     if (!deal) return [] as const;
@@ -255,6 +259,38 @@ export default function DealPage({ params }: DealPageProps): JSX.Element {
     }
   }, [actingWorkspaceId, currentTermsVersion, deal, dealId, reload, refresh]);
 
+  const onFund = useCallback(async () => {
+    if (!actingWorkspaceId) return;
+    setSubmitting("fund");
+    setFundingError(null);
+    setFundingSuccess(null);
+    try {
+      const result = await fundDeal(dealId, { actingWorkspaceId });
+      setFundingStatus(result.fundingStatus);
+      setFundingSuccess(
+        result.fundingStatus.status === "Confirmed"
+          ? "Funding confirmed; the Deal is Active."
+          : `Funding recorded: ${buildPublicFundingStatusCopy(
+              result.fundingStatus.status,
+              result.fundingStatus.sanitizedFailureReason,
+            )}`,
+      );
+      await reload(actingWorkspaceId);
+    } catch (err) {
+      const code = (err as { code?: string } | null)?.code;
+      if (code === "SESSION_INVALID" || code === "AUTH_FAILED" || code === "SESSION_EXPIRED") {
+        void refresh();
+        return;
+      }
+      setFundingError(
+        (err as { message?: string } | null)?.message ??
+          "Funding request failed. Please try again in a moment.",
+      );
+    } finally {
+      setSubmitting(null);
+    }
+  }, [actingWorkspaceId, dealId, refresh, reload]);
+
   if (loading) {
     return (
       <div className="max-w-3xl mx-auto px-6 py-12" data-testid="deal-loading">
@@ -329,9 +365,6 @@ export default function DealPage({ params }: DealPageProps): JSX.Element {
   // BG6 funding state. The FundingCard renders a single allow-listed
   // public funding-status DTO; the page does not retain any
   // internal PaymentIntent identifiers.
-  const [fundingStatus, setFundingStatus] = useState<Bg6FundingConfirmationPublicV1 | null>(null);
-  const [fundingError, setFundingError] = useState<string | null>(null);
-  const [fundingSuccess, setFundingSuccess] = useState<string | null>(null);
   const fundingBadgeLabel = buildFundingBadgeLabel();
 
   // Compute the approval rows at the page level so the funding-gate
@@ -348,38 +381,6 @@ export default function DealPage({ params }: DealPageProps): JSX.Element {
     currentTermsVersion !== null &&
     currentTermsVersion.isCurrentVersion &&
     bothPartiesApprovedAtPage;
-
-  const onFund = useCallback(async () => {
-    if (!actingWorkspaceId) return;
-    setSubmitting("fund");
-    setFundingError(null);
-    setFundingSuccess(null);
-    try {
-      const result = await fundDeal(dealId, { actingWorkspaceId });
-      setFundingStatus(result.fundingStatus);
-      setFundingSuccess(
-        result.fundingStatus.status === "Confirmed"
-          ? "Funding confirmed; the Deal is Active."
-          : `Funding recorded: ${buildPublicFundingStatusCopy(
-              result.fundingStatus.status,
-              result.fundingStatus.sanitizedFailureReason,
-            )}`,
-      );
-      await reload(actingWorkspaceId);
-    } catch (err) {
-      const code = (err as { code?: string } | null)?.code;
-      if (code === "SESSION_INVALID" || code === "AUTH_FAILED" || code === "SESSION_EXPIRED") {
-        void refresh();
-        return;
-      }
-      setFundingError(
-        (err as { message?: string } | null)?.message ??
-          "Funding request failed. Please try again in a moment.",
-      );
-    } finally {
-      setSubmitting(null);
-    }
-  }, [actingWorkspaceId, dealId, refresh, reload]);
 
   return (
     <div className="max-w-3xl mx-auto px-6 py-12 space-y-6" data-testid="deal-page">
@@ -550,7 +551,10 @@ export default function DealPage({ params }: DealPageProps): JSX.Element {
                 void onApprove();
               }}
               submitting={submitting}
-              showDraftButton={capabilityRequired !== null}
+              showDraftButton={shouldShowDraftTermsControl(
+                deal.status,
+                capabilityRequired !== null,
+              )}
               showApproveButton={showApprove}
             />
           ) : (
