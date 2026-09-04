@@ -1870,59 +1870,6 @@ export const bg6FundDealResponseV1Schema = z
   .strict();
 export type Bg6FundDealResponseV1 = z.infer<typeof bg6FundDealResponseV1Schema>;
 
-// ---------- Provider boundary contracts (BG6) ----------
-//
-// The EscrowProvider interface is provider-neutral: a deterministic
-// mock wired for the buildathon is the only adapter that ships;
-// a future PolkaAward adapter (or any real provider) extends
-// the closed `bg6ProviderKeysV1` tuple without changing the
-// application types. The strict Zod schema below is the runtime
-// boundary: every provider adapter's response is parsed through it
-// before any persistence, transition, or activation may run. A
-// failed parse fails closed and leaves the Deal Negotiating.
-//
-// The schema is `.strict()` so any unexpected field the provider
-// introduces is rejected at parse time. `providerReference` is a
-// bounded string (max 128) so the adapter cannot smuggle raw
-// exception text into the durable PaymentIntent. `confirmedAt` is
-// ISO-8601 with timezone — adapters that return epoch numbers or
-// non-ISO strings fail closed.
-
-export const bg6EscrowConfirmationV1Schema = z
-  .object({
-    providerKey: z.enum(bg6ProviderKeysV1),
-    providerReference: z.string().min(1).max(128),
-    confirmedAmountMinor: z.number().int().nonnegative(),
-    confirmedCurrency: z.literal("USD"),
-    assetLabel: z.enum(bg6SandboxAssetLabelsV1),
-    networkLabel: z.enum(bg6SimulatedNetworkLabelsV1),
-    environmentLabel: z.enum(bg6EnvironmentLabelsV1),
-    termsVersionId: z.string().min(1).max(128),
-    confirmedAt: z.string().datetime({ offset: true }),
-  })
-  .strict();
-export type Bg6EscrowConfirmationV1 = z.infer<typeof bg6EscrowConfirmationV1Schema>;
-
-// Provider request input. The internal `correlationId` is
-// INTENTIONALLY ABSENT — SoundHub's opaque durable identity is an
-// audit handle that must never cross the provider boundary. A
-// provider that needs its own external idempotency token should
-// derive it from the request's public fields (paymentIntentId is
-// the SoundHub-supplied opaque handle adapters can use for trace
-// correlation; the deterministic mock does not).
-export const bg6EscrowRequestInputV1Schema = z
-  .object({
-    paymentIntentId: z.string().min(1).max(128),
-    dealId: z.string().min(1).max(128),
-    termsVersionId: z.string().min(1).max(128),
-    termsVersionNumber: z.number().int().positive(),
-    priceAmountMinor: z.number().int().nonnegative(),
-    priceCurrency: z.literal("USD"),
-    now: z.string().datetime({ offset: true }),
-  })
-  .strict();
-export type Bg6EscrowRequestInputV1 = z.infer<typeof bg6EscrowRequestInputV1Schema>;
-
 // Sanitized failure-detail category. The closed enum below is the
 // ONLY value that may be persisted on `PaymentIntent.failureDetail`;
 // raw exception text is logged server-side only. Bounded length is

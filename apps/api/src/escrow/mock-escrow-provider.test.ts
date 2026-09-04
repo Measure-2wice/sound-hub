@@ -15,7 +15,12 @@
 
 import assert from "node:assert/strict";
 import test from "node:test";
-import { DeterministicMockEscrowProvider, type EscrowRequestInput } from "./escrow-provider.js";
+import {
+  DeterministicMockEscrowProvider,
+  escrowConfirmationSchema,
+  type EscrowProvider,
+  type EscrowRequestInput,
+} from "./escrow-provider.js";
 
 function makeInput(overrides: Partial<EscrowRequestInput> = {}): EscrowRequestInput {
   return {
@@ -80,19 +85,43 @@ test("EscrowRequestInput is provider-neutral: NO correlationId field is exposed 
   );
 });
 
-test("requestFunding returns a unique bounded providerReference per call", async () => {
+test("requestFunding returns the same bounded providerReference for identical input", async () => {
   const provider = new DeterministicMockEscrowProvider();
   const input = makeInput();
   const a = await provider.requestFunding(input);
   const b = await provider.requestFunding(input);
-  // Per call the mock generates a fresh opaque UUID — SoundHub's
-  // internal correlationId is INTENTIONALLY NOT embedded in the
-  // provider reference. The strict Zod schema bounds the
-  // providerReference length (max 128).
-  assert.notEqual(a.providerReference, b.providerReference);
+  assert.equal(a.providerReference, b.providerReference);
+  assert.deepEqual(a, b);
   assert.ok(a.providerReference.length > 0);
   assert.ok(a.providerReference.length <= 128);
   assert.ok(!a.providerReference.includes("00000000-0000-4000-8000"));
+});
+
+test("provider-neutral contract accepts a strictly validated non-mock adapter", async () => {
+  const adapter: EscrowProvider = {
+    key: "future-provider",
+    assetLabel: "future-asset",
+    networkLabel: "future-network",
+    environmentLabel: "test",
+    requestFunding(input) {
+      return Promise.resolve(
+        escrowConfirmationSchema.parse({
+          providerKey: this.key,
+          providerReference: `future-${input.paymentIntentId}`,
+          confirmedAmountMinor: input.priceAmountMinor,
+          confirmedCurrency: input.priceCurrency,
+          assetLabel: this.assetLabel,
+          networkLabel: this.networkLabel,
+          environmentLabel: this.environmentLabel,
+          termsVersionId: input.termsVersionId,
+          confirmedAt: input.now,
+        }),
+      );
+    },
+  };
+  const confirmation = await adapter.requestFunding(makeInput({ priceCurrency: "EUR" }));
+  assert.equal(confirmation.providerKey, "future-provider");
+  assert.equal(confirmation.confirmedCurrency, "EUR");
 });
 
 test("requestFunding reflects the supplied confirmedAt", async () => {

@@ -19,9 +19,11 @@
 // PostgreSQL backends.
 
 import assert from "node:assert/strict";
-import { test, before, after } from "node:test";
+import { test, before, beforeEach, after } from "node:test";
 import { createPrismaClient, type PrismaClient } from "@soundhub/db";
+import type { EscrowConfirmation, EscrowProvider } from "../escrow/escrow-provider.js";
 import { assertDisposableTestDatabase, readTestDatabaseUrl } from "../lib/test-database.js";
+import { FundingService, FundingServiceError } from "./funding.service.js";
 import { PrismaFundingRepository } from "./prisma-funding.repository.js";
 
 const BUYER_USER_ID = "user-bg6c-buyer";
@@ -228,15 +230,16 @@ async function seedFixture(prisma: PrismaClient): Promise<void> {
   });
 }
 
-before(async () => {
+before(() => {
   const url = readTestDatabaseUrl();
   assertDisposableTestDatabase(url);
   prismaA = createPrismaClient(url);
   prismaB = createPrismaClient(url);
   repoA = new PrismaFundingRepository(prismaA);
   repoB = new PrismaFundingRepository(prismaB);
-  await seedFixture(prismaA);
 });
+
+beforeEach(async () => seedFixture(prismaA));
 
 after(async () => {
   await prismaA.$disconnect();
@@ -491,4 +494,194 @@ test("Phase-3 Buyer capability revocation: fundDealInTransaction re-validation f
   await prismaA.workspaceCapability.create({
     data: { workspaceId: BUYER_WORKSPACE_ID, capability: "Buyer" },
   });
+});
+
+test("service Phase-3 revalidation rejects authoritative mutations after provider interaction", async (t) => {
+  const cases: readonly {
+    name: string;
+    mutate(): Promise<void>;
+    externallyActive?: boolean;
+  }[] = [
+    {
+      name: "membership removal",
+      mutate: () =>
+        prismaB.workspaceMembership
+          .delete({
+            where: {
+              userId_workspaceId: { userId: BUYER_USER_ID, workspaceId: BUYER_WORKSPACE_ID },
+            },
+          })
+          .then(() => undefined),
+    },
+    {
+      name: "Workspace suspension",
+      mutate: () =>
+        prismaB.workspace
+          .update({
+            where: { id: BUYER_WORKSPACE_ID },
+            data: { status: "Suspended" },
+          })
+          .then(() => undefined),
+    },
+    {
+      name: "approval removal",
+      mutate: () =>
+        prismaB.dealApproval.delete({ where: { id: "da-bg6c-buyer" } }).then(() => undefined),
+    },
+    {
+      name: "replacement TermsVersion",
+      mutate: () =>
+        prismaB.termsVersion
+          .create({
+            data: {
+              id: "tv-bg6c-replacement",
+              dealId: DEAL_ID,
+              version: 2,
+              scope: "Replacement",
+              deliverablesJson: [{ title: "Replacement", description: "Replacement" }],
+              scheduleJson: { startDate: "2026-09-04", endDate: "2026-09-25", deliveryDays: 21 },
+              priceAmountMinor: 76000,
+              priceCurrency: "USD",
+              revisionAllowance: 1,
+              rightsSummary: "Replacement rights",
+              aiProvider: "deterministic-fallback",
+              aiFallbackUsed: true,
+              draftedAt: new Date("2026-09-03T11:00:00.000Z"),
+            },
+          })
+          .then(() => undefined),
+    },
+    {
+      name: "Deal state change",
+      externallyActive: true,
+      mutate: () =>
+        prismaB.deal
+          .update({
+            where: { id: DEAL_ID },
+            data: { status: "Active", activatedAt: new Date("2026-09-03T11:59:00.000Z") },
+          })
+          .then(() => undefined),
+    },
+  ];
+  for (const scenario of cases) {
+    await t.test(scenario.name, async () => {
+      await seedFixture(prismaA);
+      const provider: EscrowProvider = {
+        key: "mock-escrow-deterministic",
+        assetLabel: "sandbox-USDC",
+        networkLabel: "simulated-network",
+        environmentLabel: "sandbox",
+        async requestFunding(input) {
+          await scenario.mutate();
+          return {
+            providerKey: this.key,
+            providerReference: `mock-${input.paymentIntentId}`,
+            confirmedAmountMinor: input.priceAmountMinor,
+            confirmedCurrency: input.priceCurrency,
+            assetLabel: this.assetLabel,
+            networkLabel: this.networkLabel,
+            environmentLabel: this.environmentLabel,
+            termsVersionId: input.termsVersionId,
+            confirmedAt: input.now,
+          };
+        },
+      };
+      const service = new FundingService({ fundingRepository: repoA, escrowProvider: provider });
+      await assert.rejects(
+        service.fundDeal({
+          userAccountId: BUYER_USER_ID,
+          actingWorkspaceId: BUYER_WORKSPACE_ID,
+          dealId: DEAL_ID,
+          now: new Date("2026-09-03T12:00:00.000Z"),
+        }),
+        (err: unknown) => err instanceof FundingServiceError,
+      );
+      const deal = await prismaA.deal.findUnique({ where: { id: DEAL_ID } });
+      if (!scenario.externallyActive) {
+        assert.equal(deal?.status, "Negotiating", "mutation must prevent SoundHub activation");
+      }
+      const intents = await prismaA.paymentIntent.findMany({ where: { dealId: DEAL_ID } });
+      assert.equal(intents.length, 1);
+      assert.notEqual(intents[0]?.providerState, "Confirmed");
+    });
+  }
+});
+
+test("concurrent service losers converge throw, malformed, and mismatch outcomes to confirmed success", async (t) => {
+  const loserModes = ["throw", "malformed", "mismatch"] as const;
+  for (const loserMode of loserModes) {
+    await t.test(loserMode, async () => {
+      await seedFixture(prismaA);
+      let resolveWinner!: (value: EscrowConfirmation) => void;
+      let settleLoser!: () => void;
+      let calls = 0;
+      const provider: EscrowProvider = {
+        key: "mock-escrow-deterministic",
+        assetLabel: "sandbox-USDC",
+        networkLabel: "simulated-network",
+        environmentLabel: "sandbox",
+        requestFunding(input) {
+          calls += 1;
+          if (calls === 1) {
+            return new Promise((resolve) => {
+              resolveWinner = resolve;
+            });
+          }
+          return new Promise((resolve, reject) => {
+            settleLoser = () => {
+              if (loserMode === "throw") reject(new Error("late outage"));
+              else if (loserMode === "malformed") resolve({} as EscrowConfirmation);
+              else
+                resolve({
+                  providerKey: provider.key,
+                  providerReference: `mismatch-${input.paymentIntentId}`,
+                  confirmedAmountMinor: input.priceAmountMinor + 1,
+                  confirmedCurrency: input.priceCurrency,
+                  assetLabel: provider.assetLabel,
+                  networkLabel: provider.networkLabel,
+                  environmentLabel: provider.environmentLabel,
+                  termsVersionId: input.termsVersionId,
+                  confirmedAt: input.now,
+                });
+            };
+          });
+        },
+      };
+      const command = {
+        userAccountId: BUYER_USER_ID,
+        actingWorkspaceId: BUYER_WORKSPACE_ID,
+        dealId: DEAL_ID,
+        now: new Date("2026-09-03T12:00:00.000Z"),
+      };
+      const winnerPromise = new FundingService({
+        fundingRepository: repoA,
+        escrowProvider: provider,
+      }).fundDeal(command);
+      const loserPromise = new FundingService({
+        fundingRepository: repoB,
+        escrowProvider: provider,
+      }).fundDeal(command);
+      while (calls < 2) await new Promise((resolve) => setImmediate(resolve));
+      const intent = await prismaA.paymentIntent.findFirstOrThrow({ where: { dealId: DEAL_ID } });
+      resolveWinner({
+        providerKey: provider.key,
+        providerReference: `mock-${intent.id}`,
+        confirmedAmountMinor: 75000,
+        confirmedCurrency: "USD",
+        assetLabel: provider.assetLabel,
+        networkLabel: provider.networkLabel,
+        environmentLabel: provider.environmentLabel,
+        termsVersionId: TV_ID,
+        confirmedAt: command.now.toISOString(),
+      });
+      const winner = await winnerPromise;
+      settleLoser();
+      const loser = await loserPromise;
+      assert.deepEqual(loser, winner);
+      const persisted = await prismaA.paymentIntent.findMany({ where: { dealId: DEAL_ID } });
+      assert.equal(persisted.length, 1);
+      assert.equal(persisted[0]?.providerState, "Confirmed");
+      assert.equal((await prismaA.deal.findUnique({ where: { id: DEAL_ID } }))?.status, "Active");
+    });
+  }
 });

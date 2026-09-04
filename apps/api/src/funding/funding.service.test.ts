@@ -84,6 +84,9 @@ function seedHappyPath(repo: InMemoryFundingRepository): void {
 
 class StubEscrowProvider implements EscrowProvider {
   readonly key = "mock-escrow-deterministic" as const;
+  readonly assetLabel = "sandbox-USDC" as const;
+  readonly networkLabel = "simulated-network" as const;
+  readonly environmentLabel = "sandbox" as const;
   public callCount = 0;
   public lastInput: EscrowRequestInput | null = null;
   constructor(
@@ -610,7 +613,7 @@ test("fundDeal idempotent Confirmed retry: a second identical command on an alre
 
 // ---------- Strict provider confirmation validation (P1-002) ----------
 
-test("fundDeal provider returns malformed confirmation (wrong provider identity) → fails closed with BG6_ESCROW_UNAVAILABLE; Deal stays Negotiating; intent on SAME row", async () => {
+test("fundDeal provider returns a confirmation with the wrong provider identity → fails closed as mismatch; Deal stays Negotiating; intent on SAME row", async () => {
   const repo = new InMemoryFundingRepository();
   seedHappyPath(repo);
   const provider = new StubEscrowProvider({
@@ -638,7 +641,7 @@ test("fundDeal provider returns malformed confirmation (wrong provider identity)
       }),
     (err: unknown) => {
       assert.ok(err instanceof FundingServiceError);
-      assert.equal(err.code, "BG6_ESCROW_UNAVAILABLE");
+      assert.equal(err.code, "BG6_FUNDING_CONFIRMATION_MISMATCH");
       return true;
     },
   );
@@ -709,4 +712,117 @@ test("fundDeal guarded failure recorder: a failure attempt against an already-Co
   assert.equal(after.providerState, "Confirmed", "Confirmed intent must NOT be demoted to Failed");
   assert.equal(after.failureReasonCode, null, "failure columns remain cleared");
   assert.equal(after.failureDetailCategory, null, "failureDetailCategory remains null");
+});
+
+test("confirmed retries reauthorize membership, exact buyer Workspace, active status, and Buyer capability", async (t) => {
+  const cases: readonly {
+    name: string;
+    mutate(repo: InMemoryFundingRepository): void;
+    actingWorkspaceId?: string;
+  }[] = [
+    {
+      name: "membership removed",
+      mutate: (repo) => repo.removeMembership(USER_ID, BUYER_WS),
+    },
+    {
+      name: "Buyer capability removed",
+      mutate: (repo) => repo.removeWorkspaceCapability(BUYER_WS, "Buyer"),
+    },
+    {
+      name: "buyer Workspace suspended",
+      mutate: (repo) => repo.seedWorkspace({ workspaceId: BUYER_WS, status: "Suspended" }),
+    },
+    {
+      name: "seller Workspace substituted",
+      actingWorkspaceId: SELLER_WS,
+      mutate: () => undefined,
+    },
+    {
+      name: "unrelated Workspace substituted",
+      actingWorkspaceId: "ws_unrelated",
+      mutate: (repo) => {
+        repo.seedWorkspace({ workspaceId: "ws_unrelated", status: "Active" });
+        repo.seedMembership({ userId: USER_ID, workspaceId: "ws_unrelated" });
+        repo.seedWorkspaceCapability({ workspaceId: "ws_unrelated", capability: "Buyer" });
+      },
+    },
+  ];
+  for (const scenario of cases) {
+    await t.test(scenario.name, async () => {
+      const repo = new InMemoryFundingRepository();
+      seedHappyPath(repo);
+      const provider = new StubEscrowProvider({ kind: "ok" });
+      const service = new FundingService({ fundingRepository: repo, escrowProvider: provider });
+      await service.fundDeal({
+        userAccountId: USER_ID,
+        actingWorkspaceId: BUYER_WS,
+        dealId: DEAL_ID,
+        now: new Date("2026-09-03T12:00:00.000Z"),
+      });
+      scenario.mutate(repo);
+      await assert.rejects(
+        service.fundDeal({
+          userAccountId: USER_ID,
+          actingWorkspaceId: scenario.actingWorkspaceId ?? BUYER_WS,
+          dealId: DEAL_ID,
+          now: new Date("2026-09-03T12:01:00.000Z"),
+        }),
+        (err: unknown) =>
+          err instanceof FundingServiceError && err.code === "BG6_FUNDING_FORBIDDEN",
+      );
+      assert.equal(provider.callCount, 1, "cached retry must not invoke provider");
+    });
+  }
+});
+
+test("concurrent provider failure that loses to confirmation converges to the successful result", async () => {
+  const repo = new InMemoryFundingRepository();
+  seedHappyPath(repo);
+  let succeed!: (value: EscrowConfirmation) => void;
+  let fail!: (reason: Error) => void;
+  let calls = 0;
+  const provider: EscrowProvider = {
+    key: "mock-escrow-deterministic",
+    assetLabel: "sandbox-USDC",
+    networkLabel: "simulated-network",
+    environmentLabel: "sandbox",
+    requestFunding() {
+      calls += 1;
+      if (calls === 1) {
+        return new Promise((resolve) => {
+          succeed = resolve;
+        });
+      }
+      return new Promise((_resolve, reject) => {
+        fail = reject;
+      });
+    },
+  };
+  const service = new FundingService({ fundingRepository: repo, escrowProvider: provider });
+  const command = {
+    userAccountId: USER_ID,
+    actingWorkspaceId: BUYER_WS,
+    dealId: DEAL_ID,
+    now: new Date("2026-09-03T12:00:00.000Z"),
+  };
+  const winner = service.fundDeal(command);
+  const loser = service.fundDeal(command);
+  await new Promise((resolve) => setImmediate(resolve));
+  succeed({
+    providerKey: provider.key,
+    providerReference: "mock-converged",
+    confirmedAmountMinor: 75000,
+    confirmedCurrency: "USD",
+    assetLabel: provider.assetLabel,
+    networkLabel: provider.networkLabel,
+    environmentLabel: provider.environmentLabel,
+    termsVersionId: TV_ID,
+    confirmedAt: command.now.toISOString(),
+  });
+  const success = await winner;
+  fail(new Error("late provider outage"));
+  const converged = await loser;
+  assert.deepEqual(converged, success);
+  const intent = await repo.findCurrentPaymentIntent(DEAL_ID);
+  assert.equal(intent?.providerState, "Confirmed");
 });

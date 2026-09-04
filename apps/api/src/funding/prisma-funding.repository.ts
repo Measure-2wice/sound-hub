@@ -237,7 +237,27 @@ export class PrismaFundingRepository implements FundingRepository {
   async findOrCreatePaymentIntentInTransaction(
     input: FindOrCreatePaymentIntentInput,
   ): Promise<FindOrCreatePaymentIntentResult> {
-    const envelope = await runWithBoundedP2034Retry(() => this.runFindOrCreateTx(input));
+    let envelope: BoundedRetryEnvelope<FindOrCreatePaymentIntentResult>;
+    try {
+      envelope = await runWithBoundedP2034Retry(() => this.runFindOrCreateTx(input));
+    } catch (err) {
+      if (err instanceof PrismaClientKnownRequestError && err.code === "P2002") {
+        // PostgreSQL aborts a transaction after a uniqueness error.
+        // Re-read only after Prisma has rolled that transaction back.
+        const winner = await this.prisma.paymentIntent.findUnique({
+          where: {
+            dealId_termsVersionId: {
+              dealId: input.dealId,
+              termsVersionId: input.termsVersionId,
+            },
+          },
+        });
+        if (winner) {
+          return { ok: true, value: toPersistedPaymentIntent(winner) };
+        }
+      }
+      throw err;
+    }
     if (envelope.outcome.kind === "exhausted") {
       // A Failed retry budget on this short tx should be vanishingly
       // rare; surface as a NOT_FOUND so the service can map to a
@@ -279,39 +299,23 @@ export class PrismaFundingRepository implements FundingRepository {
           return { ok: true as const, value: toPersistedPaymentIntent(existing) };
         }
         // Step 3: INSERT a new row with providerState = "Created".
-        try {
-          const created = await tx.paymentIntent.create({
-            data: {
-              dealId: input.dealId,
-              termsVersionId: input.termsVersionId,
-              actingWorkspaceId: input.actingWorkspaceId,
-              createdByUserId: input.createdByUserId,
-              expectedAmountMinor: input.expectedAmountMinor,
-              expectedCurrency: input.expectedCurrency,
-              assetLabel: input.assetLabel,
-              networkLabel: input.networkLabel,
-              providerKey: input.providerKey,
-              environmentLabel: input.environmentLabel,
-              correlationId: input.correlationId,
-              providerState: "Created",
-            },
-          });
-          return { ok: true as const, value: toPersistedPaymentIntent(created) };
-        } catch (err) {
-          if (err instanceof PrismaClientKnownRequestError && err.code === "P2002") {
-            // Defense-in-depth: re-read the winning row.
-            const winner = await tx.paymentIntent.findUniqueOrThrow({
-              where: {
-                dealId_termsVersionId: {
-                  dealId: input.dealId,
-                  termsVersionId: input.termsVersionId,
-                },
-              },
-            });
-            return { ok: true as const, value: toPersistedPaymentIntent(winner) };
-          }
-          throw err;
-        }
+        const created = await tx.paymentIntent.create({
+          data: {
+            dealId: input.dealId,
+            termsVersionId: input.termsVersionId,
+            actingWorkspaceId: input.actingWorkspaceId,
+            createdByUserId: input.createdByUserId,
+            expectedAmountMinor: input.expectedAmountMinor,
+            expectedCurrency: input.expectedCurrency,
+            assetLabel: input.assetLabel,
+            networkLabel: input.networkLabel,
+            providerKey: input.providerKey,
+            environmentLabel: input.environmentLabel,
+            correlationId: input.correlationId,
+            providerState: "Created",
+          },
+        });
+        return { ok: true as const, value: toPersistedPaymentIntent(created) };
       },
       { isolationLevel: "Serializable" },
     );

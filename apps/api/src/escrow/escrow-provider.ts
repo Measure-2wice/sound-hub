@@ -9,13 +9,12 @@
 // application-owned.
 //
 // The interface is provider-neutral. A future PolkaAward adapter (or
-// any real provider) slots in by extending the closed
-// `bg6ProviderKeysV1` tuple in @soundhub/types — the application
-// types do not change.
+// any real provider) slots in without changing the application
+// contract or masquerading as the deterministic mock.
 //
 // The provider is called with a fixed input and returns a fixed
 // output. The application parses the output through a STRICT Zod
-// schema (`bg6EscrowConfirmationV1Schema`) before any persistence,
+// schema (`escrowConfirmationSchema`) before any persistence,
 // transition, or activation runs. A failed parse fails closed and
 // leaves the Deal Negotiating. The deterministic mock wired for the
 // buildathon returns a parseable object whose amount/currency/
@@ -29,20 +28,42 @@
 //     opaque handle adapters may use for trace correlation; the
 //     deterministic mock does NOT embed it).
 
-import { randomUUID } from "node:crypto";
-import {
-  bg6EscrowConfirmationV1Schema,
-  bg6EscrowRequestInputV1Schema,
-  type Bg6EscrowConfirmationV1,
-  type Bg6EscrowRequestInputV1,
-} from "@soundhub/types";
+import { z } from "zod";
+
+const boundedLabel = z.string().trim().min(1).max(128);
+
+export const escrowRequestInputSchema = z
+  .object({
+    paymentIntentId: boundedLabel,
+    dealId: boundedLabel,
+    termsVersionId: boundedLabel,
+    termsVersionNumber: z.number().int().positive(),
+    priceAmountMinor: z.number().int().nonnegative(),
+    priceCurrency: z.string().regex(/^[A-Z]{3}$/),
+    now: z.string().datetime({ offset: true }),
+  })
+  .strict();
+
+export const escrowConfirmationSchema = z
+  .object({
+    providerKey: boundedLabel,
+    providerReference: boundedLabel,
+    confirmedAmountMinor: z.number().int().nonnegative(),
+    confirmedCurrency: z.string().regex(/^[A-Z]{3}$/),
+    assetLabel: boundedLabel,
+    networkLabel: boundedLabel,
+    environmentLabel: boundedLabel,
+    termsVersionId: boundedLabel,
+    confirmedAt: z.string().datetime({ offset: true }),
+  })
+  .strict();
 
 /**
  * Provider-neutral escrow confirmation. The Zod parse is the
  * runtime boundary — application code MUST validate every adapter
  * response before persisting it.
  */
-export type EscrowConfirmation = Bg6EscrowConfirmationV1;
+export type EscrowConfirmation = z.infer<typeof escrowConfirmationSchema>;
 
 /**
  * Provider-neutral escrow request input. The Zod parse is the
@@ -50,10 +71,13 @@ export type EscrowConfirmation = Bg6EscrowConfirmationV1;
  * re-validate, but the application-side parse is the authoritative
  * gate.
  */
-export type EscrowRequestInput = Bg6EscrowRequestInputV1;
+export type EscrowRequestInput = z.infer<typeof escrowRequestInputSchema>;
 
 export interface EscrowProvider {
-  readonly key: Bg6EscrowConfirmationV1["providerKey"];
+  readonly key: string;
+  readonly assetLabel: string;
+  readonly networkLabel: string;
+  readonly environmentLabel: string;
   /**
    * Request funding for the exact supplied TermsVersion + amount.
    * Throws on provider outage (the application maps the throw to
@@ -64,7 +88,7 @@ export interface EscrowProvider {
    * "mismatch is not success" rule).
    *
    * The application parses the returned object through
-   * `bg6EscrowConfirmationV1Schema` before any further processing.
+   * `escrowConfirmationSchema` before any further processing.
    */
   requestFunding(input: EscrowRequestInput): Promise<EscrowConfirmation>;
 }
@@ -84,29 +108,32 @@ export interface EscrowProvider {
  */
 export class DeterministicMockEscrowProvider implements EscrowProvider {
   readonly key = "mock-escrow-deterministic" as const;
+  readonly assetLabel = "sandbox-USDC" as const;
+  readonly networkLabel = "simulated-network" as const;
+  readonly environmentLabel = "sandbox" as const;
 
   requestFunding(input: EscrowRequestInput): Promise<EscrowConfirmation> {
     // Pre-parse the input through the closed contract so a buggy
     // caller cannot smuggle provider-neutral metadata through.
-    bg6EscrowRequestInputV1Schema.parse(input);
+    escrowRequestInputSchema.parse(input);
     // Build the confirmation with the same closed labels.
     const confirmation = {
       providerKey: this.key,
       // Reference shape: opaque to the application, bounded length
       // (max 128 chars enforced by the Zod schema). The mock does
       // NOT embed SoundHub's internal correlationId.
-      providerReference: `mock-${randomUUID()}`,
+      providerReference: `mock-${input.paymentIntentId}`,
       confirmedAmountMinor: input.priceAmountMinor,
       confirmedCurrency: input.priceCurrency,
-      assetLabel: "sandbox-USDC" as const,
-      networkLabel: "simulated-network" as const,
-      environmentLabel: "sandbox" as const,
+      assetLabel: this.assetLabel,
+      networkLabel: this.networkLabel,
+      environmentLabel: this.environmentLabel,
       termsVersionId: input.termsVersionId,
       confirmedAt: input.now,
     };
     // The deterministic mock is owned by the application; the
     // confirmation is parseable by construction. The parse is here
     // so a future code change cannot bypass the runtime boundary.
-    return Promise.resolve(bg6EscrowConfirmationV1Schema.parse(confirmation));
+    return Promise.resolve(escrowConfirmationSchema.parse(confirmation));
   }
 }

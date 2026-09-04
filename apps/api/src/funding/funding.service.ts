@@ -85,17 +85,22 @@
 
 import { randomUUID } from "node:crypto";
 import {
-  bg6EscrowConfirmationV1Schema,
   type Bg6FundingConfirmationPublicV1,
   type Bg6PublicFundingStatusV1,
 } from "@soundhub/types";
+import { ZodError } from "zod";
 import { AuthorizationError } from "../services/workspace-authorization.service.js";
-import type {
-  DeterministicMockEscrowProvider,
-  EscrowConfirmation,
-  EscrowProvider,
+import {
+  escrowConfirmationSchema,
+  escrowRequestInputSchema,
+  type DeterministicMockEscrowProvider,
+  type EscrowConfirmation,
+  type EscrowProvider,
 } from "../escrow/escrow-provider.js";
-import { evaluatePreauthAuthority } from "./funding-authorization-policy.js";
+import {
+  evaluateConfirmedRetryAuthority,
+  evaluatePreauthAuthority,
+} from "./funding-authorization-policy.js";
 import type { FundingRepository, PersistedPaymentIntent } from "./funding.repository.js";
 
 export class FundingServiceError extends Error {
@@ -130,10 +135,6 @@ export interface FundDealInput {
   readonly dealId: string;
   readonly now?: Date;
 }
-
-const SANDBOX_ASSET_LABEL = "sandbox-USDC" as const;
-const SANDBOX_NETWORK_LABEL = "simulated-network" as const;
-const SANDBOX_ENVIRONMENT_LABEL = "sandbox" as const;
 
 type FailureDetailCategory =
   | "PROVIDER_UNAVAILABLE"
@@ -181,29 +182,8 @@ export class FundingService {
     // derive from MAX(version) per Deal — re-derive here via a
     // lightweight read so the cached intent's binding is the same
     // tuple Phase 1 / Phase 3 / Phase 2 use.
-    const earlyIntent = await this.repository.findCurrentPaymentIntent(input.dealId);
-    if (earlyIntent) {
-      const early = await this.repository.findPreauthSnapshot({
-        dealId: input.dealId,
-        actingWorkspaceId: input.actingWorkspaceId,
-        actingUserAccountId: input.userAccountId,
-      });
-      if (early.ok) {
-        const cached = earlyIntent;
-        if (
-          cached.providerState === "Confirmed" &&
-          cached.termsVersionId === early.currentTermsVersion.id &&
-          early.value.dealStatus === "Active"
-        ) {
-          // Idempotent success — return the cached public DTO.
-          return {
-            dealStatus: "Active",
-            activatedAt: cached.acceptedAt ? cached.acceptedAt.toISOString() : null,
-            fundingStatus: toPublicFundingStatus(cached, early.currentTermsVersion.version, null),
-          };
-        }
-      }
-    }
+    const earlySuccess = await this.findAuthorizedConfirmedSuccess(input);
+    if (earlySuccess) return earlySuccess;
 
     // Phase 1: preauthorize BEFORE the provider call.
     const preauth = await this.repository.findPreauthSnapshot({
@@ -232,10 +212,10 @@ export class FundingService {
       termsVersionId: currentTermsVersion.id,
       expectedAmountMinor: currentTermsVersion.priceAmountMinor,
       expectedCurrency: currentTermsVersion.priceCurrency,
-      assetLabel: SANDBOX_ASSET_LABEL,
-      networkLabel: SANDBOX_NETWORK_LABEL,
+      assetLabel: this.escrowProvider.assetLabel,
+      networkLabel: this.escrowProvider.networkLabel,
       providerKey: this.escrowProvider.key,
-      environmentLabel: SANDBOX_ENVIRONMENT_LABEL,
+      environmentLabel: this.escrowProvider.environmentLabel,
       actingWorkspaceId: input.actingWorkspaceId,
       createdByUserId: input.userAccountId,
       correlationId: randomUUID(),
@@ -259,13 +239,13 @@ export class FundingService {
       // these fields were already validated at first-confirmation
       // time and persisted to PostgreSQL.
       providerConfirmation = {
-        providerKey: intent.providerKey as EscrowConfirmation["providerKey"],
+        providerKey: intent.providerKey,
         providerReference: intent.providerReference ?? "",
         confirmedAmountMinor: intent.expectedAmountMinor,
-        confirmedCurrency: intent.expectedCurrency as EscrowConfirmation["confirmedCurrency"],
-        assetLabel: SANDBOX_ASSET_LABEL,
-        networkLabel: SANDBOX_NETWORK_LABEL,
-        environmentLabel: SANDBOX_ENVIRONMENT_LABEL,
+        confirmedCurrency: intent.expectedCurrency,
+        assetLabel: intent.assetLabel,
+        networkLabel: intent.networkLabel,
+        environmentLabel: intent.environmentLabel,
         termsVersionId: intent.termsVersionId,
         confirmedAt: (intent.confirmedAt ?? now).toISOString(),
       };
@@ -274,7 +254,9 @@ export class FundingService {
         // Parse the provider input through the closed schema before
         // any network round-trip — the deterministic mock and any
         // future adapter are gated on the same boundary.
-        const providerInput: EscrowProvider["requestFunding"] extends (i: infer I) => unknown
+        const unvalidatedProviderInput: EscrowProvider["requestFunding"] extends (
+          i: infer I,
+        ) => unknown
           ? I
           : never = {
           paymentIntentId: intent.id,
@@ -282,15 +264,16 @@ export class FundingService {
           termsVersionId: intent.termsVersionId,
           termsVersionNumber,
           priceAmountMinor,
-          priceCurrency: "USD" as const,
+          priceCurrency: currentTermsVersion.priceCurrency,
           // Strict boundary exposes `now` as an ISO-8601 string.
           now: now.toISOString(),
         };
+        const providerInput = escrowRequestInputSchema.parse(unvalidatedProviderInput);
         const rawConfirmation = await this.escrowProvider.requestFunding(providerInput);
         // Strict runtime validation of provider output (P1-002).
         // The mock returns parseable-by-construction output; a future
         // adapter that returns malformed data fails closed here.
-        const parsed = bg6EscrowConfirmationV1Schema.parse(rawConfirmation);
+        const parsed = escrowConfirmationSchema.parse(rawConfirmation);
         // The strict boundary exposes `confirmedAt` as an ISO
         // string. Phase 3 stores a Date column; coerce here so the
         // cache and provider paths share one shape.
@@ -306,15 +289,17 @@ export class FundingService {
         // Raw exception text is logged server-side only; the
         // persisted column carries the closed category (P1-004).
         const category: FailureDetailCategory =
-          err instanceof Error && err.message.toLowerCase().includes("validation")
-            ? "CONFIRMATION_INVALID"
-            : "PROVIDER_UNAVAILABLE";
+          err instanceof ZodError ? "CONFIRMATION_INVALID" : "PROVIDER_UNAVAILABLE";
         logProviderDiagnostic("BG6 provider failure", err);
-        await this.repository.recordPaymentIntentFailureInTransaction({
+        const failure = await this.repository.recordPaymentIntentFailureInTransaction({
           paymentIntentId: intent.id,
           failureReasonCode: "EscrowProviderUnavailable",
           failureDetailCategory: category,
         });
+        if (!failure.persisted) {
+          const converged = await this.findAuthorizedConfirmedSuccess(input);
+          if (converged) return converged;
+        }
         throw new FundingServiceError(
           "The escrow provider is unavailable.",
           "BG6_ESCROW_UNAVAILABLE",
@@ -363,6 +348,14 @@ export class FundingService {
           if (confirmation.termsVersionId !== ctx.activation.currentTermsVersionId) {
             return tools.reject("CONFIRMATION_TERMS_VERSION_MISMATCH");
           }
+          if (
+            confirmation.providerKey !== intent.providerKey ||
+            confirmation.assetLabel !== intent.assetLabel ||
+            confirmation.networkLabel !== intent.networkLabel ||
+            confirmation.environmentLabel !== intent.environmentLabel
+          ) {
+            return tools.reject("CONFIRMATION_TERMS_VERSION_MISMATCH");
+          }
           return tools.persistFundingConfirmationAndActivate({
             paymentIntentId: ctx.paymentIntentId,
             providerReference: confirmation.providerReference,
@@ -382,6 +375,13 @@ export class FundingService {
     }
 
     if (!activationResult.ok) {
+      if (
+        activationResult.reason === "DEAL_NOT_NEGOTIATING" ||
+        activationResult.reason === "DEAL_ALREADY_ACTIVE"
+      ) {
+        const converged = await this.findAuthorizedConfirmedSuccess(input);
+        if (converged) return converged;
+      }
       // On confirmation mismatch the transaction rolls back the
       // intent update; record the latest attempt's failure fields on
       // the SAME row so a future retry carries forward the
@@ -392,11 +392,15 @@ export class FundingService {
         activationResult.reason === "CONFIRMATION_CURRENCY_MISMATCH" ||
         activationResult.reason === "CONFIRMATION_TERMS_VERSION_MISMATCH"
       ) {
-        await this.repository.recordPaymentIntentFailureInTransaction({
+        const failure = await this.repository.recordPaymentIntentFailureInTransaction({
           paymentIntentId: intent.id,
           failureReasonCode: mismatchReasonToCode(activationResult.reason),
           failureDetailCategory: "CONFIRMATION_MISMATCH",
         });
+        if (!failure.persisted) {
+          const converged = await this.findAuthorizedConfirmedSuccess(input);
+          if (converged) return converged;
+        }
         throw new FundingServiceError(
           "The provider confirmation did not match the locked TermsVersion snapshot.",
           "BG6_FUNDING_CONFIRMATION_MISMATCH",
@@ -415,6 +419,28 @@ export class FundingService {
         currentTermsVersion.version,
         null,
       ),
+    };
+  }
+
+  private async findAuthorizedConfirmedSuccess(input: FundDealInput): Promise<{
+    readonly dealStatus: "Active";
+    readonly activatedAt: string | null;
+    readonly fundingStatus: Bg6FundingConfirmationPublicV1;
+  } | null> {
+    const intent = await this.repository.findCurrentPaymentIntent(input.dealId);
+    if (!intent || intent.providerState !== "Confirmed") return null;
+    const snapshot = await this.repository.findPreauthSnapshot({
+      dealId: input.dealId,
+      actingWorkspaceId: input.actingWorkspaceId,
+      actingUserAccountId: input.userAccountId,
+    });
+    if (!snapshot.ok || intent.termsVersionId !== snapshot.currentTermsVersion.id) return null;
+    const verdict = evaluateConfirmedRetryAuthority(snapshot.value);
+    if (!verdict.ok) throw preauthVerdictToServiceError(verdict.reason);
+    return {
+      dealStatus: "Active",
+      activatedAt: intent.acceptedAt ? intent.acceptedAt.toISOString() : null,
+      fundingStatus: toPublicFundingStatus(intent, snapshot.currentTermsVersion.version, null),
     };
   }
 }
@@ -651,10 +677,10 @@ export function toPublicFundingStatus(
       intent.providerState === "Confirmed" && intent.confirmedAt
         ? { amountMinor: intent.expectedAmountMinor, currency: "USD" as const }
         : null,
-    providerKey: "mock-escrow-deterministic",
-    assetLabel: SANDBOX_ASSET_LABEL,
-    networkLabel: SANDBOX_NETWORK_LABEL,
-    environmentLabel: SANDBOX_ENVIRONMENT_LABEL,
+    providerKey: intent.providerKey as Bg6FundingConfirmationPublicV1["providerKey"],
+    assetLabel: intent.assetLabel as Bg6FundingConfirmationPublicV1["assetLabel"],
+    networkLabel: intent.networkLabel as Bg6FundingConfirmationPublicV1["networkLabel"],
+    environmentLabel: intent.environmentLabel as Bg6FundingConfirmationPublicV1["environmentLabel"],
     confirmationTime: intent.confirmedAt ? intent.confirmedAt.toISOString() : null,
     sanitizedFailureReason:
       intent.providerState === "Failed" && intent.failureReasonCode

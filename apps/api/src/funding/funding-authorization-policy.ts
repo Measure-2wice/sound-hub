@@ -108,10 +108,24 @@ export interface PreauthAuthoritySnapshot {
 export function evaluatePreauthAuthority(
   snapshot: PreauthAuthoritySnapshot,
 ): PreauthAuthorityVerdict {
+  return evaluateAuthorityForStatus(snapshot, "Negotiating");
+}
+
+/** Authorize an idempotent read of an already-confirmed funding result. */
+export function evaluateConfirmedRetryAuthority(
+  snapshot: PreauthAuthoritySnapshot,
+): PreauthAuthorityVerdict {
+  return evaluateAuthorityForStatus(snapshot, "Active");
+}
+
+function evaluateAuthorityForStatus(
+  snapshot: PreauthAuthoritySnapshot,
+  requiredStatus: "Negotiating" | "Active",
+): PreauthAuthorityVerdict {
   if (snapshot.dealStatus === null) {
     return { ok: false, reason: "DEAL_NOT_FOUND" };
   }
-  if (snapshot.dealStatus !== "Negotiating") {
+  if (snapshot.dealStatus !== requiredStatus) {
     return { ok: false, reason: "DEAL_NOT_NEGOTIATING" };
   }
   if (snapshot.currentTermsVersionId === null) {
