@@ -1,12 +1,14 @@
 "use client";
 
-// Deal page (BG5).
+// Deal page (BG5 + BG6).
 //
 // Background: ticket #63 requires the buyer + seller surfaces for
 // reviewing the current TermsVersion, approving it, and reading the
-// deal state. The page reuses the BG1 SessionProvider so the same
-// session refresh hooks keep the deal consistent across sign-in /
-// sign-out in other tabs.
+// deal state. Ticket #64 adds the BG6 funding surface: the buyer's
+// authorized human can explicitly initiate sandbox escrow funding
+// after both parties have approved the current TermsVersion; the
+// page re-uses the BG1 SessionProvider and refreshes the Deal view
+// after a successful fund.
 //
 // Per ticket #63 + the locked plan:
 //   - Renders the Deal metadata + current TermsVersion.
@@ -22,24 +24,39 @@
 //     the authorization decision.
 //   - No Navigation destination. The existing workflow links to
 //     /deals/:dealId directly.
+//
+// BG6 funding surface (ticket #64):
+//   - FundingCard is gated to `isBuyerSide && deal.status ===
+//     "Negotiating" && bothPartiesApproved`.
+//   - Every funding surface renders the "Sandbox · simulated" badge
+//     so a real network connection is never claimed.
+//   - The public funding-status DTO carries NO internal identifiers
+//     (paymentIntentId, correlationId, providerReference, raw
+//     failureDetail, internal providerState). The FundingCard
+//     renders only the allow-listed fields.
 
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import Link from "next/link";
 import type {
   Bg5DealApprovalPublicV1,
   Bg5TermsVersionPublicV1,
+  Bg6FundingConfirmationPublicV1,
   DealPublicV1,
   MarketplaceCapabilityV1,
 } from "@soundhub/types";
 import { useSession } from "../../components/SessionProvider";
 import { Card } from "../../components/ui/Card";
 import { approveTerms, draftTerms, fetchDeal } from "../../lib/deal-terms-client";
+import { fundDeal } from "../../lib/funding-client";
 import {
   buildApprovalStatusRows,
   buildApprovalSuccessCopy,
   buildAiDraftStatusLabel,
   buildDealSummaryCopy,
+  buildFundingBadgeLabel,
+  buildPublicFundingStatusCopy,
   getDealPartySide,
+  shouldShowDraftTermsControl,
 } from "../deal-summary-copy";
 import { findVisibleDeal } from "../find-visible-deal";
 
@@ -71,9 +88,12 @@ export default function DealPage({ params }: DealPageProps): JSX.Element {
   const [loadingDeal, setLoadingDeal] = useState<boolean>(false);
   const [bootstrapComplete, setBootstrapComplete] = useState<boolean>(false);
   const bootstrapKeyRef = useRef<string | null>(null);
-  const [submitting, setSubmitting] = useState<"draft" | "approve" | null>(null);
+  const [submitting, setSubmitting] = useState<"draft" | "approve" | "fund" | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [success, setSuccess] = useState<string | null>(null);
+  const [fundingStatus, setFundingStatus] = useState<Bg6FundingConfirmationPublicV1 | null>(null);
+  const [fundingError, setFundingError] = useState<string | null>(null);
+  const [fundingSuccess, setFundingSuccess] = useState<string | null>(null);
 
   const candidateWorkspaces = useMemo(() => {
     if (!deal) return [] as const;
@@ -239,6 +259,38 @@ export default function DealPage({ params }: DealPageProps): JSX.Element {
     }
   }, [actingWorkspaceId, currentTermsVersion, deal, dealId, reload, refresh]);
 
+  const onFund = useCallback(async () => {
+    if (!actingWorkspaceId) return;
+    setSubmitting("fund");
+    setFundingError(null);
+    setFundingSuccess(null);
+    try {
+      const result = await fundDeal(dealId, { actingWorkspaceId });
+      setFundingStatus(result.fundingStatus);
+      setFundingSuccess(
+        result.fundingStatus.status === "Confirmed"
+          ? "Funding confirmed; the Deal is Active."
+          : `Funding recorded: ${buildPublicFundingStatusCopy(
+              result.fundingStatus.status,
+              result.fundingStatus.sanitizedFailureReason,
+            )}`,
+      );
+      await reload(actingWorkspaceId);
+    } catch (err) {
+      const code = (err as { code?: string } | null)?.code;
+      if (code === "SESSION_INVALID" || code === "AUTH_FAILED" || code === "SESSION_EXPIRED") {
+        void refresh();
+        return;
+      }
+      setFundingError(
+        (err as { message?: string } | null)?.message ??
+          "Funding request failed. Please try again in a moment.",
+      );
+    } finally {
+      setSubmitting(null);
+    }
+  }, [actingWorkspaceId, dealId, refresh, reload]);
+
   if (loading) {
     return (
       <div className="max-w-3xl mx-auto px-6 py-12" data-testid="deal-loading">
@@ -310,6 +362,26 @@ export default function DealPage({ params }: DealPageProps): JSX.Element {
     currentTermsVersion.isCurrentVersion;
   const dealSummaryCopy = buildDealSummaryCopy(deal.status);
 
+  // BG6 funding state. The FundingCard renders a single allow-listed
+  // public funding-status DTO; the page does not retain any
+  // internal PaymentIntent identifiers.
+  const fundingBadgeLabel = buildFundingBadgeLabel();
+
+  // Compute the approval rows at the page level so the funding-gate
+  // predicate (above) and the inner TermsVersionView share the same
+  // evaluation.
+  const pageApprovalRows = buildApprovalStatusRows({
+    buyerWorkspaceId: deal.buyerWorkspaceId,
+    sellerWorkspaceId: deal.sellerWorkspaceId,
+    approvals: currentApprovals,
+  });
+  const bothPartiesApprovedAtPage = pageApprovalRows.every((row) => row.approvedAt !== null);
+  const isAwaitingFunding =
+    deal.status === "Negotiating" &&
+    currentTermsVersion !== null &&
+    currentTermsVersion.isCurrentVersion &&
+    bothPartiesApprovedAtPage;
+
   return (
     <div className="max-w-3xl mx-auto px-6 py-12 space-y-6" data-testid="deal-page">
       <Card data-testid="deal-header">
@@ -374,6 +446,76 @@ export default function DealPage({ params }: DealPageProps): JSX.Element {
         </Card.Content>
       </Card>
 
+      <Card data-testid="deal-funding-card">
+        <Card.Header>
+          <Card.Title>Escrow funding</Card.Title>
+          <Card.Description>
+            <span
+              className="inline-block text-xs uppercase tracking-wide px-2 py-1 rounded bg-amber-100 text-amber-800 mr-2"
+              data-testid="deal-funding-badge"
+            >
+              {fundingBadgeLabel}
+            </span>
+            PaymentIntent persisted (sandbox, deterministic). After both parties approve the current
+            TermsVersion, the buyer's authorized human can fund the Deal here. The
+            MockEscrowProvider returns a deterministic confirmation; the Deal becomes Active
+            atomically with the confirmation.
+          </Card.Description>
+        </Card.Header>
+        <Card.Content>
+          {fundingStatus && (
+            <p
+              className={`text-sm mb-3 ${
+                fundingStatus.status === "Confirmed"
+                  ? "text-green-700"
+                  : fundingStatus.status === "Failed"
+                    ? "text-red-700"
+                    : "text-gray-700"
+              }`}
+              data-testid="deal-funding-status"
+            >
+              {buildPublicFundingStatusCopy(
+                fundingStatus.status,
+                fundingStatus.sanitizedFailureReason,
+              )}
+              {fundingStatus.confirmationTime !== null
+                ? ` · confirmation time: ${fundingStatus.confirmationTime}`
+                : ""}
+              {" · network: "}
+              <code className="text-xs">{fundingStatus.networkLabel}</code>
+            </p>
+          )}
+          {fundingError && (
+            <p className="text-sm text-red-700 mb-3" data-testid="deal-funding-error">
+              {fundingError}
+            </p>
+          )}
+          {fundingSuccess && (
+            <p className="text-sm text-green-700 mb-3" data-testid="deal-funding-success">
+              {fundingSuccess}
+            </p>
+          )}
+          {deal.status === "Negotiating" && isBuyerSide && (
+            <button
+              type="button"
+              onClick={() => {
+                void onFund();
+              }}
+              disabled={submitting !== null || !isAwaitingFunding}
+              className="bg-green-600 text-white px-3 py-1.5 rounded-md text-sm font-medium hover:bg-green-700 disabled:opacity-50 transition-colors"
+              data-testid="deal-fund-button"
+            >
+              {submitting === "fund" ? "Funding…" : "Fund sandbox escrow"}
+            </button>
+          )}
+          {deal.status === "Active" && (
+            <p className="text-sm text-gray-700" data-testid="deal-active-terminal">
+              Deal Active — escrow funded; commissioned work may begin.
+            </p>
+          )}
+        </Card.Content>
+      </Card>
+
       <Card data-testid="deal-terms-card">
         <Card.Header>
           <Card.Title>Current TermsVersion</Card.Title>
@@ -409,7 +551,10 @@ export default function DealPage({ params }: DealPageProps): JSX.Element {
                 void onApprove();
               }}
               submitting={submitting}
-              showDraftButton={capabilityRequired !== null}
+              showDraftButton={shouldShowDraftTermsControl(
+                deal.status,
+                capabilityRequired !== null,
+              )}
               showApproveButton={showApprove}
             />
           ) : (
@@ -455,7 +600,7 @@ function TermsVersionView({
   readonly sellerWorkspaceId: string;
   readonly onDraft: () => void;
   readonly onApprove: () => void;
-  readonly submitting: "draft" | "approve" | null;
+  readonly submitting: "draft" | "approve" | "fund" | null;
   readonly showDraftButton: boolean;
   readonly showApproveButton: boolean;
 }): JSX.Element {

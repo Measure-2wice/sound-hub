@@ -13,6 +13,10 @@ import { createMatchmakerRouter } from "./routes/matchmaker.js";
 import { PrismaOfferingCatalogRepository } from "./repositories/prisma-offering-catalog.repository.js";
 import { createProjectRequestRouter } from "./routes/project-requests.js";
 import { createDealTermsRouter } from "./routes/deal-terms.js";
+import { PrismaFundingRepository } from "./funding/prisma-funding.repository.js";
+import { FundingService } from "./funding/funding.service.js";
+import { DeterministicMockEscrowProvider } from "./escrow/escrow-provider.js";
+import { createBg6FundingRouter } from "./routes/funding.js";
 import { TalentSearchService } from "./services/talent-search.service.js";
 import { AuthenticationService } from "./services/authentication.service.js";
 import { WorkspaceAuthorizationService } from "./services/workspace-authorization.service.js";
@@ -272,6 +276,17 @@ export function buildApp(options: AppOptions = {}): BuiltApp {
       workspaceAuthorizationService,
     });
 
+  // BG6 PaymentIntent + activation service. The composition root
+  // owns the Prisma adapter and the deterministic mock escrow
+  // provider; no managed provider integration is wired. Tests can
+  // inject a custom repository or escrow provider via options.
+  const fundingRepository = new PrismaFundingRepository(prisma);
+  const escrowProvider = new DeterministicMockEscrowProvider();
+  const fundingService = new FundingService({
+    fundingRepository,
+    escrowProvider,
+  });
+
   const app: Application = express();
   app.disable("x-powered-by");
   app.use(helmet());
@@ -331,6 +346,14 @@ export function buildApp(options: AppOptions = {}): BuiltApp {
     "/api/deals",
     createDealTermsRouter({
       authenticationService,
+      dealTermsService,
+    }),
+  );
+  app.use(
+    "/api/deals",
+    createBg6FundingRouter({
+      authenticationService,
+      fundingService,
       dealTermsService,
     }),
   );
