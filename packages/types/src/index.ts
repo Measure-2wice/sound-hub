@@ -499,3 +499,43 @@ export const pricingKindValuesV1 = ["StartingAt", "Fixed", "ContactForQuote"] as
 export type PricingKindV1 = (typeof pricingKindValuesV1)[number];
 export const purchaseModeValuesV1 = ["BundleOnly"] as const;
 export type PurchaseModeV1 = (typeof purchaseModeValuesV1)[number];
+
+// ---------- Polkadot Escrow Contract Schemas & Types ----------
+
+export const escrowStateValuesV1 = [
+  "Funded",
+  "Disputed",
+  "Released",
+  "Refunded",
+  "Unknown",
+] as const;
+export type EscrowStateV1 = (typeof escrowStateValuesV1)[number];
+export const escrowStateV1Schema = z.enum(escrowStateValuesV1);
+
+export const createEscrowRequestV1Schema = z.object({
+  provider: z.string().min(1, "provider address is required"),
+  arbitrator: z.string().optional(),
+  duration: z.number().int().positive("duration must be a positive integer"),
+  value: z.string().optional(),
+});
+export type CreateEscrowRequestV1 = z.infer<typeof createEscrowRequestV1Schema>;
+
+export const createEscrowResponseV1Schema = z.object({
+  contractAddress: z.string(),
+  blockHash: z.string(),
+});
+export type CreateEscrowResponseV1 = z.infer<typeof createEscrowResponseV1Schema>;
+
+export const escrowStateResponseV1Schema = z.object({
+  address: z.string(),
+  state: escrowStateV1Schema,
+});
+export type EscrowStateResponseV1 = z.infer<typeof escrowStateResponseV1Schema>;
+
+export const escrowActionResponseV1Schema = z.object({
+  address: z.string(),
+  action: z.string(),
+  blockHash: z.string(),
+  state: escrowStateV1Schema.optional(),
+});
+export type EscrowActionResponseV1 = z.infer<typeof escrowActionResponseV1Schema>;
