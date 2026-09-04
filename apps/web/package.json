@@ -10,7 +10,7 @@
     "lint": "eslint .",
     "type-check": "tsc --noEmit",
     "test:e2e": "playwright test",
-    "test": "TSX_TSCONFIG_PATH=tsconfig.test.json node --import ./src/test-setup.mjs --import tsx --test src/app/lib/talent-search-request-builder.test.ts src/app/lib/field-error-paths.test.ts src/app/lib/deal-terms-client.test.ts src/app/lib/funding-client.test.ts src/app/hooks/useSearch.test.ts src/app/components/SearchPage.test.ts src/app/components/MagicLinkVerifier.test.tsx src/app/components/SessionProvider.test.tsx src/app/matchmaker/page.test.tsx src/app/matchmaker/invite-from-recommendation.test.ts src/app/deals/find-visible-deal.test.ts src/app/deals/deal-summary-copy.test.ts src/app/deals/funding-summary-copy.test.ts"
+    "test": "TSX_TSCONFIG_PATH=tsconfig.test.json node --import ./src/test-setup.mjs --import tsx --test src/app/lib/talent-search-request-builder.test.ts src/app/lib/field-error-paths.test.ts src/app/lib/deal-terms-client.test.ts src/app/lib/funding-client.test.ts src/app/deals/deal-list-copy.test.ts src/app/lib/deal-list-client.test.ts src/app/hooks/useSearch.test.ts src/app/components/SearchPage.test.ts src/app/components/MagicLinkVerifier.test.tsx src/app/components/SessionProvider.test.tsx src/app/matchmaker/page.test.tsx src/app/matchmaker/invite-from-recommendation.test.ts src/app/deals/find-visible-deal.test.ts src/app/deals/deal-summary-copy.test.ts src/app/deals/funding-summary-copy.test.ts"
   },
   "dependencies": {
     "@soundhub/types": "workspace:*",

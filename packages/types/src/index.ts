@@ -509,6 +509,19 @@ export const apiErrorCodeV1Schema = z.enum([
   "BG6_DEAL_ALREADY_ACTIVE",
   // 500 — unexpected internal failure outside the typed surfaces.
   "BG6_FUNDING_INTERNAL_FAILED",
+  // Deals discovery list (ticket #74). The list is a private,
+  // Workspace-scoped read; its rejection surface is deliberately
+  // narrow so the response never reveals whether a Workspace exists
+  // or whether the caller merely lacks membership.
+  // 403 — the acting Workspace is unknown, not Active, or the
+  // authenticated human is not a current member of that EXACT
+  // Workspace. The single code collapses all three.
+  "DEAL_LIST_FORBIDDEN",
+  // 400 — the request failed runtime validation (missing or
+  // malformed actingWorkspaceId).
+  "DEAL_LIST_INVALID",
+  // 500 — unexpected internal failure outside the typed surfaces.
+  "DEAL_LIST_FAILED",
 ]);
 export type ApiErrorCodeV1 = z.infer<typeof apiErrorCodeV1Schema>;
 
@@ -1409,6 +1422,114 @@ export const dealPublicV1Schema = z
   })
   .strict();
 export type DealPublicV1 = z.infer<typeof dealPublicV1Schema>;
+
+// ---------- Deals discovery list DTO (ticket #74) ----------
+//
+// Background: ticket #74 makes Deals discoverable from signed-in
+// navigation. The list is a DISCOVERY surface, not a second Deal
+// detail surface: it carries only what a human needs to recognise a
+// Deal and choose a row. Full terms, approval audit records, and the
+// BG6 funding confirmation stay on `/deals/:dealId`.
+//
+// Deliberately EXCLUDED from the list item (AGENTS.md: "Do not expose
+// account identity, membership, wallet, embedding, or storage
+// internals publicly"):
+//   - buyerWorkspaceId / sellerWorkspaceId  (membership topology;
+//     `actingSide` + the counterparty NAME carry the context)
+//   - projectBriefId / projectRequestId / serviceOfferingId
+//   - paymentIntentId, correlationId, providerReference
+//   - provider / asset / network / environment labels
+//   - confirmation timestamps and failure diagnostics
+//
+// Approval state is DERIVED server-side. There is no persisted
+// approval-status column: BG5 represents approval as DealApproval row
+// existence per (termsVersionId, workspaceId), so the server derives
+// this closed enum from the current TermsVersion's approval rows. The
+// client must not reconstruct it.
+export const dealApprovalStateValuesV1 = [
+  // No TermsVersion has been drafted yet.
+  "NoTerms",
+  // A current TermsVersion exists; neither party has approved it.
+  "AwaitingBothApprovals",
+  // The seller approved the current version; the buyer has not.
+  "AwaitingBuyerApproval",
+  // The buyer approved the current version; the seller has not.
+  "AwaitingSellerApproval",
+  // Both parties approved the SAME current version.
+  "BothApproved",
+] as const;
+export type DealApprovalStateV1 = (typeof dealApprovalStateValuesV1)[number];
+
+// Slim, derived funding summary for the list. This is NOT the BG6
+// `bg6FundingConfirmationPublicV1Schema` and must not be widened into
+// it — the list exposes discovery-sufficient state only.
+//
+// Semantics (derived server-side from persisted Deal / BG5 / BG6
+// state, never reconstructed by the client):
+//   null                   funding is not yet applicable (no current
+//                          terms, or approvals are incomplete)
+//   AwaitingConfirmation   both parties approved the current version;
+//                          the Deal is ready for / awaiting funding
+//   Confirmed              funding confirmed (aligns with an Active
+//                          Deal in the Golden Slice)
+//   Failed                 the current applicable funding attempt
+//                          failed; the Deal remains Negotiating
+export const dealListFundingStatusesV1 = ["AwaitingConfirmation", "Confirmed", "Failed"] as const;
+export type DealListFundingStatusV1 = (typeof dealListFundingStatusesV1)[number];
+
+// Which side of the Deal the acting Workspace is on. Lets the UI say
+// "with {counterparty}" without exposing either workspace id.
+export const dealActingSideValuesV1 = ["Buyer", "Seller"] as const;
+export type DealActingSideV1 = (typeof dealActingSideValuesV1)[number];
+
+// One discoverable Deal row, scoped to the acting Workspace.
+//
+// `counterpartyWorkspaceName` and `serviceOfferingTitle` are the
+// human-readable primary context required by ticket #74 ("Deal rows
+// use human-readable labels rather than raw internal IDs as their
+// primary context"). They are nullable for the same reason
+// `projectRequestPublicV1Schema` makes its display context nullable:
+// a referenced row that could not be loaded must render a stable
+// placeholder rather than a fabricated label.
+export const dealListItemPublicV1Schema = z
+  .object({
+    dealId: z.string().min(1).max(128),
+    status: z.enum(dealStatusValuesV1),
+    actingSide: z.enum(dealActingSideValuesV1),
+    counterpartyWorkspaceName: z.string().min(1).max(200).nullable(),
+    serviceOfferingTitle: z.string().min(1).max(200).nullable(),
+    // The current TermsVersion's monotonic version number; null when
+    // no terms have been drafted.
+    currentTermsVersion: z.number().int().positive().nullable(),
+    approvalState: z.enum(dealApprovalStateValuesV1),
+    fundingStatus: z.enum(dealListFundingStatusesV1).nullable(),
+    activatedAt: z.string().datetime().nullable(),
+    createdAt: z.string().datetime(),
+  })
+  .strict();
+export type DealListItemPublicV1 = z.infer<typeof dealListItemPublicV1Schema>;
+
+// List request. The acting Workspace is explicit (GS 4 / GS 5
+// authority contract) and arrives as a query parameter; the server
+// revalidates current membership for the EXACT commanded Workspace
+// inside the same transaction that reads the Deals.
+export const listDealsRequestV1Schema = z
+  .object({
+    actingWorkspaceId: z.string().min(1).max(128),
+  })
+  .strict();
+export type ListDealsRequestV1 = z.infer<typeof listDealsRequestV1Schema>;
+
+// List response. Bounded by design: ticket #74 excludes pagination
+// frameworks, and the cap keeps the discovery surface from becoming
+// an unbounded export.
+export const listDealsResponseV1Schema = z
+  .object({
+    ok: z.literal(true),
+    deals: z.array(dealListItemPublicV1Schema).max(200),
+  })
+  .strict();
+export type ListDealsResponseV1 = z.infer<typeof listDealsResponseV1Schema>;
 
 // ---------- ProjectRequest endpoints ----------
 

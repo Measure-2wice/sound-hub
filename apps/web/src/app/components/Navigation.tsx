@@ -111,6 +111,21 @@ function deriveNavigationDestinations({
       testId: "nav-audio-samples",
     });
   }
+  // Deals (ticket #74). A Deal always has a Buyer-capable side and a
+  // Seller-capable side, so either capability makes a user eligible to
+  // hold Deals. Signed-out users and users whose current memberships
+  // expose neither capability never reach this line.
+  //
+  // Navigation visibility is presentation only: `/deals` and
+  // `GET /api/deals` authorize independently against current
+  // membership for the exact acting Workspace.
+  if (hasBuyerWorkspace || hasSellerWorkspace) {
+    out.push({
+      href: "/deals",
+      label: "Deals",
+      testId: "nav-deals-link",
+    });
+  }
   return out;
 }
 

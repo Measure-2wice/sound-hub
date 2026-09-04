@@ -13,6 +13,7 @@ import { createMatchmakerRouter } from "./routes/matchmaker.js";
 import { PrismaOfferingCatalogRepository } from "./repositories/prisma-offering-catalog.repository.js";
 import { createProjectRequestRouter } from "./routes/project-requests.js";
 import { createDealTermsRouter } from "./routes/deal-terms.js";
+import { createDealListRouter } from "./routes/deal-list.js";
 import { PrismaFundingRepository } from "./funding/prisma-funding.repository.js";
 import { FundingService } from "./funding/funding.service.js";
 import { DeterministicMockEscrowProvider } from "./escrow/escrow-provider.js";
@@ -31,6 +32,9 @@ import { PrismaProjectBriefRepository } from "./matchmaker/prisma-project-brief.
 import { PrismaProjectRequestRepository } from "./project-request/prisma-project-request.repository.js";
 import { PrismaDealTermsRepository } from "./deal-terms/prisma-deal-terms.repository.js";
 import { DealTermsService } from "./deal-terms/deal-terms.service.js";
+import { PrismaDealListRepository } from "./deal-list/prisma-deal-list.repository.js";
+import { DealListService } from "./deal-list/deal-list.service.js";
+import type { DealListRepository } from "./deal-list/deal-list.repository.js";
 import type { ProjectBriefRepository } from "./matchmaker/project-brief.repository.js";
 import type { ProjectRequestRepository } from "./project-request/project-request.repository.js";
 import type { MetadataRepository } from "./repositories/metadata.repository.js";
@@ -137,6 +141,19 @@ export interface AppOptions {
    * from the repository.
    */
   readonly dealTermsService?: DealTermsService;
+  /**
+   * Override for the Deal-discovery list repository (ticket #74).
+   * When supplied, the composition root does NOT construct the Prisma
+   * adapter. Tests pass the in-memory adapter, which runs the same
+   * authorization policy.
+   */
+  readonly dealListRepository?: DealListRepository;
+  /**
+   * Override for the Deal-discovery list service. When supplied, the
+   * composition root uses this service instead of constructing one
+   * from the repository.
+   */
+  readonly dealListService?: DealListService;
 }
 
 export interface BuiltApp {
@@ -154,6 +171,7 @@ export interface BuiltApp {
   readonly storageBackend: "supabase" | "deterministic";
   readonly projectRequestService: ProjectRequestService;
   readonly dealTermsService: DealTermsService;
+  readonly dealListService: DealListService;
 }
 
 export function buildApp(options: AppOptions = {}): BuiltApp {
@@ -287,6 +305,15 @@ export function buildApp(options: AppOptions = {}): BuiltApp {
     escrowProvider,
   });
 
+  // Deals discovery list (ticket #74). The list authorizes and reads
+  // in ONE transaction: the repository FOR UPDATE-locks the exact
+  // Workspace + membership rows, the service-owned policy decides,
+  // and Deals are read only on an accept. A membership revoked
+  // concurrently therefore cannot leak private rows.
+  const dealListRepository = options.dealListRepository ?? new PrismaDealListRepository(prisma);
+  const dealListService =
+    options.dealListService ?? new DealListService({ repository: dealListRepository });
+
   const app: Application = express();
   app.disable("x-powered-by");
   app.use(helmet());
@@ -340,6 +367,16 @@ export function buildApp(options: AppOptions = {}): BuiltApp {
     createProjectRequestRouter({
       authenticationService,
       projectRequestService,
+    }),
+  );
+  // Ticket #74: the Deals collection route is registered BEFORE the
+  // per-Deal routers so the collection path stays unambiguously ahead
+  // of their "/:dealId" dispatchers.
+  app.use(
+    "/api/deals",
+    createDealListRouter({
+      authenticationService,
+      dealListService,
     }),
   );
   app.use(
@@ -399,6 +436,7 @@ export function buildApp(options: AppOptions = {}): BuiltApp {
     storageBackend: storageBundle.backend,
     projectRequestService,
     dealTermsService,
+    dealListService,
   };
 }
 
