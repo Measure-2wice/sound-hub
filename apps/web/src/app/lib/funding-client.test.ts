@@ -76,7 +76,7 @@ test("fundDeal issues a POST to /api/deals/:dealId/funding with credentials + JS
         confirmedAmount: { amountMinor: 75000, currency: "USD" },
         providerKey: "mock-escrow-deterministic",
         assetLabel: "sandbox-USDC",
-        networkLabel: "simulated-polkadot-asset-hub-testnet",
+        networkLabel: "simulated-network",
         environmentLabel: "sandbox",
         confirmationTime: "2026-09-03T12:00:00.000Z",
         sanitizedFailureReason: null,
@@ -97,7 +97,7 @@ test("fundDeal issues a POST to /api/deals/:dealId/funding with credentials + JS
     );
     assert.equal(calls[0]?.init.body, JSON.stringify({ actingWorkspaceId: "ws_b" }));
     assert.equal(result.fundingStatus.status, "Confirmed");
-    assert.equal(result.fundingStatus.networkLabel, "simulated-polkadot-asset-hub-testnet");
+    assert.equal(result.fundingStatus.networkLabel, "simulated-network");
   } finally {
     restoreGlobals(calls);
   }
@@ -184,7 +184,7 @@ test("fundDeal public response does NOT contain paymentIntentId, correlationId, 
         confirmedAmount: { amountMinor: 75000, currency: "USD" },
         providerKey: "mock-escrow-deterministic",
         assetLabel: "sandbox-USDC",
-        networkLabel: "simulated-polkadot-asset-hub-testnet",
+        networkLabel: "simulated-network",
         environmentLabel: "sandbox",
         confirmationTime: "2026-09-03T12:00:00.000Z",
         sanitizedFailureReason: null,

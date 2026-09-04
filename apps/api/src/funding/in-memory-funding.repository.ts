@@ -40,6 +40,7 @@ import type {
   PersistedPaymentIntent,
   PersistedTermsVersionForFunding,
   RecordPaymentIntentFailureInput,
+  RecordPaymentIntentFailureResult,
 } from "./funding.repository.js";
 
 // ---------- Test seams ----------
@@ -83,6 +84,15 @@ export interface ProjectRequestSeedForFunding {
   readonly sellerConsentAt: Date | null;
 }
 
+/**
+ * Buyer-capability seed. Mirrors the closed `MarketplaceCapability`
+ * table; in-memory tests set this explicitly per Workspace.
+ */
+export interface WorkspaceCapabilitySeedForFunding {
+  readonly workspaceId: string;
+  readonly capability: "Buyer" | "Seller";
+}
+
 export class InMemoryFundingRepository implements FundingRepository {
   private readonly deals = new Map<string, DealSeedForFunding>();
   private readonly workspaces = new Map<string, WorkspaceSeedForFunding>();
@@ -90,6 +100,7 @@ export class InMemoryFundingRepository implements FundingRepository {
   private readonly termsVersions = new Map<string, TermsVersionSeedForFunding>();
   private readonly dealApprovals = new Map<string, DealApprovalSeedForFunding>();
   private readonly projectRequests = new Map<string, ProjectRequestSeedForFunding>();
+  private readonly workspaceCapabilities = new Map<string, WorkspaceCapabilitySeedForFunding>();
   private readonly paymentIntents = new Map<string, PersistedPaymentIntent>();
   /** Single-flight mutex so a single in-memory test cannot interleave
    *  authority mutations with a running use case. NOT a real-MVCC
@@ -134,12 +145,27 @@ export class InMemoryFundingRepository implements FundingRepository {
     this.projectRequests.delete(id);
   }
 
+  /**
+   * Seed a WorkspaceCapability row (e.g. Buyer, Seller). The Buyer
+   * capability is the authoritative grant for the funding command;
+   * membership, ownership, and Deal party identity are NOT
+   * substitutes. See ticket #64 P0-001.
+   */
+  seedWorkspaceCapability(seed: WorkspaceCapabilitySeedForFunding): void {
+    this.workspaceCapabilities.set(this.capabilityKey(seed.workspaceId, seed.capability), seed);
+  }
+
+  removeWorkspaceCapability(workspaceId: string, capability: "Buyer" | "Seller"): void {
+    this.workspaceCapabilities.delete(this.capabilityKey(workspaceId, capability));
+  }
+
   seedPaymentIntent(seed: PersistedPaymentIntent): void {
     this.paymentIntents.set(seed.id, seed);
   }
 
   // ---------- Reads ----------
 
+  // eslint-disable-next-line @typescript-eslint/require-await -- adapter signature
   async findPreauthSnapshot(input: FindPreauthInput): Promise<FindPreauthResult> {
     const deal = this.deals.get(input.dealId);
     if (!deal) {
@@ -168,6 +194,13 @@ export class InMemoryFundingRepository implements FundingRepository {
     const isMember =
       actingWs !== undefined &&
       this.memberships.has(this.membershipKey(input.actingUserAccountId, input.actingWorkspaceId));
+    // Read the buyer WorkspaceCapability(Buyer) row. The in-memory
+    // adapter consults the same closed workspaceCapabilities map the
+    // Prisma adapter queries; membership / ownership / Deal party
+    // identity are NOT substitutes. See ticket #64 P0-001.
+    const hasBuyerCapability = this.workspaceCapabilities.has(
+      this.capabilityKey(deal.buyerWorkspaceId, "Buyer"),
+    );
     let buyerApproval = false;
     let sellerApproval = false;
     for (const approval of this.dealApprovals.values()) {
@@ -183,6 +216,7 @@ export class InMemoryFundingRepository implements FundingRepository {
       actingWorkspaceId: input.actingWorkspaceId,
       actingWorkspaceStatus: actingWs?.status ?? "Suspended",
       actingUserIsMember: isMember,
+      hasBuyerCapability,
       currentTermsVersionId: current.id,
       currentTermsVersionDealId: current.dealId,
       projectRequestStatus: projectRequest.status,
@@ -252,7 +286,7 @@ export class InMemoryFundingRepository implements FundingRepository {
         confirmedAt: null,
         acceptedAt: null,
         failureReasonCode: null,
-        failureDetail: null,
+        failureDetailCategory: null,
         providerState: "Created",
         createdAt: now,
         updatedAt: now,
@@ -265,20 +299,29 @@ export class InMemoryFundingRepository implements FundingRepository {
   }
 
   // ---------- recordPaymentIntentFailureInTransaction ----------
-
+  //
+  // Guarded: a Confirmed intent is NOT demoted. The in-memory adapter
+  // checks the current providerState atomically (single-threaded JS)
+  // and returns `ALREADY_CONFIRMED` when the row is already Confirmed.
+  // The service uses that return to converge on the existing success
+  // path. See ticket #64 P0-002.
+  // eslint-disable-next-line @typescript-eslint/require-await -- adapter signature
   async recordPaymentIntentFailureInTransaction(
     input: RecordPaymentIntentFailureInput,
-  ): Promise<void> {
+  ): Promise<RecordPaymentIntentFailureResult> {
     const intent = this.paymentIntents.get(input.paymentIntentId);
-    if (!intent) return;
-    const updated: PersistedPaymentIntent = {
+    if (!intent) return { ok: true, persisted: false, reason: "ALREADY_CONFIRMED" };
+    if (intent.providerState === "Confirmed") {
+      return { ok: true, persisted: false, reason: "ALREADY_CONFIRMED" };
+    }
+    this.paymentIntents.set(intent.id, {
       ...intent,
       providerState: "Failed",
       failureReasonCode: input.failureReasonCode,
-      failureDetail: input.failureDetail,
+      failureDetailCategory: input.failureDetailCategory,
       updatedAt: new Date(),
-    };
-    this.paymentIntents.set(intent.id, updated);
+    });
+    return { ok: true, persisted: true };
   }
 
   // ---------- fundDealInTransaction ----------
@@ -328,6 +371,9 @@ export class InMemoryFundingRepository implements FundingRepository {
         this.memberships.has(
           this.membershipKey(input.actingUserAccountId, input.actingWorkspaceId),
         );
+      const hasBuyerCapability = this.workspaceCapabilities.has(
+        this.capabilityKey(deal.buyerWorkspaceId, "Buyer"),
+      );
       let buyerApproval = false;
       let sellerApproval = false;
       for (const approval of this.dealApprovals.values()) {
@@ -343,6 +389,7 @@ export class InMemoryFundingRepository implements FundingRepository {
         actingWorkspaceId: input.actingWorkspaceId,
         actingWorkspaceStatus: actingWs?.status ?? "Suspended",
         actingUserIsMember: isMember,
+        hasBuyerCapability,
         currentTermsVersionId: current.id,
         currentTermsVersionDealId: current.dealId,
         projectRequestStatus: projectRequest?.status ?? null,
@@ -396,7 +443,7 @@ export class InMemoryFundingRepository implements FundingRepository {
         acceptedAt: outcome.input.acceptedAt,
         providerState: "Confirmed",
         failureReasonCode: null,
-        failureDetail: null,
+        failureDetailCategory: null,
         updatedAt: new Date(),
       });
       const summary: PersistedDealSummaryForFunding = {
@@ -413,6 +460,7 @@ export class InMemoryFundingRepository implements FundingRepository {
     }
   }
 
+  // eslint-disable-next-line @typescript-eslint/require-await -- adapter signature
   async findCurrentPaymentIntent(dealId: string): Promise<PersistedPaymentIntent | null> {
     const candidates = [...this.paymentIntents.values()]
       .filter((row) => row.dealId === dealId)
@@ -424,6 +472,10 @@ export class InMemoryFundingRepository implements FundingRepository {
 
   private membershipKey(userId: string, workspaceId: string): string {
     return `${userId}|${workspaceId}`;
+  }
+
+  private capabilityKey(workspaceId: string, capability: "Buyer" | "Seller"): string {
+    return `${workspaceId}|${capability}`;
   }
 }
 

@@ -1,3 +1,4 @@
+/* eslint-disable @typescript-eslint/no-floating-promises */
 // BG6 funding route-helper unit tests.
 //
 // These tests assert the safe envelope mapping: BG6_* codes map to
@@ -199,7 +200,7 @@ test("validateFundingResponse accepts a well-formed payload", () => {
         confirmedAmount: { amountMinor: 75000, currency: "USD" },
         providerKey: "mock-escrow-deterministic",
         assetLabel: "sandbox-USDC",
-        networkLabel: "simulated-polkadot-asset-hub-testnet",
+        networkLabel: "simulated-network",
         environmentLabel: "sandbox",
         confirmationTime: "2026-09-03T12:00:00.000Z",
         sanitizedFailureReason: null,
@@ -242,7 +243,7 @@ test("validateFundingResponse rejects drift with BG6_FUNDING_INTERNAL_FAILED", (
         confirmedAmount: { amountMinor: 75000, currency: "USD" },
         providerKey: "mock-escrow-deterministic",
         assetLabel: "sandbox-USDC",
-        networkLabel: "simulated-polkadot-asset-hub-testnet",
+        networkLabel: "simulated-network",
         environmentLabel: "sandbox",
         confirmationTime: "2026-09-03T12:00:00.000Z",
         sanitizedFailureReason: null,

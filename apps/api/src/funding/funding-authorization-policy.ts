@@ -46,7 +46,8 @@ export type PreauthAuthorityVerdict =
         | "NOT_A_MEMBER"
         | "WORKSPACE_INELIGIBLE"
         | "SELLER_NOT_CONSENTED"
-        | "APPROVALS_INCOMPLETE";
+        | "APPROVALS_INCOMPLETE"
+        | "MISSING_BUYER_CAPABILITY";
     };
 
 /**
@@ -55,6 +56,10 @@ export type PreauthAuthorityVerdict =
  * transaction must lock so a concurrent revoke, membership deletion,
  * capability removal, or Deal state transition cannot commit between
  * the snapshot read and the BG6 write.
+ *
+ * `hasBuyerCapability` is the independently granted
+ * `WorkspaceCapability(Buyer)` row — NOT derived from membership,
+ * ownership, or Deal party identity. See ticket #64 P0-001.
  */
 export interface PreauthAuthoritySnapshot {
   readonly dealId: string;
@@ -65,6 +70,8 @@ export interface PreauthAuthoritySnapshot {
   readonly actingWorkspaceId: string;
   readonly actingWorkspaceStatus: "Active" | "Suspended";
   readonly actingUserIsMember: boolean;
+  /** True iff the buyer Workspace holds the Buyer capability. */
+  readonly hasBuyerCapability: boolean;
 
   // Current TermsVersion (MAX(version) per Deal at preauth time).
   readonly currentTermsVersionId: string | null;
@@ -89,9 +96,12 @@ export interface PreauthAuthoritySnapshot {
  *   4. The acting Workspace must be the buyer side.
  *   5. The acting Workspace must be Active.
  *   6. The acting user must be a current member of that Workspace.
- *   7. The originating ProjectRequest must be Accepted with
+ *   7. The buyer Workspace must independently hold the
+ *      `WorkspaceCapability(Buyer)` row (NOT inferred from
+ *      membership, ownership, or Deal party identity).
+ *   8. The originating ProjectRequest must be Accepted with
  *      sellerConsentAt set (GS 25 condition 1).
- *   8. Both buyer and seller approvals must exist for the current
+ *   9. Both buyer and seller approvals must exist for the current
  *      TermsVersion (GS 25 conditions 2 + 3). The exact-match
  *      re-verification lives in evaluateActivationAuthority.
  */
@@ -123,6 +133,13 @@ export function evaluatePreauthAuthority(
   }
   if (!snapshot.actingUserIsMember) {
     return { ok: false, reason: "NOT_A_MEMBER" };
+  }
+  // The Buyer capability is an independently granted
+  // WorkspaceCapability row — NOT inferred from membership,
+  // ownership, or Deal party identity. A current member without
+  // the Buyer capability is rejected here.
+  if (!snapshot.hasBuyerCapability) {
+    return { ok: false, reason: "MISSING_BUYER_CAPABILITY" };
   }
   if (
     snapshot.projectRequestStatus !== "Accepted" ||

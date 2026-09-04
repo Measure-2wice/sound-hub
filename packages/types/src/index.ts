@@ -1779,15 +1779,22 @@ export type Bg5GetDealResponseV1 = z.infer<typeof bg5GetDealResponseV1Schema>;
 export const bg6SandboxAssetLabelsV1 = ["sandbox-USDC"] as const;
 export type Bg6SandboxAssetLabelV1 = (typeof bg6SandboxAssetLabelsV1)[number];
 
-// The fixed buildathon simulated network label. Unmistakably
-// simulated ("simulated-" prefix) so a real Polkadot network
-// connection is never claimed.
-export const bg6SimulatedNetworkLabelsV1 = ["simulated-polkadot-asset-hub-testnet"] as const;
+// The fixed buildathon synthetic network label. Unmistakably
+// simulated ("simulated-" prefix and "network" generic) so no
+// concrete blockchain family is named. A future real
+// PolkaAward adapter would expose its own truthful asset /
+// network / environment labels through a separate closed tuple —
+// the BG6 application boundary remains provider-neutral.
+export const bg6SimulatedNetworkLabelsV1 = ["simulated-network"] as const;
 export type Bg6SimulatedNetworkLabelV1 = (typeof bg6SimulatedNetworkLabelsV1)[number];
 
 export const bg6EnvironmentLabelsV1 = ["sandbox"] as const;
 export type Bg6EnvironmentLabelV1 = (typeof bg6EnvironmentLabelsV1)[number];
 
+// Provider-neutral provider keys. The buildathon only wires the
+// deterministic mock; a future PolkaAward adapter (or any other
+// real adapter) extends this tuple WITHOUT changing the application
+// types.
 export const bg6ProviderKeysV1 = ["mock-escrow-deterministic"] as const;
 export type Bg6ProviderKeyV1 = (typeof bg6ProviderKeysV1)[number];
 
@@ -1862,6 +1869,79 @@ export const bg6FundDealResponseV1Schema = z
   })
   .strict();
 export type Bg6FundDealResponseV1 = z.infer<typeof bg6FundDealResponseV1Schema>;
+
+// ---------- Provider boundary contracts (BG6) ----------
+//
+// The EscrowProvider interface is provider-neutral: a deterministic
+// mock wired for the buildathon is the only adapter that ships;
+// a future PolkaAward adapter (or any real provider) extends
+// the closed `bg6ProviderKeysV1` tuple without changing the
+// application types. The strict Zod schema below is the runtime
+// boundary: every provider adapter's response is parsed through it
+// before any persistence, transition, or activation may run. A
+// failed parse fails closed and leaves the Deal Negotiating.
+//
+// The schema is `.strict()` so any unexpected field the provider
+// introduces is rejected at parse time. `providerReference` is a
+// bounded string (max 128) so the adapter cannot smuggle raw
+// exception text into the durable PaymentIntent. `confirmedAt` is
+// ISO-8601 with timezone — adapters that return epoch numbers or
+// non-ISO strings fail closed.
+
+export const bg6EscrowConfirmationV1Schema = z
+  .object({
+    providerKey: z.enum(bg6ProviderKeysV1),
+    providerReference: z.string().min(1).max(128),
+    confirmedAmountMinor: z.number().int().nonnegative(),
+    confirmedCurrency: z.literal("USD"),
+    assetLabel: z.enum(bg6SandboxAssetLabelsV1),
+    networkLabel: z.enum(bg6SimulatedNetworkLabelsV1),
+    environmentLabel: z.enum(bg6EnvironmentLabelsV1),
+    termsVersionId: z.string().min(1).max(128),
+    confirmedAt: z.string().datetime({ offset: true }),
+  })
+  .strict();
+export type Bg6EscrowConfirmationV1 = z.infer<typeof bg6EscrowConfirmationV1Schema>;
+
+// Provider request input. The internal `correlationId` is
+// INTENTIONALLY ABSENT — SoundHub's opaque durable identity is an
+// audit handle that must never cross the provider boundary. A
+// provider that needs its own external idempotency token should
+// derive it from the request's public fields (paymentIntentId is
+// the SoundHub-supplied opaque handle adapters can use for trace
+// correlation; the deterministic mock does not).
+export const bg6EscrowRequestInputV1Schema = z
+  .object({
+    paymentIntentId: z.string().min(1).max(128),
+    dealId: z.string().min(1).max(128),
+    termsVersionId: z.string().min(1).max(128),
+    termsVersionNumber: z.number().int().positive(),
+    priceAmountMinor: z.number().int().nonnegative(),
+    priceCurrency: z.literal("USD"),
+    now: z.string().datetime({ offset: true }),
+  })
+  .strict();
+export type Bg6EscrowRequestInputV1 = z.infer<typeof bg6EscrowRequestInputV1Schema>;
+
+// Sanitized failure-detail category. The closed enum below is the
+// ONLY value that may be persisted on `PaymentIntent.failureDetail`;
+// raw exception text is logged server-side only. Bounded length is
+// enforced at the application boundary so the column cannot be
+// used to smuggle provider stack traces into the database.
+export const bg6PaymentIntentFailureDetailCategoriesV1 = [
+  "PROVIDER_UNAVAILABLE",
+  "CONFIRMATION_INVALID",
+  "CONFIRMATION_MISMATCH",
+] as const;
+export type Bg6PaymentIntentFailureDetailCategoryV1 =
+  (typeof bg6PaymentIntentFailureDetailCategoriesV1)[number];
+
+export const bg6PaymentIntentFailureDetailV1Schema = z
+  .object({
+    category: z.enum(bg6PaymentIntentFailureDetailCategoriesV1),
+  })
+  .strict();
+export type Bg6PaymentIntentFailureDetailV1 = z.infer<typeof bg6PaymentIntentFailureDetailV1Schema>;
 
 // ---------- BG5 error codes (appended to the shared safe envelope) ----------
 //

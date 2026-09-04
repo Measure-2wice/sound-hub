@@ -70,7 +70,17 @@ export interface PersistedPaymentIntent {
   readonly confirmedAt: Date | null;
   readonly acceptedAt: Date | null;
   readonly failureReasonCode: string | null;
-  readonly failureDetail: string | null;
+  /**
+   * Closed sanitized failure-detail category. Raw exception text,
+   * stack traces, hostnames, secrets, or stack-frame diagnostics
+   * are NEVER persisted; server-side logs retain them. See ticket
+   * #64 P1-004.
+   */
+  readonly failureDetailCategory:
+    | "PROVIDER_UNAVAILABLE"
+    | "CONFIRMATION_INVALID"
+    | "CONFIRMATION_MISMATCH"
+    | null;
   readonly providerState: "Created" | "Confirmed" | "Failed";
   readonly createdAt: Date;
   readonly updatedAt: Date;
@@ -152,8 +162,16 @@ export interface RecordPaymentIntentFailureInput {
     | "EscrowConfirmationAmountMismatch"
     | "EscrowConfirmationCurrencyMismatch"
     | "EscrowConfirmationVersionMismatch";
-  /** Server-only raw exception text. NEVER returned in any DTO. */
-  readonly failureDetail: string;
+  /**
+   * Closed sanitized failure-detail category. The ONLY value
+   * persisted alongside `failureReasonCode`; raw exception text,
+   * stack traces, hostnames, secrets, or stack-frame diagnostics
+   * are NEVER persisted. See ticket #64 P1-004.
+   */
+  readonly failureDetailCategory:
+    | "PROVIDER_UNAVAILABLE"
+    | "CONFIRMATION_INVALID"
+    | "CONFIRMATION_MISMATCH";
 }
 
 // ---------- fundDealInTransaction (Phase 3) ----------
@@ -168,6 +186,7 @@ export type FundDealFailureReason =
   | "WORKSPACE_INELIGIBLE"
   | "SELLER_NOT_CONSENTED"
   | "APPROVALS_INCOMPLETE"
+  | "MISSING_BUYER_CAPABILITY"
   | "CONFIRMATION_AMOUNT_MISMATCH"
   | "CONFIRMATION_CURRENCY_MISMATCH"
   | "CONFIRMATION_TERMS_VERSION_MISMATCH"
@@ -235,6 +254,21 @@ export interface FundDealTransactionInput {
   readonly actingUserAccountId: string;
 }
 
+// ---------- guarded failure recorder contract ----------
+
+/**
+ * Outcome of `recordPaymentIntentFailureInTransaction` — distinguishes
+ * "the failure was persisted" from "the failure was a no-op because
+ * the intent is already Confirmed" (the latter is the
+ * Confirmed→Failed demotion guard from ticket #64 P0-002). The
+ * service uses this to surface a safe envelope when the no-op
+ * branch is taken so concurrent callers do not disagree about the
+ * intent's terminal state.
+ */
+export type RecordPaymentIntentFailureResult =
+  | { readonly ok: true; readonly persisted: true }
+  | { readonly ok: true; readonly persisted: false; readonly reason: "ALREADY_CONFIRMED" };
+
 // ---------- Public DTO mapping surface ----------
 
 /**
@@ -249,7 +283,15 @@ export interface FundingRepository {
     input: FindOrCreatePaymentIntentInput,
   ): Promise<FindOrCreatePaymentIntentResult>;
 
-  recordPaymentIntentFailureInTransaction(input: RecordPaymentIntentFailureInput): Promise<void>;
+  /**
+   * Transition the intent to Failed with the supplied closed codes.
+   * The Prisma adapter issues a guarded UPDATE that NO-OPs when the
+   * intent is already Confirmed so a late concurrent failure cannot
+   * demote a confirmed payment. See ticket #64 P0-002.
+   */
+  recordPaymentIntentFailureInTransaction(
+    input: RecordPaymentIntentFailureInput,
+  ): Promise<RecordPaymentIntentFailureResult>;
 
   fundDealInTransaction(
     input: FundDealTransactionInput,
@@ -259,9 +301,10 @@ export interface FundingRepository {
   /**
    * Read the persisted PaymentIntent for the current
    * (dealId, termsVersionId) tuple. Returns null when no intent
-   * exists yet. Used by the service to surface the public funding
-   * status on a fresh page load (the route does NOT need to wait
-   * for a fundDeal response to render the current intent state).
+   * exists yet. Used by the service for the idempotent Confirmed
+   * retry path (P1-001) — a second identical fundDeal command
+   * recognizes an existing Confirmed intent before any preauth /
+   * provider call / transaction runs.
    */
   findCurrentPaymentIntent(dealId: string): Promise<PersistedPaymentIntent | null>;
 }

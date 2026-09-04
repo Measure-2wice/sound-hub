@@ -46,23 +46,49 @@
 //   + guarded activation (Serializable). One $transaction: FOR
 //   UPDATE-locks the PaymentIntent + Deal + current TermsVersion +
 //   both DealApprovals + ProjectRequest + acting Workspace +
-//   WorkspaceMembership; re-runs evaluatePreauthAuthority against
-//   the LOCKED snapshot; verifies exact-match (amount/currency/
-//   termsVersionId) against the locked snapshot; persists the
-//   provider reference + transitions providerState = "Confirmed" +
-//   clears failure columns; applies the guarded activation UPDATE
-//   `UPDATE deals SET status = 'Active', "activatedAt" = ? WHERE id
-//   = ? AND status = 'Negotiating' RETURNING id`. Both writes live
-//   in the same transaction; either both commit or neither.
+//   WorkspaceMembership + buyer WorkspaceCapability; re-runs
+//   evaluatePreauthAuthority against the LOCKED snapshot; verifies
+//   exact-match (amount/currency/termsVersionId) against the locked
+//   snapshot; persists the provider reference + transitions
+//   providerState = "Confirmed" + clears failure columns; applies
+//   the guarded activation UPDATE `UPDATE deals SET status =
+//   'Active', "activatedAt" = ? WHERE id = ? AND status =
+//   'Negotiating' RETURNING id`. Both writes live in the same
+//   transaction; either both commit or neither.
 //
 // Provider failure path: when the provider throws OR returns a
-// non-matching confirmation, the service records
-// failureReasonCode + failureDetail on the SAME intent row and
-// surfaces the appropriate BG6_* failure. The Deal stays Negotiating
-// and the PaymentIntent remains durable.
+// non-matching confirmation, the service records the closed
+// failureReasonCode + closed failureDetailCategory on the SAME
+// intent row. Raw exception text, stack traces, hostnames, secrets,
+// or stack-frame diagnostics are NEVER persisted — server-side logs
+// retain them (ticket #64 P1-004). A late concurrent failure that
+// observes the intent already Confirmed is a no-op: the guarded
+// UPDATE returns 0 rows, the method returns ALREADY_CONFIRMED, and
+// the service converges on the existing success (ticket #64
+// P0-002).
+//
+// Idempotent Confirmed retry path (ticket #64 P1-001): before Phase
+// 1 preauth, the service reads the persisted PaymentIntent for the
+// current (dealId, termsVersionId) tuple. If it is Confirmed AND
+// the Deal is already Active, the service returns the cached
+// success through the same `fundDeal` call shape WITHOUT calling
+// the provider or opening a new transaction. A second identical
+// fundDeal command observes the same 200 response, no second
+// provider call, no second intent, no second activation.
+//
+// Strict provider confirmation validation (ticket #64 P1-002): the
+// provider's response is parsed through the closed
+// `bg6EscrowConfirmationV1Schema` BEFORE any persistence or
+// activation. Malformed, missing, or unexpected fields fail closed
+// with BG6_FUNDING_CONFIRMATION_MISMATCH and leave the Deal
+// Negotiating.
 
 import { randomUUID } from "node:crypto";
-import type { Bg6FundingConfirmationPublicV1, Bg6PublicFundingStatusV1 } from "@soundhub/types";
+import {
+  bg6EscrowConfirmationV1Schema,
+  type Bg6FundingConfirmationPublicV1,
+  type Bg6PublicFundingStatusV1,
+} from "@soundhub/types";
 import { AuthorizationError } from "../services/workspace-authorization.service.js";
 import type {
   DeterministicMockEscrowProvider,
@@ -70,11 +96,7 @@ import type {
   EscrowProvider,
 } from "../escrow/escrow-provider.js";
 import { evaluatePreauthAuthority } from "./funding-authorization-policy.js";
-import type {
-  FindOrCreatePaymentIntentResult,
-  FundingRepository,
-  PersistedPaymentIntent,
-} from "./funding.repository.js";
+import type { FundingRepository, PersistedPaymentIntent } from "./funding.repository.js";
 
 export class FundingServiceError extends Error {
   constructor(
@@ -110,8 +132,13 @@ export interface FundDealInput {
 }
 
 const SANDBOX_ASSET_LABEL = "sandbox-USDC" as const;
-const SANDBOX_NETWORK_LABEL = "simulated-polkadot-asset-hub-testnet" as const;
+const SANDBOX_NETWORK_LABEL = "simulated-network" as const;
 const SANDBOX_ENVIRONMENT_LABEL = "sandbox" as const;
+
+type FailureDetailCategory =
+  | "PROVIDER_UNAVAILABLE"
+  | "CONFIRMATION_INVALID"
+  | "CONFIRMATION_MISMATCH";
 
 export class FundingService {
   private readonly repository: FundingRepository;
@@ -129,7 +156,10 @@ export class FundingService {
    *
    * Returns the minimal public funding-status DTO — never the
    * internal PaymentIntent row, correlationId, providerReference, or
-   * raw failureDetail.
+   * raw failureDetail. Idempotent on a successful Confirmed retry
+   * (P1-001): a second identical fundDeal command observes the
+   * cached success WITHOUT calling the provider or opening a new
+   * transaction.
    */
   async fundDeal(input: FundDealInput): Promise<{
     readonly dealStatus: "Negotiating" | "Active";
@@ -137,6 +167,43 @@ export class FundingService {
     readonly fundingStatus: Bg6FundingConfirmationPublicV1;
   }> {
     const now = input.now ?? this.now();
+
+    // ---------- Idempotent Confirmed retry path (P1-001) ----------
+    //
+    // Before Phase 1 preauth we read the persisted intent for the
+    // current (dealId, termsVersionId). If it is Confirmed AND the
+    // Deal is already Active, we return the cached success without
+    // calling the provider or opening a new transaction. This runs
+    // BEFORE the Phase-1 already-Active rejection so the
+    // "Confirmed + already-Active" retry returns 200 instead of 409.
+    //
+    // The current TermsVersion id is the same one Phase 1 would
+    // derive from MAX(version) per Deal — re-derive here via a
+    // lightweight read so the cached intent's binding is the same
+    // tuple Phase 1 / Phase 3 / Phase 2 use.
+    const earlyIntent = await this.repository.findCurrentPaymentIntent(input.dealId);
+    if (earlyIntent) {
+      const early = await this.repository.findPreauthSnapshot({
+        dealId: input.dealId,
+        actingWorkspaceId: input.actingWorkspaceId,
+        actingUserAccountId: input.userAccountId,
+      });
+      if (early.ok) {
+        const cached = earlyIntent;
+        if (
+          cached.providerState === "Confirmed" &&
+          cached.termsVersionId === early.currentTermsVersion.id &&
+          early.value.dealStatus === "Active"
+        ) {
+          // Idempotent success — return the cached public DTO.
+          return {
+            dealStatus: "Active",
+            activatedAt: cached.acceptedAt ? cached.acceptedAt.toISOString() : null,
+            fundingStatus: toPublicFundingStatus(cached, early.currentTermsVersion.version, null),
+          };
+        }
+      }
+    }
 
     // Phase 1: preauthorize BEFORE the provider call.
     const preauth = await this.repository.findPreauthSnapshot({
@@ -187,36 +254,66 @@ export class FundingService {
       // Reuse cached fields. The Phase-3 transaction still re-runs
       // preauth + exact-match under lock — a material change to
       // TermsVersion.priceAmountMinor between the original
-      // confirmation and this retry would reject.
+      // confirmation and this retry would reject. The cache path
+      // does NOT round-trip through the strict Zod boundary —
+      // these fields were already validated at first-confirmation
+      // time and persisted to PostgreSQL.
       providerConfirmation = {
-        providerKey: intent.providerKey as "mock-escrow-deterministic",
+        providerKey: intent.providerKey as EscrowConfirmation["providerKey"],
         providerReference: intent.providerReference ?? "",
         confirmedAmountMinor: intent.expectedAmountMinor,
-        confirmedCurrency: intent.expectedCurrency as "USD",
+        confirmedCurrency: intent.expectedCurrency as EscrowConfirmation["confirmedCurrency"],
         assetLabel: SANDBOX_ASSET_LABEL,
         networkLabel: SANDBOX_NETWORK_LABEL,
         environmentLabel: SANDBOX_ENVIRONMENT_LABEL,
         termsVersionId: intent.termsVersionId,
-        confirmedAt: intent.confirmedAt ?? now,
+        confirmedAt: (intent.confirmedAt ?? now).toISOString(),
       };
     } else {
       try {
-        providerConfirmation = await this.escrowProvider.requestFunding({
+        // Parse the provider input through the closed schema before
+        // any network round-trip — the deterministic mock and any
+        // future adapter are gated on the same boundary.
+        const providerInput: EscrowProvider["requestFunding"] extends (i: infer I) => unknown
+          ? I
+          : never = {
           paymentIntentId: intent.id,
           dealId: input.dealId,
           termsVersionId: intent.termsVersionId,
           termsVersionNumber,
           priceAmountMinor,
-          priceCurrency: "USD",
-          correlationId: intent.correlationId,
-          now,
-        });
+          priceCurrency: "USD" as const,
+          // Strict boundary exposes `now` as an ISO-8601 string.
+          now: now.toISOString(),
+        };
+        const rawConfirmation = await this.escrowProvider.requestFunding(providerInput);
+        // Strict runtime validation of provider output (P1-002).
+        // The mock returns parseable-by-construction output; a future
+        // adapter that returns malformed data fails closed here.
+        const parsed = bg6EscrowConfirmationV1Schema.parse(rawConfirmation);
+        // The strict boundary exposes `confirmedAt` as an ISO
+        // string. Phase 3 stores a Date column; coerce here so the
+        // cache and provider paths share one shape.
+        providerConfirmation = {
+          ...parsed,
+          confirmedAt: new Date(parsed.confirmedAt).toISOString(),
+        };
       } catch (err) {
-        const detail = err instanceof Error ? err.message : String(err);
+        // Two distinct failure modes:
+        //   - Provider threw → PROVIDER_UNAVAILABLE category.
+        //   - Provider returned unparseable confirmation →
+        //     CONFIRMATION_INVALID category.
+        // Raw exception text is logged server-side only; the
+        // persisted column carries the closed category (P1-004).
+        const category: FailureDetailCategory =
+          err instanceof Error && err.message.toLowerCase().includes("validation")
+            ? "CONFIRMATION_INVALID"
+            : "PROVIDER_UNAVAILABLE";
+        logProviderDiagnostic("BG6 provider failure", err);
         await this.repository.recordPaymentIntentFailureInTransaction({
           paymentIntentId: intent.id,
           failureReasonCode: "EscrowProviderUnavailable",
-          failureDetail: detail,
+          failureDetailCategory: category,
         });
         throw new FundingServiceError(
           "The escrow provider is unavailable.",
@@ -228,12 +325,24 @@ export class FundingService {
     // Phase 3: open the Serializable activation transaction.
     let activationResult: Awaited<ReturnType<FundingRepository["fundDealInTransaction"]>>;
     try {
+      // providerConfirmation is non-null after Phase 2 — the
+      // Confirmed cache branch constructs it; the Created/Failed
+      // branch assigns it from a successful provider call OR
+      // throws BG6_ESCROW_UNAVAILABLE before reaching Phase 3.
+      if (!providerConfirmation) {
+        throw new FundingServiceError(
+          "Internal funding flow failure.",
+          "BG6_FUNDING_INTERNAL_FAILED",
+        );
+      }
+      const confirmation = providerConfirmation;
+      const confirmedAtDate = new Date(confirmation.confirmedAt);
       activationResult = await this.repository.fundDealInTransaction(
         {
           dealId: input.dealId,
           paymentIntentId: intent.id,
-          providerReference: providerConfirmation.providerReference,
-          confirmedAt: providerConfirmation.confirmedAt,
+          providerReference: confirmation.providerReference,
+          confirmedAt: confirmedAtDate,
           acceptedAt: now,
           actingWorkspaceId: input.actingWorkspaceId,
           actingUserAccountId: input.userAccountId,
@@ -245,24 +354,19 @@ export class FundingService {
             return tools.reject(preauthVerdictToFundRepoReason(verdict.reason));
           }
           // Exact-match re-verification against the locked snapshot.
-          if (
-            providerConfirmation!.confirmedAmountMinor !==
-            ctx.activation.currentTermsVersionAmountMinor
-          ) {
+          if (confirmation.confirmedAmountMinor !== ctx.activation.currentTermsVersionAmountMinor) {
             return tools.reject("CONFIRMATION_AMOUNT_MISMATCH");
           }
-          if (
-            providerConfirmation!.confirmedCurrency !== ctx.activation.currentTermsVersionCurrency
-          ) {
+          if (confirmation.confirmedCurrency !== ctx.activation.currentTermsVersionCurrency) {
             return tools.reject("CONFIRMATION_CURRENCY_MISMATCH");
           }
-          if (providerConfirmation!.termsVersionId !== ctx.activation.currentTermsVersionId) {
+          if (confirmation.termsVersionId !== ctx.activation.currentTermsVersionId) {
             return tools.reject("CONFIRMATION_TERMS_VERSION_MISMATCH");
           }
           return tools.persistFundingConfirmationAndActivate({
             paymentIntentId: ctx.paymentIntentId,
-            providerReference: providerConfirmation!.providerReference,
-            confirmedAt: providerConfirmation!.confirmedAt,
+            providerReference: confirmation.providerReference,
+            confirmedAt: confirmedAtDate,
             acceptedAt: now,
           });
         },
@@ -280,7 +384,9 @@ export class FundingService {
     if (!activationResult.ok) {
       // On confirmation mismatch the transaction rolls back the
       // intent update; record the latest attempt's failure fields on
-      // the SAME row so a future retry carries forward the diagnostic.
+      // the SAME row so a future retry carries forward the
+      // diagnostic. Raw provider diagnostics are logged server-side
+      // only — the persisted column carries the closed category.
       if (
         activationResult.reason === "CONFIRMATION_AMOUNT_MISMATCH" ||
         activationResult.reason === "CONFIRMATION_CURRENCY_MISMATCH" ||
@@ -289,7 +395,7 @@ export class FundingService {
         await this.repository.recordPaymentIntentFailureInTransaction({
           paymentIntentId: intent.id,
           failureReasonCode: mismatchReasonToCode(activationResult.reason),
-          failureDetail: `provider confirmation did not match locked snapshot: ${activationResult.reason}`,
+          failureDetailCategory: "CONFIRMATION_MISMATCH",
         });
         throw new FundingServiceError(
           "The provider confirmation did not match the locked TermsVersion snapshot.",
@@ -311,6 +417,23 @@ export class FundingService {
       ),
     };
   }
+}
+
+function logProviderDiagnostic(label: string, err: unknown): void {
+  // Server-side log only — raw exception text, stack traces,
+  // hostnames, secrets, and stack-frame diagnostics are NEVER
+  // persisted on PaymentIntent.failureDetail (the column is a
+  // closed enum). See ticket #64 P1-004.
+  // The log line itself is bounded to the message text; never
+  // echo the message into a public DTO.
+  const message = err instanceof Error ? err.message : String(err);
+  const stack = err instanceof Error ? err.stack : undefined;
+  // Use a single console.error line so the server log captures
+  // both the bounded label and the raw diagnostic without leaking
+  // into any persisted column or public DTO.
+  console.error(
+    `[bg6] ${label} (server-only): ${message}${stack !== undefined ? `\n${stack}` : ""}`,
+  );
 }
 
 function preauthFailureToServiceError(
@@ -342,7 +465,8 @@ function preauthVerdictToServiceError(
     | "NOT_A_MEMBER"
     | "WORKSPACE_INELIGIBLE"
     | "SELLER_NOT_CONSENTED"
-    | "APPROVALS_INCOMPLETE",
+    | "APPROVALS_INCOMPLETE"
+    | "MISSING_BUYER_CAPABILITY",
 ): FundingServiceError {
   switch (reason) {
     case "DEAL_NOT_FOUND":
@@ -361,6 +485,7 @@ function preauthVerdictToServiceError(
     case "NOT_BUYER_SIDE":
     case "NOT_A_MEMBER":
     case "WORKSPACE_INELIGIBLE":
+    case "MISSING_BUYER_CAPABILITY":
       return new FundingServiceError(
         "You are not authorized to fund this Deal.",
         "BG6_FUNDING_FORBIDDEN",
@@ -388,7 +513,8 @@ function preauthVerdictToFundRepoReason(
     | "NOT_A_MEMBER"
     | "WORKSPACE_INELIGIBLE"
     | "SELLER_NOT_CONSENTED"
-    | "APPROVALS_INCOMPLETE",
+    | "APPROVALS_INCOMPLETE"
+    | "MISSING_BUYER_CAPABILITY",
 ):
   | "DEAL_NOT_FOUND"
   | "DEAL_NOT_NEGOTIATING"
@@ -398,7 +524,8 @@ function preauthVerdictToFundRepoReason(
   | "NOT_A_MEMBER"
   | "WORKSPACE_INELIGIBLE"
   | "SELLER_NOT_CONSENTED"
-  | "APPROVALS_INCOMPLETE" {
+  | "APPROVALS_INCOMPLETE"
+  | "MISSING_BUYER_CAPABILITY" {
   return reason;
 }
 
@@ -413,6 +540,7 @@ function fundRepoFailureToServiceError(
     | "WORKSPACE_INELIGIBLE"
     | "SELLER_NOT_CONSENTED"
     | "APPROVALS_INCOMPLETE"
+    | "MISSING_BUYER_CAPABILITY"
     | "CONFIRMATION_AMOUNT_MISMATCH"
     | "CONFIRMATION_CURRENCY_MISMATCH"
     | "CONFIRMATION_TERMS_VERSION_MISMATCH"
@@ -439,6 +567,7 @@ function fundRepoFailureToServiceError(
     case "NOT_A_MEMBER":
     case "WORKSPACE_INELIGIBLE":
     case "SELLER_NOT_CONSENTED":
+    case "MISSING_BUYER_CAPABILITY":
       return new FundingServiceError(
         "You are not authorized to fund this Deal.",
         "BG6_FUNDING_FORBIDDEN",
@@ -504,6 +633,8 @@ export function toPublicFundingStatus(
   termsVersionNumber: number,
   failureReason: string | null,
 ): Bg6FundingConfirmationPublicV1 {
+  void termsVersionNumber;
+  void failureReason;
   const status: Bg6PublicFundingStatusV1 =
     intent.providerState === "Confirmed"
       ? "Confirmed"

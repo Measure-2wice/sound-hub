@@ -1,3 +1,4 @@
+/* eslint-disable @typescript-eslint/no-floating-promises */
 // Pure evaluator tests for the BG6 funding authorization policy.
 
 import assert from "node:assert/strict";
@@ -20,6 +21,7 @@ function makePreauthSnapshot(
     actingWorkspaceId: "ws_buyer",
     actingWorkspaceStatus: "Active",
     actingUserIsMember: true,
+    hasBuyerCapability: true,
     currentTermsVersionId: "tv_current",
     currentTermsVersionDealId: "deal_test_001",
     projectRequestStatus: "Accepted",
@@ -84,6 +86,15 @@ test("evaluatePreauthAuthority: WORKSPACE_INELIGIBLE when buyer WS is Suspended"
 test("evaluatePreauthAuthority: NOT_A_MEMBER when user has lost membership", () => {
   const verdict = evaluatePreauthAuthority(makePreauthSnapshot({ actingUserIsMember: false }));
   assert.deepEqual(verdict, { ok: false, reason: "NOT_A_MEMBER" });
+});
+
+test("evaluatePreauthAuthority: MISSING_BUYER_CAPABILITY when buyer Workspace lacks Buyer capability", () => {
+  // Per ticket #64 P0-001 the Buyer capability is an independently
+  // granted WorkspaceCapability row — NOT inferred from membership,
+  // ownership, or Deal party identity. A current member of the
+  // buyer Workspace without the Buyer capability is rejected here.
+  const verdict = evaluatePreauthAuthority(makePreauthSnapshot({ hasBuyerCapability: false }));
+  assert.deepEqual(verdict, { ok: false, reason: "MISSING_BUYER_CAPABILITY" });
 });
 
 test("evaluatePreauthAuthority: SELLER_NOT_CONSENTED when PR is Pending", () => {

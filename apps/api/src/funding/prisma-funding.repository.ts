@@ -44,14 +44,27 @@
 // Phase 3 transaction: opens a Serializable $transaction, FOR
 // UPDATE-locks the PaymentIntent + Deal + TermsVersion + both
 // DealApprovals + ProjectRequest + acting Workspace +
-// WorkspaceMembership, hands the locked snapshot to the use case.
-// On `persistFundingConfirmationAndActivate`, the repository:
+// WorkspaceMembership + buyer WorkspaceCapability, hands the locked
+// snapshot to the use case. On `persistFundingConfirmationAndActivate`,
+// the repository:
 //   - `tx.paymentIntent.update` to transition the intent to
 //     `providerState = "Confirmed"`, persist `providerReference` +
 //     `confirmedAt` + `acceptedAt`, and clear the failure columns.
 //   - raw guarded `UPDATE deals SET status = 'Active', "activatedAt"
 //     = ? WHERE id = ? AND status = 'Negotiating' RETURNING id`.
 //     `RETURNING` 0 rows => `DEAL_ALREADY_ACTIVE`.
+//
+// Concurrency safety:
+//   - The failure recorder is a guarded UPDATE
+//     `WHERE id = ? AND "providerState" <> 'Confirmed'`. A concurrent
+//     success that has already Committed the Confirmed state is
+//     observed by the slow failure attempt; the UPDATE matches 0
+//     rows; the method returns `ALREADY_CONFIRMED` rather than
+//     demoting the intent (ticket #64 P0-002).
+//   - The Buyer capability row is FOR UPDATE-locked in BOTH Phase 1
+//     (best-effort read) and Phase 3 (transactional revalidation).
+//     A revocation between phases fails closed with
+//     `MISSING_BUYER_CAPABILITY` (ticket #64 P0-001).
 //
 // All four transactional methods retry on P2034 (serialization
 // conflict) up to a bounded budget (3 attempts). After the budget
@@ -78,6 +91,7 @@ import type {
   PersistedDealSummaryForFunding,
   PersistedPaymentIntent,
   RecordPaymentIntentFailureInput,
+  RecordPaymentIntentFailureResult,
 } from "./funding.repository.js";
 
 // Small fixed maximum. Mirrors the BG4 retry budget; not a generalized
@@ -170,6 +184,16 @@ export class PrismaFundingRepository implements FundingRepository {
         AND m."workspaceId" = ${input.actingWorkspaceId}
     `;
     const member = memberRows[0];
+    // Read the buyer WorkspaceCapability(Buyer) row. Phase 1 is a
+    // best-effort check; Phase 3 re-validates under FOR UPDATE.
+    // Capability is NOT inferred from membership, ownership, or
+    // Deal party identity — the closed WorkspaceCapability table is
+    // the authoritative source.
+    const capabilityRows = await this.prisma.$queryRaw<{ readonly capability: string }[]>`
+      SELECT capability FROM workspace_capabilities
+      WHERE "workspaceId" = ${deal.buyerWorkspaceId} AND capability = 'Buyer'
+    `;
+    const hasBuyerCapability = capabilityRows.length > 0;
     const approvals = await this.prisma.dealApproval.findMany({
       where: { termsVersionId: current.id },
       select: { workspaceId: true },
@@ -188,6 +212,7 @@ export class PrismaFundingRepository implements FundingRepository {
       actingWorkspaceId: input.actingWorkspaceId,
       actingWorkspaceStatus: member?.status ?? "Suspended",
       actingUserIsMember: member !== undefined,
+      hasBuyerCapability,
       currentTermsVersionId: current.id,
       currentTermsVersionDealId: current.dealId,
       projectRequestStatus: projectRequest.status,
@@ -293,18 +318,32 @@ export class PrismaFundingRepository implements FundingRepository {
   }
 
   // ---------- recordPaymentIntentFailureInTransaction ----------
-
+  //
+  // Guarded UPDATE: a slow failing provider attempt must NOT be
+  // able to demote a Confirmed PaymentIntent that a concurrent
+  // success has already committed. The predicate
+  // `"providerState" <> 'Confirmed'` makes the UPDATE a no-op when
+  // the row is already Confirmed; the caller (the service) maps
+  // the `ALREADY_CONFIRMED` return onto the idempotent success
+  // path. See ticket #64 P0-002.
   async recordPaymentIntentFailureInTransaction(
     input: RecordPaymentIntentFailureInput,
-  ): Promise<void> {
-    await this.prisma.paymentIntent.update({
-      where: { id: input.paymentIntentId },
+  ): Promise<RecordPaymentIntentFailureResult> {
+    const updated = await this.prisma.paymentIntent.updateMany({
+      where: {
+        id: input.paymentIntentId,
+        providerState: { not: "Confirmed" },
+      },
       data: {
         providerState: "Failed",
         failureReasonCode: input.failureReasonCode,
-        failureDetail: input.failureDetail,
+        failureDetailCategory: input.failureDetailCategory,
       },
     });
+    if (updated.count === 1) {
+      return { ok: true, persisted: true };
+    }
+    return { ok: true, persisted: false, reason: "ALREADY_CONFIRMED" };
   }
 
   // ---------- fundDealInTransaction ----------
@@ -420,11 +459,22 @@ export class PrismaFundingRepository implements FundingRepository {
           FOR UPDATE OF w, m
         `;
         const memberRow = memberRows[0];
-        // Step 6: read both DealApprovals for the current TermsVersion.
-        const approvals = await tx.dealApproval.findMany({
-          where: { termsVersionId: currentVersionId },
-          select: { workspaceId: true },
-        });
+        // Step 6: FOR UPDATE-lock the buyer WorkspaceCapability(Buyer)
+        // row. A revocation between Phase 1 and Phase 3 fails closed
+        // here. Capability is NEVER inferred from membership,
+        // ownership, or Deal party identity — see ticket #64 P0-001.
+        const capabilityRows = await tx.$queryRaw<{ readonly capability: string }[]>`
+          SELECT capability FROM workspace_capabilities
+          WHERE "workspaceId" = ${dealRow.buyerWorkspaceId} AND capability = 'Buyer'
+          FOR UPDATE
+        `;
+        const hasBuyerCapability = capabilityRows.length > 0;
+        // Step 7: lock both DealApprovals for the current TermsVersion.
+        const approvals = await tx.$queryRaw<{ readonly workspaceId: string }[]>`
+          SELECT "workspaceId" FROM deal_approvals
+          WHERE "termsVersionId" = ${currentVersionId}
+          FOR UPDATE
+        `;
         let buyerApproval = false;
         let sellerApproval = false;
         for (const approval of approvals) {
@@ -439,6 +489,7 @@ export class PrismaFundingRepository implements FundingRepository {
           actingWorkspaceId: input.actingWorkspaceId,
           actingWorkspaceStatus: memberRow?.status ?? "Suspended",
           actingUserIsMember: memberRow !== undefined,
+          hasBuyerCapability,
           currentTermsVersionId: currentVersionId,
           currentTermsVersionDealId: tvRow.dealId,
           projectRequestStatus: prRow.status,
@@ -488,7 +539,7 @@ export class PrismaFundingRepository implements FundingRepository {
             acceptedAt: outcome.input.acceptedAt,
             providerState: "Confirmed",
             failureReasonCode: null,
-            failureDetail: null,
+            failureDetailCategory: null,
           },
         });
         // Guarded activation UPDATE. RETURNING 0 rows => deal is no
@@ -552,7 +603,11 @@ function toPersistedPaymentIntent(row: {
   confirmedAt: Date | null;
   acceptedAt: Date | null;
   failureReasonCode: string | null;
-  failureDetail: string | null;
+  failureDetailCategory:
+    | "PROVIDER_UNAVAILABLE"
+    | "CONFIRMATION_INVALID"
+    | "CONFIRMATION_MISMATCH"
+    | null;
   providerState: "Created" | "Confirmed" | "Failed";
   createdAt: Date;
   updatedAt: Date;
@@ -574,7 +629,7 @@ function toPersistedPaymentIntent(row: {
     confirmedAt: row.confirmedAt,
     acceptedAt: row.acceptedAt,
     failureReasonCode: row.failureReasonCode,
-    failureDetail: row.failureDetail,
+    failureDetailCategory: row.failureDetailCategory,
     providerState: row.providerState,
     createdAt: row.createdAt,
     updatedAt: row.updatedAt,

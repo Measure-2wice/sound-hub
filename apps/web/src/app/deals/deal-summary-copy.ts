@@ -38,7 +38,8 @@ export function buildPublicFundingStatusCopy(
 ): string {
   if (status === "Confirmed") return "Funding confirmed (sandbox)";
   if (status === "AwaitingConfirmation") return "Awaiting sandbox confirmation";
-  // Failed — render the closed sanitized code only; never raw text.
+  // Failed — render the closed sanitized code only; never raw
+  // provider exception text. See ticket #64 P1-004.
   return sanitizedReason ? `Funding failed (${sanitizedReason})` : "Funding failed";
 }
 

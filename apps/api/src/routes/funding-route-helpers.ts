@@ -6,7 +6,7 @@
 // because it is BG6-specific; the BG5 code path is unaffected.
 
 import type { Request, Response } from "express";
-import { ZodError, type ZodSchema } from "zod";
+import type { ZodSchema } from "zod";
 import { buildFieldErrors, buildSafeError, writeSafeError } from "../lib/errors.js";
 import { SESSION_COOKIE } from "../lib/session-cookie.js";
 import { FundingServiceError } from "../funding/funding.service.js";
@@ -89,7 +89,7 @@ export function validateFundingRequestBody<TSchema extends ZodSchema>(
         "BG6_FUNDING_INVALID",
         `${actionLabel} failed schema validation.`,
         buildFieldErrors(
-          (parsed.error as ZodError).issues.map((issue) => ({
+          parsed.error.issues.map((issue) => ({
             path: issue.path,
             code: issue.code,
             message: issue.message,
@@ -126,7 +126,7 @@ export function validateFundingResponse<TSchema extends ZodSchema>(
         "BG6_FUNDING_INTERNAL_FAILED",
         `${actionLabel} response drift detected.`,
         buildFieldErrors(
-          (parsed.error as ZodError).issues.map((issue) => ({
+          parsed.error.issues.map((issue) => ({
             path: issue.path,
             code: issue.code,
             message: issue.message,

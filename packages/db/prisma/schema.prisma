@@ -137,6 +137,21 @@ enum PaymentIntentFailureReasonCode {
   EscrowConfirmationVersionMismatch
 }
 
+// Closed sanitized failure-detail category. The ONLY persisted
+// value allowed alongside `failureReasonCode`. Raw provider
+// exception text, stack traces, hostnames, secrets, or stack-frame
+// diagnostics are NEVER persisted. See ticket #64 P1-004.
+enum PaymentIntentFailureDetailCategory {
+  // Provider threw or returned an unparseable response.
+  PROVIDER_UNAVAILABLE
+  // Provider returned a parseable response that failed strict
+  // runtime validation (malformed fields, wrong labels, etc.).
+  CONFIRMATION_INVALID
+  // Provider returned a parseable response whose amount/currency/
+  // termsVersionId did not match the locked snapshot.
+  CONFIRMATION_MISMATCH
+}
+
 // ---------- Identity and authority ----------
 
 model UserAccount {
@@ -1055,8 +1070,10 @@ model PaymentIntent {
   // never claimed.
   assetLabel        String
   // Truthful network label. The mock provider returns
-  // "simulated-polkadot-asset-hub-testnet" — unmistakably simulated
-  // so a real Polkadot connection is never claimed.
+  // "simulated-network" — a generic synthetic label so no concrete
+  // blockchain family is named. A future real PolkaAward adapter
+  // returns its own truthful real-network label through the same
+  // column; the BG6 application boundary remains provider-neutral.
   networkLabel      String
   // The provider key that owns this intent. Fixed at
   // "mock-escrow-deterministic" for BG6.
@@ -1082,17 +1099,19 @@ model PaymentIntent {
   // providers whose confirmation arrives asynchronously.
   acceptedAt        DateTime?
   // Closed sanitized reason code persisted when the intent transitions
-  // to Failed. The raw exception text is captured in `failureDetail`
-  // (server-only, never crosses any public DTO).
-  failureReasonCode PaymentIntentFailureReasonCode?
-  // Server-only raw provider exception text. NEVER returned in any
-  // public DTO; logged alongside the closed `failureReasonCode`.
-  failureDetail     String?
+  // to Failed. The closed category is captured in `failureDetailCategory`
+  // (server-side log retains raw provider diagnostics; never persisted).
+  failureReasonCode       PaymentIntentFailureReasonCode?
+  // Closed sanitized failure-detail category. ONLY a value from the
+  // `PaymentIntentFailureDetailCategory` enum may be persisted; raw
+  // exception text, stack traces, hostnames, secrets, or stack-frame
+  // diagnostics are NEVER persisted. See ticket #64 P1-004.
+  failureDetailCategory   PaymentIntentFailureDetailCategory?
   // Closed lifecycle state. Defaults to "Created" so the row is
   // semantically meaningful immediately after persistence.
-  providerState     PaymentIntentProviderState @default(Created)
-  createdAt         DateTime                  @default(now())
-  updatedAt         DateTime                  @updatedAt
+  providerState           PaymentIntentProviderState          @default(Created)
+  createdAt               DateTime                            @default(now())
+  updatedAt               DateTime                            @updatedAt
 
   deal            Deal         @relation(fields: [dealId], references: [id], onDelete: Restrict)
   termsVersion    TermsVersion @relation(fields: [termsVersionId], references: [id], onDelete: Restrict)

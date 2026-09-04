@@ -1,10 +1,17 @@
-// Provider-layer tests for the deterministic mock escrow provider.
+/* eslint-disable @typescript-eslint/no-floating-promises */
+// Provider-layer tests for the deterministic mock escrow provider
+// (BG6).
 //
 // Per refinement feedback: provider failure tests live at the
 // provider/service layer (this file plus funding.service.test.ts);
 // repository tests focus on persisted state, transactionality,
 // locking, retry safety, exact-version/amount matching, and guarded
 // activation.
+//
+// The provider boundary is provider-neutral: a future PolkaAward
+// adapter (or any real provider) slots into the same interface
+// without changing the application boundary. The deterministic mock
+// returns unmistakably synthetic labels — see ticket #64 P1-006.
 
 import assert from "node:assert/strict";
 import test from "node:test";
@@ -18,8 +25,7 @@ function makeInput(overrides: Partial<EscrowRequestInput> = {}): EscrowRequestIn
     termsVersionNumber: 1,
     priceAmountMinor: 75000,
     priceCurrency: "USD",
-    correlationId: "00000000-0000-4000-8000-000000000001",
-    now: new Date("2026-09-03T12:00:00.000Z"),
+    now: "2026-09-03T12:00:00.000Z",
     ...overrides,
   };
 }
@@ -38,13 +44,18 @@ test("requestFunding returns a confirmation whose amount/currency/termsVersionId
   assert.equal(confirmation.termsVersionId, input.termsVersionId);
 });
 
-test("requestFunding uses the unmistakable simulated network label — never 'sandbox-polkadot-...'", async () => {
+test("requestFunding returns the unmistakable synthetic network label — never a real network family", async () => {
   const provider = new DeterministicMockEscrowProvider();
   const confirmation = await provider.requestFunding(makeInput());
-  assert.equal(confirmation.networkLabel, "simulated-polkadot-asset-hub-testnet");
-  // Explicit anti-assertion: a real network label is never claimed.
+  // Per ticket #64 P1-006 — the mock has zero blockchain
+  // connectivity so the network label must be unmistakably synthetic.
+  // The closed tuple in @soundhub/types now exposes only
+  // "simulated-network"; no concrete blockchain family is named.
+  assert.equal(confirmation.networkLabel, "simulated-network");
+  // Anti-assertions: no real network family is ever claimed.
   assert.notEqual(confirmation.networkLabel, "sandbox-polkadot-asset-hub-testnet");
   assert.notEqual(confirmation.networkLabel, "polkadot-asset-hub-testnet");
+  assert.notEqual(confirmation.networkLabel, "polkadot");
 });
 
 test("requestFunding returns the fixed asset / environment / provider labels", async () => {
@@ -55,29 +66,44 @@ test("requestFunding returns the fixed asset / environment / provider labels", a
   assert.equal(confirmation.providerKey, "mock-escrow-deterministic");
 });
 
-test("requestFunding produces a deterministic providerReference for the same input", async () => {
+test("EscrowRequestInput is provider-neutral: NO correlationId field is exposed (P1-003)", () => {
+  // The internal correlationId is SoundHub's opaque durable audit
+  // identity. The provider MUST NOT see this value. A provider
+  // that needs an external idempotency token should derive it
+  // from the public paymentIntentId (the SoundHub-supplied opaque
+  // handle adapters can use for trace correlation).
+  const input = makeInput() as unknown as Record<string, unknown>;
+  assert.equal(
+    Object.prototype.hasOwnProperty.call(input, "correlationId"),
+    false,
+    "EscrowRequestInput MUST NOT carry SoundHub's internal correlationId",
+  );
+});
+
+test("requestFunding returns a unique bounded providerReference per call", async () => {
   const provider = new DeterministicMockEscrowProvider();
   const input = makeInput();
   const a = await provider.requestFunding(input);
   const b = await provider.requestFunding(input);
-  assert.equal(a.providerReference, b.providerReference);
-  // The reference embeds paymentIntentId + correlationId so a future
-  // provider integration can correlate without depending on SoundHub
-  // internal ids.
-  assert.equal(a.providerReference, `mock-${input.paymentIntentId}-${input.correlationId}`);
+  // Per call the mock generates a fresh opaque UUID — SoundHub's
+  // internal correlationId is INTENTIONALLY NOT embedded in the
+  // provider reference. The strict Zod schema bounds the
+  // providerReference length (max 128).
+  assert.notEqual(a.providerReference, b.providerReference);
+  assert.ok(a.providerReference.length > 0);
+  assert.ok(a.providerReference.length <= 128);
+  assert.ok(!a.providerReference.includes("00000000-0000-4000-8000"));
 });
 
 test("requestFunding reflects the supplied confirmedAt", async () => {
   const provider = new DeterministicMockEscrowProvider();
-  const now = new Date("2026-09-03T12:34:56.000Z");
+  const now = "2026-09-03T12:34:56.000Z";
   const confirmation = await provider.requestFunding(makeInput({ now }));
-  assert.equal(confirmation.confirmedAt.getTime(), now.getTime());
+  assert.equal(confirmation.confirmedAt, now);
 });
 
 test("requestFunding does NOT throw on a well-formed input (the deterministic mock has no failure path)", async () => {
   const provider = new DeterministicMockEscrowProvider();
-  // Calling the mock never throws; the service-layer test injects a
-  // failing stub for the failure path.
   await assert.doesNotReject(() => provider.requestFunding(makeInput()));
 });
 

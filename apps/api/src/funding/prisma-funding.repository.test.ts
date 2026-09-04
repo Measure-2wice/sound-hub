@@ -287,7 +287,7 @@ test("findOrCreatePaymentIntentInTransaction inserts a row with providerState = 
     expectedAmountMinor: 75000,
     expectedCurrency: "USD",
     assetLabel: "sandbox-USDC",
-    networkLabel: "simulated-polkadot-asset-hub-testnet",
+    networkLabel: "simulated-network",
     providerKey: "mock-escrow-deterministic",
     environmentLabel: "sandbox",
     actingWorkspaceId: BUYER_WORKSPACE_ID,
@@ -309,7 +309,7 @@ test("findOrCreatePaymentIntentInTransaction converges retries on the SAME row",
     expectedAmountMinor: 75000,
     expectedCurrency: "USD",
     assetLabel: "sandbox-USDC",
-    networkLabel: "simulated-polkadot-asset-hub-testnet",
+    networkLabel: "simulated-network",
     providerKey: "mock-escrow-deterministic",
     environmentLabel: "sandbox",
     actingWorkspaceId: BUYER_WORKSPACE_ID,
@@ -322,7 +322,7 @@ test("findOrCreatePaymentIntentInTransaction converges retries on the SAME row",
     expectedAmountMinor: 75000,
     expectedCurrency: "USD",
     assetLabel: "sandbox-USDC",
-    networkLabel: "simulated-polkadot-asset-hub-testnet",
+    networkLabel: "simulated-network",
     providerKey: "mock-escrow-deterministic",
     environmentLabel: "sandbox",
     actingWorkspaceId: BUYER_WORKSPACE_ID,
@@ -347,7 +347,7 @@ test("findOrCreatePaymentIntentInTransaction returns TERMS_VERSION_NOT_FOUND for
     expectedAmountMinor: 75000,
     expectedCurrency: "USD",
     assetLabel: "sandbox-USDC",
-    networkLabel: "simulated-polkadot-asset-hub-testnet",
+    networkLabel: "simulated-network",
     providerKey: "mock-escrow-deterministic",
     environmentLabel: "sandbox",
     actingWorkspaceId: BUYER_WORKSPACE_ID,
@@ -361,7 +361,7 @@ test("findOrCreatePaymentIntentInTransaction returns TERMS_VERSION_NOT_FOUND for
 
 // ---------- recordPaymentIntentFailureInTransaction ----------
 
-test("recordPaymentIntentFailureInTransition transitions Created → Failed with sanitized code", async () => {
+test("recordPaymentIntentFailureInTransition transitions Created → Failed with sanitized code + closed category; raw detail is NOT persisted (P1-004)", async () => {
   await prisma.paymentIntent.deleteMany({ where: { dealId: DEAL_ID } });
   const created = await repo.findOrCreatePaymentIntentInTransaction({
     dealId: DEAL_ID,
@@ -369,7 +369,7 @@ test("recordPaymentIntentFailureInTransition transitions Created → Failed with
     expectedAmountMinor: 75000,
     expectedCurrency: "USD",
     assetLabel: "sandbox-USDC",
-    networkLabel: "simulated-polkadot-asset-hub-testnet",
+    networkLabel: "simulated-network",
     providerKey: "mock-escrow-deterministic",
     environmentLabel: "sandbox",
     actingWorkspaceId: BUYER_WORKSPACE_ID,
@@ -377,16 +377,57 @@ test("recordPaymentIntentFailureInTransition transitions Created → Failed with
     correlationId: "corr_failure",
   });
   if (!created.ok) throw new Error("seed failed");
-  await repo.recordPaymentIntentFailureInTransaction({
+  const result = await repo.recordPaymentIntentFailureInTransaction({
     paymentIntentId: created.value.id,
     failureReasonCode: "EscrowProviderUnavailable",
-    failureDetail: "ECONNRESET (server-only)",
+    failureDetailCategory: "PROVIDER_UNAVAILABLE",
   });
+  assert.deepEqual(result, { ok: true, persisted: true });
   const reread = await repo.findCurrentPaymentIntent(DEAL_ID);
   assert.ok(reread);
   assert.equal(reread.providerState, "Failed");
   assert.equal(reread.failureReasonCode, "EscrowProviderUnavailable");
-  assert.equal(reread.failureDetail, "ECONNRESET (server-only)");
+  assert.equal(reread.failureDetailCategory, "PROVIDER_UNAVAILABLE");
+});
+
+test("recordPaymentIntentFailureInTransaction is a no-op when the intent is already Confirmed (P0-002 demotion guard)", async () => {
+  await prisma.paymentIntent.deleteMany({ where: { dealId: DEAL_ID } });
+  const created = await repo.findOrCreatePaymentIntentInTransaction({
+    dealId: DEAL_ID,
+    termsVersionId: TV_ID,
+    expectedAmountMinor: 75000,
+    expectedCurrency: "USD",
+    assetLabel: "sandbox-USDC",
+    networkLabel: "simulated-network",
+    providerKey: "mock-escrow-deterministic",
+    environmentLabel: "sandbox",
+    actingWorkspaceId: BUYER_WORKSPACE_ID,
+    createdByUserId: BUYER_USER_ID,
+    correlationId: "corr_confirmed",
+  });
+  if (!created.ok) throw new Error("seed failed");
+  // Mark the intent Confirmed.
+  await prisma.paymentIntent.update({
+    where: { id: created.value.id },
+    data: {
+      providerState: "Confirmed",
+      providerReference: "mock_pi-corr_confirmed",
+      confirmedAt: new Date("2026-09-03T12:00:00.000Z"),
+      acceptedAt: new Date("2026-09-03T12:00:00.000Z"),
+    },
+  });
+  // Attempt a late concurrent failure — must be a no-op.
+  const result = await repo.recordPaymentIntentFailureInTransaction({
+    paymentIntentId: created.value.id,
+    failureReasonCode: "EscrowProviderUnavailable",
+    failureDetailCategory: "PROVIDER_UNAVAILABLE",
+  });
+  assert.deepEqual(result, { ok: true, persisted: false, reason: "ALREADY_CONFIRMED" });
+  const reread = await repo.findCurrentPaymentIntent(DEAL_ID);
+  assert.ok(reread);
+  assert.equal(reread.providerState, "Confirmed", "Confirmed intent must NOT be demoted to Failed");
+  assert.equal(reread.failureReasonCode, null);
+  assert.equal(reread.failureDetailCategory, null);
 });
 
 // ---------- fundDealInTransaction ----------
@@ -404,7 +445,7 @@ test("fundDealInTransaction activates the Deal and transitions the intent to Con
     expectedAmountMinor: 75000,
     expectedCurrency: "USD",
     assetLabel: "sandbox-USDC",
-    networkLabel: "simulated-polkadot-asset-hub-testnet",
+    networkLabel: "simulated-network",
     providerKey: "mock-escrow-deterministic",
     environmentLabel: "sandbox",
     actingWorkspaceId: BUYER_WORKSPACE_ID,
@@ -447,7 +488,7 @@ test("fundDealInTransaction activates the Deal and transitions the intent to Con
   assert.ok(result.value.deal.activatedAt);
   assert.equal(result.value.paymentIntent.providerState, "Confirmed");
   assert.equal(result.value.paymentIntent.failureReasonCode, null);
-  assert.equal(result.value.paymentIntent.failureDetail, null);
+  assert.equal(result.value.paymentIntent.failureDetailCategory, null);
 });
 
 test("fundDealInTransaction rejects with DEAL_ALREADY_ACTIVE when the guarded UPDATE matches 0 rows", async () => {
@@ -462,7 +503,7 @@ test("fundDealInTransaction rejects with DEAL_ALREADY_ACTIVE when the guarded UP
     expectedAmountMinor: 75000,
     expectedCurrency: "USD",
     assetLabel: "sandbox-USDC",
-    networkLabel: "simulated-polkadot-asset-hub-testnet",
+    networkLabel: "simulated-network",
     providerKey: "mock-escrow-deterministic",
     environmentLabel: "sandbox",
     actingWorkspaceId: BUYER_WORKSPACE_ID,
@@ -515,7 +556,7 @@ test("fundDealInTransaction persists Confirmed fields + activates the Deal even 
     expectedAmountMinor: 75000,
     expectedCurrency: "USD",
     assetLabel: "sandbox-USDC",
-    networkLabel: "simulated-polkadot-asset-hub-testnet",
+    networkLabel: "simulated-network",
     providerKey: "mock-escrow-deterministic",
     environmentLabel: "sandbox",
     actingWorkspaceId: BUYER_WORKSPACE_ID,
