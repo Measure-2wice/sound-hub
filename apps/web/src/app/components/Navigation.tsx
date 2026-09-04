@@ -18,12 +18,18 @@ import { SessionStatus } from "./SessionStatus";
 
 export function Navigation() {
   return (
-    <nav className="bg-white shadow-lg border-b">
+    <nav className="bg-white shadow-sm border-b border-gray-200">
       <div className="max-w-7xl mx-auto px-4 sm:px-6 lg:px-8">
         <div className="flex justify-between items-center h-16">
           <div className="flex items-center gap-6">
             <Link href="/" className="text-2xl font-bold text-blue-600">
               🎧 SoundHub Talent
+            </Link>
+            <Link
+              href="/escrow"
+              className="text-sm font-medium text-gray-700 hover:text-blue-600 transition-colors flex items-center gap-1.5"
+            >
+              <span>🔒</span> Escrow
             </Link>
             <SessionAwareMatchmakerLink />
           </div>

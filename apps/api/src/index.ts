@@ -6,6 +6,7 @@ import { createPrismaClient, type PrismaClient } from "@soundhub/db";
 import { healthRoutes } from "./routes/health.js";
 import { createSearchRouter } from "./routes/search.js";
 import { createMetadataRouter } from "./routes/metadata.js";
+import { createEscrowRouter, type EscrowService } from "./routes/escrow.js";
 import { createAuthRouter } from "./routes/auth.js";
 import { createAudioSamplesRouter } from "./routes/audio-samples.js";
 import { createOfferingCatalogRouter } from "./routes/offering-catalog.js";
@@ -46,6 +47,7 @@ export interface AppOptions {
   readonly service?: TalentSearchService;
   readonly metadataRepository?: MetadataRepository;
   readonly prismaClient?: PrismaClient;
+  readonly escrowService?: EscrowService;
   readonly authenticationService?: AuthenticationService;
   readonly workspaceAuthorizationService?: WorkspaceAuthorizationService;
   readonly authRepository?: AuthRepository;
@@ -272,6 +274,7 @@ export function buildApp(options: AppOptions = {}): BuiltApp {
       authenticationService,
     }),
   );
+  app.use("/api/escrow", createEscrowRouter({ service: options.escrowService }));
 
   // 404 fallback
   app.use((req: Request, res: Response) => {
