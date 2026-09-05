@@ -192,6 +192,22 @@ function mapStatus(code: ApiErrorCodeV1): number {
       // the write. The caller can retry the same payload without
       // changing the request.
       return 503;
+    // Deals discovery list (ticket #74).
+    case "DEAL_LIST_FORBIDDEN":
+      // 403 Forbidden. Collapses "unknown Workspace", "Workspace not
+      // Active", and "not a current member" into one envelope so the
+      // caller learns nothing about Workspaces they cannot act for.
+      // Notably NOT 404: the list is addressed by the acting
+      // Workspace, and distinguishing absence from denial would leak
+      // Workspace existence.
+      return 403;
+    case "DEAL_LIST_INVALID":
+      return 400;
+    case "DEAL_LIST_FAILED":
+      // 500 Internal Server Error. Used only when the handler catches
+      // an exception outside the typed DealListError surface; the
+      // underlying message is logged but never echoed.
+      return 500;
     // Buildathon Golden Slice 6 (BG6) — PaymentIntent + activation
     // status mapping. The mapping mirrors the BG5 pattern: 403 for
     // authorization rejections, 404 for unknown ids, 409 for
