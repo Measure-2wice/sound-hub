@@ -26,11 +26,12 @@
 //     browser extracts it from the magic-link callback URL and POSTs
 //     it to `/api/auth/verify-token`. The deterministic adapter
 //     stores its pending request under this value and returns it on
-//     the adapter's `SignInRequestResult` so local test harnesses can
-//     drive `verifySignIn`. The
-//     managed adapter forwards whatever the browser sent directly
-//     to Supabase's verify endpoint. It MUST NEVER appear in a
-//     public DTO, an error envelope, or a log line.
+//     the adapter's `SignInRequestResult` so local test harnesses
+//     can drive `verifySignIn`. The managed adapter forwards
+//     whatever the browser sent directly to Supabase's verify
+//     endpoint. It MUST NEVER appear in a public DTO, an error
+//     envelope, or a log line, and it is NOT a recovery credential
+//     that any deployed workflow can read.
 
 import type { Bg1IdentityProviderV1 } from "@soundhub/types";
 
@@ -137,11 +138,13 @@ export interface IdentityAdapter {
   /**
    * Initiate a magic-link sign-in for the given email. Returns an
    * opaque public correlation id (safe to log) and, for the
-   * deterministic adapter, a private `verificationToken` (the
-   * operator-only credential). Managed adapters send the magic link
-   * through their provider's email channel; the deterministic
-   * adapter stores the request locally and returns a
-   * `devVerificationUrl` the tests can use.
+   * deterministic adapter, a private `verificationToken` exposed
+   * only on the adapter's return value so local test harnesses
+   * can drive `verifySignIn`. Managed adapters send the magic
+   * link through their provider's email channel; the
+   * deterministic adapter stores the request locally and returns
+   * a `devVerificationUrl` only when explicitly gated to
+   * local-test mode.
    */
   requestSignIn(input: { readonly email: string }): Promise<SignInRequestResult>;
   /**
@@ -151,12 +154,13 @@ export interface IdentityAdapter {
    * (single-use per BG1 semantics).
    *
    * The accepted value is the PRIVATE credential the browser
-   * extracted from the magic-link callback URL (or the operator
-   * recovery workflow read from the server log). The PUBLIC
+   * extracted from the magic-link callback URL. The PUBLIC
    * correlation id from `requestSignIn` is NOT accepted here —
    * presenting it is rejected as an unknown credential so the
    * provider-neutral seam cannot accidentally substitute one for
-   * the other (ticket #59 P2-001).
+   * the other (ticket #59 P2-001). The credential is not a
+   * deployed recovery mechanism: production deployments do not
+   * expose any path that yields it.
    */
   verifySignIn(input: { readonly verificationToken: string }): Promise<VerifiedIdentity | null>;
 }

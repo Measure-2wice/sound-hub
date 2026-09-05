@@ -127,8 +127,7 @@ export class AuthenticationService {
    *
    * Per ticket #59 P2-001 the input field is named
    * `verificationToken`: the private, one-time credential the
-   * browser extracted from the magic-link callback URL (or the
-   * operator recovery workflow read from the server log). The
+   * browser extracted from the magic-link callback URL. The
    * PUBLIC `correlationId` from `requestSignIn` is NOT accepted
    * here — presenting it is rejected as an unknown credential.
    *

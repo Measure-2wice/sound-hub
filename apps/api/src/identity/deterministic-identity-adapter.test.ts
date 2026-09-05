@@ -90,14 +90,21 @@ describe("DeterministicIdentityAdapter", () => {
     // for the verificationToken.
     const browserAttempt = await adapter.verifySignIn({ verificationToken: request.correlationId });
     assert.equal(browserAttempt, null, "public correlation id must not satisfy verifySignIn");
-    // The verificationToken still works for the operator
-    // recovery path.
-    const operatorAttempt = await verifyWithVerifier(adapter, request);
-    assert.ok(operatorAttempt);
-    assert.equal(operatorAttempt.providerEmail, "demo.buyer@soundhub.example");
+    // The private verificationToken still works for the
+    // local-test verify path — production deployments never
+    // expose any route that yields this value.
+    const localTestAttempt = await verifyWithVerifier(adapter, request);
+    assert.ok(localTestAttempt);
+    assert.equal(localTestAttempt.providerEmail, "demo.buyer@soundhub.example");
   });
 
-  test("operator-mode requestSignIn emits the devVerificationUrl on the result AND logs it to the operator sink (buildathon browser journey, P0-001, P1-002)", async () => {
+  test("local-test allowDevVerificationUrl emits the devVerificationUrl on the result AND logs it (buildathon browser journey, P0-001, P1-002)", async () => {
+    // The local-test escape hatch is the only path that yields a
+    // usable `devVerificationUrl`. The composition root gates the
+    // flag to NODE_ENV=test; production always fails closed so
+    // this field is absent in deployed processes. The local
+    // Playwright journey uses the surfaced URL to complete sign-in
+    // without parsing logs.
     const logs: string[] = [];
     const originalLog = console.log;
     console.log = (msg: string) => {
@@ -106,7 +113,7 @@ describe("DeterministicIdentityAdapter", () => {
     try {
       const adapter = new DeterministicIdentityAdapter({ allowDevVerificationUrl: true });
       const result = await adapter.requestSignIn({ email: "buyer@example.com" });
-      // The URL is now also surfaced on the result so the browser
+      // The URL is also surfaced on the result so the browser
       // journey can follow it without parsing logs. The deployed
       // fallback path (allowDevVerificationUrl=false) is unaffected
       // because the field remains undefined there.
@@ -116,11 +123,11 @@ describe("DeterministicIdentityAdapter", () => {
       assert.ok(
         logs.some(
           (line) =>
-            line.includes("operator-mode verification URL") &&
+            line.includes("local-test verification URL") &&
             line.includes(verificationToken) &&
             line.includes("buyer@example.com"),
         ),
-        "operator-mode URL must be logged with the verificationToken",
+        "local-test URL must be logged with the verificationToken",
       );
     } finally {
       console.log = originalLog;
@@ -223,7 +230,7 @@ describe("DeterministicIdentityAdapter", () => {
     assert.equal(adapter.pendingCount(), 0);
   });
 
-  test("the verificationPathPrefix is reflected in the operator-mode log and result when allowDevVerificationUrl is true (P1-002)", async () => {
+  test("the verificationPathPrefix is reflected in the local-test log and result when allowDevVerificationUrl is true (P1-002)", async () => {
     const logs: string[] = [];
     const originalLog = console.log;
     console.log = (msg: string) => {

@@ -9,14 +9,13 @@
 //      the `allowDevVerificationUrl` constructor option and
 //      drive `verifySignIn` directly with the adapter's
 //      `verificationToken` return value.
-//   2. The approved emergency fallback path: if managed email
-//      delivery, callback/session integration, or deployment
-//      configuration cannot pass the bounded provider smoke, this
-//      adapter is the deployed fallback. Per the ticket this
-//      fallback changes credential verification only and requires
-//      no redesign or relaxation of Workspace authorization —
+//   2. The local/test-only fallback adapter. The deterministic
+//      adapter is the canonical provider-fallback implementation;
 //      every other layer (session store, authorization service,
-//      route handler) is identical to the managed path.
+//      route handler) consumes the same contract as the managed
+//      adapter. Production deployments fail closed: even when
+//      `allowDevVerificationUrl` is misconfigured on, the
+//      composition root only honors it under `NODE_ENV=test`.
 //
 // Per ticket #59 P2-001, the deterministic adapter splits its
 // pending request into two opaque identifiers with distinct names
@@ -27,7 +26,9 @@
 //     verify. Surfaces in logs and observability.
 //   - `verificationToken`: the PRIVATE one-time credential the
 //     pending request is stored under. Returned on the adapter's
-//     internal result so test harnesses can drive `verifySignIn`.
+//     internal result so local test harnesses can drive
+//     `verifySignIn`. The deployed API surface never receives
+//     this value through any route.
 //
 // Per ADR 0004 the adapter never touches UserAccount, Workspace, or
 // membership tables — those live in `PrismaAuthRepository`.
@@ -67,9 +68,11 @@ export interface DeterministicIdentityAdapterOptions {
   readonly ttlMs?: number;
   /**
    * Local-test escape hatch. When `true`, the adapter returns a
-   * `devVerificationUrl` that a test browser can follow without
-   * email delivery. The composition root honors this only under
-   * `NODE_ENV=test`.
+   * `devVerificationUrl` that a local test browser can follow
+   * without email delivery. The composition root honors this only
+   * under `NODE_ENV=test`; production always fails closed even if
+   * the flag is set, so deployed callers can never obtain a
+   * usable verification credential from the deterministic path.
    */
   readonly allowDevVerificationUrl?: boolean;
   /**
@@ -145,18 +148,17 @@ export class DeterministicIdentityAdapter implements IdentityAdapter {
    *     pending request is stored under this value (not the
    *     `correlationId`), so a browser that submits the
    *     correlation id to `/api/auth/verify-token` is rejected as
-   *     an unknown credential. Test harnesses drive
-   *     `verifySignIn` with this value directly; the deployed
-   *     operator recovery workflow reads it from the operator log
-   *     sink.
+   *     an unknown credential. Local test harnesses drive
+   *     `verifySignIn` with this value directly. The deployed API
+   *     never exposes it through any route or response shape.
    *
    * The `devVerificationUrl` is returned on the adapter's
    * `SignInRequestResult` ONLY when `allowDevVerificationUrl` is
    * `true`. The composition root permits that option only under
-   * `NODE_ENV=test`; deployed and production-like processes cannot
-   * enable this response field. The local Playwright journey uses it
-   * to exercise the normal callback and session boundary without
-   * live email delivery.
+   * `NODE_ENV=test`; production always fails closed and the
+   * field is absent in deployed responses. The local Playwright
+   * journey uses it to exercise the normal callback and session
+   * boundary without live email delivery.
    */
   async requestSignIn(input: { readonly email: string }): Promise<SignInRequestResult> {
     const normalizedEmail = input.email.trim().toLowerCase();
@@ -172,9 +174,12 @@ export class DeterministicIdentityAdapter implements IdentityAdapter {
     if (this.allowDevVerificationUrl) {
       const url = `${this.verificationPathPrefix}?token=${encodeURIComponent(verificationToken)}`;
       // Local test mode: emit the URL so the browser-side E2E flow
-      // can exercise the verification callback.
+      // can exercise the verification callback. The composition
+      // root only honors `allowDevVerificationUrl` under
+      // `NODE_ENV=test`; production always fails closed so this
+      // branch is unreachable in deployed processes.
       console.log(
-        `[bg1-deterministic] operator-mode verification URL for ${normalizedEmail} ` +
+        `[bg1-deterministic] local-test verification URL for ${normalizedEmail} ` +
           `(correlation=${correlationId}): ${url}`,
       );
       return Promise.resolve({ correlationId, verificationToken, devVerificationUrl: url });

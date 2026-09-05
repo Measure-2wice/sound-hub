@@ -6,10 +6,10 @@
 // repository and the deterministic identity adapter. Per ticket
 // #59 P0-001 the deterministic adapter returns a private
 // `verificationToken` that the service's `verifySignIn` consumes
-// — tests use the same seam the operator recovery path uses.
-// Per ticket #59 P2-001 the input field is named
-// `verificationToken` (private) and the magic-link envelope field
-// is named `requestId` (public correlation).
+// — tests drive the adapter through the same seam the local
+// test-only E2E flow uses. Per ticket #59 P2-001 the input
+// field is named `verificationToken` (private) and the magic-
+// link envelope field is named `requestId` (public correlation).
 
 /* eslint-disable @typescript-eslint/no-floating-promises */
 /* eslint-disable @typescript-eslint/require-await */
@@ -56,7 +56,7 @@ describe("AuthenticationService", () => {
 
   test("the envelope never exposes the private verificationToken (P0-001, P2-001)", async () => {
     // Direct adapter call: the verificationToken is the
-    // operator-only credential; the envelope the service
+    // local-test-only credential; the envelope the service
     // produces MUST NOT carry it. The deterministic adapter only
     // emits it on the adapter's return value (where the test
     // harness can read it). The service explicitly forwards only
@@ -70,42 +70,48 @@ describe("AuthenticationService", () => {
     assert.equal(envelope.requestId === raw.verificationToken, false);
   });
 
-  test("requestSignIn forwards the operator-mode URL only to the operator sink, not the response (P1-002)", async () => {
+  test("local-test allowDevVerificationUrl surfaces devVerificationUrl on the envelope and in the adapter log (P1-002)", async () => {
+    // The deterministic adapter's local-test escape hatch is the
+    // ONLY path that yields a usable `devVerificationUrl`. The
+    // composition root gates the flag to NODE_ENV=test; production
+    // always fails closed so this response field is absent in
+    // deployed processes. The local Playwright journey uses the
+    // surfaced URL to complete sign-in without parsing logs.
     const originalLog = console.log;
     const logs: string[] = [];
     console.log = (msg: string) => {
       logs.push(msg);
     };
     try {
-      const operatorAdapter = new DeterministicIdentityAdapter({
+      const localTestAdapter = new DeterministicIdentityAdapter({
         now: () => now,
         allowDevVerificationUrl: true,
       });
-      const operatorService = new AuthenticationService({
-        identityAdapter: operatorAdapter,
+      const localTestService = new AuthenticationService({
+        identityAdapter: localTestAdapter,
         authRepository: authRepo,
         now: () => now,
       });
-      const result = await operatorService.requestSignIn({ email: "buyer@example.com" });
+      const result = await localTestService.requestSignIn({ email: "buyer@example.com" });
       const envelope = result.envelope;
       assert.ok(envelope, "envelope must be defined");
       assert.ok(envelope.requestId, "envelope.requestId must be defined");
       assert.ok(envelope.requestId.length > 0);
-      // The operator-mode envelope now surfaces the devVerificationUrl
-      // so the buildathon browser journey can complete sign-in
+      // The local-test envelope surfaces the devVerificationUrl so
+      // the buildathon browser journey can complete sign-in
       // without parsing logs. Production behavior (managed, or
       // deterministic with allowDevVerificationUrl=false) is
       // unchanged: the field is absent.
       assert.ok(envelope.devVerificationUrl);
       assert.match(envelope.devVerificationUrl, /\/auth\/verify\?token=/);
-      const adapterResult = await operatorAdapter.requestSignIn({
+      const adapterResult = await localTestAdapter.requestSignIn({
         email: "buyer2@example.com",
       });
       assert.ok(adapterResult.verificationToken);
       assert.ok(
         logs.some(
           (line) =>
-            line.includes("operator-mode verification URL") &&
+            line.includes("local-test verification URL") &&
             line.includes(adapterResult.verificationToken ?? ""),
         ),
       );

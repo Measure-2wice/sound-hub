@@ -6,9 +6,12 @@
 // Regression coverage for the M1.1 deterministic seed.
 //
 // These tests run against the disposable test database (TEST_DATABASE_URL)
-// and use a local fail-closed exact-target guard. They prove that the
-// seed restores canonical relationships and field values on every
-// invocation, regardless of how the database was mutated between runs.
+// and reuse the canonical approved-disposable-test guard from
+// `packages/db/src/approved-disposable-test-db.ts` so the seed and
+// the test harness stay in lock-step. They prove that the seed
+// restores canonical relationships and field values on every
+// invocation, regardless of how the database was mutated between
+// runs.
 //
 // Each test invokes the seed as a child process so the seed's
 // `process.env.DATABASE_URL` requirement is satisfied cleanly.
@@ -19,50 +22,29 @@ import { existsSync } from "node:fs";
 import { after, before, describe, test } from "node:test";
 import { PrismaPg } from "@prisma/adapter-pg";
 import { PrismaClient } from "../src/generated/client.js";
-
-const APPROVED_DATABASE = "soundhub_m1_test";
-const APPROVED_PORT = 5433;
-const APPROVED_HOSTS = new Set(["localhost", "127.0.0.1", "::1"]);
-
-class TestGuardError extends Error {
-  constructor(message: string) {
-    super(message);
-    this.name = "TestGuardError";
-  }
-}
-
-function resolveDatabaseUrl(): string {
-  const url = process.env.TEST_DATABASE_URL;
-  if (!url) {
-    throw new TestGuardError("TEST_DATABASE_URL is not set");
-  }
-  let parsed: URL;
-  try {
-    parsed = new URL(url);
-  } catch (err) {
-    throw new TestGuardError(`invalid URL: ${err instanceof Error ? err.message : String(err)}`);
-  }
-  if (parsed.protocol !== "postgresql:" && parsed.protocol !== "postgres:") {
-    throw new TestGuardError(`not a postgres URL: ${parsed.protocol}`);
-  }
-  if (!APPROVED_HOSTS.has(parsed.hostname)) {
-    throw new TestGuardError(`host ${parsed.hostname} is not an approved local host`);
-  }
-  if (Number(parsed.port || 5432) !== APPROVED_PORT) {
-    throw new TestGuardError(`port ${parsed.port} must be ${APPROVED_PORT}`);
-  }
-  const database = parsed.pathname.replace(/^\/+/, "");
-  if (database !== APPROVED_DATABASE) {
-    throw new TestGuardError(`database ${database} must be ${APPROVED_DATABASE}`);
-  }
-  return url;
-}
+import {
+  ApprovedDisposableTestDbError,
+  checkApprovedDisposableTestDatabase,
+} from "../src/approved-disposable-test-db.js";
+import {
+  BG7_FIXTURE_STORAGE_REF,
+  BG7_FIXTURE_LABEL,
+  shouldSeedDeterministicAudioFixtureForDatabase,
+} from "../src/audio-sample-fixture.js";
 
 let prisma: PrismaClient;
 let databaseUrl: string;
 
 before(() => {
-  databaseUrl = resolveDatabaseUrl();
+  const url = process.env.TEST_DATABASE_URL;
+  const decision = checkApprovedDisposableTestDatabase(url);
+  if (!decision.approved) {
+    throw new ApprovedDisposableTestDbError(
+      `seed.test.ts requires TEST_DATABASE_URL to point at the approved disposable ` +
+        `local test PostgreSQL: ${decision.reason}`,
+    );
+  }
+  databaseUrl = url as string;
   prisma = new PrismaClient({
     adapter: new PrismaPg({ connectionString: databaseUrl }),
   });
@@ -73,25 +55,41 @@ after(async () => {
 });
 
 function runSeed(options: { readonly deterministicAudioFixture?: boolean } = {}): Promise<void> {
+  return runSeedCaptureOutput(options).then((result) => {
+    if (result.exitCode !== 0) {
+      throw new Error(`seed exited with code ${result.exitCode}: ${result.stderr}`);
+    }
+  });
+}
+
+function runSeedCaptureOutput(options: {
+  readonly deterministicAudioFixture?: boolean;
+  readonly databaseUrlOverride?: string;
+}): Promise<{ readonly exitCode: number; readonly stderr: string }> {
+  const childDatabaseUrl = options.databaseUrlOverride ?? databaseUrl;
   return new Promise((resolve, reject) => {
+    const stderrChunks: Buffer[] = [];
     const child = spawn("npx", ["tsx", "prisma/seed.ts"], {
       cwd: new URL("..", import.meta.url).pathname,
-      stdio: "inherit",
+      stdio: ["ignore", "pipe", "pipe"],
       env: {
         ...process.env,
-        DATABASE_URL: databaseUrl,
-        TEST_DATABASE_URL: databaseUrl,
+        DATABASE_URL: childDatabaseUrl,
+        TEST_DATABASE_URL: childDatabaseUrl,
         NODE_ENV: "test",
         BG2_STORAGE_BACKEND:
           options.deterministicAudioFixture === false ? "supabase" : "deterministic",
         BG7_DETERMINISTIC_AUDIO_FIXTURE: options.deterministicAudioFixture === false ? "0" : "1",
       },
     });
+    child.stderr.on("data", (chunk: Buffer) => stderrChunks.push(chunk));
     child.on("error", reject);
-    child.on("exit", (code) => {
-      if (code === 0) resolve();
-      else reject(new Error(`seed exited with code ${code}`));
-    });
+    child.on("exit", (code) =>
+      resolve({
+        exitCode: code ?? -1,
+        stderr: Buffer.concat(stderrChunks).toString("utf8"),
+      }),
+    );
   });
 }
 
@@ -140,6 +138,155 @@ describe("M1.1 seed regression coverage", () => {
       managed,
     );
     await prisma.serviceOfferingAudioSample.delete({ where: { id: managed.id } });
+  });
+
+  // Ticket #65 P1 (Codex review) regression: the deterministic
+  // fixture insertion boundary must require the caller-controlled
+  // env flags AND the DATABASE_URL must be verified as the
+  // approved disposable local test PostgreSQL. The unit-level
+  // coverage for the predicate lives in
+  // packages/db/src/audio-sample-fixture.test.ts (the
+  // `shouldSeedDeterministicAudioFixtureForDatabase` test), which
+  // proves the predicate refuses every non-approved host/port/
+  // database combination. This integration test exercises the
+  // combined predicate against the same env shape the seed sees
+  // for a managed Supabase URL — proving the predicate refuses
+  // before any mutation could happen.
+  test("deterministic flags + non-approved DATABASE_URL refuse fixture insertion at the predicate boundary (ticket #65 P1)", async () => {
+    const managedUrl =
+      "postgresql://soundhub:password@db.supabase.example:6543/postgres?sslmode=require";
+    const decision = shouldSeedDeterministicAudioFixtureForDatabase({
+      NODE_ENV: "test",
+      BG2_STORAGE_BACKEND: "deterministic",
+      BG7_DETERMINISTIC_AUDIO_FIXTURE: "1",
+      DATABASE_URL: managedUrl,
+    });
+    assert.equal(
+      decision.approved,
+      false,
+      "predicate must refuse non-approved host when all fixture flags are set",
+    );
+    if (decision.approved) {
+      throw new Error("unreachable");
+    }
+    assert.match(
+      decision.reason,
+      /not an approved local host|not a postgres URL|invalid URL/,
+      `decision.reason must identify the database-target failure; got ${decision.reason}`,
+    );
+
+    // The real database target (the approved disposable
+    // localhost:5433/soundhub_m1_test) must remain untouched:
+    // the predicate refuses before any write could happen.
+    const offering = await prisma.serviceOffering.findUniqueOrThrow({
+      where: { id: "of-creole-beats-dancehall-single-remote" },
+    });
+    const before = await prisma.serviceOfferingAudioSample.findMany({
+      where: { offeringId: offering.id, displayOrder: 1 },
+    });
+    assert.ok(
+      before.length <= 1,
+      `the canonical slot must hold at most one row; got ${before.length}`,
+    );
+    if (before.some((row) => row.storageRef === BG7_FIXTURE_STORAGE_REF)) {
+      // The canonical deterministic fixture is already present.
+      // Run the seed against the approved DB (not the managed
+      // override) so we exercise the path where the predicate
+      // would otherwise refuse, but the seed's actual DATABASE_URL
+      // is approved: the existing canonical fixture must remain
+      // untouched (idempotent no-op).
+      await runSeed({ deterministicAudioFixture: true });
+      const after = await prisma.serviceOfferingAudioSample.findMany({
+        where: { offeringId: offering.id, displayOrder: 1 },
+      });
+      assert.deepEqual(after, before);
+    }
+  });
+
+  // Ticket #65 P1 (Codex review) regression: an existing
+  // non-canonical (managed) row occupying the canonical fixture
+  // slot must be preserved byte-for-byte/field-for-field. The
+  // seed must not rewrite its label, MIME type, byte size,
+  // storage reference, or cleanup state.
+  test("a non-canonical row at (offeringId, displayOrder=1) is preserved when the deterministic fixture flags are set (ticket #65 P1)", async () => {
+    const offering = await prisma.serviceOffering.findUniqueOrThrow({
+      where: { id: "of-creole-beats-dancehall-single-remote" },
+    });
+    // Wipe any prior canonical fixture row so the test starts
+    // from a clean slot.
+    await prisma.serviceOfferingAudioSample.deleteMany({
+      where: { offeringId: offering.id, displayOrder: 1 },
+    });
+    const managed = await prisma.serviceOfferingAudioSample.create({
+      data: {
+        offeringId: offering.id,
+        label: "Managed sample must remain byte-for-byte",
+        contentType: "audio/wav",
+        byteSize: 99_999,
+        displayOrder: 1,
+        storageRef: "supa:offering-audio:managed/preserve.mp3",
+        cleanupStatus: "Live",
+        cleanupAttempts: 7,
+      },
+    });
+
+    const result = await runSeedCaptureOutput({
+      deterministicAudioFixture: true,
+    });
+
+    // The seed runs against the approved disposable DB, so the
+    // env flags pass the predicate; the existing-row guard must
+    // now refuse to overwrite the managed row.
+    assert.equal(
+      result.exitCode,
+      1,
+      `seed must refuse to overwrite a non-canonical row; got exit=${result.exitCode} stderr=${result.stderr}`,
+    );
+    assert.ok(
+      result.stderr.includes("BG7 deterministic audio fixture refused"),
+      `seed stderr must report the BG7 refusal; got ${result.stderr}`,
+    );
+    assert.ok(
+      result.stderr.includes(managed.storageRef),
+      `seed stderr must identify the conflicting storageRef; got ${result.stderr}`,
+    );
+
+    // The managed row must be preserved field-for-field.
+    const after = await prisma.serviceOfferingAudioSample.findUniqueOrThrow({
+      where: { id: managed.id },
+    });
+    assert.deepEqual(after, managed);
+    await prisma.serviceOfferingAudioSample.delete({ where: { id: managed.id } });
+  });
+
+  // Ticket #65 P1 (Codex review) regression: an existing
+  // canonical deterministic fixture row remains idempotent
+  // across repeated seed cycles. The function is a no-op when
+  // the existing row is already the canonical fixture.
+  test("a canonical deterministic fixture row remains idempotent across repeated seeds (ticket #65 P1)", async () => {
+    await runSeed({ deterministicAudioFixture: true });
+    const first = await prisma.serviceOfferingAudioSample.findFirstOrThrow({
+      where: { storageRef: BG7_FIXTURE_STORAGE_REF },
+    });
+    // Mutate only the audit fields so we can prove the seed
+    // leaves them alone (the seed must NOT rewrite them when
+    // the existing row is already canonical).
+    const updated = await prisma.serviceOfferingAudioSample.update({
+      where: { id: first.id },
+      data: { cleanupAttempts: 3, cleanupLastFailureAt: new Date(0) },
+    });
+    await runSeed({ deterministicAudioFixture: true });
+    const after = await prisma.serviceOfferingAudioSample.findUniqueOrThrow({
+      where: { id: first.id },
+    });
+    assert.equal(after.id, first.id);
+    assert.equal(after.storageRef, BG7_FIXTURE_STORAGE_REF);
+    assert.equal(after.label, BG7_FIXTURE_LABEL);
+    assert.equal(after.displayOrder, 1);
+    // The audit fields the seed must not touch when the row is
+    // already canonical.
+    assert.equal(after.cleanupAttempts, updated.cleanupAttempts);
+    assert.deepEqual(after.cleanupLastFailureAt, updated.cleanupLastFailureAt);
   });
 
   test("restores Workspace.ownerUserId after a stale update", async () => {
