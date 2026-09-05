@@ -58,7 +58,7 @@ describe("DeterministicIdentityAdapter", () => {
     assert.equal(result.devVerificationUrl, undefined);
   });
 
-  test("requestSignIn returns the devVerificationUrl on the result ONLY in operator mode (buildathon browser journey)", async () => {
+  test("requestSignIn returns the devVerificationUrl only through the local/test-only verification path", async () => {
     const adapter = new DeterministicIdentityAdapter({ allowDevVerificationUrl: true });
     const result = await adapter.requestSignIn({ email: "buyer@example.com" });
     assert.ok(result.correlationId.length > 0);

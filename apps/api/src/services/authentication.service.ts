@@ -253,9 +253,9 @@ export class AuthenticationService {
  * inside the adapter boundary so the public route layer can never
  * expose it (the BG1 magic-link response schema is `.strict()`
  * and does not declare a `verificationToken` field). The
- * `devVerificationUrl` is operator-only and absent in the
- * deployed deterministic fallback so an unauthenticated browser
- * cannot pick a demo identity by email.
+ * `devVerificationUrl` is local/test-only and absent outside the
+ * local test verification path so an unauthenticated browser cannot
+ * pick a demo identity by email.
  */
 function withRequestIdAndOptionalDevUrl(result: SignInRequestResult): {
   ok: true;

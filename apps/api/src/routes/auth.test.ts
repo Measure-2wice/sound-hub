@@ -110,8 +110,8 @@ describe("BG1 auth routes (in-memory, deterministic adapter)", () => {
     // verificationToken never crosses the route boundary and
     // the schema does not declare it.
     assert.equal("verificationToken" in response.body, false);
-    // Operator mode: the devVerificationUrl IS now surfaced on the
-    // response so the buildathon browser journey can complete
+    // Local/test-only verification: the devVerificationUrl is
+    // surfaced on the response so the browser journey can complete
     // sign-in without parsing logs. The production path
     // (allowDevVerificationUrl=false) is exercised by the next
     // test in this suite.
@@ -120,7 +120,7 @@ describe("BG1 auth routes (in-memory, deterministic adapter)", () => {
     assert.match(devUrl, /\/auth\/verify\?token=/);
   });
 
-  test("POST /api/auth/magic-link never returns a devVerificationUrl regardless of operator mode (P1-002)", async () => {
+  test("POST /api/auth/magic-link never returns a devVerificationUrl outside the local/test-only path (P1-002)", async () => {
     const restrictedAdapter = new DeterministicIdentityAdapter();
     const { app: restrictedApp } = buildApp({
       authenticationService: new AuthenticationService({
