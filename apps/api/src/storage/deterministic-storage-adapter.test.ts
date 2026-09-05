@@ -19,6 +19,11 @@ import { describe, test } from "node:test";
 import { DeterministicStorageAdapter } from "./deterministic-storage-adapter.js";
 import { StorageRejectedError, StorageUnavailableError } from "./storage-adapter.js";
 import { BG2_AUDIO_SAMPLE_MAX_BYTE_SIZE } from "@soundhub/types";
+import {
+  BG7_FIXTURE_STORAGE_REF,
+  BG7_FIXTURE_OFFERING_ID,
+  buildDeterministicMp3Fixture,
+} from "@soundhub/db";
 
 describe("DeterministicStorageAdapter", () => {
   test("uploadSample returns an opaque storage reference", async () => {
@@ -192,5 +197,93 @@ describe("DeterministicStorageAdapter", () => {
       () => adapter.getPlaybackBytes(uploaded.storageRef),
       (err: unknown) => err instanceof Error && err.name === "StorageReferenceUnknownError",
     );
+  });
+
+  // ----------------------------------------------------------------
+  // BG7 canonical-fixture lazy hydration (ticket #65).
+  //
+  // The seed persists a single canonical ServiceOfferingAudioSample
+  // row with `storageRef = BG7_FIXTURE_STORAGE_REF`. The adapter's
+  // cold-start `objects` Map does not contain that ref. On the first
+  // `getPlaybackBytes` call the adapter must lazily re-mint the
+  // fixture bytes via `buildDeterministicMp3Fixture`, cache them,
+  // and return them. The Supabase adapter is unaffected.
+  // ----------------------------------------------------------------
+
+  test("BG7 fixture: getPlaybackBytes lazily re-mints canonical fixture bytes", async () => {
+    const adapter = new DeterministicStorageAdapter();
+    const bytes = await adapter.getPlaybackBytes(BG7_FIXTURE_STORAGE_REF);
+    assert.ok(bytes);
+    // The fixture is the SAME 417-byte MPEG-1 Layer III frame the
+    // existing mp3FrameBytes() test helper emits. The exact bytes
+    // returned by buildDeterministicMp3Fixture are the canonical
+    // answer; we assert byte equality here so a future drift is
+    // caught.
+    const canonical = buildDeterministicMp3Fixture();
+    assert.deepEqual(bytes, canonical);
+  });
+
+  test("BG7 fixture: second getPlaybackBytes call returns identical bytes (cache hit)", async () => {
+    const adapter = new DeterministicStorageAdapter();
+    const first = await adapter.getPlaybackBytes(BG7_FIXTURE_STORAGE_REF);
+    const second = await adapter.getPlaybackBytes(BG7_FIXTURE_STORAGE_REF);
+    assert.deepEqual(first, second);
+  });
+
+  test("BG7 fixture: getPlaybackReference composes the canonical in-app playback URL", async () => {
+    const adapter = new DeterministicStorageAdapter();
+    const ref = await adapter.getPlaybackReference({
+      storageRef: BG7_FIXTURE_STORAGE_REF,
+      offeringId: BG7_FIXTURE_OFFERING_ID,
+      sampleId: "smp-bg7-fixture",
+    });
+    assert.ok(ref);
+    if (!ref) throw new Error("playback reference must be present");
+    // The URL pattern matches the in-app playback route the browser
+    // fetches for `<audio src>`. The seed's `storageRef` is preserved
+    // verbatim; only the URL is is composed from the offeringId + sampleId.
+    assert.match(
+      ref.url,
+      /\/api\/services\/of-creole-beats-dancehall-single-remote\/audio-samples\/smp-bg7-fixture\/play$/,
+    );
+  });
+
+  test("BG7 fixture: removeSample followed by getPlaybackBytes returns unknown-ref error", async () => {
+    const adapter = new DeterministicStorageAdapter();
+    // Warm the cache.
+    await adapter.getPlaybackBytes(BG7_FIXTURE_STORAGE_REF);
+    await adapter.removeSample(BG7_FIXTURE_STORAGE_REF);
+    await assert.rejects(
+      () => adapter.getPlaybackBytes(BG7_FIXTURE_STORAGE_REF),
+      (err: unknown) => err instanceof Error && err.name === "StorageReferenceUnknownError",
+    );
+  });
+
+  test("BG7 fixture: non-canonical det: refs still return unknown-ref on cold start", async () => {
+    // The hydration guard is single-purpose: ONLY the canonical
+    // BG7_FIXTURE_STORAGE_REF triggers re-mint. Any other `det:`
+    // reference that was never cached is rejected — production
+    // behavior is preserved.
+    const adapter = new DeterministicStorageAdapter();
+    await assert.rejects(
+      () => adapter.getPlaybackBytes(`det:${BG7_FIXTURE_OFFERING_ID}:some-uploaded-id`),
+      (err: unknown) => err instanceof Error && err.name === "StorageReferenceUnknownError",
+    );
+  });
+
+  test("BG7 fixture: uploadSample path is unaffected by the hydration guard", async () => {
+    const adapter = new DeterministicStorageAdapter();
+    const result = await adapter.uploadSample({
+      label: "Live upload",
+      contentType: "audio/mpeg",
+      byteSize: 16,
+      offeringId: BG7_FIXTURE_OFFERING_ID,
+      bytes: new Uint8Array([1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16]),
+    });
+    // Uploaded refs are NOT the canonical fixture ref and must NOT
+    // be re-minted — the in-memory Map holds the uploaded bytes.
+    const bytes = await adapter.getPlaybackBytes(result.storageRef);
+    assert.equal(bytes.length, 16);
+    assert.equal(bytes[0], 1);
   });
 });

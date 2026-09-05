@@ -28,7 +28,10 @@ import type {
   DealPublicV1,
 } from "@soundhub/types";
 import type { PersistedBrief } from "../matchmaker/project-brief.repository.js";
-import { AuthorizationError, type WorkspaceAuthorizationService } from "../services/workspace-authorization.service.js";
+import {
+  AuthorizationError,
+  type WorkspaceAuthorizationService,
+} from "../services/workspace-authorization.service.js";
 import type {
   AcceptProjectRequestResult,
   CreateProjectRequestFailureReason,
@@ -282,10 +285,7 @@ export class ProjectRequestService {
       // falsely suggest the record does not exist and mask the
       // incident from operators.
       if (err instanceof AuthorizationError) {
-        throw new ProjectRequestError(
-          "ProjectRequest not found.",
-          "PROJECT_REQUEST_NOT_FOUND",
-        );
+        throw new ProjectRequestError("ProjectRequest not found.", "PROJECT_REQUEST_NOT_FOUND");
       }
       throw err;
     }
@@ -326,10 +326,7 @@ export class ProjectRequestService {
       // envelope does not leak the existence of the Workspace's
       // records. Unexpected infrastructure errors propagate.
       if (err instanceof AuthorizationError) {
-        throw new ProjectRequestError(
-          "ProjectRequest not found.",
-          "PROJECT_REQUEST_NOT_FOUND",
-        );
+        throw new ProjectRequestError("ProjectRequest not found.", "PROJECT_REQUEST_NOT_FOUND");
       }
       throw err;
     }

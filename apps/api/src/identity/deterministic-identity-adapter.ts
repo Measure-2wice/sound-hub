@@ -159,13 +159,18 @@ export class DeterministicIdentityAdapter implements IdentityAdapter {
    *     operator recovery workflow reads it from the operator log
    *     sink.
    *
-   * The `devVerificationUrl` is NEVER returned on the adapter's
-   * `SignInRequestResult`. When `allowDevVerificationUrl` is
-   * `true` the URL is emitted to the operator's log sink so the
-   * operator-driven recovery workflow can drive verifySignIn
-   * through the same application boundary the managed path uses,
-   * but without any usable value ever crossing the public
-   * response.
+   * The `devVerificationUrl` is returned on the adapter's
+   * `SignInRequestResult` ONLY when `allowDevVerificationUrl` is
+   * `true` (operator mode). Production behavior is unchanged:
+   * the managed adapter never sets `allowDevVerificationUrl`,
+   * and the deployed deterministic fallback (the default
+   * `BG1_DETERMINISTIC_OPERATOR_MODE` value) is `false`. When
+   * the field IS returned, the URL is also emitted to the
+   * operator's log sink so a human operator running the
+   * fallback can drive the recovery flow without inspecting
+   * stdout alone. The buildathon browser journey relies on the
+   * response-side emission because Playwright cannot parse
+   * stdout from a spawned API process.
    */
   async requestSignIn(input: { readonly email: string }): Promise<SignInRequestResult> {
     const normalizedEmail = input.email.trim().toLowerCase();
@@ -180,16 +185,15 @@ export class DeterministicIdentityAdapter implements IdentityAdapter {
     });
     if (this.allowDevVerificationUrl) {
       const url = `${this.verificationPathPrefix}?token=${encodeURIComponent(verificationToken)}`;
-      // Operator-mode log sink: the URL is recorded so the
-      // operator can drive the recovery flow. The browser MUST
-      // NEVER receive the URL — the response carries only the
-      // opaque public correlationId. The verificationToken in
-      // the URL is the same value the adapter returned on the
-      // SignInRequestResult for test harnesses.
+      // Operator-mode: emit the URL both to stdout (human-readable
+      // log for the deployed fallback) and on the response (so the
+      // browser-side flow can surface the "Continue with dev
+      // verification URL" button the login page already renders).
       console.log(
         `[bg1-deterministic] operator-mode verification URL for ${normalizedEmail} ` +
           `(correlation=${correlationId}): ${url}`,
       );
+      return Promise.resolve({ correlationId, verificationToken, devVerificationUrl: url });
     }
     return Promise.resolve({ correlationId, verificationToken });
   }

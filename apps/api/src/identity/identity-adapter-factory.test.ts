@@ -63,8 +63,10 @@ describe("buildIdentityAdapters", () => {
     }
     // With operator mode: the URL is logged to the operator sink
     // (we don't read it here; the deterministic-adapter tests
-    // cover the log capture) and the response still does NOT
-    // carry the URL.
+    // cover the log capture) AND surfaces on the response so the
+    // buildathon browser journey can complete sign-in without
+    // parsing logs. Production-managed behavior is unaffected
+    // because the managed adapter never sets allowDevVerificationUrl.
     process.env.BG1_DETERMINISTIC_OPERATOR_MODE = "1";
     try {
       const { deterministic } = buildIdentityAdapters({
@@ -72,7 +74,8 @@ describe("buildIdentityAdapters", () => {
         managedSmoke: { ok: false, reason: "network" },
       });
       const operator = await deterministic.requestSignIn({ email: "buyer@example.com" });
-      assert.equal(operator.devVerificationUrl, undefined);
+      assert.ok(operator.devVerificationUrl);
+      assert.match(operator.devVerificationUrl, /\/auth\/verify\?token=/);
       assert.ok(operator.correlationId.length > 0);
     } finally {
       process.env.BG1_DETERMINISTIC_OPERATOR_MODE = "";

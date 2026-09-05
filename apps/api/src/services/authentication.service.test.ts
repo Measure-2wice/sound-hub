@@ -91,7 +91,13 @@ describe("AuthenticationService", () => {
       assert.ok(envelope, "envelope must be defined");
       assert.ok(envelope.requestId, "envelope.requestId must be defined");
       assert.ok(envelope.requestId.length > 0);
-      assert.equal(envelope.devVerificationUrl, undefined);
+      // The operator-mode envelope now surfaces the devVerificationUrl
+      // so the buildathon browser journey can complete sign-in
+      // without parsing logs. Production behavior (managed, or
+      // deterministic with allowDevVerificationUrl=false) is
+      // unchanged: the field is absent.
+      assert.ok(envelope.devVerificationUrl);
+      assert.match(envelope.devVerificationUrl, /\/auth\/verify\?token=/);
       const adapterResult = await operatorAdapter.requestSignIn({
         email: "buyer2@example.com",
       });

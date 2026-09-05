@@ -4,7 +4,10 @@
 //
 // Background: BG3 ships the buyer-side Matchmaker vertical slice;
 // BG4 extends it with the buyer-side invitation step that converts
-// a recommendation into a persisted ProjectRequest. The page
+// a recommendation into a persisted ProjectRequest. BG7 (ticket #65)
+// extends the recommendation row with a "▶ Preview sample" toggle
+// that fetches the bounded audio samples attached to the offering
+// and renders the first sample's `playbackUrl` inline. The page
 // accepts a natural-language ProjectBrief, submits it to
 // `/api/matchmaker/brief`, and renders the resulting brief +
 // recommendations. After the brief persists, the buyer can select
@@ -23,6 +26,10 @@
 // from the persisted search result.
 
 import { useEffect, useState, type FormEvent } from "react";
+import {
+  fetchRecommendationAudioPreview,
+  type RecommendationAudioPreview,
+} from "../lib/matchmaker-audio";
 import Link from "next/link";
 import type {
   CategoryMetadataItemV1,
@@ -339,9 +346,9 @@ function BriefResults({
                   recommendation={rec}
                   index={index + 1}
                   // Disable every invite button while any invite is in
- // flight so a buyer cannot fire concurrent ProjectRequest writes
- // against the same brief. The in-flight row still renders the
- // "Inviting…" label so the buyer can see which row is in flight.
+                  // flight so a buyer cannot fire concurrent ProjectRequest writes
+                  // against the same brief. The in-flight row still renders the
+                  // "Inviting…" label so the buyer can see which row is in flight.
                   disabled={!actingWorkspaceId || invitingRecommendationId !== null}
                   submitting={invitingRecommendationId === rec.bestMatchingOffering.offeringId}
                   onInvite={() => onInvite(rec)}
@@ -368,6 +375,41 @@ function RecommendationItem({
   readonly submitting: boolean;
   readonly onInvite: () => void;
 }) {
+  // BG7 inline audio preview. The buyer can click "▶ Preview
+  // sample" to fetch the bounded audio samples for this offering
+  // and play the first sample inline. The toggle keeps the
+  // collapsed row readable; the fetch reuses the existing
+  // buyer-safe `listOfferingSamples` endpoint.
+  const [previewing, setPreviewing] = useState<boolean>(false);
+  const [preview, setPreview] = useState<RecommendationAudioPreview | null>(null);
+  const [previewError, setPreviewError] = useState<string | null>(null);
+  const [previewLoading, setPreviewLoading] = useState<boolean>(false);
+
+  const onPreviewToggle = async () => {
+    if (previewing) {
+      setPreviewing(false);
+      setPreview(null);
+      setPreviewError(null);
+      return;
+    }
+    setPreviewing(true);
+    setPreviewLoading(true);
+    setPreviewError(null);
+    try {
+      const result = await fetchRecommendationAudioPreview(
+        recommendation.bestMatchingOffering.offeringId,
+      );
+      setPreview(result);
+      if (result === null) {
+        setPreviewError("No samples available for this offering.");
+      }
+    } catch (err) {
+      setPreviewError(err instanceof Error ? err.message : "Could not load the audio sample.");
+    } finally {
+      setPreviewLoading(false);
+    }
+  };
+
   return (
     <li
       className="border border-gray-200 rounded-md p-3 space-y-2"
@@ -405,6 +447,61 @@ function RecommendationItem({
         <p className="text-xs text-gray-700 mt-1" data-testid="matchmaker-match-reason">
           {recommendation.matchReason}
         </p>
+      </div>
+      {/* BG7 inline audio preview surface. The toggle is a plain
+          button the focused UI test clicks; the player is a
+          SoundHub-owned in-app playback URL the browser renders as
+          `<audio src>` without inspecting its internals. */}
+      <div
+        className="space-y-1"
+        data-testid="matchmaker-recommendation-audio"
+        data-offering-id={recommendation.bestMatchingOffering.offeringId}
+      >
+        <button
+          type="button"
+          onClick={() => {
+            onPreviewToggle().catch(() => {
+              /* surfaced via setPreviewError above */
+            });
+          }}
+          className="text-blue-700 hover:text-blue-900 text-xs font-medium underline disabled:opacity-50 disabled:cursor-not-allowed"
+          data-testid="matchmaker-preview-toggle"
+          data-preview-state={previewing ? "open" : "closed"}
+          aria-expanded={previewing}
+        >
+          {previewing ? "Hide sample preview" : "▶ Preview sample"}
+        </button>
+        {previewing && (
+          <div className="space-y-1" data-testid="matchmaker-preview-region">
+            {previewLoading && (
+              <p className="text-xs text-gray-600" data-testid="matchmaker-preview-loading">
+                Loading sample…
+              </p>
+            )}
+            {previewError && (
+              <p className="text-xs text-red-700" data-testid="matchmaker-preview-error">
+                {previewError}
+              </p>
+            )}
+            {preview && (
+              <audio
+                controls
+                preload="none"
+                data-testid="matchmaker-audio-player"
+                data-sample-id={preview.sampleId}
+                data-offering-id={preview.offeringId}
+                src={preview.playbackUrl}
+              >
+                Your browser does not support the audio element.
+              </audio>
+            )}
+            {preview && (
+              <p className="text-xs text-gray-500" data-testid="matchmaker-preview-label">
+                {preview.label}
+              </p>
+            )}
+          </div>
+        )}
       </div>
       <div>
         <button

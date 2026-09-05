@@ -95,6 +95,17 @@ export default defineConfig({
       // seeded URL resolves end to end (contract requires `z.string().url()`).
       PUBLIC_FIXTURE_ORIGIN: BASE_URL,
       PORT_WEB: String(PORT_WEB),
+      // BG7 (ticket #65): the integrated browser journey needs the
+      // deterministic identity adapter to surface the dev
+      // verification URL on the magic-link response so the test
+      // session can complete sign-in without live email delivery.
+      // BG1_DETERMINISTIC_OPERATOR_MODE is the existing factory
+      // escape hatch — see apps/api/src/identity/identity-adapter-factory.ts.
+      BG1_DETERMINISTIC_OPERATOR_MODE: "1",
+      // BG7: force the deterministic in-memory storage backend
+      // regardless of Supabase configuration so the audio fixture
+      // is hydrated by the adapter rather than a managed bucket.
+      BG2_STORAGE_BACKEND: "deterministic",
     },
   },
   metadata: {

@@ -302,7 +302,10 @@ function RequestRow({
       data-request-id={request.projectRequestId}
     >
       <div className="min-w-0">
-        <p className="text-sm font-medium text-gray-900 break-words" data-testid="seller-request-title">
+        <p
+          className="text-sm font-medium text-gray-900 break-words"
+          data-testid="seller-request-title"
+        >
           From {buyerWorkspaceLabel} — {offeringLabel}
         </p>
         <p

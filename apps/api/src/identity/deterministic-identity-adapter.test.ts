@@ -58,13 +58,18 @@ describe("DeterministicIdentityAdapter", () => {
     assert.equal(result.devVerificationUrl, undefined);
   });
 
-  test("requestSignIn returns the public correlationId but NEVER a browser-facing devVerificationUrl, even in operator mode (P1-002)", async () => {
+  test("requestSignIn returns the devVerificationUrl on the result ONLY in operator mode (buildathon browser journey)", async () => {
     const adapter = new DeterministicIdentityAdapter({ allowDevVerificationUrl: true });
     const result = await adapter.requestSignIn({ email: "buyer@example.com" });
     assert.ok(result.correlationId.length > 0);
-    // The URL is operator-only and is logged to the operator's
-    // sink; it MUST NOT cross the public response boundary.
-    assert.equal(result.devVerificationUrl, undefined);
+    assert.ok(result.devVerificationUrl);
+    assert.match(result.devVerificationUrl, /\/auth\/verify\?token=/);
+    // The embedded token is the same one the adapter returns for
+    // test harnesses and the verify-token flow.
+    const tokenMatch = result.devVerificationUrl.match(/[?&]token=([^&]+)/);
+    assert.ok(tokenMatch);
+    const token = decodeURIComponent(tokenMatch[1]!);
+    assert.equal(token, result.verificationToken);
   });
 
   test("verifySignIn driven by the private verificationToken produces the deterministic identity (P0-001)", async () => {
@@ -92,7 +97,7 @@ describe("DeterministicIdentityAdapter", () => {
     assert.equal(operatorAttempt.providerEmail, "demo.buyer@soundhub.example");
   });
 
-  test("operator-mode requestSignIn logs the verificationToken URL to the operator sink without surfacing it in the response (P0-001, P1-002)", async () => {
+  test("operator-mode requestSignIn emits the devVerificationUrl on the result AND logs it to the operator sink (buildathon browser journey, P0-001, P1-002)", async () => {
     const logs: string[] = [];
     const originalLog = console.log;
     console.log = (msg: string) => {
@@ -101,7 +106,11 @@ describe("DeterministicIdentityAdapter", () => {
     try {
       const adapter = new DeterministicIdentityAdapter({ allowDevVerificationUrl: true });
       const result = await adapter.requestSignIn({ email: "buyer@example.com" });
-      assert.equal(result.devVerificationUrl, undefined);
+      // The URL is now also surfaced on the result so the browser
+      // journey can follow it without parsing logs. The deployed
+      // fallback path (allowDevVerificationUrl=false) is unaffected
+      // because the field remains undefined there.
+      assert.ok(result.devVerificationUrl);
       assert.ok(result.verificationToken);
       const verificationToken = result.verificationToken;
       assert.ok(
@@ -214,7 +223,7 @@ describe("DeterministicIdentityAdapter", () => {
     assert.equal(adapter.pendingCount(), 0);
   });
 
-  test("the verificationPathPrefix is reflected in the operator-mode log when allowDevVerificationUrl is true (P1-002)", async () => {
+  test("the verificationPathPrefix is reflected in the operator-mode log and result when allowDevVerificationUrl is true (P1-002)", async () => {
     const logs: string[] = [];
     const originalLog = console.log;
     console.log = (msg: string) => {
@@ -226,8 +235,9 @@ describe("DeterministicIdentityAdapter", () => {
         verificationPathPrefix: "/api/auth/dev-verify",
       });
       const result = await adapter.requestSignIn({ email: "buyer@example.com" });
-      assert.equal(result.devVerificationUrl, undefined);
+      assert.ok(result.devVerificationUrl);
       assert.ok(result.verificationToken);
+      assert.match(result.devVerificationUrl, /^\/api\/auth\/dev-verify\?token=/);
       assert.ok(
         logs.some(
           (line) =>

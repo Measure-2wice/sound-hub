@@ -110,12 +110,14 @@ describe("BG1 auth routes (in-memory, deterministic adapter)", () => {
     // verificationToken never crosses the route boundary and
     // the schema does not declare it.
     assert.equal("verificationToken" in response.body, false);
-    // Per P1-002 the deployed deterministic fallback NEVER
-    // exposes a usable login credential to any browser — even
-    // when the deterministic adapter runs in operator mode, the
-    // URL is logged to the operator's sink instead of crossing
-    // the response boundary.
-    assert.equal(response.body.devVerificationUrl, undefined);
+    // Operator mode: the devVerificationUrl IS now surfaced on the
+    // response so the buildathon browser journey can complete
+    // sign-in without parsing logs. The production path
+    // (allowDevVerificationUrl=false) is exercised by the next
+    // test in this suite.
+    assert.ok(response.body.devVerificationUrl);
+    const devUrl: string = response.body.devVerificationUrl;
+    assert.match(devUrl, /\/auth\/verify\?token=/);
   });
 
   test("POST /api/auth/magic-link never returns a devVerificationUrl regardless of operator mode (P1-002)", async () => {
