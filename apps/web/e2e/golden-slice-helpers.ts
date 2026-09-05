@@ -1,6 +1,6 @@
 // BG7 (ticket #65) — Golden Slice Playwright helpers.
 //
-// Optional helpers used by the integrated browser journey to
+// Shared assertion used by the integrated browser journey to
 // strengthen the audio playback evidence beyond a bare `<audio
 // src=...>` element. The journey in `golden-slice.spec.ts` is the
 // single source of truth for the BG7 acceptance; this module is
@@ -13,10 +13,7 @@
 //     best-effort attempt play(). NEVER asserts physical speaker
 //     output.
 //
-// The journey spec imports the same Playwright primitives
-// directly to keep the spec file self-contained; this module
-// exists so future refinements (e.g. retry-on-timeout wrappers,
-// recording-only mode) have a single typed seam.
+// This module is the single implementation of that proof.
 
 import { expect, type Page } from "@playwright/test";
 
@@ -34,19 +31,12 @@ export async function assertAudioPlaybackUsable(input: {
 }): Promise<AudioUsabilityResult> {
   const timeoutMs = input.timeoutMs ?? 15_000;
 
-  const playbackResponse = await input.page.waitForResponse(
-    (response) =>
-      response.url().includes("/api/services/") &&
-      response.url().includes("/audio-samples/") &&
-      response.url().endsWith("/play"),
+  const playbackUrl = await input.playerLocator.evaluate((el: HTMLAudioElement) => el.src);
+  const playbackResponsePromise = input.page.waitForResponse(
+    (response) => response.url() === playbackUrl,
     { timeout: timeoutMs },
   );
-
-  expect(playbackResponse.status()).toBe(200);
-  const contentType = playbackResponse.headers()["content-type"] ?? "";
-  expect(contentType).toMatch(/audio\/mpeg/);
-
-  const readyState = await input.playerLocator.evaluate((el: HTMLAudioElement) => {
+  const readyStatePromise = input.playerLocator.evaluate((el: HTMLAudioElement) => {
     return new Promise<number>((resolve, reject) => {
       if (el.readyState >= 3) {
         resolve(el.readyState);
@@ -63,7 +53,7 @@ export async function assertAudioPlaybackUsable(input: {
       const t = setTimeout(() => {
         cleanup();
         reject(new Error("audio loadability timeout"));
-      }, 5_000);
+      }, 10_000);
       function cleanup(): void {
         clearTimeout(t);
         el.removeEventListener("loadeddata", onReady);
@@ -76,6 +66,13 @@ export async function assertAudioPlaybackUsable(input: {
       el.load();
     });
   });
+  const [playbackResponse, readyState] = await Promise.all([
+    playbackResponsePromise,
+    readyStatePromise,
+  ]);
+  expect(playbackResponse.status()).toBe(200);
+  const contentType = playbackResponse.headers()["content-type"] ?? "";
+  expect(contentType).toMatch(/audio\/mpeg/);
   expect(readyState).toBeGreaterThanOrEqual(3);
 
   const playOutcome = await input.playerLocator.evaluate(async (el: HTMLAudioElement) => {

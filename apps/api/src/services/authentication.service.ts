@@ -77,9 +77,8 @@ export interface RequestSignInResult {
    * correlation id) and is required by the BG1 shared contract; it
    * is NOT a verification credential (per ticket #59 P2-001). The
    * `devVerificationUrl` is set only when the deterministic adapter
-   * runs in operator mode (`BG1_DETERMINISTIC_OPERATOR_MODE=1`)
-   * so the deployed fallback never exposes a usable login credential
-   * to an unauthenticated browser that merely supplies a demo email.
+   * runs in explicitly gated local test mode. Deployed and
+   * production-like processes cannot enable this field.
    */
   readonly envelope: {
     readonly ok: true;

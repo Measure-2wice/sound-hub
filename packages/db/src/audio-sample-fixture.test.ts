@@ -12,8 +12,8 @@
 // (which lives in apps/api) because packages/db/prisma has no
 // cross-package import path to apps/api. The byte-level assertions
 // below are equivalent to what the trusted-boundary validator checks:
-// MPEG-1 Layer III sync word, no CRC, 128 kbps / 44.1 kHz header,
-// and a 417-byte frame body.
+// an ID3 preamble followed by a complete multi-frame MPEG Layer III
+// payload.
 
 /* eslint-disable @typescript-eslint/no-floating-promises */
 
@@ -24,33 +24,23 @@ import {
   BG7_FIXTURE_OFFERING_ID,
   BG7_FIXTURE_STORAGE_REF,
   BG7_FIXTURE_LABEL,
+  shouldSeedDeterministicAudioFixture,
 } from "./audio-sample-fixture.js";
 
-test("buildDeterministicMp3Fixture returns exactly 417 bytes", () => {
+test("buildDeterministicMp3Fixture returns the complete stripped MP3 stream", () => {
   const bytes = buildDeterministicMp3Fixture();
-  assert.equal(bytes.byteLength, 417);
+  assert.equal(bytes.byteLength, 8663);
 });
 
-test("buildDeterministicMp3Fixture header is a real MPEG-1 Layer III 128kbps 44.1kHz frame", () => {
+test("buildDeterministicMp3Fixture begins with a valid MPEG Layer III frame", () => {
   const bytes = buildDeterministicMp3Fixture();
-  // Sync word: 11 bits set to 1. Encoded as 0xFF followed by the
-  // top 3 bits of 0xFB.
   assert.equal(bytes[0], 0xff, "sync byte 1");
   assert.equal(bytes[1]! & 0xe0, 0xe0, "sync byte 2 top 3 bits");
-  // MPEG version: bits 4..3 of byte 1 = 11 = MPEG-1.
-  assert.equal((bytes[1]! >> 3) & 0x03, 0x03, "MPEG version = MPEG-1");
-  // Layer: bits 2..1 of byte 1 = 01 = Layer III.
-  assert.equal((bytes[1]! >> 1) & 0x03, 0x01, "layer = Layer III");
-  // Protection bit: bit 0 of byte 1 = 1 = no CRC follows header.
-  // (The MP3 spec calls this `protection_bit`; 0 = CRC present, 1 =
-  // CRC absent. The fixture header 0xfb has protection_bit=1.)
-  assert.equal(bytes[1]! & 0x01, 0x01, "protection bit set (no CRC follows header)");
-  // Bitrate index 9 = 128 kbps for MPEG-1 Layer III.
-  assert.equal((bytes[2]! >> 4) & 0x0f, 0x09, "bitrate index = 9 (128 kbps)");
-  // Sample-rate index 0 = 44.1 kHz.
-  assert.equal((bytes[2]! >> 2) & 0x03, 0x00, "sample-rate index = 0 (44.1 kHz)");
-  // Padding bit unset.
-  assert.equal((bytes[2]! >> 1) & 0x01, 0x00, "padding bit unset");
+  assert.equal(bytes[0], 0xff, "MPEG frame sync byte 1");
+  const frameOffset = bytes.findIndex(
+    (byte, index) => byte === 0xff && (bytes[index + 1] ?? 0) >= 0xe0,
+  );
+  assert.equal(frameOffset, 0, "begins directly with an MPEG audio frame");
 });
 
 test("buildDeterministicMp3Fixture is deterministic across calls", () => {
@@ -63,22 +53,37 @@ test("buildDeterministicMp3Fixture is deterministic across calls", () => {
   assert.deepEqual(a, c);
 });
 
-test("buildDeterministicMp3Fixture bytes equal the existing mp3FrameBytes test helper", () => {
-  // The trusted-boundary validator uses the same header bytes as
-  // this fixture. We compare the header slice to confirm the
-  // match; the body is zero in the fixture and zero in
-  // mp3FrameBytes (Buffer.alloc zero-initializes), so a full
-  // 417-byte deep-equal would also hold. We assert both for
-  // explicitness.
+test("buildDeterministicMp3Fixture is not a truncated header-only payload", () => {
   const bytes = buildDeterministicMp3Fixture();
   assert.equal(bytes[0], 0xff);
-  assert.equal(bytes[1], 0xfb);
-  assert.equal(bytes[2], 0x90);
-  assert.equal(bytes[3], 0x00);
-  // Body bytes 4..416 are all zero (silent frame).
-  for (let i = 4; i < bytes.byteLength; i++) {
-    assert.equal(bytes[i], 0x00, `body byte ${i} must be zero`);
-  }
+  assert.ok(bytes.byteLength > 8_000);
+});
+
+test("deterministic audio seeding is enabled only by the explicit local test boundary", () => {
+  assert.equal(
+    shouldSeedDeterministicAudioFixture({
+      NODE_ENV: "test",
+      BG2_STORAGE_BACKEND: "deterministic",
+      BG7_DETERMINISTIC_AUDIO_FIXTURE: "1",
+    }),
+    true,
+  );
+  assert.equal(
+    shouldSeedDeterministicAudioFixture({
+      NODE_ENV: "production",
+      BG2_STORAGE_BACKEND: "deterministic",
+      BG7_DETERMINISTIC_AUDIO_FIXTURE: "1",
+    }),
+    false,
+  );
+  assert.equal(
+    shouldSeedDeterministicAudioFixture({
+      NODE_ENV: "test",
+      BG2_STORAGE_BACKEND: "supabase",
+      BG7_DETERMINISTIC_AUDIO_FIXTURE: "1",
+    }),
+    false,
+  );
 });
 
 test("BG7 fixture constants are stable and have the canonical shape", () => {

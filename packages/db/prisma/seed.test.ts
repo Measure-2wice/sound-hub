@@ -72,7 +72,7 @@ after(async () => {
   await prisma.$disconnect();
 });
 
-function runSeed(): Promise<void> {
+function runSeed(options: { readonly deterministicAudioFixture?: boolean } = {}): Promise<void> {
   return new Promise((resolve, reject) => {
     const child = spawn("npx", ["tsx", "prisma/seed.ts"], {
       cwd: new URL("..", import.meta.url).pathname,
@@ -81,6 +81,10 @@ function runSeed(): Promise<void> {
         ...process.env,
         DATABASE_URL: databaseUrl,
         TEST_DATABASE_URL: databaseUrl,
+        NODE_ENV: "test",
+        BG2_STORAGE_BACKEND:
+          options.deterministicAudioFixture === false ? "supabase" : "deterministic",
+        BG7_DETERMINISTIC_AUDIO_FIXTURE: options.deterministicAudioFixture === false ? "0" : "1",
       },
     });
     child.on("error", reject);
@@ -92,6 +96,52 @@ function runSeed(): Promise<void> {
 }
 
 describe("M1.1 seed regression coverage", () => {
+  test("deterministic test mode seeds exactly one canonical BG7 audio sample", async () => {
+    await runSeed();
+    const rows = await prisma.serviceOfferingAudioSample.findMany({
+      where: { storageRef: "det:of-creole-beats-dancehall-single-remote:fixture" },
+    });
+    assert.equal(rows.length, 1);
+    assert.equal(rows[0]?.displayOrder, 1);
+    assert.equal(rows[0]?.contentType, "audio/mpeg");
+  });
+
+  test("managed storage seed mode neither creates the deterministic fixture nor overwrites managed metadata", async () => {
+    await prisma.serviceOfferingAudioSample.deleteMany({
+      where: { storageRef: "det:of-creole-beats-dancehall-single-remote:fixture" },
+    });
+    await runSeed({ deterministicAudioFixture: false });
+    const offering = await prisma.serviceOffering.findUniqueOrThrow({
+      where: { id: "of-creole-beats-dancehall-single-remote" },
+    });
+    await prisma.serviceOfferingAudioSample.deleteMany({ where: { offeringId: offering.id } });
+    const managed = await prisma.serviceOfferingAudioSample.create({
+      data: {
+        offeringId: offering.id,
+        label: "Managed sample must survive",
+        contentType: "audio/mpeg",
+        byteSize: 12_345,
+        displayOrder: 1,
+        storageRef: "supa:offering-audio:managed/sample.mp3",
+        cleanupStatus: "Live",
+      },
+    });
+
+    await runSeed({ deterministicAudioFixture: false });
+
+    assert.equal(
+      await prisma.serviceOfferingAudioSample.count({
+        where: { storageRef: { startsWith: "det:" } },
+      }),
+      0,
+    );
+    assert.deepEqual(
+      await prisma.serviceOfferingAudioSample.findUnique({ where: { id: managed.id } }),
+      managed,
+    );
+    await prisma.serviceOfferingAudioSample.delete({ where: { id: managed.id } });
+  });
+
   test("restores Workspace.ownerUserId after a stale update", async () => {
     await runSeed();
     const workspace = await prisma.workspace.findUnique({
@@ -244,6 +294,9 @@ describe("M1.1 seed regression coverage", () => {
     assert.ok(profileId);
 
     // Wipe the seller and its entire graph.
+    await prisma.serviceOfferingAudioSample.deleteMany({
+      where: { offeringId: { in: offeringIds } },
+    });
     await prisma.serviceOfferingPricing.deleteMany({
       where: { offeringId: { in: offeringIds } },
     });

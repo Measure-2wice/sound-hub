@@ -653,8 +653,8 @@ export type DealStatusV1 = (typeof dealStatusValuesV1)[number];
 // SoundHub always uses neutral responses: the request envelope returns
 // the same shape whether the email is registered or not, so the public
 // surface cannot be used to enumerate accounts. The deterministic
-// adapter adds a non-production `devVerificationUrl` for the
-// integration test and emergency fallback paths; managed providers omit
+// adapter adds a test-only `devVerificationUrl` for the local
+// integration test; managed providers omit
 // it because the real email delivery happens on the provider side.
 export const bg1MagicLinkRequestV1Schema = z
   .object({
@@ -686,9 +686,9 @@ export const bg1MagicLinkResponseV1Schema = z
     // that round-trips this value to `/api/auth/verify-token` is
     // rejected as an unknown credential.
     requestId: z.string().min(1).max(256),
-    // Deterministic-adapter operator-mode only: a one-time
-    // verification URL that the operator-driven recovery UI can
-    // follow in the absence of email delivery. Production Supabase
+    // Deterministic-adapter local-test mode only: a one-time
+    // verification URL that the Playwright flow can follow without
+    // live email delivery. Production Supabase
     // magic-link emails render this field absent; the deployed
     // deterministic fallback also renders it absent so an
     // unauthenticated browser cannot choose a demo identity by
@@ -712,8 +712,8 @@ export type Bg1MagicLinkResponseV1 = z.infer<typeof bg1MagicLinkResponseV1Schema
 //     magic-link response and carried into logs and observability.
 //     It is never a credential and cannot be used to mint a session.
 //   - `verificationToken` is the **private one-time credential** the
-//     browser extracts from the email callback URL (or the dev
-//     recovery workflow reads from the server log). It is the only
+//     browser extracts from the managed email callback URL or the
+//     explicitly gated local test URL. It is the only
 //     value `verifySignIn` accepts. It MUST NEVER appear in public
 //     DTOs, error envelopes, or log lines.
 export const bg1VerifyTokenRequestV1Schema = z

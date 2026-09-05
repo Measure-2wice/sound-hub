@@ -1,4 +1,5 @@
 import { test, expect } from "@playwright/test";
+import { assertAudioPlaybackUsable } from "./golden-slice-helpers";
 
 // BG7 (ticket #65) — the integrated Buildathon Golden Slice
 // browser journey.
@@ -110,41 +111,7 @@ test("BG7: integrated buyer-to-Active-Deal journey", async ({ page }) => {
     /^https?:\/\/[^/]+\/api\/services\/of-creole-beats-dancehall-single-remote\/audio-samples\/.+\/play$/,
   );
 
-  // The <audio> element renders with preload="none" so the
-  // browser does NOT fetch the resource until the user clicks
-  // play. Verify the resource is reachable through the same
-  // cookie-bearing session via Playwright's request API. The
-  // response proves the playback URL is real and returns the
-  // expected audio media type — not merely that an <audio src>
-  // attribute was emitted. The loadability / HAVE_FUTURE_DATA
-  // assertion in headless Chromium is environment-dependent (the
-  // bundled codec may refuse MP3 in a containerised build), so we
-  // do not require the <audio> element to actually load bytes;
-  // the strongest portable signal is that the GET succeeds and
-  // the response carries the canonical audio media type.
-  const playbackResponse = await page.request.get(audioSrc!);
-  expect(playbackResponse.status(), "playback GET must succeed").toBe(200);
-  expect(
-    playbackResponse.headers()["content-type"] ?? "",
-    "playback GET must return audio/mpeg",
-  ).toMatch(/audio\/mpeg/);
-  // Best-effort play() probe: in headless Chromium the call may
-  // reject with NotAllowedError (no audio device) which is not
-  // a regression. We tolerate that case AND any DOMException
-  // caused by the headless codec refusing MP3; the strongest
-  // portable signal is the GET response above.
-  const playOutcome = await audioPlayer.evaluate(async (el: HTMLAudioElement) => {
-    try {
-      await el.play();
-      return "ok" as const;
-    } catch (err) {
-      const name = (err as { name?: string }).name ?? "unknown";
-      return ["NotAllowedError", "NotSupportedError", "AbortError"].includes(name)
-        ? ("ok" as const)
-        : ("error" as const);
-    }
-  });
-  expect(playOutcome, "audio.play() must not reject with an unexpected error").not.toBe("error");
+  await assertAudioPlaybackUsable({ page, playerLocator: audioPlayer });
 
   // -------------------------------------------------------------
   // Step 4 — Invite the seller (BG4).

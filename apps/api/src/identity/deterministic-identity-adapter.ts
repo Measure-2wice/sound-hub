@@ -27,11 +27,7 @@
 //     verify. Surfaces in logs and observability.
 //   - `verificationToken`: the PRIVATE one-time credential the
 //     pending request is stored under. Returned on the adapter's
-//     `SignInRequestResult.verificationToken` so test harnesses can
-//     drive `verifySignIn` directly, and logged to the operator
-//     sink in operator mode so the deployed recovery path can
-//     complete sign-in through the same application boundary the
-//     managed path uses. Never returned in any public DTO.
+//     internal result so test harnesses can drive `verifySignIn`.
 //
 // Per ADR 0004 the adapter never touches UserAccount, Workspace, or
 // membership tables — those live in `PrismaAuthRepository`.
@@ -70,15 +66,10 @@ export interface DeterministicIdentityAdapterOptions {
    */
   readonly ttlMs?: number;
   /**
-   * Operator-controlled escape hatch. When `true`, the adapter
-   * returns a `devVerificationUrl` that an operator-driven UI
-   * (or a test harness) can follow to verify without email
-   * delivery. Defaults to `false` so the deployed process never
-   * exposes a usable login credential to an unauthenticated
-   * browser that merely supplies an email. Tests pass `true`
-   * explicitly; the operator enables the allow-listed recovery
-   * mode by setting `BG1_DETERMINISTIC_OPERATOR_MODE=1` in the
-   * deployed process.
+   * Local-test escape hatch. When `true`, the adapter returns a
+   * `devVerificationUrl` that a test browser can follow without
+   * email delivery. The composition root honors this only under
+   * `NODE_ENV=test`.
    */
   readonly allowDevVerificationUrl?: boolean;
   /**
@@ -161,16 +152,11 @@ export class DeterministicIdentityAdapter implements IdentityAdapter {
    *
    * The `devVerificationUrl` is returned on the adapter's
    * `SignInRequestResult` ONLY when `allowDevVerificationUrl` is
-   * `true` (operator mode). Production behavior is unchanged:
-   * the managed adapter never sets `allowDevVerificationUrl`,
-   * and the deployed deterministic fallback (the default
-   * `BG1_DETERMINISTIC_OPERATOR_MODE` value) is `false`. When
-   * the field IS returned, the URL is also emitted to the
-   * operator's log sink so a human operator running the
-   * fallback can drive the recovery flow without inspecting
-   * stdout alone. The buildathon browser journey relies on the
-   * response-side emission because Playwright cannot parse
-   * stdout from a spawned API process.
+   * `true`. The composition root permits that option only under
+   * `NODE_ENV=test`; deployed and production-like processes cannot
+   * enable this response field. The local Playwright journey uses it
+   * to exercise the normal callback and session boundary without
+   * live email delivery.
    */
   async requestSignIn(input: { readonly email: string }): Promise<SignInRequestResult> {
     const normalizedEmail = input.email.trim().toLowerCase();
@@ -185,10 +171,8 @@ export class DeterministicIdentityAdapter implements IdentityAdapter {
     });
     if (this.allowDevVerificationUrl) {
       const url = `${this.verificationPathPrefix}?token=${encodeURIComponent(verificationToken)}`;
-      // Operator-mode: emit the URL both to stdout (human-readable
-      // log for the deployed fallback) and on the response (so the
-      // browser-side flow can surface the "Continue with dev
-      // verification URL" button the login page already renders).
+      // Local test mode: emit the URL so the browser-side E2E flow
+      // can exercise the verification callback.
       console.log(
         `[bg1-deterministic] operator-mode verification URL for ${normalizedEmail} ` +
           `(correlation=${correlationId}): ${url}`,

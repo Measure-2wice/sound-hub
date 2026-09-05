@@ -1301,7 +1301,10 @@ async function applySeed(): Promise<void> {
     // NOT touch the storage adapter. The label and offering id are
     // exported from @soundhub/db/audio-sample-fixture so the seed
     // and the adapter agree on the canonical identifiers.
-    await applyDeterministicAudioSamples(tx);
+    const { shouldSeedDeterministicAudioFixture } = await import("../src/audio-sample-fixture.js");
+    if (shouldSeedDeterministicAudioFixture(process.env)) {
+      await applyDeterministicAudioSamples(tx);
+    }
   });
 }
 
@@ -1335,7 +1338,7 @@ async function applyDeterministicAudioSamples(tx: Prisma.TransactionClient): Pro
     );
   }
 
-  const fixtureByteSize = 417; // matches the deterministic MP3 frame size in @soundhub/db/audio-sample-fixture
+  const fixtureByteSize = 8663;
 
   // Idempotent upsert keyed by the stable (offeringId, displayOrder)
   // tuple. A previous run with a stale storageRef is overwritten
@@ -1933,6 +1936,13 @@ export function assertCanonicalSnapshotCorrect(snapshot: CanonicalSnapshot): voi
   // assertion.
   const BG7_FIXTURE_STORAGE_REF = "det:of-creole-beats-dancehall-single-remote:fixture";
   const fixtureRows = snapshot.audioSamples;
+  const expectAudioFixture =
+    process.env.NODE_ENV === "test" &&
+    process.env.BG2_STORAGE_BACKEND === "deterministic" &&
+    process.env.BG7_DETERMINISTIC_AUDIO_FIXTURE === "1";
+  if (!expectAudioFixture) {
+    return;
+  }
   if (fixtureRows.length !== 1) {
     throw new Error(
       `BG7 audio-sample fixture count mismatch: expected exactly 1 row with storageRef ${BG7_FIXTURE_STORAGE_REF}, got ${fixtureRows.length}`,
