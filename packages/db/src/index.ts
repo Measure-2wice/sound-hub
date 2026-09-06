@@ -12,7 +12,8 @@
 import { PrismaPg } from "@prisma/adapter-pg";
 import { PrismaClient } from "./generated/client.js";
 
-export type { PrismaClient, Prisma } from "./generated/client.js";
+export type { PrismaClient } from "./generated/client.js";
+export { Prisma } from "./generated/client.js";
 export * from "./generated/enums.js";
 
 export function createPrismaClient(connectionString = process.env.DATABASE_URL): PrismaClient {
