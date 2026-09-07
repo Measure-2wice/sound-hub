@@ -178,12 +178,16 @@ pnpm dev:api          # Express only
 # Quality gates
 pnpm type-check
 pnpm lint
-pnpm test
+pnpm test             # requires disposable PostgreSQL on port 5433; resets its test schema
 pnpm build
 pnpm format:check
 pnpm check            # type-check + lint + test + build
 pnpm format           # write (mutate) formatting
 ```
+
+Start the disposable database with `pnpm db:test:up` before running `pnpm test` or `pnpm check`.
+The repository-test portion of both commands runs `pnpm db:test:reset`, which drops and recreates
+the schema in the validated local database whose name ends in `_test`.
 
 ### Database and Prisma
 
@@ -247,7 +251,9 @@ at `apps/api/src/index.ts`, and the adapter factories). **No secret values are i
 | `FRONTEND_URL`                    | Web origin used for CORS                                                |
 | `API_URL`                         | API origin used by the web app                                          |
 | `PUBLIC_API_BASE_URL`             | Public base URL for browser-facing API references                       |
+| `PORT`                            | API listen-port fallback used when `PORT_API` is unset                  |
 | `PORT_WEB`                        | Web listen port (defaults to 3000)                                      |
+| `PORT_API`                        | API listen port (takes precedence over `PORT`; defaults to 4000)        |
 | `PUBLIC_FIXTURE_ORIGIN`           | Origin used to build deterministic audio-fixture URLs                   |
 | `SUPABASE_URL`                    | Supabase project URL (managed identity adapter)                         |
 | `SUPABASE_ANON_KEY`               | Supabase anon key (managed identity adapter)                            |
@@ -273,8 +279,9 @@ Auth project's email channel and verified by the bounded deployed smoke.
   `apps/web`, plus `pnpm test:repository`, `pnpm test:forbidden-deps`, and `pnpm test:db-qa-env`
 - **Disposable PostgreSQL** — `pnpm test:repository` against a real local test database; the
   `db:test:*` scripts drive the cycle (clean → migrate → seed → snapshot equality)
-- **Forbidden-dependency guard** — `pnpm test:forbidden-deps` rejects AI, vector, Redis, storage,
-  wallet, and blockchain references in `package.json`, the lockfile, and TypeScript source
+- **Forbidden-dependency guard** — `pnpm test:forbidden-deps` rejects an enumerated set of
+  unauthorized AI, vector, Redis, storage, wallet, and blockchain package declarations, resolved
+  dependencies, import specifiers, and literal package identifiers in scanned source
 - **Playwright (web e2e)** — `pnpm test:e2e` runs the single integrated Golden Slice journey plus
   stale-request, concurrency, and outage projects against disposable PostgreSQL
 - **Acceptance gate** — `pnpm acceptance-gate` orchestrates the forbidden-deps check, the
