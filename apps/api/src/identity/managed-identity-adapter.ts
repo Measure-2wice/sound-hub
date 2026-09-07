@@ -129,6 +129,15 @@ const supabaseUserV1Schema = z
     email_change_sent_at: z.string().max(64).nullable().optional(),
     new_email: z.string().email().nullable().optional(),
     new_phone: z.string().max(64).nullable().optional(),
+    // Documented Supabase GoTrue User field; present on
+    // pending phone-change flows that have dispatched a
+    // verification challenge. Tolerated for forward
+    // compatibility; identity derivation does not consume it.
+    phone_change_sent_at: z.string().max(64).nullable().optional(),
+    // Documented Supabase GoTrue User field; present on
+    // reauthentication challenges. Tolerated for forward
+    // compatibility; identity derivation does not consume it.
+    reauthentication_sent_at: z.string().max(64).nullable().optional(),
     invited_at: z.string().max(64).nullable().optional(),
     action_link: z.string().max(2048).nullable().optional(),
     is_sso_user: z.boolean().optional(),

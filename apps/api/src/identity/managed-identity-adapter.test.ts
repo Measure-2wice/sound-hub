@@ -143,6 +143,8 @@ function supabaseVerifyEnvelope(overrides: {
       email_change_sent_at: null,
       new_email: null,
       new_phone: null,
+      phone_change_sent_at: null,
+      reauthentication_sent_at: null,
       invited_at: null,
       action_link: null,
       is_sso_user: false,
@@ -500,6 +502,8 @@ describe("ManagedIdentityAdapter", () => {
     userRecord["email_change_sent_at"] = null;
     userRecord["new_email"] = null;
     userRecord["new_phone"] = null;
+    userRecord["phone_change_sent_at"] = "2025-01-01T00:00:00.000Z";
+    userRecord["reauthentication_sent_at"] = "2025-01-01T00:00:00.000Z";
     userRecord["invited_at"] = "2025-01-01T00:00:00.000Z";
     userRecord["action_link"] = null;
     userRecord["is_sso_user"] = false;
