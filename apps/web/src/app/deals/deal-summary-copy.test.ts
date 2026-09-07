@@ -6,6 +6,7 @@ import {
   buildApprovalSuccessCopy,
   buildAiDraftStatusLabel,
   buildDealSummaryCopy,
+  buildSellerConsentLabel,
   shouldShowDraftTermsControl,
 } from "./deal-summary-copy.js";
 
@@ -73,6 +74,44 @@ describe("BG5 approval presentation", () => {
         { side: "Seller", approvedAt: "2026-09-02T22:36:14.000Z" },
       ]),
       "AI-drafted · approved by both parties",
+    );
+  });
+});
+
+describe("BG5 seller-consent projection (ticket AC27)", () => {
+  test("renders an explicit Accepted label when the projection carries a timestamp", () => {
+    const copy = buildSellerConsentLabel({
+      status: "Accepted",
+      sellerConsentAt: "2026-09-02T22:30:05.000Z",
+    });
+    assert.ok(copy !== null);
+    assert.equal(copy.label, "Seller consent: Accepted");
+    assert.equal(copy.consentedAt, "2026-09-02T22:30:05.000Z");
+  });
+
+  test("fails closed (returns null) when the projection is null", () => {
+    assert.equal(buildSellerConsentLabel(null), null);
+  });
+
+  test("fails closed (returns null) when the projection lacks a timestamp", () => {
+    // Defensive: a null sellerConsentAt must NOT present "Accepted"
+    // consent — only a complete projection drives the indicator.
+    assert.equal(buildSellerConsentLabel({ status: "Accepted", sellerConsentAt: null }), null);
+  });
+
+  test("the label names the side (Seller) but no Workspace ID or internal id", () => {
+    const copy = buildSellerConsentLabel({
+      status: "Accepted",
+      sellerConsentAt: "2026-09-02T22:30:05.000Z",
+    });
+    assert.ok(copy !== null);
+    const json = JSON.stringify(copy);
+    assert.equal(json.includes("ws-"), false, "label must not leak a Workspace id");
+    assert.equal(json.includes("dealId"), false, "label must not leak a Deal id");
+    assert.equal(
+      json.includes("projectRequestId"),
+      false,
+      "label must not leak a ProjectRequest id",
     );
   });
 });

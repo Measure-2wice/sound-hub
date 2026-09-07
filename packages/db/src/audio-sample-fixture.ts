@@ -88,19 +88,11 @@ import { checkApprovedDisposableTestDatabase } from "./approved-disposable-test-
 /**
  * Build the short deterministic MP3 used by the browser proof.
  *
- * The `label` parameter is preserved for future observability hooks
- * (logging, instrumentation) but does NOT alter the bytes — the
- * function is byte-deterministic across calls regardless of input.
+ * The function is byte-deterministic across calls — it always returns
+ * the canonical BG7 fixture bytes with no caller-visible inputs.
  */
-export function buildDeterministicMp3Fixture(label?: string): Uint8Array {
-  const bytes = new Uint8Array(Buffer.from(FIXTURE_BASE64, "base64"));
-  // Touch the label to avoid unused-arg lint; observability hooks can
-  // be added here without changing the byte output.
-  if (label !== undefined) {
-    // no-op; intentionally observable in trace logs only
-    void label;
-  }
-  return bytes;
+export function buildDeterministicMp3Fixture(): Uint8Array {
+  return new Uint8Array(Buffer.from(FIXTURE_BASE64, "base64"));
 }
 
 /**

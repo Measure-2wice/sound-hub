@@ -87,6 +87,10 @@ describe("fetchDeal", () => {
           },
           currentTermsVersion: sampleTermsVersion,
           currentApprovals: [],
+          sellerConsent: {
+            status: "Accepted",
+            sellerConsentAt: "2026-09-01T00:00:05.000Z",
+          },
         },
       },
     });
@@ -94,6 +98,7 @@ describe("fetchDeal", () => {
     assert.equal(result.deal.deal.dealId, "deal-1");
     assert.equal(result.deal.currentTermsVersion?.termsVersionId, "tv-1");
     assert.equal(result.deal.currentApprovals.length, 0);
+    assert.equal(result.deal.sellerConsent?.status, "Accepted");
   });
 
   test("sends actingWorkspaceId as a query parameter with credentials", async () => {
@@ -114,6 +119,7 @@ describe("fetchDeal", () => {
           },
           currentTermsVersion: null,
           currentApprovals: [],
+          sellerConsent: null,
         },
       },
     });

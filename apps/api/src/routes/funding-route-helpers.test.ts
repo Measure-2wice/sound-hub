@@ -193,6 +193,7 @@ test("validateFundingResponse accepts a well-formed payload", () => {
         },
         currentTermsVersion: null,
         currentApprovals: [],
+        sellerConsent: null,
       },
       fundingStatus: {
         status: "Confirmed",
@@ -236,6 +237,7 @@ test("validateFundingResponse rejects drift with BG6_FUNDING_INTERNAL_FAILED", (
         },
         currentTermsVersion: null,
         currentApprovals: [],
+        sellerConsent: null,
       },
       fundingStatus: {
         status: "Confirmed",

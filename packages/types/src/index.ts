@@ -1801,15 +1801,42 @@ export const bg5DealApprovalPublicV1Schema = z
   .strict();
 export type Bg5DealApprovalPublicV1 = z.infer<typeof bg5DealApprovalPublicV1Schema>;
 
+// Allow-listed seller-consent projection surfaced on the BG5 Deal
+// view (ticket AC27). The authoritative source remains the persisted
+// ProjectRequest already loaded by DealTermsService.getDeal(); this
+// schema is the smallest public surface the Active Deal view needs
+// to render an explicit seller-consent indicator.
+//
+// Domain invariant: every persisted Deal must have originated from a
+// seller-accepted ProjectRequest, so for any Deal whose invariant
+// holds the projection is non-null with `status: "Accepted"`. When
+// the invariant does not hold (ProjectRequest row missing, status
+// not "Accepted") the route MUST emit `sellerConsent: null` rather
+// than presenting false consent — the page renders no "Accepted"
+// indicator in that case.
+//
+// This is a projection, NOT a re-derivation hint: the UI MUST NOT
+// infer consent from the Deal's existence, status, approvals, or
+// any other DTO field. Only this field drives the indicator.
+export const bg5SellerConsentProjectionV1Schema = z
+  .object({
+    status: z.literal("Accepted"),
+    sellerConsentAt: z.string().datetime().nullable(),
+  })
+  .strict();
+export type Bg5SellerConsentProjectionV1 = z.infer<typeof bg5SellerConsentProjectionV1Schema>;
+
 // Extended Deal view for the /deals/:dealId page. Wraps the BG4
 // `dealPublicV1Schema` and adds the current TermsVersion (nullable —
-// a Deal in Negotiating may not yet have a draft) and the current
-// approvals (max 2: buyer + seller).
+// a Deal in Negotiating may not yet have a draft), the current
+// approvals (max 2: buyer + seller), and the seller-consent
+// projection (null when the invariant does not hold).
 export const bg5DealViewV1Schema = z
   .object({
     deal: dealPublicV1Schema,
     currentTermsVersion: bg5TermsVersionPublicV1Schema.nullable(),
     currentApprovals: z.array(bg5DealApprovalPublicV1Schema).max(2),
+    sellerConsent: bg5SellerConsentProjectionV1Schema.nullable(),
   })
   .strict();
 export type Bg5DealViewV1 = z.infer<typeof bg5DealViewV1Schema>;

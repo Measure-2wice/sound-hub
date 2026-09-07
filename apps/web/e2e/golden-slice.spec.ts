@@ -22,6 +22,11 @@ import { assertAudioPlaybackUsable } from "./golden-slice-helpers";
 //         approvals, sandbox funding confirmation, and the
 //         terminal "Deal Active — escrow funded; commissioned
 //         work may begin." message (asserted in step 10).
+//         Per Codex P1 (ticket AC27), the seller-consent
+//         indicator is driven by the narrow `sellerConsent`
+//         projection on the BG5 Deal view, which is derived
+//         from the persisted ProjectRequest; it MUST NOT be
+//         inferred from Deal existence alone.
 //   AC4 — managed Supabase Auth and Storage configuration pass one
 //         bounded deployed-environment smoke (operator-run; not
 //         in this file; tracked in docs/deployment/bg7-golden-slice-evidence.md).
@@ -243,6 +248,42 @@ test("BG7: integrated buyer-to-Active-Deal journey", async ({ page }) => {
   // -------------------------------------------------------------
   // Step 10 — Terminal assertions (AC#3, #5, #6).
   // -------------------------------------------------------------
+  // AC3 (seller consent — ticket AC27): the Active Deal view
+  // renders an explicit seller-consent indicator sourced from the
+  // narrow `sellerConsent` projection on the BG5 Deal view. The
+  // projection is derived from the persisted ProjectRequest
+  // (status="Accepted" + sellerConsentAt), so the indicator
+  // appears here because the seller accepted the ProjectRequest in
+  // step 6. The indicator MUST NOT be inferred from Deal
+  // existence alone.
+  await expect(page.getByTestId("deal-seller-consent")).toBeVisible();
+  await expect(page.getByTestId("deal-seller-consent")).toContainText(/Seller consent.*Accepted/);
+  await expect(page.getByTestId("deal-seller-consent")).toHaveAttribute(
+    "data-consent-status",
+    "Accepted",
+  );
+
+  // AC3 (seller approval): the seller-side approval row
+  // transitioned from "Pending" to "Approved at …" in step 8.
+  // The approval list is stable across the buyer round-trip; we
+  // re-assert it here so the terminal step proves both sides
+  // have approved and consent is recorded.
+  const terminalSellerApprovalRow = page
+    .locator(`[data-testid="deal-approvals"] [data-testid="deal-approval"]`)
+    .filter({ hasText: /Seller:/ });
+  await expect(terminalSellerApprovalRow.first()).toContainText("Approved at");
+
+  // AC3 (buyer approval): the buyer-side approval row also
+  // transitioned to "Approved at …" in step 9.
+  const terminalBuyerApprovalRow = page
+    .locator(`[data-testid="deal-approvals"] [data-testid="deal-approval"]`)
+    .filter({ hasText: /Buyer:/ });
+  await expect(terminalBuyerApprovalRow.first()).toContainText("Approved at");
+
+  // AC3 (sandbox funding confirmation): the funding status row
+  // carries the deterministic-confirmed copy from the public DTO.
+  await expect(page.getByTestId("deal-funding-status")).toContainText(/Funding confirmed/i);
+
   // AC3: the Active Deal view displays the required terminal copy.
   await expect(page.getByTestId("deal-active-terminal")).toHaveText(TERMINAL_ACTIVE_COPY);
 

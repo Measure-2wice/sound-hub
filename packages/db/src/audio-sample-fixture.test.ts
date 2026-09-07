@@ -45,13 +45,9 @@ test("buildDeterministicMp3Fixture begins with a valid MPEG Layer III frame", ()
 });
 
 test("buildDeterministicMp3Fixture is deterministic across calls", () => {
-  const a = buildDeterministicMp3Fixture(BG7_FIXTURE_LABEL);
-  const b = buildDeterministicMp3Fixture(BG7_FIXTURE_LABEL);
-  const c = buildDeterministicMp3Fixture(undefined);
+  const a = buildDeterministicMp3Fixture();
+  const b = buildDeterministicMp3Fixture();
   assert.deepEqual(a, b);
-  // The label argument does not change the bytes — observability
-  // hook only.
-  assert.deepEqual(a, c);
 });
 
 test("buildDeterministicMp3Fixture is not a truncated header-only payload", () => {

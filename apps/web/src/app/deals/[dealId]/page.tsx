@@ -39,6 +39,7 @@ import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import Link from "next/link";
 import type {
   Bg5DealApprovalPublicV1,
+  Bg5SellerConsentProjectionV1,
   Bg5TermsVersionPublicV1,
   Bg6FundingConfirmationPublicV1,
   DealPublicV1,
@@ -55,6 +56,7 @@ import {
   buildDealSummaryCopy,
   buildFundingBadgeLabel,
   buildPublicFundingStatusCopy,
+  buildSellerConsentLabel,
   getDealPartySide,
   shouldShowDraftTermsControl,
 } from "../deal-summary-copy";
@@ -85,6 +87,7 @@ export default function DealPage({ params }: DealPageProps): JSX.Element {
     null,
   );
   const [currentApprovals, setCurrentApprovals] = useState<readonly Bg5DealApprovalPublicV1[]>([]);
+  const [sellerConsent, setSellerConsent] = useState<Bg5SellerConsentProjectionV1 | null>(null);
   const [loadingDeal, setLoadingDeal] = useState<boolean>(false);
   const [bootstrapComplete, setBootstrapComplete] = useState<boolean>(false);
   const bootstrapKeyRef = useRef<string | null>(null);
@@ -107,6 +110,7 @@ export default function DealPage({ params }: DealPageProps): JSX.Element {
         setDeal(null);
         setCurrentTermsVersion(null);
         setCurrentApprovals([]);
+        setSellerConsent(null);
         return;
       }
       setLoadingDeal(true);
@@ -116,6 +120,7 @@ export default function DealPage({ params }: DealPageProps): JSX.Element {
         setDeal(result.deal.deal);
         setCurrentTermsVersion(result.deal.currentTermsVersion);
         setCurrentApprovals(result.deal.currentApprovals);
+        setSellerConsent(result.deal.sellerConsent);
       } catch (err) {
         if (
           err instanceof Error &&
@@ -139,6 +144,7 @@ export default function DealPage({ params }: DealPageProps): JSX.Element {
       setDeal(null);
       setCurrentTermsVersion(null);
       setCurrentApprovals([]);
+      setSellerConsent(null);
       return;
     }
     if (
@@ -174,6 +180,7 @@ export default function DealPage({ params }: DealPageProps): JSX.Element {
         setDeal(result.response.deal.deal);
         setCurrentTermsVersion(result.response.deal.currentTermsVersion);
         setCurrentApprovals(result.response.deal.currentApprovals);
+        setSellerConsent(result.response.deal.sellerConsent);
       })
       .catch((err: unknown) => {
         if (cancelled) return;
@@ -389,6 +396,21 @@ export default function DealPage({ params }: DealPageProps): JSX.Element {
           <Card.Title>{dealSummaryCopy.title}</Card.Title>
           <Card.Description>{dealSummaryCopy.description}</Card.Description>
         </Card.Header>
+        <Card.Content>
+          {(() => {
+            const sellerConsentCopy = buildSellerConsentLabel(sellerConsent);
+            if (sellerConsentCopy === null) return null;
+            return (
+              <p
+                className="text-sm text-gray-700"
+                data-testid="deal-seller-consent"
+                data-consent-status="Accepted"
+              >
+                {sellerConsentCopy.label}
+              </p>
+            );
+          })()}
+        </Card.Content>
       </Card>
 
       <Card data-testid="deal-workspace-card">
