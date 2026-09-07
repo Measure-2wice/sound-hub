@@ -308,7 +308,7 @@ itself IS the bound.
 
 | Gate                                                                                        | Evidence                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                         |
 | ------------------------------------------------------------------------------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| Local BG7 gates (type-check, lint, focused tests, production builds, format, runtime smoke) | The orchestrator script is `scripts/acceptance-gate.mjs` (invoked as `pnpm acceptance-gate` in `package.json`). The gate composes `scripts/db-test-cycle.mjs`, `pnpm format:check`, `pnpm lint`, `pnpm type-check`, `pnpm test`, `pnpm build`, and `scripts/runtime-smoke.mjs` in dependency order, stopping on the first failure and emitting `READY FOR CODEX REVIEW` on success. The same orchestrator, the same order, and the same exit-code convention are documented in `docs/integration/m1.7-acceptance-gate-evidence.md` (lines 50, 123). The current branch's working tree is clean (see the git snapshot below).                                                                                                     |
+| Local BG7 gates (type-check, lint, focused tests, production builds, format, runtime smoke) | `pnpm acceptance-gate` exited 0 against implementation/remediation commit `7543e7115a0e7edef29fbefd8d0d6107dc9bb883` at `2026-09-07T15:53:57Z`. All 9 orchestrated steps passed in 398.8 seconds, including the production builds, runtime smoke, and 43/43 Playwright tests. The orchestrator is `scripts/acceptance-gate.mjs`; it stops at the first failure and emits `READY FOR CODEX REVIEW` only after every step succeeds.                                                                                                                                                                                                                                                                                                |
 | Deployed web online                                                                         | `https://soundhub-web-production.up.railway.app` is reachable; the deployed web app served the managed Auth + Storage smoke in `AC4`.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                            |
 | API HTTP 200 health smoke                                                                   | See `Railway deployed API health smoke — PASS` below.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                            |
 | Prisma migrations deployed / no pending migrations                                          | 13 migrations applied in the deployed PostgreSQL service. The migration list lives in `packages/db/prisma/migrations/`: `20260808114423_m1_foundation`, `20260808120000_drop_seed_markers`, `20260824171036_bg1_identity`, `20260825120000_bg2_audio_samples`, `20260826090000_bg3_project_brief`, `20260826110000_bg2_audio_cleanup`, `20260826160000_bg3_persist_criteria_query`, `20260826170000_bg3_persist_additional_offerings`, `20260826180000_bg2_audio_orphaned_storage`, `20260827090000_bg4_project_requests`, `20260827100000_bg4_restrict_cascades`, `20260901090000_bg5_terms_approvals`, `20260904120000_bg6_payment_intent`. The Railway deploy reported `No pending migrations` after `prisma migrate deploy`. |
@@ -379,15 +379,15 @@ fixed point in the deployed PostgreSQL service.
 ## Branch / Deployment Evidence
 
 The deployment uses **direct-local-CLI via the Railway CLI**.
-The branch was pushed after the local `pnpm acceptance-gate`
-orchestrator (see `AC7`) emitted `READY FOR CODEX REVIEW`
-against the current branch HEAD; no PR was opened and no merge
-was performed against `main`.
+The deployed application was uploaded from the local checkout;
+no PR was opened and no merge was performed against `main`.
+Later local review remediations have not been deployed. Their
+local validation and synchronization state are recorded below.
 
 - **Branch:** `feat/bg7-golden-slice`
-- **Current evidence-document HEAD:**
-  `59f04e2f0b1ae60ea38148325fdd929873a61aea` —
-  `docs(deploy): record Railway deployed API health smoke as PASS`
+- **Acceptance-tested implementation/remediation commit:**
+  `7543e7115a0e7edef29fbefd8d0d6107dc9bb883` —
+  `fix(bg7): resolve final review findings`
 - **Application commit deployed** (the most recent non-doc
   commit at the time of the Railway `up`):
   `a385ea1` — `fix(auth): allow phone_change_sent_at +
@@ -407,27 +407,28 @@ reauthentication_sent_at on managed verify`. The
   - Web: `https://soundhub-web-production.up.railway.app`
   - API: `https://soundhub-api-production.up.railway.app`
 
-- **Read-only git snapshot at sign-off:**
+- **Read-only git snapshot after the acceptance gate and before
+  this evidence-only update:**
 
   ```text
   $ git branch --show-current
   feat/bg7-golden-slice
 
   $ git rev-parse HEAD
-  59f04e2f0b1ae60ea38148325fdd929873a61aea
+  7543e7115a0e7edef29fbefd8d0d6107dc9bb883
 
   $ git status --short
   (clean)
 
   $ git log -1 --oneline
-  59f04e2 docs(deploy): record Railway deployed API health smoke as PASS
+  7543e71 fix(bg7): resolve final review findings
 
   $ git rev-list --left-right --count origin/feat/bg7-golden-slice...HEAD
-  0	0
+  0	5
   ```
 
-  (Local branch is at the same SHA as `origin/feat/bg7-golden-slice`
-  — 0 ahead, 0 behind.)
+  (At this snapshot, the local branch was 5 commits ahead of and
+  0 commits behind `origin/feat/bg7-golden-slice`.)
 
 ---
 
