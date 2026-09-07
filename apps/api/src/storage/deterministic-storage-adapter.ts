@@ -27,6 +27,7 @@
 
 import { randomUUID } from "node:crypto";
 import { BG2_AUDIO_SAMPLE_CONTENT_TYPE, BG2_AUDIO_SAMPLE_MAX_BYTE_SIZE } from "@soundhub/types";
+import { BG7_FIXTURE_STORAGE_REF, buildDeterministicMp3Fixture } from "@soundhub/db";
 import {
   StorageRejectedError,
   StorageReferenceUnknownError,
@@ -65,6 +66,14 @@ interface StoredObject {
 
 export class DeterministicStorageAdapter implements StorageAdapter {
   private readonly objects = new Map<string, StoredObject>();
+  /**
+   * BG7: refs that were explicitly removed and must NOT be lazily
+   * re-minted on the next `getPlaybackBytes` call. Without this,
+   * the canonical BG7 fixture would resurrect after a removeSample
+   * because the hydration guard would re-populate the Map.
+   * Single-purpose: tracks only the canonical fixture reference.
+   */
+  private fixtureRemoved = false;
   private readonly playbackBaseUrl: string;
   private readonly now: () => number;
 
@@ -124,9 +133,15 @@ export class DeterministicStorageAdapter implements StorageAdapter {
    * always points at the application route; the application
    * proxy-streams the bytes through that path after eligibility
    * checks. Returns `null` when the storage ref is unknown.
+   *
+   * BG7: also returns the canonical URL when the supplied ref is
+   * the canonical BG7 fixture reference (so the browser can render
+   * `<audio src>` before any playback has actually streamed).
    */
   getPlaybackReference(input: StoragePlaybackInput): Promise<StoragePlaybackReference | null> {
-    if (!this.objects.has(input.storageRef)) return Promise.resolve(null);
+    if (input.storageRef !== BG7_FIXTURE_STORAGE_REF && !this.objects.has(input.storageRef)) {
+      return Promise.resolve(null);
+    }
     const baseUrl = this.playbackBaseUrl.replace(/\/+$/, "");
     const url = `${baseUrl}/api/services/${encodeURIComponent(input.offeringId)}/audio-samples/${encodeURIComponent(input.sampleId)}/play`;
     return Promise.resolve({
@@ -139,12 +154,50 @@ export class DeterministicStorageAdapter implements StorageAdapter {
    * Return the raw MP3 bytes for the given storage ref. The
    * application calls this only after eligibility + sample-
    * existence checks have run on the in-app route.
+   *
+   * BG7 fixture re-mint: when the supplied `storageRef` equals the
+   * canonical BG7 fixture reference (`BG7_FIXTURE_STORAGE_REF`), the
+   * adapter lazily re-mints the deterministic fixture bytes and
+   * caches them in the existing `objects` Map before returning. This
+   * pattern is exactly what the adapter comment at the top of this
+   * file anticipates ("the seeded `deterministic-samples` fixture
+   * re-mints the same bytes, so the locator still resolves"). The
+   * fixture is single-purpose and is NOT a generalized framework.
+   *
+   * If the caller previously invoked `removeSample` on the
+   * canonical fixture, this method rejects with the canonical
+   * unknown-ref error — removal is sticky.
+   *
+   * Production/managed storage behavior is unchanged: any ref that
+   * is NOT the canonical fixture reference and is not already cached
+   * returns the canonical unknown-ref error. The Supabase adapter
+   * has its own implementation and is unaffected.
    */
   getPlaybackBytes(storageRef: string): Promise<Uint8Array> {
     if (!storageRef.startsWith(DET_STORAGE_REF_PREFIX)) {
       return Promise.reject(
         new StorageReferenceUnknownError("Storage reference is not managed by this adapter."),
       );
+    }
+    // Canonical BG7 fixture lazy hydration. Re-mints the bytes the
+    // first time the locator resolves, then caches them so subsequent
+    // lookups hit the in-memory Map. No second fixture build per
+    // process. Removal is sticky via `fixtureRemoved`.
+    if (storageRef === BG7_FIXTURE_STORAGE_REF) {
+      if (this.fixtureRemoved) {
+        return Promise.reject(
+          new StorageReferenceUnknownError("Storage reference has been removed."),
+        );
+      }
+      const cached = this.objects.get(storageRef);
+      if (!cached) {
+        const bytes = buildDeterministicMp3Fixture();
+        this.objects.set(storageRef, {
+          bytes,
+          contentType: BG2_AUDIO_SAMPLE_CONTENT_TYPE,
+          storedAt: this.now(),
+        });
+      }
     }
     const obj = this.objects.get(storageRef);
     if (!obj) {
@@ -160,6 +213,9 @@ export class DeterministicStorageAdapter implements StorageAdapter {
       return Promise.reject(
         new StorageUnavailableError("Storage reference is not managed by this adapter."),
       );
+    }
+    if (storageRef === BG7_FIXTURE_STORAGE_REF) {
+      this.fixtureRemoved = true;
     }
     this.objects.delete(storageRef);
     return Promise.resolve();

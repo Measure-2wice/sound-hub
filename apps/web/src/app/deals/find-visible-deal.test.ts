@@ -19,6 +19,10 @@ const visibleDeal = {
     },
     currentTermsVersion: null,
     currentApprovals: [],
+    sellerConsent: {
+      status: "Accepted",
+      sellerConsentAt: "2026-09-02T00:00:05.000Z",
+    },
   },
 } satisfies Bg5GetDealResponseV1;
 
@@ -39,12 +43,14 @@ describe("BG5 Deal bootstrap", () => {
     assert.equal(result.response.deal.deal.dealId, "deal-1");
   });
 
-  test("tries another current Workspace only after a safe DEAL_NOT_FOUND response", async () => {
+  test("probes the next current Workspace after a BG5_DEAL_NOT_FOUND from the unrelated one", async () => {
     const calls: string[] = [];
-    const notFound = Object.assign(new Error("Deal not found."), { code: "DEAL_NOT_FOUND" });
+    const notFound = Object.assign(new Error("Deal not found."), {
+      code: "BG5_DEAL_NOT_FOUND",
+    });
     const result = await findVisibleDeal({
       dealId: "deal-1",
-      workspaceIds: ["ws-unrelated", "ws-seller"],
+      workspaceIds: ["ws-unrelated", "ws-buyer"],
       fetchDeal: (_dealId, workspaceId) => {
         calls.push(workspaceId);
         if (workspaceId === "ws-unrelated") return Promise.reject(notFound);
@@ -52,8 +58,9 @@ describe("BG5 Deal bootstrap", () => {
       },
     });
 
-    assert.deepEqual(calls, ["ws-unrelated", "ws-seller"]);
-    assert.equal(result.actingWorkspaceId, "ws-seller");
+    assert.deepEqual(calls, ["ws-unrelated", "ws-buyer"]);
+    assert.equal(result.actingWorkspaceId, "ws-buyer");
+    assert.equal(result.response.deal.deal.dealId, "deal-1");
   });
 
   test("does not hide session failures by probing another Workspace", async () => {
@@ -74,5 +81,25 @@ describe("BG5 Deal bootstrap", () => {
       sessionError,
     );
     assert.deepEqual(calls, ["ws-one"]);
+  });
+
+  test("stops immediately on an arbitrary non-not-found error", async () => {
+    const calls: string[] = [];
+    const arbitraryError = Object.assign(new Error("Unexpected boom."), {
+      code: "BG5_DEAL_INTERNAL_FAILED",
+    });
+
+    await assert.rejects(
+      findVisibleDeal({
+        dealId: "deal-1",
+        workspaceIds: ["ws-unrelated", "ws-buyer"],
+        fetchDeal: (_dealId, workspaceId) => {
+          calls.push(workspaceId);
+          return Promise.reject(arbitraryError);
+        },
+      }),
+      arbitraryError,
+    );
+    assert.deepEqual(calls, ["ws-unrelated"]);
   });
 });

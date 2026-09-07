@@ -1,5 +1,6 @@
 import type {
   Bg5DealApprovalPublicV1,
+  Bg5SellerConsentProjectionV1,
   Bg6PublicFundingFailureReasonCodeV1,
   Bg6PublicFundingStatusV1,
   DealStatusV1,
@@ -87,4 +88,29 @@ export function buildAiDraftStatusLabel(rows: readonly ApprovalStatusRow[]): str
   return pendingSide
     ? `AI-drafted · awaiting ${pendingSide.toLowerCase()} approval`
     : "AI-drafted · awaiting remaining approval";
+}
+
+/**
+ * Render the seller-consent indicator on the Active Deal view
+ * (ticket AC27). The indicator is shown only when the public BG5
+ * Deal view exposes a non-null `sellerConsent` projection AND that
+ * projection carries a non-null `sellerConsentAt` timestamp. The
+ * page MUST NOT infer seller consent from Deal existence, status,
+ * approvals, or any other DTO field — this helper centralizes that
+ * fail-closed rule and returns `null` whenever consent cannot be
+ * proven from the projection.
+ *
+ * The returned `label` is the human-readable text the page renders;
+ * callers should not display the indicator when this helper returns
+ * `null`.
+ */
+export function buildSellerConsentLabel(
+  sellerConsent: Bg5SellerConsentProjectionV1 | null,
+): { readonly label: string } | null {
+  if (sellerConsent === null) return null;
+  if (sellerConsent.status !== "Accepted") return null;
+  if (sellerConsent.sellerConsentAt === null) return null;
+  return {
+    label: "Seller consent: Accepted",
+  };
 }

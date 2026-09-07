@@ -878,8 +878,7 @@ test("createProjectRequest maps CONCURRENCY_RETRY_EXHAUSTED to PROJECT_REQUEST_U
   const stubRepository = {
     createProjectRequestInTransaction: () =>
       Promise.resolve({ ok: false, reason: "CONCURRENCY_RETRY_EXHAUSTED" as const }),
-    respondToProjectRequestInTransaction: () =>
-      Promise.reject(new Error("not used in this test")),
+    respondToProjectRequestInTransaction: () => Promise.reject(new Error("not used in this test")),
     findProjectRequestById: () => Promise.resolve(null),
     listProjectRequests: () => Promise.resolve([]),
   };
@@ -907,8 +906,7 @@ test("createProjectRequest maps CONCURRENCY_RETRY_EXHAUSTED to PROJECT_REQUEST_U
 test("acceptProjectRequest maps CONCURRENCY_RETRY_EXHAUSTED to PROJECT_REQUEST_UNAVAILABLE", async () => {
   const { workspaceAuthorizationService } = buildFixture();
   const stubRepository = {
-    createProjectRequestInTransaction: () =>
-      Promise.reject(new Error("not used in this test")),
+    createProjectRequestInTransaction: () => Promise.reject(new Error("not used in this test")),
     respondToProjectRequestInTransaction: () =>
       Promise.resolve({ ok: false, reason: "CONCURRENCY_RETRY_EXHAUSTED" as const }),
     findProjectRequestById: () => Promise.resolve(null),
@@ -1015,8 +1013,7 @@ test("listProjectRequests does not collapse unexpected infrastructure errors to 
 test("declineProjectRequest maps CONCURRENCY_RETRY_EXHAUSTED to PROJECT_REQUEST_UNAVAILABLE", async () => {
   const { workspaceAuthorizationService } = buildFixture();
   const stubRepository = {
-    createProjectRequestInTransaction: () =>
-      Promise.reject(new Error("not used in this test")),
+    createProjectRequestInTransaction: () => Promise.reject(new Error("not used in this test")),
     respondToProjectRequestInTransaction: () =>
       Promise.resolve({ ok: false, reason: "CONCURRENCY_RETRY_EXHAUSTED" as const }),
     findProjectRequestById: () => Promise.resolve(null),

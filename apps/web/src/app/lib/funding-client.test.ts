@@ -69,6 +69,7 @@ test("fundDeal issues a POST to /api/deals/:dealId/funding with credentials + JS
         },
         currentTermsVersion: null,
         currentApprovals: [],
+        sellerConsent: null,
       },
       fundingStatus: {
         status: "Confirmed",
@@ -177,6 +178,7 @@ test("fundDeal public response does NOT contain paymentIntentId, correlationId, 
         },
         currentTermsVersion: null,
         currentApprovals: [],
+        sellerConsent: null,
       },
       fundingStatus: {
         status: "Confirmed",

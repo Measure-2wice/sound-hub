@@ -673,13 +673,19 @@ export class PrismaProjectRequestRepository implements ProjectRequestRepository 
     // placeholder).
     const contextByKey = await this.loadDisplayContextForRequests(rows);
     return rows.map((row) => {
-      const context =
-        contextByKey.get(contextKey(row.buyerWorkspaceId, row.sellerWorkspaceId, row.serviceOfferingId, row.projectBriefId)) ?? {
-          buyerWorkspaceName: null,
-          sellerWorkspaceName: null,
-          serviceOfferingTitle: null,
-          briefExcerpt: null,
-        };
+      const context = contextByKey.get(
+        contextKey(
+          row.buyerWorkspaceId,
+          row.sellerWorkspaceId,
+          row.serviceOfferingId,
+          row.projectBriefId,
+        ),
+      ) ?? {
+        buyerWorkspaceName: null,
+        sellerWorkspaceName: null,
+        serviceOfferingTitle: null,
+        briefExcerpt: null,
+      };
       return toPersisted(row, context);
     });
   }
@@ -688,7 +694,12 @@ export class PrismaProjectRequestRepository implements ProjectRequestRepository 
   // supplied rows reference. A missing referenced row simply yields
   // no match; the corresponding DTO field is rendered as null.
   private async loadDisplayContextForRequests(
-    rows: readonly { readonly buyerWorkspaceId: string; readonly sellerWorkspaceId: string; readonly serviceOfferingId: string; readonly projectBriefId: string }[],
+    rows: readonly {
+      readonly buyerWorkspaceId: string;
+      readonly sellerWorkspaceId: string;
+      readonly serviceOfferingId: string;
+      readonly projectBriefId: string;
+    }[],
   ): Promise<Map<string, ProjectRequestDisplayContext>> {
     const workspaceIds = new Set<string>();
     const offeringIds = new Set<string>();
@@ -720,12 +731,20 @@ export class PrismaProjectRequestRepository implements ProjectRequestRepository 
     );
     const out = new Map<string, ProjectRequestDisplayContext>();
     for (const row of rows) {
-      out.set(contextKey(row.buyerWorkspaceId, row.sellerWorkspaceId, row.serviceOfferingId, row.projectBriefId), {
-        buyerWorkspaceName: workspaceNames.get(row.buyerWorkspaceId) ?? null,
-        sellerWorkspaceName: workspaceNames.get(row.sellerWorkspaceId) ?? null,
-        serviceOfferingTitle: offeringTitles.get(row.serviceOfferingId) ?? null,
-        briefExcerpt: briefExcerpts.get(row.projectBriefId) ?? null,
-      });
+      out.set(
+        contextKey(
+          row.buyerWorkspaceId,
+          row.sellerWorkspaceId,
+          row.serviceOfferingId,
+          row.projectBriefId,
+        ),
+        {
+          buyerWorkspaceName: workspaceNames.get(row.buyerWorkspaceId) ?? null,
+          sellerWorkspaceName: workspaceNames.get(row.sellerWorkspaceId) ?? null,
+          serviceOfferingTitle: offeringTitles.get(row.serviceOfferingId) ?? null,
+          briefExcerpt: briefExcerpts.get(row.projectBriefId) ?? null,
+        },
+      );
     }
     return out;
   }

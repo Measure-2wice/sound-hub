@@ -40,6 +40,7 @@
 
 import type {
   Bg5DealApprovalPublicV1,
+  Bg5SellerConsentProjectionV1,
   Bg5TermsVersionPublicV1,
   ProjectRequestPublicV1,
   DealPublicV1,
@@ -49,6 +50,8 @@ import {
   AuthorizationError,
   type WorkspaceAuthorizationService,
 } from "../services/workspace-authorization.service.js";
+import { toPublicProjectRequest } from "../project-request/project-request.service.js";
+import type { ProjectRequestRepository } from "../project-request/project-request.repository.js";
 import {
   evaluateApprovalAuthority,
   evaluateDealReadAuthority,
@@ -108,6 +111,16 @@ export class DealTermsError extends Error {
 export interface DealTermsServiceDeps {
   readonly dealTermsRepository: DealTermsRepository;
   readonly workspaceAuthorizationService: WorkspaceAuthorizationService;
+  /**
+   * Optional ProjectRequestRepository. When supplied, `getDeal()`
+   * looks up the associated ProjectRequest and projects its
+   * seller-consent fact onto the public Deal view as the narrow
+   * `Bg5SellerConsentProjectionV1`. When omitted, the projection is
+   * always `null` (fail-closed). The repository is queried outside
+   * the Deal read transaction; the persisted consent timestamp is a
+   * historical audit fact that cannot revert once recorded.
+   */
+  readonly projectRequestRepository?: ProjectRequestRepository;
   readonly aiAdapter?: DealTermsAiAdapter;
   readonly deterministicAiAdapter?: DealTermsAiAdapter;
   readonly now?: () => Date;
@@ -144,6 +157,7 @@ export interface GetDealInput {
 export class DealTermsService {
   private readonly repository: DealTermsRepository;
   private readonly authz: WorkspaceAuthorizationService;
+  private readonly projectRequestRepository: ProjectRequestRepository | null;
   private readonly aiAdapter: DealTermsAiAdapter;
   private readonly fallbackAiAdapter: DealTermsAiAdapter;
   private readonly now: () => Date;
@@ -151,6 +165,7 @@ export class DealTermsService {
   constructor(deps: DealTermsServiceDeps) {
     this.repository = deps.dealTermsRepository;
     this.authz = deps.workspaceAuthorizationService;
+    this.projectRequestRepository = deps.projectRequestRepository ?? null;
     this.fallbackAiAdapter = deps.deterministicAiAdapter ?? new DeterministicDealTermsAiAdapter();
     this.aiAdapter = deps.aiAdapter ?? this.fallbackAiAdapter;
     this.now = deps.now ?? (() => new Date());
@@ -294,19 +309,31 @@ export class DealTermsService {
 
   /**
    * Read the Deal view (Deal + current TermsVersion + current
-   * approvals). P0-001: the route must supply the exact
-   * authenticated userAccountId + actingWorkspaceId; this service
-   * verifies current membership against the EXACT acting Workspace
-   * atomically with the read under a Serializable transaction.
-   * Authorization ownership stays in the application layer (the
-   * repository never decides policy); the persistence + locking stay
-   * in the repository layer.
+   * approvals + seller-consent projection). P0-001: the route must
+   * supply the exact authenticated userAccountId + actingWorkspaceId;
+   * this service verifies current membership against the EXACT acting
+   * Workspace atomically with the read under a Serializable
+   * transaction. Authorization ownership stays in the application
+   * layer (the repository never decides policy); the persistence +
+   * locking stay in the repository layer.
+   *
+   * The seller-consent projection is the narrow public allow-list
+   * surface derived from the associated persisted ProjectRequest.
+   * It is null whenever:
+   *   - no ProjectRequestRepository is wired (fail-closed default),
+   *   - the ProjectRequest row is missing, or
+   *   - the ProjectRequest is not in the `Accepted` status (violates
+   *     the domain invariant that a Deal can only exist after
+   *     seller acceptance).
+   * The UI MUST NOT infer consent from Deal existence alone — only
+   * the `sellerConsent` projection drives the indicator.
    */
   async getDeal(input: GetDealInput): Promise<{
     readonly deal: DealPublicV1;
     readonly currentTermsVersion: Bg5TermsVersionPublicV1 | null;
     readonly currentApprovals: readonly Bg5DealApprovalPublicV1[];
     readonly projectRequest: ProjectRequestPublicV1 | null;
+    readonly sellerConsent: Bg5SellerConsentProjectionV1 | null;
   }> {
     const view = await this.repository.findDealViewInTransaction(
       {
@@ -319,14 +346,47 @@ export class DealTermsService {
     if (!view.ok) {
       throw new DealTermsError("Deal not found.", "BG5_DEAL_NOT_FOUND");
     }
+    const publicDeal = dealSummaryToPublic(view.value.deal);
+    const projectRequest = await this.loadProjectRequest(publicDeal.projectRequestId);
+    const sellerConsent = projectRequest ? buildSellerConsentProjection(projectRequest) : null;
     return {
-      deal: dealSummaryToPublic(view.value.deal),
+      deal: publicDeal,
       currentTermsVersion: view.value.currentTermsVersion
         ? toPublicTermsVersion(view.value.currentTermsVersion, true)
         : null,
       currentApprovals: view.value.currentApprovals.map(toPublicApproval),
-      projectRequest: view.value.projectRequest,
+      projectRequest,
+      sellerConsent,
     };
+  }
+
+  /**
+   * Load the ProjectRequest by id via the wired repository, returning
+   * the public DTO. Returns null when no ProjectRequestRepository is
+   * wired, when the row is missing, or when the read fails closed.
+   *
+   * Note: the ProjectRequest read is OUTSIDE the Deal-read
+   * transaction. The consent timestamp is a historical audit fact;
+   * it cannot revert once recorded, so a snapshot read is
+   * sufficient. A concurrent UPDATE on ProjectRequest.status after
+   * the Deal read would only affect Deals created after that UPDATE
+   * (the accept-side invariant is what gates Deal creation, not
+   * this read).
+   */
+  private async loadProjectRequest(
+    projectRequestId: string,
+  ): Promise<ProjectRequestPublicV1 | null> {
+    if (this.projectRequestRepository === null) return null;
+    try {
+      const persisted =
+        await this.projectRequestRepository.findProjectRequestById(projectRequestId);
+      if (persisted === null) return null;
+      return toPublicProjectRequest(persisted);
+    } catch {
+      // Fail-closed: any read failure collapses to "no consent
+      // fact available". The UI must not present false consent.
+      return null;
+    }
   }
 
   // -----------------------------------------------------------------------
@@ -706,6 +766,27 @@ export function dealSummaryToPublic(persisted: PersistedDealSummary): DealPublic
     status: persisted.status,
     activatedAt: persisted.activatedAt ? persisted.activatedAt.toISOString() : null,
     createdAt: persisted.createdAt.toISOString(),
+  };
+}
+
+/**
+ * Build the narrow `Bg5SellerConsentProjectionV1` from a public
+ * ProjectRequest DTO. Fail-closed when the ProjectRequest is not in
+ * the only consent state an existing Deal can possibly carry
+ * (`Accepted`); the projection is `null` so the UI does NOT present
+ * false consent.
+ *
+ * `sellerConsentAt` is preserved as-is (may be null defensively).
+ * The invariant says it must be set when status is "Accepted", but
+ * the projection type permits null for resilience.
+ */
+export function buildSellerConsentProjection(
+  projectRequest: ProjectRequestPublicV1,
+): Bg5SellerConsentProjectionV1 | null {
+  if (projectRequest.status !== "Accepted") return null;
+  return {
+    status: "Accepted",
+    sellerConsentAt: projectRequest.sellerConsentAt,
   };
 }
 

@@ -14,12 +14,9 @@
 // verification credential and CANNOT be submitted here.
 //
 // Per ticket #59 P1-002 the deployed process never returns a
-// `devVerificationUrl`; the operator-driven recovery workflow reads
-// it from server logs. The browser uses the opaque
-// `verificationToken` (managed: Supabase-issued token from the email
-// link; deterministic: operator-side credential from the log sink)
-// to drive verify-token when the magic-link callback URL is
-// configured to route through the deterministic fallback.
+// `devVerificationUrl`. The field exists only for explicitly gated
+// local browser tests; managed verification tokens arrive through
+// the email callback.
 
 import type {
   Bg1MagicLinkRequestV1,

@@ -7,7 +7,8 @@
 // The route re-uses the BG5 DealTermsService.getDeal to compose the
 // full Deal view for the response so the public DTO carries the
 // canonical Deal + current TermsVersion + approvals + project
-// request fields. The funding status is layered on top.
+// request + seller-consent fields. The funding status is layered on
+// top.
 
 import type { Request, Response } from "express";
 import { bg6FundDealRequestV1Schema, bg6FundDealResponseV1Schema } from "@soundhub/types";
@@ -84,7 +85,14 @@ function fundDeal(
       });
       // Re-fetch the Deal view through the BG5 service so the
       // response carries the canonical Deal + current TermsVersion +
-      // approvals + project request shape.
+      // approvals + project request + seller-consent shape.
+      //
+      // The seller-consent projection is required by
+      // bg5DealViewV1Schema (AC27 widening) and is sourced from the
+      // canonical DealTermsService.getDeal() result — NOT recomputed
+      // or inferred here, and NOT fetched via a separate
+      // ProjectRequest query. The funding route is intentionally a
+      // pure serializer over the BG5 service output.
       const view = await deps.dealTermsService.getDeal({
         userAccountId,
         actingWorkspaceId: parsed.actingWorkspaceId,
@@ -100,6 +108,7 @@ function fundDeal(
             deal: view.deal,
             currentTermsVersion: view.currentTermsVersion,
             currentApprovals: view.currentApprovals,
+            sellerConsent: view.sellerConsent,
           },
           fundingStatus: result.fundingStatus,
         },

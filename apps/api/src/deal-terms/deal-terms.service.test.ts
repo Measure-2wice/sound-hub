@@ -23,6 +23,43 @@ import { DealTermsService, DealTermsError } from "./deal-terms.service.js";
 import { InMemoryDealTermsRepository } from "./in-memory-deal-terms.repository.js";
 import { WorkspaceAuthorizationService } from "../services/workspace-authorization.service.js";
 import { InMemoryAuthRepository } from "../auth-repository/in-memory-auth-repository.js";
+import type {
+  ProjectRequestRepository,
+  PersistedProjectRequest,
+} from "../project-request/project-request.repository.js";
+
+/**
+ * Lightweight ProjectRequestRepository stub for unit tests. Holds a
+ * single ProjectRequest row in memory; tests seed it directly. Other
+ * ProjectRequestRepository methods throw because they are not
+ * exercised on this path (DealTermsService.getDeal only calls
+ * findProjectRequestById).
+ */
+class StubProjectRequestRepository implements ProjectRequestRepository {
+  private row: PersistedProjectRequest | null = null;
+
+  seed(row: PersistedProjectRequest): void {
+    this.row = row;
+  }
+
+  createProjectRequestInTransaction(): Promise<never> {
+    return Promise.reject(new Error("not implemented"));
+  }
+
+  respondToProjectRequestInTransaction(): Promise<never> {
+    return Promise.reject(new Error("not implemented"));
+  }
+
+  findProjectRequestById(id: string): Promise<PersistedProjectRequest | null> {
+    if (this.row === null) return Promise.resolve(null);
+    return Promise.resolve(this.row.id === id ? this.row : null);
+  }
+
+  listProjectRequests(): Promise<readonly PersistedProjectRequest[]> {
+    if (this.row === null) return Promise.resolve([]);
+    return Promise.resolve([this.row]);
+  }
+}
 
 const BUYER_USER_ID = "user-buyer";
 const BUYER_WORKSPACE_ID = "ws-buyer";
@@ -50,6 +87,11 @@ interface Fixture {
   repo: InMemoryDealTermsRepository;
   authz: WorkspaceAuthorizationService;
   clock: { current: Date };
+  // ProjectRequestRepository the service is wired with. Tests that
+  // want to exercise the seller-consent projection can call
+  // `.seed(...)` directly. Defaults to an empty repository so the
+  // projection is always null unless the test seeds one.
+  projectRequestRepository: StubProjectRequestRepository;
 }
 
 function buildFixture(opts?: { dealStatus?: "Negotiating" | "Active" }): Fixture {
@@ -147,13 +189,19 @@ function buildFixture(opts?: { dealStatus?: "Negotiating" | "Active" }): Fixture
   });
 
   const clock = { current: new Date("2026-09-01T00:00:00Z") };
+  // The ProjectRequestRepository is wired in the service so getDeal()
+  // can derive the seller-consent projection from the associated
+  // ProjectRequest. The default stub holds nothing, so the projection
+  // is null unless the test seeds it via `projectRequestRepository.seed(...)`.
+  const projectRequestRepository = new StubProjectRequestRepository();
   const service = new DealTermsService({
     dealTermsRepository: repo,
     workspaceAuthorizationService: authz,
+    projectRequestRepository,
     now: () => clock.current,
   });
 
-  return { service, repo, clock, authz };
+  return { service, repo, clock, authz, projectRequestRepository };
 }
 
 // ---------------------------------------------------------------------------
@@ -634,4 +682,123 @@ test("funding deadline is persisted as display-only and never gates approval sta
     pastDeadline,
     "deadline persists verbatim for display",
   );
+});
+
+// ---------------------------------------------------------------------------
+// Seller-consent projection (ticket AC27)
+//
+// The DealTermsService.getDeal() method computes the narrow public
+// `sellerConsent` projection from the persisted ProjectRequest
+// associated with the Deal. The projection is the smallest surface
+// needed by the Active Deal view to render an explicit seller-consent
+// indicator; it MUST be null whenever the domain invariant (a Deal
+// only exists after seller acceptance) does not hold.
+// ---------------------------------------------------------------------------
+
+test("getDeal surfaces sellerConsent: null when no ProjectRequest is wired for the Deal", async () => {
+  const { service } = buildFixture();
+  // No ProjectRequest seeded → projection must be null. The page
+  // MUST NOT infer consent from Deal existence alone.
+  const view = await service.getDeal({
+    userAccountId: BUYER_USER_ID,
+    actingWorkspaceId: BUYER_WORKSPACE_ID,
+    dealId: DEAL_ID,
+  });
+  assert.equal(view.sellerConsent, null);
+});
+
+test("getDeal surfaces the Accepted seller-consent projection when the PR is Accepted", async () => {
+  const { service, projectRequestRepository } = buildFixture();
+  // Seed the wired ProjectRequestRepository with an Accepted row.
+  // The Deal row references PROJECT_REQUEST_ID, so the service's
+  // getDeal() looks up by that id and projects consent.
+  projectRequestRepository.seed({
+    id: PROJECT_REQUEST_ID,
+    buyerWorkspaceId: BUYER_WORKSPACE_ID,
+    sellerWorkspaceId: SELLER_WORKSPACE_ID,
+    serviceOfferingId: OFFERING_ID,
+    projectBriefId: BRIEF_ID,
+    createdByUserId: BUYER_USER_ID,
+    status: "Accepted",
+    sellerDecisionAt: new Date("2026-08-31T12:00:00Z"),
+    sellerDecisionByUserId: SELLER_USER_ID,
+    sellerConsentAt: new Date("2026-08-31T12:00:00Z"),
+    createdAt: new Date("2026-08-30T00:00:00Z"),
+    buyerWorkspaceName: "Buyer",
+    sellerWorkspaceName: "Seller",
+    serviceOfferingTitle: "Dancehall single",
+    briefExcerpt: null,
+  });
+  const view = await service.getDeal({
+    userAccountId: BUYER_USER_ID,
+    actingWorkspaceId: BUYER_WORKSPACE_ID,
+    dealId: DEAL_ID,
+  });
+  assert.equal(view.sellerConsent?.status, "Accepted");
+  assert.equal(view.sellerConsent?.sellerConsentAt, "2026-08-31T12:00:00.000Z");
+});
+
+test("getDeal surfaces sellerConsent: null when the PR exists but is not Accepted (fail-closed)", async () => {
+  const { service, projectRequestRepository } = buildFixture();
+  // A Declined PR violates the domain invariant that a Deal can
+  // only exist after seller acceptance; even if a stale PR row is
+  // reachable, the projection must be null so the UI does NOT
+  // present false consent.
+  projectRequestRepository.seed({
+    id: PROJECT_REQUEST_ID,
+    buyerWorkspaceId: BUYER_WORKSPACE_ID,
+    sellerWorkspaceId: SELLER_WORKSPACE_ID,
+    serviceOfferingId: OFFERING_ID,
+    projectBriefId: BRIEF_ID,
+    createdByUserId: BUYER_USER_ID,
+    status: "Declined",
+    sellerDecisionAt: new Date("2026-08-31T12:00:00Z"),
+    sellerDecisionByUserId: SELLER_USER_ID,
+    sellerConsentAt: null,
+    createdAt: new Date("2026-08-30T00:00:00Z"),
+    buyerWorkspaceName: "Buyer",
+    sellerWorkspaceName: "Seller",
+    serviceOfferingTitle: "Dancehall single",
+    briefExcerpt: null,
+  });
+  const view = await service.getDeal({
+    userAccountId: BUYER_USER_ID,
+    actingWorkspaceId: BUYER_WORKSPACE_ID,
+    dealId: DEAL_ID,
+  });
+  assert.equal(view.sellerConsent, null);
+});
+
+test("getDeal surfaces sellerConsent: null when the PR lookup throws (fail-closed)", async () => {
+  const { repo } = buildFixture();
+  // Stub a faulty ProjectRequestRepository. A read failure must
+  // collapse to null rather than bubble up — the UI must not
+  // present false consent.
+  const faultyRepo: ProjectRequestRepository = {
+    createProjectRequestInTransaction: () => Promise.reject(new Error("not implemented")),
+    respondToProjectRequestInTransaction: () => Promise.reject(new Error("not implemented")),
+    findProjectRequestById: () => Promise.reject(new Error("db unavailable")),
+    listProjectRequests: () => Promise.reject(new Error("not implemented")),
+  };
+  const clock = { current: new Date("2026-09-01T00:00:00Z") };
+  const failClosedService = new DealTermsService({
+    dealTermsRepository: repo,
+    workspaceAuthorizationService: new WorkspaceAuthorizationService({
+      authRepository: new InMemoryAuthRepository([]),
+    }),
+    projectRequestRepository: faultyRepo,
+    now: () => clock.current,
+  });
+  // Use a service-bound Deal by seeding membership; reuse the
+  // existing seedDeal approach via a fresh fixture.
+  const view = await failClosedService.getDeal({
+    userAccountId: BUYER_USER_ID,
+    actingWorkspaceId: BUYER_WORKSPACE_ID,
+    dealId: DEAL_ID,
+  });
+  // Even with a faulty PR repo, the Deal read itself succeeded —
+  // the projection collapses to null but the view's Deal fields are
+  // intact.
+  assert.equal(view.deal.dealId, DEAL_ID);
+  assert.equal(view.sellerConsent, null);
 });

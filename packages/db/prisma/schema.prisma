@@ -10,6 +10,17 @@
 generator client {
   provider        = "prisma-client"
   output          = "../src/generated"
+  // Prisma 7's `prisma-client` generator emits relative ESM imports
+  // without an extension by default. TypeScript preserves those
+  // extensionless specifiers into the compiled `.js`, but Node's
+  // ESM resolver requires an explicit extension on relative paths.
+  // Setting `importFileExtension = "js"` makes the generated TS
+  // source import `./internal/class.js` (and `./enums.js`,
+  // `./models.js`, etc.), which TypeScript preserves and Node ESM
+  // resolves correctly against the compiled output. `tsx` and the
+  // API's local dev path are unaffected because they consume the
+  // emitted JS through the same `.js` extensions.
+  importFileExtension = "js"
   // `partialIndexes` enables the `where:` predicate on @@index /
   // @@unique declarations. BG4 created the partial unique index
   // `project_requests_pending_unique_idx` in

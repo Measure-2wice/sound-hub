@@ -25,11 +25,11 @@ import type { PrismaClient } from "@soundhub/db";
 import {
   AudioSampleCleanupStatus,
   MarketplaceCapability,
+  Prisma,
   SellerProfileStatus,
   ServiceOfferingStatus,
   WorkspaceStatus,
 } from "@soundhub/db";
-import { Prisma } from "@soundhub/db/src/generated/client.js";
 import type {
   AudioOfferingContext,
   AudioRepository,

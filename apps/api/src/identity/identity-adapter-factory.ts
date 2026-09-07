@@ -93,13 +93,9 @@ export interface IdentityAdapterFactoryOptions {
    */
   readonly log?: (message: string) => void;
   /**
-   * Operator-controlled escape hatch for the deterministic
-   * fallback. When `true`, the deterministic adapter returns the
-   * `devVerificationUrl` so the operator-driven recovery UI can
-   * complete sign-in without email delivery. Defaults to `false`;
-   * the deployed process enables it only when
-   * `BG1_DETERMINISTIC_OPERATOR_MODE=1`. Tests pass `true` so the
-   * existing automated journeys continue to work end to end.
+   * Local-test escape hatch for deterministic browser verification.
+   * This option is honored only when `NODE_ENV=test`; deployed and
+   * production-like processes fail closed even if it is set.
    */
   readonly allowDeterministicOperatorMode?: boolean;
 }
@@ -122,7 +118,8 @@ function buildAdaptersInternal(options: IdentityAdapterFactoryOptions): {
   operatorMode: boolean;
 } {
   const operatorMode =
-    options.allowDeterministicOperatorMode ?? process.env.BG1_DETERMINISTIC_OPERATOR_MODE === "1";
+    process.env.NODE_ENV === "test" &&
+    (options.allowDeterministicOperatorMode ?? process.env.BG1_DETERMINISTIC_OPERATOR_MODE === "1");
   const deterministic = new DeterministicIdentityAdapter({
     allowDevVerificationUrl: operatorMode,
   });

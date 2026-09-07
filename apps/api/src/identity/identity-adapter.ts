@@ -26,11 +26,12 @@
 //     browser extracts it from the magic-link callback URL and POSTs
 //     it to `/api/auth/verify-token`. The deterministic adapter
 //     stores its pending request under this value and returns it on
-//     the adapter's `SignInRequestResult` so test harnesses and the
-//     operator recovery workflow can drive `verifySignIn`. The
-//     managed adapter forwards whatever the browser sent directly
-//     to Supabase's verify endpoint. It MUST NEVER appear in a
-//     public DTO, an error envelope, or a log line.
+//     the adapter's `SignInRequestResult` so local test harnesses
+//     can drive `verifySignIn`. The managed adapter forwards
+//     whatever the browser sent directly to Supabase's verify
+//     endpoint. It MUST NEVER appear in a public DTO, an error
+//     envelope, or a log line, and it is NOT a recovery credential
+//     that any deployed workflow can read.
 
 import type { Bg1IdentityProviderV1 } from "@soundhub/types";
 
@@ -60,8 +61,8 @@ export interface VerifiedIdentity {
  * Result of `requestSignIn`. The adapter returns a public
  * correlation id (`correlationId`) and (for the deterministic
  * adapter) an internal verify credential (`verificationToken`) and
- * (only when operator mode is enabled) a one-shot URL the operator
- * recovery flow can drive.
+ * (only in explicitly gated local tests) a one-shot URL the browser
+ * test can drive.
  *
  * The public route strips every field except `requestId` (the
  * correlation id, renamed from `correlationId` for backward
@@ -74,12 +75,10 @@ export interface VerifiedIdentity {
  * not the public correlation id, so a browser that round-trips the
  * correlation id is rejected as an unknown credential.
  *
- * `devVerificationUrl` is set only when the deterministic adapter
- * runs in operator mode (`BG1_DETERMINISTIC_OPERATOR_MODE=1`); the
- * managed adapter never sets it. Even in operator mode the URL is
- * emitted to the operator log sink only — the public response is
- * restricted to `{ ok, requestId }` by the schema so a deployed
- * browser can never receive a usable login credential.
+ * `devVerificationUrl` is set only by the deterministic adapter in
+ * explicitly gated local test mode. The managed adapter never sets
+ * it, and the composition root prevents deployed environments from
+ * enabling it.
  */
 export interface SignInRequestResult {
   /**
@@ -91,21 +90,18 @@ export interface SignInRequestResult {
    */
   readonly correlationId: string;
   /**
-   * Operator-only verify credential. The deterministic adapter
+   * Internal verify credential. The deterministic adapter
    * looks up its pending request by this value (not by the public
    * correlationId), so the browser never has a valid value to
    * present to `/api/auth/verify-token`. The credential is exposed
    * via the adapter's return value so test harnesses can drive the
-   * verify path directly; the deployed operator recovery path
-   * reads it from the operator log sink. NEVER log, serialize, or
+   * verify path directly. NEVER log, serialize, or
    * forward this value into any public DTO.
    */
   readonly verificationToken?: string;
   /**
-   * Operator-only one-shot URL. Only the deterministic adapter sets
-   * it, and only when operator mode is enabled. Production
-   * deployments and the deployed deterministic fallback both render
-   * it absent.
+   * Local-test-only one-shot URL. Production deployments and the
+   * deployed deterministic fallback always render it absent.
    */
   readonly devVerificationUrl?: string;
 }
@@ -142,11 +138,13 @@ export interface IdentityAdapter {
   /**
    * Initiate a magic-link sign-in for the given email. Returns an
    * opaque public correlation id (safe to log) and, for the
-   * deterministic adapter, a private `verificationToken` (the
-   * operator-only credential). Managed adapters send the magic link
-   * through their provider's email channel; the deterministic
-   * adapter stores the request locally and returns a
-   * `devVerificationUrl` the tests can use.
+   * deterministic adapter, a private `verificationToken` exposed
+   * only on the adapter's return value so local test harnesses
+   * can drive `verifySignIn`. Managed adapters send the magic
+   * link through their provider's email channel; the
+   * deterministic adapter stores the request locally and returns
+   * a `devVerificationUrl` only when explicitly gated to
+   * local-test mode.
    */
   requestSignIn(input: { readonly email: string }): Promise<SignInRequestResult>;
   /**
@@ -156,12 +154,13 @@ export interface IdentityAdapter {
    * (single-use per BG1 semantics).
    *
    * The accepted value is the PRIVATE credential the browser
-   * extracted from the magic-link callback URL (or the operator
-   * recovery workflow read from the server log). The PUBLIC
+   * extracted from the magic-link callback URL. The PUBLIC
    * correlation id from `requestSignIn` is NOT accepted here —
    * presenting it is rejected as an unknown credential so the
    * provider-neutral seam cannot accidentally substitute one for
-   * the other (ticket #59 P2-001).
+   * the other (ticket #59 P2-001). The credential is not a
+   * deployed recovery mechanism: production deployments do not
+   * expose any path that yields it.
    */
   verifySignIn(input: { readonly verificationToken: string }): Promise<VerifiedIdentity | null>;
 }

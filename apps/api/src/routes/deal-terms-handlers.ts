@@ -223,6 +223,7 @@ function getDeal(
             deal: result.deal,
             currentTermsVersion: result.currentTermsVersion,
             currentApprovals: result.currentApprovals,
+            sellerConsent: result.sellerConsent,
           },
         },
         requestId,

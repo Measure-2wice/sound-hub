@@ -39,7 +39,7 @@ describe("buildIdentityAdapters", () => {
     }
   });
 
-  test("the deterministic fallback omits the devVerificationUrl unless operator mode is enabled (P1-002)", async () => {
+  test("production never exposes the deterministic dev verification URL, even when the flag is set", async () => {
     // Without operator mode: the deployed deterministic fallback
     // MUST NOT return a usable login credential to the browser.
     const previousEnv = process.env.NODE_ENV;
@@ -61,21 +61,38 @@ describe("buildIdentityAdapters", () => {
         process.env.BG1_DETERMINISTIC_OPERATOR_MODE = previousOperatorEnv;
       }
     }
-    // With operator mode: the URL is logged to the operator sink
-    // (we don't read it here; the deterministic-adapter tests
-    // cover the log capture) and the response still does NOT
-    // carry the URL.
+    // A deployment must fail closed even if the local-E2E flag is
+    // accidentally carried into its environment.
     process.env.BG1_DETERMINISTIC_OPERATOR_MODE = "1";
     try {
       const { deterministic } = buildIdentityAdapters({
         override: "deterministic",
         managedSmoke: { ok: false, reason: "network" },
       });
-      const operator = await deterministic.requestSignIn({ email: "buyer@example.com" });
-      assert.equal(operator.devVerificationUrl, undefined);
-      assert.ok(operator.correlationId.length > 0);
+      const production = await deterministic.requestSignIn({ email: "buyer@example.com" });
+      assert.equal(production.devVerificationUrl, undefined);
+      assert.ok(production.correlationId.length > 0);
     } finally {
       process.env.BG1_DETERMINISTIC_OPERATOR_MODE = "";
+    }
+  });
+
+  test("test mode may expose the deterministic dev verification URL for local E2E", async () => {
+    const previousEnv = process.env.NODE_ENV;
+    const previousOperatorEnv = process.env.BG1_DETERMINISTIC_OPERATOR_MODE;
+    process.env.NODE_ENV = "test";
+    process.env.BG1_DETERMINISTIC_OPERATOR_MODE = "1";
+    try {
+      const { deterministic } = buildIdentityAdapters({
+        override: "deterministic",
+        managedSmoke: { ok: false, reason: "unconfigured" },
+      });
+      const local = await deterministic.requestSignIn({ email: "buyer@example.com" });
+      assert.match(local.devVerificationUrl ?? "", /\/auth\/verify\?token=/);
+    } finally {
+      process.env.NODE_ENV = previousEnv;
+      if (previousOperatorEnv === undefined) delete process.env.BG1_DETERMINISTIC_OPERATOR_MODE;
+      else process.env.BG1_DETERMINISTIC_OPERATOR_MODE = previousOperatorEnv;
     }
   });
 

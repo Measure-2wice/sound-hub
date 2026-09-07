@@ -292,6 +292,13 @@ export function buildApp(options: AppOptions = {}): BuiltApp {
     new DealTermsService({
       dealTermsRepository,
       workspaceAuthorizationService,
+      // Wire the ProjectRequestRepository so `getDeal()` can derive
+      // the narrow `sellerConsent` projection from the associated
+      // ProjectRequest (ticket AC27). The read is fail-closed; a
+      // missing or non-Accepted ProjectRequest yields
+      // `sellerConsent: null` and the UI must not present false
+      // consent.
+      projectRequestRepository,
     });
 
   // BG6 PaymentIntent + activation service. The composition root

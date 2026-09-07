@@ -615,14 +615,14 @@ test("concurrent service losers converge throw, malformed, and mismatch outcomes
       let resolveWinner!: (value: EscrowConfirmation) => void;
       let settleLoser!: () => void;
       let calls = 0;
-      const provider: EscrowProvider = {
+      const providerFor = (outcome: "winner" | "loser"): EscrowProvider => ({
         key: "mock-escrow-deterministic",
         assetLabel: "sandbox-USDC",
         networkLabel: "simulated-network",
         environmentLabel: "sandbox",
         requestFunding(input) {
           calls += 1;
-          if (calls === 1) {
+          if (outcome === "winner") {
             return new Promise((resolve) => {
               resolveWinner = resolve;
             });
@@ -633,44 +633,50 @@ test("concurrent service losers converge throw, malformed, and mismatch outcomes
               else if (loserMode === "malformed") resolve({} as EscrowConfirmation);
               else
                 resolve({
-                  providerKey: provider.key,
+                  providerKey: this.key,
                   providerReference: `mismatch-${input.paymentIntentId}`,
                   confirmedAmountMinor: input.priceAmountMinor + 1,
                   confirmedCurrency: input.priceCurrency,
-                  assetLabel: provider.assetLabel,
-                  networkLabel: provider.networkLabel,
-                  environmentLabel: provider.environmentLabel,
+                  assetLabel: this.assetLabel,
+                  networkLabel: this.networkLabel,
+                  environmentLabel: this.environmentLabel,
                   termsVersionId: input.termsVersionId,
                   confirmedAt: input.now,
                 });
             };
           });
         },
-      };
+      });
+      const winnerProvider = providerFor("winner");
+      const loserProvider = providerFor("loser");
       const command = {
         userAccountId: BUYER_USER_ID,
         actingWorkspaceId: BUYER_WORKSPACE_ID,
         dealId: DEAL_ID,
         now: new Date("2026-09-03T12:00:00.000Z"),
       };
-      const winnerPromise = new FundingService({
-        fundingRepository: repoA,
-        escrowProvider: provider,
-      }).fundDeal(command);
       const loserPromise = new FundingService({
         fundingRepository: repoB,
-        escrowProvider: provider,
+        escrowProvider: loserProvider,
+      }).fundDeal(command);
+      // Force the eventual loser into the provider first. The test
+      // must not rely on repository/client scheduling to decide
+      // which service promise owns the first provider callback.
+      while (calls < 1) await new Promise((resolve) => setImmediate(resolve));
+      const winnerPromise = new FundingService({
+        fundingRepository: repoA,
+        escrowProvider: winnerProvider,
       }).fundDeal(command);
       while (calls < 2) await new Promise((resolve) => setImmediate(resolve));
       const intent = await prismaA.paymentIntent.findFirstOrThrow({ where: { dealId: DEAL_ID } });
       resolveWinner({
-        providerKey: provider.key,
+        providerKey: winnerProvider.key,
         providerReference: `mock-${intent.id}`,
         confirmedAmountMinor: 75000,
         confirmedCurrency: "USD",
-        assetLabel: provider.assetLabel,
-        networkLabel: provider.networkLabel,
-        environmentLabel: provider.environmentLabel,
+        assetLabel: winnerProvider.assetLabel,
+        networkLabel: winnerProvider.networkLabel,
+        environmentLabel: winnerProvider.environmentLabel,
         termsVersionId: TV_ID,
         confirmedAt: command.now.toISOString(),
       });
