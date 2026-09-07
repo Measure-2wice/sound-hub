@@ -30,11 +30,11 @@ export async function findVisibleDeal(input: FindVisibleDealInput): Promise<Visi
       return { actingWorkspaceId: workspaceId, response };
     } catch (error) {
       const candidate = error instanceof Error ? (error as DealClientError) : null;
-      if (candidate?.code !== "DEAL_NOT_FOUND") throw error;
+      if (candidate?.code !== "BG5_DEAL_NOT_FOUND") throw error;
       lastNotFound = candidate;
     }
   }
 
   if (lastNotFound) throw lastNotFound;
-  throw Object.assign(new Error("Deal not found."), { code: "DEAL_NOT_FOUND" });
+  throw Object.assign(new Error("Deal not found."), { code: "BG5_DEAL_NOT_FOUND" });
 }
