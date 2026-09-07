@@ -86,7 +86,6 @@ describe("BG5 seller-consent projection (ticket AC27)", () => {
     });
     assert.ok(copy !== null);
     assert.equal(copy.label, "Seller consent: Accepted");
-    assert.equal(copy.consentedAt, "2026-09-02T22:30:05.000Z");
   });
 
   test("fails closed (returns null) when the projection is null", () => {

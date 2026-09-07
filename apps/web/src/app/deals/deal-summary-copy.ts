@@ -106,12 +106,11 @@ export function buildAiDraftStatusLabel(rows: readonly ApprovalStatusRow[]): str
  */
 export function buildSellerConsentLabel(
   sellerConsent: Bg5SellerConsentProjectionV1 | null,
-): { readonly label: string; readonly consentedAt: string | null } | null {
+): { readonly label: string } | null {
   if (sellerConsent === null) return null;
   if (sellerConsent.status !== "Accepted") return null;
   if (sellerConsent.sellerConsentAt === null) return null;
   return {
     label: "Seller consent: Accepted",
-    consentedAt: sellerConsent.sellerConsentAt,
   };
 }
