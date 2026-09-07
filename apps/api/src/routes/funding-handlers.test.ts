@@ -130,14 +130,12 @@ function makeFundingStatus(): Bg6FundingConfirmationPublicV1 {
 // ---------- Test doubles ----------
 
 class FakeAuthService {
-  signedIn = true;
   async resolveSession(): Promise<{ userAccountId: string } | null> {
-    return this.signedIn ? { userAccountId: USER_ID } : null;
+    return { userAccountId: USER_ID };
   }
 }
 
 class FakeFundingService {
-  static MODE: "OK" | "THROW_NOT_FOUND" = "OK";
   readonly calls: { userAccountId: string; actingWorkspaceId: string; dealId: string }[] = [];
   async fundDeal(input: {
     userAccountId: string;
@@ -149,9 +147,6 @@ class FakeFundingService {
     readonly fundingStatus: Bg6FundingConfirmationPublicV1;
   }> {
     this.calls.push(input);
-    if (FakeFundingService.MODE === "THROW_NOT_FOUND") {
-      throw new Error("FundingService.DEAL_NOT_FOUND");
-    }
     return {
       dealStatus: "Active",
       activatedAt: "2026-09-03T12:00:00.000Z",
