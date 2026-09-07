@@ -98,10 +98,10 @@ journey.
 | Required element                                        | Where it is rendered/asserted in the journey                                                                                                                                                                                                                                                                                                                                                                                     |
 | ------------------------------------------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
 | **Seller consent** (explicit ProjectRequest acceptance) | Persisted as `ProjectRequest.sellerConsentAt`, projected through the narrow `sellerConsent` field on the public Deal view, and rendered on the Active Deal page as `Seller consent: Accepted` in `data-testid="deal-seller-consent"`. `golden-slice.spec.ts` Step 10 asserts the indicator is visible, contains the accepted copy, and carries `data-consent-status="Accepted"`.                                                 |
-| **Buyer approval**                                      | Asserted on the Deal page. Step 9 clicks `deal-approve-button` and asserts `deal-terms-ai-badge` transitions to `/approved/i`. The row is rendered by `apps/web/src/app/deals/[dealId]/page.tsx` lines 678–687 as `data-testid="deal-approvals"` with rows `data-testid="deal-approval"` ("Buyer: Approved at …" or "Pending"). Built by `buildApprovalStatusRows` in `apps/web/src/app/deals/deal-summary-copy.ts` lines 67–79. |
+| **Buyer approval**                                      | Asserted on the Deal page. Step 9 clicks `deal-approve-button` and asserts `deal-terms-ai-badge` transitions to `/approved/i`. The row is rendered by `apps/web/src/app/deals/[dealId]/page.tsx` lines 701–708 as `data-testid="deal-approvals"` with rows `data-testid="deal-approval"` ("Buyer: Approved at …" or "Pending"). Built by `buildApprovalStatusRows` in `apps/web/src/app/deals/deal-summary-copy.ts` lines 67–79. |
 | **Seller approval**                                     | Same `deal-approvals` rows on the Deal page (Step 8: seller clicks `deal-approve-button`; assertion is on the `Seller:` row transitioning to "Approved at …"). Built by the same `buildApprovalStatusRows` helper.                                                                                                                                                                                                               |
-| **Sandbox funding confirmation**                        | Asserted on the Deal page. The funding surface is rendered by `apps/web/src/app/deals/[dealId]/page.tsx` lines 449–515 (`data-testid="deal-funding-card"`). After `deal-fund-button` is clicked in Step 9, the spec asserts the Active terminal appears — i.e., the deterministic activation invariant fired and the funding confirmation is persisted.                                                                          |
-| **Terminal message**                                    | `apps/web/src/app/deals/[dealId]/page.tsx` line 512 renders the exact copy `Deal Active — escrow funded; commissioned work may begin.` inside `data-testid="deal-active-terminal"`. Asserted by Step 10 line 247 (`toHaveText(TERMINAL_ACTIVE_COPY)`, defined line 45).                                                                                                                                                          |
+| **Sandbox funding confirmation**                        | Asserted on the Deal page. The funding surface is rendered by `apps/web/src/app/deals/[dealId]/page.tsx` lines 471–539 (`data-testid="deal-funding-card"`). After `deal-fund-button` is clicked in Step 9, the spec asserts the Active terminal appears — i.e., the deterministic activation invariant fired and the funding confirmation is persisted.                                                                          |
+| **Terminal message**                                    | `apps/web/src/app/deals/[dealId]/page.tsx` lines 534–536 render the exact copy `Deal Active — escrow funded; commissioned work may begin.` inside `data-testid="deal-active-terminal"`. Asserted by Step 10 in `apps/web/e2e/golden-slice.spec.ts` lines 287–288 (`toHaveText(TERMINAL_ACTIVE_COPY)`).                                                                                                                           |
 
 **Scope note:** the Deployed Beta smoke (`AC4`, `AC7`) is
 intentionally provider verification. It does not exercise a
@@ -308,7 +308,7 @@ itself IS the bound.
 
 | Gate                                                                                        | Evidence                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                         |
 | ------------------------------------------------------------------------------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| Local BG7 gates (type-check, lint, focused tests, production builds, format, runtime smoke) | `pnpm acceptance-gate` exited 0 against implementation/remediation commit `7543e7115a0e7edef29fbefd8d0d6107dc9bb883` at `2026-09-07T15:53:57Z`. All 9 orchestrated steps passed in 398.8 seconds, including the production builds, runtime smoke, and 43/43 Playwright tests. The orchestrator is `scripts/acceptance-gate.mjs`; it stops at the first failure and emits `READY FOR CODEX REVIEW` only after every step succeeds.                                                                                                                                                                                                                                                                                                |
+| Local BG7 gates (type-check, lint, focused tests, production builds, format, runtime smoke) | `pnpm acceptance-gate` exited 0 against then-current final HEAD `eef2cd271ae88702f805f1d115878713e7953711`; the result was recorded at `2026-09-07T16:34:05Z`. All 9 orchestrated steps passed in 393.5 seconds, including the production builds, runtime smoke, and 43/43 Playwright tests. The orchestrator is `scripts/acceptance-gate.mjs`; it stops at the first failure and emits `READY FOR CODEX REVIEW` only after every step succeeds. An earlier run against implementation/remediation commit `7543e7115a0e7edef29fbefd8d0d6107dc9bb883` also passed, in 398.8 seconds.                                                                                                                                              |
 | Deployed web online                                                                         | `https://soundhub-web-production.up.railway.app` is reachable; the deployed web app served the managed Auth + Storage smoke in `AC4`.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                            |
 | API HTTP 200 health smoke                                                                   | See `Railway deployed API health smoke — PASS` below.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                            |
 | Prisma migrations deployed / no pending migrations                                          | 13 migrations applied in the deployed PostgreSQL service. The migration list lives in `packages/db/prisma/migrations/`: `20260808114423_m1_foundation`, `20260808120000_drop_seed_markers`, `20260824171036_bg1_identity`, `20260825120000_bg2_audio_samples`, `20260826090000_bg3_project_brief`, `20260826110000_bg2_audio_cleanup`, `20260826160000_bg3_persist_criteria_query`, `20260826170000_bg3_persist_additional_offerings`, `20260826180000_bg2_audio_orphaned_storage`, `20260827090000_bg4_project_requests`, `20260827100000_bg4_restrict_cascades`, `20260901090000_bg5_terms_approvals`, `20260904120000_bg6_payment_intent`. The Railway deploy reported `No pending migrations` after `prisma migrate deploy`. |
@@ -385,9 +385,10 @@ Later local review remediations have not been deployed. Their
 local validation and synchronization state are recorded below.
 
 - **Branch:** `feat/bg7-golden-slice`
-- **Acceptance-tested implementation/remediation commit:**
-  `7543e7115a0e7edef29fbefd8d0d6107dc9bb883` —
-  `fix(bg7): resolve final review findings`
+- **Acceptance-tested final HEAD before this evidence-only
+  correction:**
+  `eef2cd271ae88702f805f1d115878713e7953711` —
+  `docs(bg7): record final acceptance evidence`
 - **Application commit deployed** (the most recent non-doc
   commit at the time of the Railway `up`):
   `a385ea1` — `fix(auth): allow phone_change_sent_at +
@@ -415,19 +416,19 @@ reauthentication_sent_at on managed verify`. The
   feat/bg7-golden-slice
 
   $ git rev-parse HEAD
-  7543e7115a0e7edef29fbefd8d0d6107dc9bb883
+  eef2cd271ae88702f805f1d115878713e7953711
 
   $ git status --short
   (clean)
 
   $ git log -1 --oneline
-  7543e71 fix(bg7): resolve final review findings
+  eef2cd2 docs(bg7): record final acceptance evidence
 
   $ git rev-list --left-right --count origin/feat/bg7-golden-slice...HEAD
-  0	5
+  0	6
   ```
 
-  (At this snapshot, the local branch was 5 commits ahead of and
+  (At this snapshot, the local branch was 6 commits ahead of and
   0 commits behind `origin/feat/bg7-golden-slice`.)
 
 ---
