@@ -115,6 +115,30 @@ const supabaseUserV1Schema = z
     // (e.g. anonymous pivots). Tolerated for forward compatibility;
     // identity derivation does not consume it.
     is_anonymous: z.boolean().optional(),
+    // Additional documented Supabase auth-js / GoTrue User fields
+    // now returned by the live verify response. Each is enumerated
+    // explicitly so the parser tolerates the documented shape
+    // Supabase publishes while `.strict()` keeps the SoundHub
+    // boundary closed against unknown / custom provider claims.
+    // Identity derivation continues to read only the allow-listed
+    // `id` and `email` from the parsed user; every other parsed
+    // field is discarded after identity is established, so the
+    // additional fields never cross a SoundHub DTO.
+    confirmation_sent_at: z.string().max(64).nullable().optional(),
+    recovery_sent_at: z.string().max(64).nullable().optional(),
+    email_change_sent_at: z.string().max(64).nullable().optional(),
+    new_email: z.string().email().nullable().optional(),
+    new_phone: z.string().max(64).nullable().optional(),
+    invited_at: z.string().max(64).nullable().optional(),
+    action_link: z.string().max(2048).nullable().optional(),
+    is_sso_user: z.boolean().optional(),
+    factors: z.array(z.record(z.unknown())).nullable().optional(),
+    deleted_at: z.string().max(64).nullable().optional(),
+    // Documented on GoTrue's admin moderation surface; some
+    // deployments surface it on the verify envelope. Tolerated
+    // for forward compatibility; identity derivation does not
+    // consume it.
+    banned_until: z.string().max(64).nullable().optional(),
   })
   .strict();
 
