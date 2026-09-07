@@ -95,6 +95,27 @@ output — every step exit code 0>`. The acceptance gate runs
 
 ---
 
+## Deployed Runtime / API Evidence
+
+### Railway deployed API health smoke — PASS
+
+Command:
+
+`curl -i https://soundhub-api-production.up.railway.app/api/health`
+
+Observed:
+
+- HTTP/2 200
+- `status`: `ok`
+- `service`: `SoundHub API`
+- `version`: `0.1.0`
+- `environment`: `production`
+- Observed at approximately 2026-09-07T03:17:47Z
+
+Result: PASS — deployed SoundHub API is reachable and healthy in the production Railway environment.
+
+At this point we have live evidence for:
+
 ## Branch Push Policy (per the plan's completion contract)
 
 - **Branch:** `feat/bg7-golden-slice`
