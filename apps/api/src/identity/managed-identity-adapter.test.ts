@@ -122,6 +122,7 @@ function supabaseVerifyEnvelope(overrides: {
       email: overrides.email,
       email_confirmed_at: "2025-01-01T00:00:00.000Z",
       phone: "",
+      phone_confirmed_at: null,
       confirmed_at: "2025-01-01T00:00:00.000Z",
       last_sign_in_at: "2025-01-01T00:00:00.000Z",
       app_metadata: { provider: "email" },
@@ -129,6 +130,7 @@ function supabaseVerifyEnvelope(overrides: {
       identities: [],
       created_at: "2025-01-01T00:00:00.000Z",
       updated_at: "2025-01-01T00:00:00.000Z",
+      is_anonymous: false,
     },
   };
 }
@@ -403,6 +405,45 @@ describe("ManagedIdentityAdapter", () => {
     const verified = await adapter.verifySignIn({ verificationToken: "captured-token" });
     assert.ok(verified);
     assert.equal(verified.subject, "supabase-uuid-forward-compatible");
+    assert.equal(verified.providerEmail, "buyer@example.com");
+  });
+
+  test("verifySignIn accepts a realistic Supabase verify response carrying phone_confirmed_at and is_anonymous", async () => {
+    // Live deployed managed-auth failure: Supabase now returns the
+    // documented GoTrue User fields `phone_confirmed_at` and
+    // `is_anonymous` on the verify response. The previous strict
+    // schema rejected the response and surfaced
+    // `Magic link verification failed.` (AUTH_FAILED). The
+    // documented fields are now explicitly allow-listed on the
+    // provider-response schema; identity derivation still only
+    // reads the allow-listed `id` and `email` and discards every
+    // other parsed field, so the public SoundHub DTO contract is
+    // unchanged.
+    const verifiedBody = supabaseVerifyEnvelope({
+      id: "supabase-uuid-realistic-shape",
+      email: "buyer@example.com",
+    });
+    // Mirror the live Supabase payload shape verbatim — non-null
+    // phone_confirmed_at, is_anonymous=false — so the regression
+    // cannot return.
+    const userRecord = verifiedBody.user as Record<string, unknown>;
+    userRecord["phone_confirmed_at"] = "2025-01-02T03:04:05.000Z";
+    userRecord["is_anonymous"] = false;
+    const { fetchImpl } = makeFetch({
+      url: "https://example.supabase.co/auth/v1/verify",
+      responses: [{ status: 200, body: verifiedBody }],
+    });
+    const adapter = configure({ fetchImpl });
+    const verified = await adapter.verifySignIn({
+      verificationToken: "realistic-supabase-shape-token",
+    });
+    assert.ok(verified, "verifySignIn must succeed on the realistic Supabase shape");
+    assert.equal(verified.provider, "managed-magic-link");
+    assert.equal(verified.subject, "supabase-uuid-realistic-shape");
+    // Only the allow-listed SoundHub identity fields are surfaced;
+    // `phone_confirmed_at`, `is_anonymous`, and the rest of the
+    // provider envelope never cross the public DTO boundary.
+    assert.deepEqual(Object.keys(verified).sort(), ["provider", "providerEmail", "subject"]);
     assert.equal(verified.providerEmail, "buyer@example.com");
   });
 

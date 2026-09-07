@@ -98,6 +98,11 @@ const supabaseUserV1Schema = z
     role: z.string().max(64).optional(),
     email_confirmed_at: z.string().max(64).nullable().optional(),
     phone: z.string().max(64).nullable().optional(),
+    // Documented Supabase GoTrue User field; the provider now
+    // returns it on the verify response, and the parser must
+    // tolerate it without weakening the SoundHub DTO contract.
+    // Identity derivation still only reads `id` and `email`.
+    phone_confirmed_at: z.string().max(64).nullable().optional(),
     confirmed_at: z.string().max(64).nullable().optional(),
     last_sign_in_at: z.string().max(64).nullable().optional(),
     app_metadata: z.record(z.unknown()).optional(),
@@ -105,6 +110,11 @@ const supabaseUserV1Schema = z
     identities: z.array(z.record(z.unknown())).optional(),
     created_at: z.string().max(64).nullable().optional(),
     updated_at: z.string().max(64).nullable().optional(),
+    // Documented Supabase GoTrue User field; present on auth-link
+    // sessions that did not originate from a regular sign-in
+    // (e.g. anonymous pivots). Tolerated for forward compatibility;
+    // identity derivation does not consume it.
+    is_anonymous: z.boolean().optional(),
   })
   .strict();
 
