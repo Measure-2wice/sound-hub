@@ -444,6 +444,84 @@ export const apiErrorCodeV1Schema = z.enum([
   "AUDIO_PAYLOAD_MISSING",
   "AUDIO_PROVIDER_UNAVAILABLE",
   "AUDIO_STORAGE_FAILED",
+  // Buildathon Golden Slice 4 error codes. ProjectRequest / Deal
+  // specific. The 403 codes cover both buyer-side and seller-side
+  // authorization failures (route layer collapses them to a single
+  // safe envelope); PROJECT_REQUEST_ALREADY_PENDING and
+  // PROJECT_REQUEST_ALREADY_RESPONDED surface as 409 to indicate a
+  // retry that would have produced a duplicate row.
+  "PROJECT_REQUEST_INVALID",
+  "PROJECT_REQUEST_BRIEF_NOT_FOUND",
+  "PROJECT_REQUEST_BRIEF_FORBIDDEN",
+  "PROJECT_REQUEST_OFFERING_INELIGIBLE",
+  "PROJECT_REQUEST_NOT_FOUND",
+  "PROJECT_REQUEST_FORBIDDEN",
+  "PROJECT_REQUEST_ALREADY_PENDING",
+  "PROJECT_REQUEST_ALREADY_RESPONDED",
+  // Transient marketplace-busy envelope. Maps to 503 so the buyer or
+  // seller can retry the request without changing the payload.
+  "PROJECT_REQUEST_UNAVAILABLE",
+  // Generic ProjectRequest internal-failure envelope. Maps to 500.
+  // Used only when the handler catches an exception that does not
+  // match a typed ProjectRequestError; the underlying message is
+  // never echoed.
+  "PROJECT_REQUEST_FAILED",
+  // Buildathon Golden Slice 5 (BG5) error codes. Cover the
+  // Deal/TermsVersion/DealApprover/DealApproval slice. The codes
+  // never expose private identifiers (UserAccount ids, DealApprover
+  // ids, storage references). Status mapping in
+  // `apps/api/src/lib/errors.ts` is the single source of truth.
+  "BG5_DEAL_NOT_FOUND",
+  "BG5_TERMS_VERSION_NOT_FOUND",
+  "BG5_DEAL_NOT_NEGOTIATING",
+  "BG5_TERMS_DRAFT_FORBIDDEN",
+  "BG5_TERMS_DRAFT_INVALID",
+  "BG5_APPROVAL_FORBIDDEN",
+  "BG5_APPROVAL_INVALID",
+  "BG5_APPROVAL_NOT_CURRENT_VERSION",
+  "BG5_APPROVAL_ALREADY_RECORDED",
+  "BG5_DEAL_INTERNAL_FAILED",
+  "BG5_DEAL_UNAVAILABLE",
+  // Buildathon Golden Slice 6 (BG6) — PaymentIntent + activation codes.
+  // 404 — the Deal id is unknown to the acting Workspace.
+  "BG6_DEAL_NOT_FOUND",
+  // 403 — the acting Workspace is not the buyer side, is not a
+  // current member, lacks the Buyer capability, or another
+  // authorization rejection (safe envelope collapses them).
+  "BG6_FUNDING_FORBIDDEN",
+  // 400 — the request body failed runtime validation.
+  "BG6_FUNDING_INVALID",
+  // 422 — the Deal is past Negotiating (typically already Active).
+  "BG6_DEAL_NOT_NEGOTIATING",
+  // 422 — both parties have not approved the current TermsVersion.
+  "BG6_APPROVALS_INCOMPLETE",
+  // 422 — the current TermsVersion moved under us between preauth
+  // and Phase 3; retry-safe.
+  "BG6_TERMS_VERSION_NOT_CURRENT",
+  // 422 — the provider confirmation's amount/currency/termsVersionId
+  // did not match the locked TermsVersion snapshot.
+  "BG6_FUNDING_CONFIRMATION_MISMATCH",
+  // 503 — provider outage; Deal stays Negotiating; intent transitions
+  // to Failed on the SAME row.
+  "BG6_ESCROW_UNAVAILABLE",
+  // 409 — guarded activation UPDATE returned 0 rows; concurrent
+  // activation already happened.
+  "BG6_DEAL_ALREADY_ACTIVE",
+  // 500 — unexpected internal failure outside the typed surfaces.
+  "BG6_FUNDING_INTERNAL_FAILED",
+  // Deals discovery list (ticket #74). The list is a private,
+  // Workspace-scoped read; its rejection surface is deliberately
+  // narrow so the response never reveals whether a Workspace exists
+  // or whether the caller merely lacks membership.
+  // 403 — the acting Workspace is unknown, not Active, or the
+  // authenticated human is not a current member of that EXACT
+  // Workspace. The single code collapses all three.
+  "DEAL_LIST_FORBIDDEN",
+  // 400 — the request failed runtime validation (missing or
+  // malformed actingWorkspaceId).
+  "DEAL_LIST_INVALID",
+  // 500 — unexpected internal failure outside the typed surfaces.
+  "DEAL_LIST_FAILED",
 ]);
 export type ApiErrorCodeV1 = z.infer<typeof apiErrorCodeV1Schema>;
 
@@ -536,6 +614,14 @@ export type PricingKindV1 = (typeof pricingKindValuesV1)[number];
 export const purchaseModeValuesV1 = ["BundleOnly"] as const;
 export type PurchaseModeV1 = (typeof purchaseModeValuesV1)[number];
 
+// BG4 closed behavior states. These mirror the Prisma enum values
+// added in migration 20260827090000_bg4_project_requests.
+export const projectRequestStatusValuesV1 = ["Pending", "Accepted", "Declined"] as const;
+export type ProjectRequestStatusV1 = (typeof projectRequestStatusValuesV1)[number];
+
+export const dealStatusValuesV1 = ["Negotiating", "Active"] as const;
+export type DealStatusV1 = (typeof dealStatusValuesV1)[number];
+
 // ===========================================================================
 // Buildathon Golden Slice 1 (BG1) shared runtime contracts.
 //
@@ -567,8 +653,8 @@ export type PurchaseModeV1 = (typeof purchaseModeValuesV1)[number];
 // SoundHub always uses neutral responses: the request envelope returns
 // the same shape whether the email is registered or not, so the public
 // surface cannot be used to enumerate accounts. The deterministic
-// adapter adds a non-production `devVerificationUrl` for the
-// integration test and emergency fallback paths; managed providers omit
+// adapter adds a test-only `devVerificationUrl` for the local
+// integration test; managed providers omit
 // it because the real email delivery happens on the provider side.
 export const bg1MagicLinkRequestV1Schema = z
   .object({
@@ -600,9 +686,9 @@ export const bg1MagicLinkResponseV1Schema = z
     // that round-trips this value to `/api/auth/verify-token` is
     // rejected as an unknown credential.
     requestId: z.string().min(1).max(256),
-    // Deterministic-adapter operator-mode only: a one-time
-    // verification URL that the operator-driven recovery UI can
-    // follow in the absence of email delivery. Production Supabase
+    // Deterministic-adapter local-test mode only: a one-time
+    // verification URL that the Playwright flow can follow without
+    // live email delivery. Production Supabase
     // magic-link emails render this field absent; the deployed
     // deterministic fallback also renders it absent so an
     // unauthenticated browser cannot choose a demo identity by
@@ -626,8 +712,8 @@ export type Bg1MagicLinkResponseV1 = z.infer<typeof bg1MagicLinkResponseV1Schema
 //     magic-link response and carried into logs and observability.
 //     It is never a credential and cannot be used to mint a session.
 //   - `verificationToken` is the **private one-time credential** the
-//     browser extracts from the email callback URL (or the dev
-//     recovery workflow reads from the server log). It is the only
+//     browser extracts from the managed email callback URL or the
+//     explicitly gated local test URL. It is the only
 //     value `verifySignIn` accepts. It MUST NEVER appear in public
 //     DTOs, error envelopes, or log lines.
 export const bg1VerifyTokenRequestV1Schema = z
@@ -1247,3 +1333,715 @@ export const BG2_AUDIO_SAMPLE_MAX_DISPLAY_ORDER = 3;
 // detector can compare this list against the runtime error builder.
 // The drift test (`apps/api/src/lib/enum-drift.test.ts`) is the only
 // place that consults this list outside the route layer.
+
+// ===========================================================================
+// Buildathon Golden Slice 4 (BG4) shared runtime contracts.
+//
+// These schemas cover the ProjectRequest + seller-consent slice:
+// persistence, decision, view, and list endpoints. The same patterns
+// as the BG3 contracts are reused: shared Zod is the executable
+// contract; TypeScript types are inferred from it; the same schema is
+// consumed by the API route validator and the browser response parser.
+// No Prisma model, raw provider subject, or storage key ever crosses
+// a public DTO.
+//
+// Per ticket #62, GS 16–18 require:
+//   GS 16 — ProjectRequest creation revalidates current eligibility
+//           and persists a Pending request owned by the buyer
+//           Workspace; it does not create a Deal.
+//   GS 17 — Only an authorized seller Workspace member can accept or
+//           decline the request.
+//   GS 18 — Decline creates no Deal; acceptance records seller
+//           consent and creates exactly one Negotiating Deal.
+// And GS 26 requires that retries cannot create duplicate
+// ProjectRequests or multiple Deals for one accepted ProjectRequest.
+// ===========================================================================
+
+// ---------- ProjectRequest public DTO ----------
+
+// Allow-listed ProjectRequest shape. The counterparty-visible surface
+// does NOT include private human-actor identifiers (`createdByUserId`,
+// `sellerDecisionByUserId`): those are persisted as audit evidence
+// only and are never serialized into responses (CLAUDE.md: "Do not
+// expose account identity... publicly"). `sellerConsentAt` is the
+// canonical "explicit seller consent" evidence referenced by GS 18
+// / future activation invariants. It is null for Pending and
+// Declined requests and the timestamp of the accept call for
+// Accepted ones.
+//
+// BG4 seller-inbox UI (ticket #62 acceptance QA, P3-002) requires
+// that a row carries human-readable context — the buyer Workspace
+// name, the ServiceOffering title, and a brief excerpt — so the
+// seller can distinguish multiple Pending requests without seeing
+// raw internal ids as primary user-facing content. The ids remain on
+// the response for client-side keys, audit correlation, and tests,
+// but the UI MUST render the human-readable context as the primary
+// label. The fields are bounded and pulled from the same referenced
+// rows that authorize the request; they do not expose account,
+// membership, embedding, or storage internals.
+export const projectRequestPublicV1Schema = z
+  .object({
+    projectRequestId: z.string().min(1).max(128),
+    buyerWorkspaceId: z.string().min(1).max(128),
+    sellerWorkspaceId: z.string().min(1).max(128),
+    serviceOfferingId: z.string().min(1).max(128),
+    projectBriefId: z.string().min(1).max(128),
+    status: z.enum(projectRequestStatusValuesV1),
+    sellerDecisionAt: z.string().datetime().nullable(),
+    sellerConsentAt: z.string().datetime().nullable(),
+    createdAt: z.string().datetime(),
+    // Display-only context for the seller inbox (and the symmetric
+    // buyer audit view). Pulled from the referenced Workspace /
+    // ServiceOffering / ProjectBrief rows at read time. Null when
+    // the referenced row could not be loaded; the UI must render
+    // a stable placeholder rather than fabricating a label.
+    buyerWorkspaceName: z.string().min(1).max(200).nullable(),
+    sellerWorkspaceName: z.string().min(1).max(200).nullable(),
+    serviceOfferingTitle: z.string().min(1).max(200).nullable(),
+    briefExcerpt: z.string().max(280).nullable(),
+  })
+  .strict();
+export type ProjectRequestPublicV1 = z.infer<typeof projectRequestPublicV1Schema>;
+
+// ---------- Deal public DTO ----------
+
+// Allow-listed Deal shape. BG4 only ever emits Negotiating Deals; the
+// `activatedAt` field is always null in this slice. Future
+// activation-invariant code (a later ticket) will set it.
+export const dealPublicV1Schema = z
+  .object({
+    dealId: z.string().min(1).max(128),
+    buyerWorkspaceId: z.string().min(1).max(128),
+    sellerWorkspaceId: z.string().min(1).max(128),
+    serviceOfferingId: z.string().min(1).max(128),
+    projectBriefId: z.string().min(1).max(128),
+    projectRequestId: z.string().min(1).max(128),
+    status: z.enum(dealStatusValuesV1),
+    activatedAt: z.string().datetime().nullable(),
+    createdAt: z.string().datetime(),
+  })
+  .strict();
+export type DealPublicV1 = z.infer<typeof dealPublicV1Schema>;
+
+// ---------- Deals discovery list DTO (ticket #74) ----------
+//
+// Background: ticket #74 makes Deals discoverable from signed-in
+// navigation. The list is a DISCOVERY surface, not a second Deal
+// detail surface: it carries only what a human needs to recognise a
+// Deal and choose a row. Full terms, approval audit records, and the
+// BG6 funding confirmation stay on `/deals/:dealId`.
+//
+// Deliberately EXCLUDED from the list item (AGENTS.md: "Do not expose
+// account identity, membership, wallet, embedding, or storage
+// internals publicly"):
+//   - buyerWorkspaceId / sellerWorkspaceId  (membership topology;
+//     `actingSide` + the counterparty NAME carry the context)
+//   - projectBriefId / projectRequestId / serviceOfferingId
+//   - paymentIntentId, correlationId, providerReference
+//   - provider / asset / network / environment labels
+//   - confirmation timestamps and failure diagnostics
+//
+// Approval state is DERIVED server-side. There is no persisted
+// approval-status column: BG5 represents approval as DealApproval row
+// existence per (termsVersionId, workspaceId), so the server derives
+// this closed enum from the current TermsVersion's approval rows. The
+// client must not reconstruct it.
+export const dealApprovalStateValuesV1 = [
+  // No TermsVersion has been drafted yet.
+  "NoTerms",
+  // A current TermsVersion exists; neither party has approved it.
+  "AwaitingBothApprovals",
+  // The seller approved the current version; the buyer has not.
+  "AwaitingBuyerApproval",
+  // The buyer approved the current version; the seller has not.
+  "AwaitingSellerApproval",
+  // Both parties approved the SAME current version.
+  "BothApproved",
+] as const;
+export type DealApprovalStateV1 = (typeof dealApprovalStateValuesV1)[number];
+
+// Slim, derived funding summary for the list. This is NOT the BG6
+// `bg6FundingConfirmationPublicV1Schema` and must not be widened into
+// it — the list exposes discovery-sufficient state only.
+//
+// Semantics (derived server-side from persisted Deal / BG5 / BG6
+// state, never reconstructed by the client):
+//   null                   funding is not yet applicable (no current
+//                          terms, or approvals are incomplete)
+//   AwaitingConfirmation   both parties approved the current version;
+//                          the Deal is ready for / awaiting funding
+//   Confirmed              funding confirmed (aligns with an Active
+//                          Deal in the Golden Slice)
+//   Failed                 the current applicable funding attempt
+//                          failed; the Deal remains Negotiating
+export const dealListFundingStatusesV1 = ["AwaitingConfirmation", "Confirmed", "Failed"] as const;
+export type DealListFundingStatusV1 = (typeof dealListFundingStatusesV1)[number];
+
+// Which side of the Deal the acting Workspace is on. Lets the UI say
+// "with {counterparty}" without exposing either workspace id.
+export const dealActingSideValuesV1 = ["Buyer", "Seller"] as const;
+export type DealActingSideV1 = (typeof dealActingSideValuesV1)[number];
+
+// One discoverable Deal row, scoped to the acting Workspace.
+//
+// `counterpartyWorkspaceName` and `serviceOfferingTitle` are the
+// human-readable primary context required by ticket #74 ("Deal rows
+// use human-readable labels rather than raw internal IDs as their
+// primary context"). They are nullable for the same reason
+// `projectRequestPublicV1Schema` makes its display context nullable:
+// a referenced row that could not be loaded must render a stable
+// placeholder rather than a fabricated label.
+export const dealListItemPublicV1Schema = z
+  .object({
+    dealId: z.string().min(1).max(128),
+    status: z.enum(dealStatusValuesV1),
+    actingSide: z.enum(dealActingSideValuesV1),
+    counterpartyWorkspaceName: z.string().min(1).max(200).nullable(),
+    serviceOfferingTitle: z.string().min(1).max(200).nullable(),
+    // The current TermsVersion's monotonic version number; null when
+    // no terms have been drafted.
+    currentTermsVersion: z.number().int().positive().nullable(),
+    approvalState: z.enum(dealApprovalStateValuesV1),
+    fundingStatus: z.enum(dealListFundingStatusesV1).nullable(),
+    activatedAt: z.string().datetime().nullable(),
+    createdAt: z.string().datetime(),
+  })
+  .strict();
+export type DealListItemPublicV1 = z.infer<typeof dealListItemPublicV1Schema>;
+
+// List request. The acting Workspace is explicit (GS 4 / GS 5
+// authority contract) and arrives as a query parameter; the server
+// revalidates current membership for the EXACT commanded Workspace
+// inside the same transaction that reads the Deals.
+export const listDealsRequestV1Schema = z
+  .object({
+    actingWorkspaceId: z.string().min(1).max(128),
+  })
+  .strict();
+export type ListDealsRequestV1 = z.infer<typeof listDealsRequestV1Schema>;
+
+// List response. Bounded by design: ticket #74 excludes pagination
+// frameworks, and the cap keeps the discovery surface from becoming
+// an unbounded export.
+export const listDealsResponseV1Schema = z
+  .object({
+    ok: z.literal(true),
+    deals: z.array(dealListItemPublicV1Schema).max(200),
+  })
+  .strict();
+export type ListDealsResponseV1 = z.infer<typeof listDealsResponseV1Schema>;
+
+// ---------- ProjectRequest endpoints ----------
+
+// Create-ProjectRequest request body. The buyer-side acting
+// Workspace id (GS 4 / GS 5 / GS 6 authority contract), the persisted
+// ProjectBrief id (required by ticket #62 GS 16 — selection is
+// grounded in a previously-persisted brief), and the selected
+// ServiceOffering id (one of the eligibility-determined offerings).
+export const createProjectRequestRequestV1Schema = z
+  .object({
+    actingWorkspaceId: z.string().min(1).max(128),
+    projectBriefId: z.string().min(1).max(128),
+    serviceOfferingId: z.string().min(1).max(128),
+  })
+  .strict();
+export type CreateProjectRequestRequestV1 = z.infer<typeof createProjectRequestRequestV1Schema>;
+
+export const createProjectRequestResponseV1Schema = z
+  .object({
+    ok: z.literal(true),
+    projectRequest: projectRequestPublicV1Schema,
+  })
+  .strict();
+export type CreateProjectRequestResponseV1 = z.infer<typeof createProjectRequestResponseV1Schema>;
+
+// View one ProjectRequest. Authorization is revalidated on every
+// read (GS 4); a non-member of either side receives
+// PROJECT_REQUEST_FORBIDDEN (403) and an unknown id receives
+// PROJECT_REQUEST_NOT_FOUND (404).
+export const getProjectRequestResponseV1Schema = z
+  .object({
+    projectRequest: projectRequestPublicV1Schema,
+  })
+  .strict();
+export type GetProjectRequestResponseV1 = z.infer<typeof getProjectRequestResponseV1Schema>;
+
+// List ProjectRequests for an acting Workspace. Used by the seller
+// inbox (statusFilter=Pending) and the audit view (no filter). The
+// route revalidates current membership on every call.
+export const listProjectRequestsRequestV1Schema = z
+  .object({
+    actingWorkspaceId: z.string().min(1).max(128),
+    statusFilter: z.enum(projectRequestStatusValuesV1).optional(),
+  })
+  .strict();
+export type ListProjectRequestsRequestV1 = z.infer<typeof listProjectRequestsRequestV1Schema>;
+
+export const listProjectRequestsResponseV1Schema = z
+  .object({
+    projectRequests: z.array(projectRequestPublicV1Schema).max(200),
+  })
+  .strict();
+export type ListProjectRequestsResponseV1 = z.infer<typeof listProjectRequestsResponseV1Schema>;
+
+// ---------- Seller decision endpoints ----------
+
+// Accept / Decline carry the same payload: the acting Workspace id
+// is required so the route can revalidate membership and the
+// seller-side authorization before touching the request row.
+export const respondProjectRequestRequestV1Schema = z
+  .object({
+    actingWorkspaceId: z.string().min(1).max(128),
+  })
+  .strict();
+export type RespondProjectRequestRequestV1 = z.infer<typeof respondProjectRequestRequestV1Schema>;
+
+export const acceptProjectRequestResponseV1Schema = z
+  .object({
+    ok: z.literal(true),
+    projectRequest: projectRequestPublicV1Schema,
+    deal: dealPublicV1Schema,
+  })
+  .strict();
+export type AcceptProjectRequestResponseV1 = z.infer<typeof acceptProjectRequestResponseV1Schema>;
+
+export const declineProjectRequestResponseV1Schema = z
+  .object({
+    ok: z.literal(true),
+    projectRequest: projectRequestPublicV1Schema,
+  })
+  .strict();
+export type DeclineProjectRequestResponseV1 = z.infer<typeof declineProjectRequestResponseV1Schema>;
+
+// ===========================================================================
+// Buildathon Golden Slice 5 (BG5) shared runtime contracts.
+//
+// These schemas cover the TermsVersion, DealApproval, and DealApprover
+// surfaces introduced by ticket #63. The same patterns as BG1–BG4 are
+// reused: shared Zod is the executable contract; TypeScript types are
+// inferred from it; the same schema is consumed by the API route
+// validator and the browser response parser.
+//
+// Per ticket #63 the BG5 slice satisfies the Golden Slice GS 19, GS 20,
+// GS 21, GS 26 (terms / approval surface) and the DealApprover portion
+// of GS 6. The slice is buildathon-scoped: no managed AI integration,
+// no generalized idempotency framework, and no visible terms-edit UI
+// (per ticket #63: "Do not implement clock-driven expiration or
+// require a visible terms-edit/versioning UI").
+//
+// Public DTOs are strict allow-lists. Private audit-only identifiers
+// (`draftedByUserId`, `approvedByUserId`, `dealApproverId`) are
+// persisted in PostgreSQL for later milestones but NEVER cross a
+// public DTO. The Application derives approval completeness from
+// durable DealApproval rows; AI output, UI state, provider metadata,
+// and one party's approval cannot synthesize the other party's
+// approval.
+// ===========================================================================
+
+// ---------- Money (USD; BG5 is USD-only per the Golden Slice) ----------
+
+const bg5UsdMoneyV1Schema = z.object({
+  amountMinor: z.number().int().nonnegative(),
+  currency: z.literal("USD"),
+});
+export type Bg5UsdMoneyV1 = z.infer<typeof bg5UsdMoneyV1Schema>;
+
+// ---------- Deliverable requirement ----------
+
+// One structured deliverable requirement inside a TermsVersion. The
+// shape is small enough to remain stable across the buildathon; future
+// milestones can extend it (sub-deliverables, attached assets, …)
+// without breaking the public contract.
+export const bg5DeliverableRequirementV1Schema = z
+  .object({
+    title: z.string().min(1).max(200),
+    description: z.string().min(1).max(2000),
+  })
+  .strict();
+export type Bg5DeliverableRequirementV1 = z.infer<typeof bg5DeliverableRequirementV1Schema>;
+
+// ---------- Schedule ----------
+
+export const bg5ScheduleV1Schema = z
+  .object({
+    // ISO date strings (YYYY-MM-DD). The contract accepts any ISO
+    // date; the application does not enforce timezone alignment with
+    // the buyer's locale.
+    startDate: z.string().regex(/^\d{4}-\d{2}-\d{2}$/, "startDate must be YYYY-MM-DD"),
+    endDate: z.string().regex(/^\d{4}-\d{2}-\d{2}$/, "endDate must be YYYY-MM-DD"),
+    // Bounded: 1..365 days. Larger engagements are not part of the
+    // Golden Slice and would need a separate negotiation flow.
+    deliveryDays: z.number().int().min(1).max(365),
+  })
+  .strict()
+  .superRefine((value, ctx) => {
+    if (value.startDate > value.endDate) {
+      ctx.addIssue({
+        code: z.ZodIssueCode.custom,
+        message: "startDate must not be after endDate",
+      });
+    }
+  });
+export type Bg5ScheduleV1 = z.infer<typeof bg5ScheduleV1Schema>;
+
+// ---------- Proposed terms (AI boundary output, strict) ----------
+//
+// The shape produced by `DealTermsAiAdapter.draftProposedTerms` and
+// validated at the application boundary before any TermsVersion row
+// is persisted. AI output never crosses the boundary untyped; this
+// schema is the single source of truth for the candidate proposal.
+// The deterministic fallback re-derives a value that parses through
+// the same schema so a managed-adapter failure cannot bypass the
+// validation invariant.
+
+export const bg5RevisionAllowanceV1Schema = z.number().int().min(0).max(10);
+export type Bg5RevisionAllowanceV1 = z.infer<typeof bg5RevisionAllowanceV1Schema>;
+
+export const bg5ProposedTermsV1Schema = z
+  .object({
+    scope: z.string().min(1).max(2000),
+    deliverables: z.array(bg5DeliverableRequirementV1Schema).min(1).max(20),
+    schedule: bg5ScheduleV1Schema,
+    // USD-only for BG5 per the Golden Slice spec.
+    price: bg5UsdMoneyV1Schema,
+    revisionAllowance: bg5RevisionAllowanceV1Schema,
+    rightsSummary: z.string().min(1).max(2000),
+    // Optional, display-only. The application never reads this as a
+    // state-transition source.
+    fundingDeadlineAt: z.string().datetime({ offset: true }).optional(),
+  })
+  .strict();
+export type Bg5ProposedTermsV1 = z.infer<typeof bg5ProposedTermsV1Schema>;
+
+// ---------- AI boundary input / output ----------
+
+export const bg5AiProviderV1Values = ["managed", "deterministic-fallback"] as const;
+export type Bg5AiProviderV1 = (typeof bg5AiProviderV1Values)[number];
+
+// Provider-neutral input handed to the DealTermsAiAdapter. The
+// adapter receives the persisted Deal + ProjectBrief context it needs
+// to draft a proposal; it never receives raw Prisma models, provider
+// subjects, session tokens, or storage keys.
+export const dealTermsAiDraftInputV1Schema = z
+  .object({
+    dealId: z.string().min(1).max(128),
+    buyerWorkspaceId: z.string().min(1).max(128),
+    sellerWorkspaceId: z.string().min(1).max(128),
+    serviceOfferingId: z.string().min(1).max(128),
+    projectBriefId: z.string().min(1).max(128),
+  })
+  .strict();
+export type DealTermsAiDraftInputV1 = z.infer<typeof dealTermsAiDraftInputV1Schema>;
+
+// Provider-neutral output. The structure is the candidate proposal
+// (NOT yet validated) plus provenance metadata the application
+// persists alongside the TermsVersion. The application is the only
+// layer that validates the proposal against `bg5ProposedTermsV1Schema`;
+// AI output NEVER crosses the validation boundary untyped.
+export const dealTermsAiDraftOutputV1Schema = z
+  .object({
+    provider: z.enum(bg5AiProviderV1Values),
+    modelId: z.string().min(1).max(120).nullable(),
+    candidate: z.record(z.string(), z.unknown()),
+  })
+  .strict();
+export type DealTermsAiDraftOutputV1 = z.infer<typeof dealTermsAiDraftOutputV1Schema>;
+
+// ---------- Public DTOs (strict allow-list) ----------
+//
+// Per the Golden Slice privacy boundary:
+//   - `draftedByUserId` is private audit attribution. NEVER public.
+//   - `approvedByUserId` is private audit attribution. NEVER public.
+//   - `dealApproverId` is the private authorization row id. NEVER public.
+//   - Buyer + seller approval rows are both public so each side can see
+//     the OTHER side's approval, but the public row carries no human
+//     actor identifier (the Workspace identity is the authorization
+//     carrier for counterparty display).
+//
+// `aiDraftedUnapprovedBadge` is a literal `true` field on every public
+// TermsVersion DTO. The UI is required to render the "AI-drafted ·
+// unapproved" badge whenever this field is present; making the field a
+// schema-mandated literal guarantees the UI cannot silently drop it.
+
+export const bg5TermsVersionPublicV1Schema = z
+  .object({
+    termsVersionId: z.string().min(1).max(128),
+    dealId: z.string().min(1).max(128),
+    version: z.number().int().min(1),
+    scope: z.string().min(1).max(2000),
+    deliverables: z.array(bg5DeliverableRequirementV1Schema).min(1).max(20),
+    schedule: bg5ScheduleV1Schema,
+    price: bg5UsdMoneyV1Schema,
+    revisionAllowance: bg5RevisionAllowanceV1Schema,
+    rightsSummary: z.string().min(1).max(2000),
+    fundingDeadlineAt: z.string().datetime({ offset: true }).nullable(),
+    aiProvider: z.enum(bg5AiProviderV1Values),
+    aiModelId: z.string().min(1).max(120).nullable(),
+    aiFallbackUsed: z.boolean(),
+    // Schema-mandated literal so the UI cannot silently drop the badge.
+    aiDraftedUnapprovedBadge: z.literal(true),
+    draftedAt: z.string().datetime(),
+    createdAt: z.string().datetime(),
+    // `isCurrentVersion` is derived (MAX(version) per Deal) at the
+    // read boundary. It is NOT persisted on the TermsVersion row;
+    // including it here lets the UI render the "current" indicator
+    // without a second round trip.
+    isCurrentVersion: z.boolean(),
+  })
+  .strict();
+export type Bg5TermsVersionPublicV1 = z.infer<typeof bg5TermsVersionPublicV1Schema>;
+
+export const bg5DealApprovalPublicV1Schema = z
+  .object({
+    dealApprovalId: z.string().min(1).max(128),
+    termsVersionId: z.string().min(1).max(128),
+    workspaceId: z.string().min(1).max(128),
+    approvedAt: z.string().datetime(),
+  })
+  .strict();
+export type Bg5DealApprovalPublicV1 = z.infer<typeof bg5DealApprovalPublicV1Schema>;
+
+// Allow-listed seller-consent projection surfaced on the BG5 Deal
+// view (ticket AC27). The authoritative source remains the persisted
+// ProjectRequest already loaded by DealTermsService.getDeal(); this
+// schema is the smallest public surface the Active Deal view needs
+// to render an explicit seller-consent indicator.
+//
+// Domain invariant: every persisted Deal must have originated from a
+// seller-accepted ProjectRequest, so for any Deal whose invariant
+// holds the projection is non-null with `status: "Accepted"`. When
+// the invariant does not hold (ProjectRequest row missing, status
+// not "Accepted") the route MUST emit `sellerConsent: null` rather
+// than presenting false consent — the page renders no "Accepted"
+// indicator in that case.
+//
+// This is a projection, NOT a re-derivation hint: the UI MUST NOT
+// infer consent from the Deal's existence, status, approvals, or
+// any other DTO field. Only this field drives the indicator.
+export const bg5SellerConsentProjectionV1Schema = z
+  .object({
+    status: z.literal("Accepted"),
+    sellerConsentAt: z.string().datetime().nullable(),
+  })
+  .strict();
+export type Bg5SellerConsentProjectionV1 = z.infer<typeof bg5SellerConsentProjectionV1Schema>;
+
+// Extended Deal view for the /deals/:dealId page. Wraps the BG4
+// `dealPublicV1Schema` and adds the current TermsVersion (nullable —
+// a Deal in Negotiating may not yet have a draft), the current
+// approvals (max 2: buyer + seller), and the seller-consent
+// projection (null when the invariant does not hold).
+export const bg5DealViewV1Schema = z
+  .object({
+    deal: dealPublicV1Schema,
+    currentTermsVersion: bg5TermsVersionPublicV1Schema.nullable(),
+    currentApprovals: z.array(bg5DealApprovalPublicV1Schema).max(2),
+    sellerConsent: bg5SellerConsentProjectionV1Schema.nullable(),
+  })
+  .strict();
+export type Bg5DealViewV1 = z.infer<typeof bg5DealViewV1Schema>;
+
+// ---------- Request / response schemas ----------
+
+// Draft terms. The acting Workspace id is required so the route can
+// revalidate current membership. The Deal id comes from the URL path
+// in the route layer; this schema carries the body payload only.
+export const bg5DraftTermsRequestV1Schema = z
+  .object({
+    actingWorkspaceId: z.string().min(1).max(128),
+  })
+  .strict();
+export type Bg5DraftTermsRequestV1 = z.infer<typeof bg5DraftTermsRequestV1Schema>;
+
+export const bg5DraftTermsResponseV1Schema = z
+  .object({
+    ok: z.literal(true),
+    termsVersion: bg5TermsVersionPublicV1Schema,
+  })
+  .strict();
+export type Bg5DraftTermsResponseV1 = z.infer<typeof bg5DraftTermsResponseV1Schema>;
+
+// Approve terms. The termsVersionId is supplied in the body so the
+// application policy can verify it equals the current version before
+// recording approval. A stale version produces
+// BG5_APPROVAL_NOT_CURRENT_VERSION (422) and is NOT persisted.
+export const bg5ApproveTermsRequestV1Schema = z
+  .object({
+    actingWorkspaceId: z.string().min(1).max(128),
+    termsVersionId: z.string().min(1).max(128),
+  })
+  .strict();
+export type Bg5ApproveTermsRequestV1 = z.infer<typeof bg5ApproveTermsRequestV1Schema>;
+
+export const bg5ApproveTermsResponseV1Schema = z
+  .object({
+    ok: z.literal(true),
+    approval: bg5DealApprovalPublicV1Schema,
+  })
+  .strict();
+export type Bg5ApproveTermsResponseV1 = z.infer<typeof bg5ApproveTermsResponseV1Schema>;
+
+// Read the Deal view. No request body. The route accepts the Deal id
+// in the path and the acting Workspace id as a query parameter so
+// current membership can be revalidated server-side.
+export const bg5GetDealRequestV1Schema = z
+  .object({
+    actingWorkspaceId: z.string().min(1).max(128),
+  })
+  .strict();
+export type Bg5GetDealRequestV1 = z.infer<typeof bg5GetDealRequestV1Schema>;
+
+export const bg5GetDealResponseV1Schema = z
+  .object({
+    deal: bg5DealViewV1Schema,
+  })
+  .strict();
+export type Bg5GetDealResponseV1 = z.infer<typeof bg5GetDealResponseV1Schema>;
+
+// ===========================================================================
+// Buildathon Golden Slice 6 (BG6) — PaymentIntent + deterministic activation
+//
+// Per ticket #64 the buyer's authorized human explicitly requests
+// funding for the current TermsVersion after both parties have
+// approved it. The MockEscrowProvider is the only provider the
+// buildathon wires; the confirmation carries an opaque reference, the
+// exact amount the TermsVersion bound, the asset/network labels the
+// mock returned, the current TermsVersion id, and a confirmation
+// timestamp. The Deal becomes Active atomically with the
+// confirmation persistence.
+//
+// Persistence is private: paymentIntentId, correlationId, raw
+// providerReference, raw failureDetail, and internal providerState
+// NEVER cross the public DTO. The single allow-listed public surface
+// is bg6FundingConfirmationPublicV1Schema, which carries only
+// product-safe status, amount, truthful provider/asset/network/
+// environment labels, confirmation time, the sanitized failure code,
+// and the schema-mandated sandboxSimulatedBadge literal.
+// ===========================================================================
+
+// ---------- Closed label / status / reason tuples ----------
+
+// The fixed buildathon sandbox asset labels. The mock provider returns
+// exactly this value; the application surfaces it in the UI so the
+// sandbox / production distinction is unmistakable.
+export const bg6SandboxAssetLabelsV1 = ["sandbox-USDC"] as const;
+export type Bg6SandboxAssetLabelV1 = (typeof bg6SandboxAssetLabelsV1)[number];
+
+// The fixed buildathon synthetic network label. Unmistakably
+// simulated ("simulated-" prefix and "network" generic) so no
+// concrete blockchain family is named. A future real
+// PolkaAward adapter would expose its own truthful asset /
+// network / environment labels through a separate closed tuple —
+// the BG6 application boundary remains provider-neutral.
+export const bg6SimulatedNetworkLabelsV1 = ["simulated-network"] as const;
+export type Bg6SimulatedNetworkLabelV1 = (typeof bg6SimulatedNetworkLabelsV1)[number];
+
+export const bg6EnvironmentLabelsV1 = ["sandbox"] as const;
+export type Bg6EnvironmentLabelV1 = (typeof bg6EnvironmentLabelsV1)[number];
+
+// Provider-neutral provider keys. The buildathon only wires the
+// deterministic mock; a future PolkaAward adapter (or any other
+// real adapter) extends this tuple WITHOUT changing the application
+// types.
+export const bg6ProviderKeysV1 = ["mock-escrow-deterministic"] as const;
+export type Bg6ProviderKeyV1 = (typeof bg6ProviderKeysV1)[number];
+
+// Public product-safe status enum. Mapped from internal
+// PaymentIntentProviderState at the DTO boundary.
+export const bg6PublicFundingStatusesV1 = ["AwaitingConfirmation", "Confirmed", "Failed"] as const;
+export type Bg6PublicFundingStatusV1 = (typeof bg6PublicFundingStatusesV1)[number];
+
+// Closed sanitized reason codes that may appear in the public DTO.
+// Matches the persisted PaymentIntentFailureReasonCode enum.
+export const bg6PublicFundingFailureReasonCodesV1 = [
+  "EscrowProviderUnavailable",
+  "EscrowConfirmationAmountMismatch",
+  "EscrowConfirmationCurrencyMismatch",
+  "EscrowConfirmationVersionMismatch",
+] as const;
+export type Bg6PublicFundingFailureReasonCodeV1 =
+  (typeof bg6PublicFundingFailureReasonCodesV1)[number];
+
+// ---------- Public DTOs ----------
+
+// Minimal allow-listed public funding-status DTO. Carries ONLY
+// product-safe fields. EXCLUDED from this schema:
+//   - paymentIntentId        (internal audit id)
+//   - correlationId          (SoundHub-owned opaque identity)
+//   - providerReference      (provider-side handle)
+//   - raw failureDetail      (server-only)
+//   - internal providerState (mapped onto `status` here)
+//
+// `sandboxSimulatedBadge: z.literal(true)` is schema-mandated so a
+// future refactor cannot silently drop the badge from the UI.
+export const bg6FundingConfirmationPublicV1Schema = z
+  .object({
+    status: z.enum(bg6PublicFundingStatusesV1),
+    expectedAmount: bg5UsdMoneyV1Schema,
+    confirmedAmount: bg5UsdMoneyV1Schema.nullable(),
+    providerKey: z.enum(bg6ProviderKeysV1),
+    assetLabel: z.enum(bg6SandboxAssetLabelsV1),
+    networkLabel: z.enum(bg6SimulatedNetworkLabelsV1),
+    environmentLabel: z.enum(bg6EnvironmentLabelsV1),
+    confirmationTime: z.string().datetime().nullable(),
+    sanitizedFailureReason: z.enum(bg6PublicFundingFailureReasonCodesV1).nullable(),
+    sandboxSimulatedBadge: z.literal(true),
+  })
+  .strict();
+export type Bg6FundingConfirmationPublicV1 = z.infer<typeof bg6FundingConfirmationPublicV1Schema>;
+
+// Funding request body. The actingWorkspaceId is required so the
+// route can revalidate current membership + the Buyer capability.
+// The Deal id comes from the URL path; no TermsVersion id from the
+// client — the service derives the current version from the locked
+// snapshot, so a stale client cannot force funding against a
+// superseded version.
+export const bg6FundDealRequestV1Schema = z
+  .object({
+    actingWorkspaceId: z.string().min(1).max(128),
+  })
+  .strict();
+export type Bg6FundDealRequestV1 = z.infer<typeof bg6FundDealRequestV1Schema>;
+
+// Funding response. Wraps the BG5 Deal view + the public funding
+// status DTO. After a successful fund, the Deal view's
+// `deal.status` carries "Active" and `activatedAt` the activation
+// timestamp. The single allow-listed public funding surface is
+// `fundingStatus` — no separate paymentIntent / fundingConfirmation
+// members.
+export const bg6FundDealResponseV1Schema = z
+  .object({
+    ok: z.literal(true),
+    deal: bg5DealViewV1Schema,
+    fundingStatus: bg6FundingConfirmationPublicV1Schema,
+  })
+  .strict();
+export type Bg6FundDealResponseV1 = z.infer<typeof bg6FundDealResponseV1Schema>;
+
+// Sanitized failure-detail category. The closed enum below is the
+// ONLY value that may be persisted on `PaymentIntent.failureDetail`;
+// raw exception text is logged server-side only. Bounded length is
+// enforced at the application boundary so the column cannot be
+// used to smuggle provider stack traces into the database.
+export const bg6PaymentIntentFailureDetailCategoriesV1 = [
+  "PROVIDER_UNAVAILABLE",
+  "CONFIRMATION_INVALID",
+  "CONFIRMATION_MISMATCH",
+] as const;
+export type Bg6PaymentIntentFailureDetailCategoryV1 =
+  (typeof bg6PaymentIntentFailureDetailCategoriesV1)[number];
+
+export const bg6PaymentIntentFailureDetailV1Schema = z
+  .object({
+    category: z.enum(bg6PaymentIntentFailureDetailCategoriesV1),
+  })
+  .strict();
+export type Bg6PaymentIntentFailureDetailV1 = z.infer<typeof bg6PaymentIntentFailureDetailV1Schema>;
+
+// ---------- BG5 error codes (appended to the shared safe envelope) ----------
+//
+// The new codes cover the rejection surfaces unique to the
+// terms/approval slice and round-trip through `mapStatus` in
+// `apps/api/src/lib/errors.ts`. They never expose provider subjects,
+// raw tokens, session ids, storage credentials, bucket names,
+// UserAccount ids, or internal DealApprover row ids.

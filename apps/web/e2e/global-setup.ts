@@ -72,6 +72,8 @@ export default async function globalSetup(): Promise<void> {
       // explicitly instead of falling back to localhost:3000.
       PUBLIC_FIXTURE_ORIGIN: WEB_URL,
       NODE_ENV: "test",
+      BG2_STORAGE_BACKEND: "deterministic",
+      BG7_DETERMINISTIC_AUDIO_FIXTURE: "1",
     },
   );
 

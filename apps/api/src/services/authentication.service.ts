@@ -74,9 +74,8 @@ export interface RequestSignInResult {
    * correlation id) and is required by the BG1 shared contract; it
    * is NOT a verification credential (per ticket #59 P2-001). The
    * `devVerificationUrl` is set only when the deterministic adapter
-   * runs in operator mode (`BG1_DETERMINISTIC_OPERATOR_MODE=1`)
-   * so the deployed fallback never exposes a usable login credential
-   * to an unauthenticated browser that merely supplies a demo email.
+   * runs in explicitly gated local test mode. Deployed and
+   * production-like processes cannot enable this field.
    */
   readonly envelope: {
     readonly ok: true;
@@ -125,8 +124,7 @@ export class AuthenticationService {
    *
    * Per ticket #59 P2-001 the input field is named
    * `verificationToken`: the private, one-time credential the
-   * browser extracted from the magic-link callback URL (or the
-   * operator recovery workflow read from the server log). The
+   * browser extracted from the magic-link callback URL. The
    * PUBLIC `correlationId` from `requestSignIn` is NOT accepted
    * here — presenting it is rejected as an unknown credential.
    *
@@ -252,9 +250,9 @@ export class AuthenticationService {
  * inside the adapter boundary so the public route layer can never
  * expose it (the BG1 magic-link response schema is `.strict()`
  * and does not declare a `verificationToken` field). The
- * `devVerificationUrl` is operator-only and absent in the
- * deployed deterministic fallback so an unauthenticated browser
- * cannot pick a demo identity by email.
+ * `devVerificationUrl` is local/test-only and absent outside the
+ * local test verification path so an unauthenticated browser cannot
+ * pick a demo identity by email.
  */
 function withRequestIdAndOptionalDevUrl(result: SignInRequestResult): {
   ok: true;

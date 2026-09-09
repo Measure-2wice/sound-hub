@@ -11,19 +11,35 @@ import { createAudioSamplesRouter } from "./routes/audio-samples.js";
 import { createOfferingCatalogRouter } from "./routes/offering-catalog.js";
 import { createMatchmakerRouter } from "./routes/matchmaker.js";
 import { PrismaOfferingCatalogRepository } from "./repositories/prisma-offering-catalog.repository.js";
+import { createProjectRequestRouter } from "./routes/project-requests.js";
+import { createDealTermsRouter } from "./routes/deal-terms.js";
+import { createDealListRouter } from "./routes/deal-list.js";
+import { PrismaFundingRepository } from "./funding/prisma-funding.repository.js";
+import { FundingService } from "./funding/funding.service.js";
+import { DeterministicMockEscrowProvider } from "./escrow/escrow-provider.js";
+import { createBg6FundingRouter } from "./routes/funding.js";
 import { TalentSearchService } from "./services/talent-search.service.js";
 import { AuthenticationService } from "./services/authentication.service.js";
 import { WorkspaceAuthorizationService } from "./services/workspace-authorization.service.js";
 import { AudioSampleService } from "./services/audio-sample.service.js";
 import { MatchmakerService } from "./services/matchmaker.service.js";
+import { ProjectRequestService } from "./project-request/project-request.service.js";
 import { PrismaTalentSearchRepository } from "./repositories/prisma-talent-search.repository.js";
 import { PrismaMetadataRepository } from "./repositories/prisma-metadata.repository.js";
 import { PrismaAuthRepository } from "./auth-repository/prisma-auth-repository.js";
 import { PrismaAudioRepository } from "./audio-repository/prisma-audio-repository.js";
 import { PrismaProjectBriefRepository } from "./matchmaker/prisma-project-brief.repository.js";
+import { PrismaProjectRequestRepository } from "./project-request/prisma-project-request.repository.js";
+import { PrismaDealTermsRepository } from "./deal-terms/prisma-deal-terms.repository.js";
+import { DealTermsService } from "./deal-terms/deal-terms.service.js";
+import { PrismaDealListRepository } from "./deal-list/prisma-deal-list.repository.js";
+import { DealListService } from "./deal-list/deal-list.service.js";
+import type { DealListRepository } from "./deal-list/deal-list.repository.js";
 import type { ProjectBriefRepository } from "./matchmaker/project-brief.repository.js";
+import type { ProjectRequestRepository } from "./project-request/project-request.repository.js";
 import type { MetadataRepository } from "./repositories/metadata.repository.js";
 import type { AuthRepository } from "./auth-repository/auth-repository.js";
+import type { DealTermsRepository } from "./deal-terms/deal-terms.repository.js";
 import type { AudioRepository } from "./audio-repository/audio-repository.js";
 import type { IdentityAdapter } from "./identity/identity-adapter.js";
 import type { AiAdapter } from "./matchmaker/ai-adapter.js";
@@ -111,6 +127,33 @@ export interface AppOptions {
    * from the repository and storage adapter.
    */
   readonly audioSampleService?: AudioSampleService;
+  readonly projectRequestRepository?: ProjectRequestRepository;
+  readonly projectRequestService?: ProjectRequestService;
+  /**
+   * Override for the DealTerms repository. When supplied, the
+   * composition root does NOT construct the Prisma adapter; the
+   * override is served directly. Tests pass the in-memory adapter.
+   */
+  readonly dealTermsRepository?: DealTermsRepository;
+  /**
+   * Override for the DealTerms service. When supplied, the
+   * composition root uses this service instead of constructing one
+   * from the repository.
+   */
+  readonly dealTermsService?: DealTermsService;
+  /**
+   * Override for the Deal-discovery list repository (ticket #74).
+   * When supplied, the composition root does NOT construct the Prisma
+   * adapter. Tests pass the in-memory adapter, which runs the same
+   * authorization policy.
+   */
+  readonly dealListRepository?: DealListRepository;
+  /**
+   * Override for the Deal-discovery list service. When supplied, the
+   * composition root uses this service instead of constructing one
+   * from the repository.
+   */
+  readonly dealListService?: DealListService;
 }
 
 export interface BuiltApp {
@@ -126,6 +169,9 @@ export interface BuiltApp {
   readonly audioSampleService: AudioSampleService;
   readonly storageAdapter: StorageAdapter;
   readonly storageBackend: "supabase" | "deterministic";
+  readonly projectRequestService: ProjectRequestService;
+  readonly dealTermsService: DealTermsService;
+  readonly dealListService: DealListService;
 }
 
 export function buildApp(options: AppOptions = {}): BuiltApp {
@@ -224,6 +270,57 @@ export function buildApp(options: AppOptions = {}): BuiltApp {
       publicApiBaseUrl: process.env.PUBLIC_API_BASE_URL ?? "http://localhost:4000",
     });
 
+  // BG4 ProjectRequest service. The composition root owns the
+  // Prisma adapter; the service is the only boundary the route
+  // and tests depend on.
+  const projectRequestRepository =
+    options.projectRequestRepository ?? new PrismaProjectRequestRepository(prisma);
+  const projectRequestService =
+    options.projectRequestService ??
+    new ProjectRequestService({
+      projectRequestRepository,
+      workspaceAuthorizationService,
+    });
+
+  // BG5 DealTerms service. The composition root owns the Prisma
+  // adapter; the service is the only boundary the route and tests
+  // depend on. The deterministic AI adapter is the buildathon-only
+  // AI path; no managed provider integration is wired.
+  const dealTermsRepository = options.dealTermsRepository ?? new PrismaDealTermsRepository(prisma);
+  const dealTermsService =
+    options.dealTermsService ??
+    new DealTermsService({
+      dealTermsRepository,
+      workspaceAuthorizationService,
+      // Wire the ProjectRequestRepository so `getDeal()` can derive
+      // the narrow `sellerConsent` projection from the associated
+      // ProjectRequest (ticket AC27). The read is fail-closed; a
+      // missing or non-Accepted ProjectRequest yields
+      // `sellerConsent: null` and the UI must not present false
+      // consent.
+      projectRequestRepository,
+    });
+
+  // BG6 PaymentIntent + activation service. The composition root
+  // owns the Prisma adapter and the deterministic mock escrow
+  // provider; no managed provider integration is wired. Tests can
+  // inject a custom repository or escrow provider via options.
+  const fundingRepository = new PrismaFundingRepository(prisma);
+  const escrowProvider = new DeterministicMockEscrowProvider();
+  const fundingService = new FundingService({
+    fundingRepository,
+    escrowProvider,
+  });
+
+  // Deals discovery list (ticket #74). The list authorizes and reads
+  // in ONE transaction: the repository FOR UPDATE-locks the exact
+  // Workspace + membership rows, the service-owned policy decides,
+  // and Deals are read only on an accept. A membership revoked
+  // concurrently therefore cannot leak private rows.
+  const dealListRepository = options.dealListRepository ?? new PrismaDealListRepository(prisma);
+  const dealListService =
+    options.dealListService ?? new DealListService({ repository: dealListRepository });
+
   const app: Application = express();
   app.disable("x-powered-by");
   app.use(helmet());
@@ -272,6 +369,38 @@ export function buildApp(options: AppOptions = {}): BuiltApp {
       authenticationService,
     }),
   );
+  app.use(
+    "/api/project-requests",
+    createProjectRequestRouter({
+      authenticationService,
+      projectRequestService,
+    }),
+  );
+  // Ticket #74: the Deals collection route is registered BEFORE the
+  // per-Deal routers so the collection path stays unambiguously ahead
+  // of their "/:dealId" dispatchers.
+  app.use(
+    "/api/deals",
+    createDealListRouter({
+      authenticationService,
+      dealListService,
+    }),
+  );
+  app.use(
+    "/api/deals",
+    createDealTermsRouter({
+      authenticationService,
+      dealTermsService,
+    }),
+  );
+  app.use(
+    "/api/deals",
+    createBg6FundingRouter({
+      authenticationService,
+      fundingService,
+      dealTermsService,
+    }),
+  );
 
   // 404 fallback
   app.use((req: Request, res: Response) => {
@@ -312,6 +441,9 @@ export function buildApp(options: AppOptions = {}): BuiltApp {
     audioSampleService,
     storageAdapter,
     storageBackend: storageBundle.backend,
+    projectRequestService,
+    dealTermsService,
+    dealListService,
   };
 }
 

@@ -84,6 +84,8 @@ function mapStatus(code: ApiErrorCodeV1): number {
     case "NOT_A_MEMBER":
     case "MISSING_CAPABILITY":
     case "BRIEF_FORBIDDEN":
+    case "PROJECT_REQUEST_FORBIDDEN":
+    case "PROJECT_REQUEST_BRIEF_FORBIDDEN":
       return 403;
     // Buildathon Golden Slice 2 (BG2) seller-audio rejection
     // surfaces. Each code maps to a stable HTTP status that respects
@@ -112,6 +114,136 @@ function mapStatus(code: ApiErrorCodeV1): number {
       return 500;
     case "AUDIO_SAMPLE_NOT_FOUND":
       return 404;
+    case "PROJECT_REQUEST_NOT_FOUND":
+    case "PROJECT_REQUEST_BRIEF_NOT_FOUND":
+      return 404;
+    case "PROJECT_REQUEST_INVALID":
+      return 400;
+    case "PROJECT_REQUEST_OFFERING_INELIGIBLE":
+      // The selected offering is ineligible at the revalidation
+      // step (stale, suspended, archived, etc.). Surface as 422 to
+      // signal the request was well-formed but the chosen resource
+      // does not satisfy current eligibility. The safe envelope
+      // stays buyer-safe; the offering id is not echoed.
+      return 422;
+    case "PROJECT_REQUEST_ALREADY_PENDING":
+    case "PROJECT_REQUEST_ALREADY_RESPONDED":
+      // 409 Conflict. A retry would have produced a duplicate
+      // ProjectRequest or a duplicate Deal; the guarded state
+      // transition rejected the duplicate. The caller can read the
+      // current state via GET /api/project-requests/:id.
+      return 409;
+    case "PROJECT_REQUEST_UNAVAILABLE":
+      // 503 Service Unavailable. The bounded P2034 retry budget was
+      // exhausted; the marketplace is briefly unable to authorise
+      // the write. The caller can retry the same payload without
+      // changing the request.
+      return 503;
+    case "PROJECT_REQUEST_FAILED":
+      // 500 Internal Server Error. Used only when the handler
+      // catches an exception outside the typed ProjectRequestError
+      // surface. The underlying exception message is logged server
+      // side but never echoed to the response envelope.
+      return 500;
+    // Buildathon Golden Slice 5 (BG5) Deal / TermsVersion /
+    // DealApprover / DealApproval status mapping. The codes mirror
+    // the BG4 pattern: 403 for authorization rejections, 404 for
+    // unknown ids, 409 for retry-detected duplicates, 422 for
+    // semantic-but-well-formed rejections (non-Negotiating,
+    // non-current version), 400 for malformed requests, 500 for
+    // unexpected internal failures, 503 for transient marketplace
+    // unavailability.
+    case "BG5_DEAL_NOT_FOUND":
+    case "BG5_TERMS_VERSION_NOT_FOUND":
+      return 404;
+    case "BG5_TERMS_DRAFT_FORBIDDEN":
+    case "BG5_APPROVAL_FORBIDDEN":
+      return 403;
+    case "BG5_DEAL_NOT_NEGOTIATING":
+      // Semantic rejection: the Deal is Active or otherwise past
+      // Negotiating. The Golden Slice does NOT support drafting
+      // terms for an Active Deal.
+      return 422;
+    case "BG5_APPROVAL_NOT_CURRENT_VERSION":
+      // Semantic rejection: the requested termsVersionId is not the
+      // Deal's current (MAX(version)) TermsVersion. The approval is
+      // rejected; the caller may re-issue against the new current
+      // version. A retry that re-sends the stale version is rejected
+      // for the same reason — the application policy is the only
+      // arbiter.
+      return 422;
+    case "BG5_APPROVAL_ALREADY_RECORDED":
+      // 409 Conflict. A retry would have produced a duplicate
+      // DealApproval; the unique index + guarded insert rejected the
+      // duplicate.
+      return 409;
+    case "BG5_TERMS_DRAFT_INVALID":
+    case "BG5_APPROVAL_INVALID":
+      return 400;
+    case "BG5_DEAL_INTERNAL_FAILED":
+      // 500 Internal Server Error. Used only when the handler
+      // catches an exception outside the typed DealTermsError
+      // surface. The underlying exception message is logged server
+      // side but never echoed to the response envelope.
+      return 500;
+    case "BG5_DEAL_UNAVAILABLE":
+      // 503 Service Unavailable. The bounded P2034 retry budget was
+      // exhausted; the marketplace is briefly unable to authorise
+      // the write. The caller can retry the same payload without
+      // changing the request.
+      return 503;
+    // Deals discovery list (ticket #74).
+    case "DEAL_LIST_FORBIDDEN":
+      // 403 Forbidden. Collapses "unknown Workspace", "Workspace not
+      // Active", and "not a current member" into one envelope so the
+      // caller learns nothing about Workspaces they cannot act for.
+      // Notably NOT 404: the list is addressed by the acting
+      // Workspace, and distinguishing absence from denial would leak
+      // Workspace existence.
+      return 403;
+    case "DEAL_LIST_INVALID":
+      return 400;
+    case "DEAL_LIST_FAILED":
+      // 500 Internal Server Error. Used only when the handler catches
+      // an exception outside the typed DealListError surface; the
+      // underlying message is logged but never echoed.
+      return 500;
+    // Buildathon Golden Slice 6 (BG6) — PaymentIntent + activation
+    // status mapping. The mapping mirrors the BG5 pattern: 403 for
+    // authorization rejections, 404 for unknown ids, 409 for
+    // retry-detected duplicates, 422 for semantic-but-well-formed
+    // rejections (non-Negotiating, non-current version, mismatch),
+    // 400 for malformed requests, 500 for unexpected internal
+    // failures, 503 for transient provider unavailability.
+    case "BG6_DEAL_NOT_FOUND":
+      return 404;
+    case "BG6_FUNDING_FORBIDDEN":
+      return 403;
+    case "BG6_DEAL_NOT_NEGOTIATING":
+    case "BG6_APPROVALS_INCOMPLETE":
+    case "BG6_TERMS_VERSION_NOT_CURRENT":
+    case "BG6_FUNDING_CONFIRMATION_MISMATCH":
+      return 422;
+    case "BG6_DEAL_ALREADY_ACTIVE":
+      // 409 Conflict. The guarded activation UPDATE returned 0 rows;
+      // a concurrent activation already happened. Safe for the buyer
+      // to retry against the (now Active) Deal only after re-reading
+      // the deal view.
+      return 409;
+    case "BG6_FUNDING_INVALID":
+      return 400;
+    case "BG6_ESCROW_UNAVAILABLE":
+      // 503 Service Unavailable. The provider threw or was
+      // unreachable; the intent transitions to Failed on the same
+      // durable row and the Deal stays Negotiating. The caller can
+      // retry the same payload without changing the request.
+      return 503;
+    case "BG6_FUNDING_INTERNAL_FAILED":
+      // 500 Internal Server Error. Used only when the handler
+      // catches an exception outside the typed FundingServiceError
+      // surface. The underlying message is logged server side but
+      // never echoed to the response envelope.
+      return 500;
   }
 }
 

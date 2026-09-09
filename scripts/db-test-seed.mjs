@@ -34,6 +34,9 @@ async function main() {
         ...process.env,
         DATABASE_URL: target.url,
         TEST_DATABASE_URL: target.url,
+        NODE_ENV: "test",
+        BG2_STORAGE_BACKEND: "deterministic",
+        BG7_DETERMINISTIC_AUDIO_FIXTURE: "1",
       },
     });
     child.on("error", reject);

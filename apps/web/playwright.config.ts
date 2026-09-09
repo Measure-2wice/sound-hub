@@ -38,6 +38,7 @@ const PORT_WEB = Number(process.env.PORT_WEB ?? 3000);
 const PORT_API = Number(process.env.PORT_API ?? 4000);
 const BASE_URL = process.env.E2E_BASE_URL ?? `http://localhost:${PORT_WEB}`;
 const API_URL = process.env.API_URL ?? `http://localhost:${PORT_API}`;
+const E2E_BROWSER_EXECUTABLE_PATH = process.env.E2E_BROWSER_EXECUTABLE_PATH;
 
 export default defineConfig({
   testDir: "./e2e",
@@ -60,7 +61,12 @@ export default defineConfig({
     {
       name: "chromium",
       testIgnore: "search-outage.spec.ts",
-      use: { ...devices["Desktop Chrome"] },
+      use: {
+        ...devices["Desktop Chrome"],
+        ...(E2E_BROWSER_EXECUTABLE_PATH
+          ? { launchOptions: { executablePath: E2E_BROWSER_EXECUTABLE_PATH } }
+          : {}),
+      },
     },
     {
       // The outage test deliberately interrupts PostgreSQL and can leave the
@@ -69,7 +75,12 @@ export default defineConfig({
       name: "chromium-outage",
       testMatch: "search-outage.spec.ts",
       dependencies: ["chromium"],
-      use: { ...devices["Desktop Chrome"] },
+      use: {
+        ...devices["Desktop Chrome"],
+        ...(E2E_BROWSER_EXECUTABLE_PATH
+          ? { launchOptions: { executablePath: E2E_BROWSER_EXECUTABLE_PATH } }
+          : {}),
+      },
     },
   ],
   webServer: {
@@ -94,7 +105,22 @@ export default defineConfig({
       // Match the origin the browser will actually request from so the
       // seeded URL resolves end to end (contract requires `z.string().url()`).
       PUBLIC_FIXTURE_ORIGIN: BASE_URL,
+      // Keep deterministic playback on the shipped same-origin Next
+      // proxy. The browser must load the resource, not merely fetch
+      // a cross-origin API URL that Helmet correctly blocks as media.
+      PUBLIC_API_BASE_URL: BASE_URL,
       PORT_WEB: String(PORT_WEB),
+      // BG7 (ticket #65): the integrated browser journey needs the
+      // deterministic identity adapter to surface the dev
+      // verification URL on the magic-link response so the test
+      // session can complete sign-in without live email delivery.
+      // BG1_DETERMINISTIC_OPERATOR_MODE is the existing factory
+      // escape hatch — see apps/api/src/identity/identity-adapter-factory.ts.
+      BG1_DETERMINISTIC_OPERATOR_MODE: "1",
+      // BG7: force the deterministic in-memory storage backend
+      // regardless of Supabase configuration so the audio fixture
+      // is hydrated by the adapter rather than a managed bucket.
+      BG2_STORAGE_BACKEND: "deterministic",
     },
   },
   metadata: {

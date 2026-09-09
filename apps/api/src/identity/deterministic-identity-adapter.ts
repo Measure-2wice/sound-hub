@@ -9,14 +9,13 @@
 //      the `allowDevVerificationUrl` constructor option and
 //      drive `verifySignIn` directly with the adapter's
 //      `verificationToken` return value.
-//   2. The approved emergency fallback path: if managed email
-//      delivery, callback/session integration, or deployment
-//      configuration cannot pass the bounded provider smoke, this
-//      adapter is the deployed fallback. Per the ticket this
-//      fallback changes credential verification only and requires
-//      no redesign or relaxation of Workspace authorization —
+//   2. The local/test-only fallback adapter. The deterministic
+//      adapter is the canonical provider-fallback implementation;
 //      every other layer (session store, authorization service,
-//      route handler) is identical to the managed path.
+//      route handler) consumes the same contract as the managed
+//      adapter. Production deployments fail closed: even when
+//      `allowDevVerificationUrl` is misconfigured on, the
+//      composition root only honors it under `NODE_ENV=test`.
 //
 // Per ticket #59 P2-001, the deterministic adapter splits its
 // pending request into two opaque identifiers with distinct names
@@ -27,11 +26,9 @@
 //     verify. Surfaces in logs and observability.
 //   - `verificationToken`: the PRIVATE one-time credential the
 //     pending request is stored under. Returned on the adapter's
-//     `SignInRequestResult.verificationToken` so test harnesses can
-//     drive `verifySignIn` directly, and logged to the operator
-//     sink in operator mode so the deployed recovery path can
-//     complete sign-in through the same application boundary the
-//     managed path uses. Never returned in any public DTO.
+//     internal result so local test harnesses can drive
+//     `verifySignIn`. The deployed API surface never receives
+//     this value through any route.
 //
 // Per ADR 0004 the adapter never touches UserAccount, Workspace, or
 // membership tables — those live in `PrismaAuthRepository`.
@@ -70,15 +67,12 @@ export interface DeterministicIdentityAdapterOptions {
    */
   readonly ttlMs?: number;
   /**
-   * Operator-controlled escape hatch. When `true`, the adapter
-   * returns a `devVerificationUrl` that an operator-driven UI
-   * (or a test harness) can follow to verify without email
-   * delivery. Defaults to `false` so the deployed process never
-   * exposes a usable login credential to an unauthenticated
-   * browser that merely supplies an email. Tests pass `true`
-   * explicitly; the operator enables the allow-listed recovery
-   * mode by setting `BG1_DETERMINISTIC_OPERATOR_MODE=1` in the
-   * deployed process.
+   * Local-test escape hatch. When `true`, the adapter returns a
+   * `devVerificationUrl` that a local test browser can follow
+   * without email delivery. The composition root honors this only
+   * under `NODE_ENV=test`; production always fails closed even if
+   * the flag is set, so deployed callers can never obtain a
+   * usable verification credential from the deterministic path.
    */
   readonly allowDevVerificationUrl?: boolean;
   /**
@@ -154,18 +148,17 @@ export class DeterministicIdentityAdapter implements IdentityAdapter {
    *     pending request is stored under this value (not the
    *     `correlationId`), so a browser that submits the
    *     correlation id to `/api/auth/verify-token` is rejected as
-   *     an unknown credential. Test harnesses drive
-   *     `verifySignIn` with this value directly; the deployed
-   *     operator recovery workflow reads it from the operator log
-   *     sink.
+   *     an unknown credential. Local test harnesses drive
+   *     `verifySignIn` with this value directly. The deployed API
+   *     never exposes it through any route or response shape.
    *
-   * The `devVerificationUrl` is NEVER returned on the adapter's
-   * `SignInRequestResult`. When `allowDevVerificationUrl` is
-   * `true` the URL is emitted to the operator's log sink so the
-   * operator-driven recovery workflow can drive verifySignIn
-   * through the same application boundary the managed path uses,
-   * but without any usable value ever crossing the public
-   * response.
+   * The `devVerificationUrl` is returned on the adapter's
+   * `SignInRequestResult` ONLY when `allowDevVerificationUrl` is
+   * `true`. The composition root permits that option only under
+   * `NODE_ENV=test`; production always fails closed and the
+   * field is absent in deployed responses. The local Playwright
+   * journey uses it to exercise the normal callback and session
+   * boundary without live email delivery.
    */
   async requestSignIn(input: { readonly email: string }): Promise<SignInRequestResult> {
     const normalizedEmail = input.email.trim().toLowerCase();
@@ -180,16 +173,16 @@ export class DeterministicIdentityAdapter implements IdentityAdapter {
     });
     if (this.allowDevVerificationUrl) {
       const url = `${this.verificationPathPrefix}?token=${encodeURIComponent(verificationToken)}`;
-      // Operator-mode log sink: the URL is recorded so the
-      // operator can drive the recovery flow. The browser MUST
-      // NEVER receive the URL — the response carries only the
-      // opaque public correlationId. The verificationToken in
-      // the URL is the same value the adapter returned on the
-      // SignInRequestResult for test harnesses.
+      // Local test mode: emit the URL so the browser-side E2E flow
+      // can exercise the verification callback. The composition
+      // root only honors `allowDevVerificationUrl` under
+      // `NODE_ENV=test`; production always fails closed so this
+      // branch is unreachable in deployed processes.
       console.log(
-        `[bg1-deterministic] operator-mode verification URL for ${normalizedEmail} ` +
+        `[bg1-deterministic] local-test verification URL for ${normalizedEmail} ` +
           `(correlation=${correlationId}): ${url}`,
       );
+      return Promise.resolve({ correlationId, verificationToken, devVerificationUrl: url });
     }
     return Promise.resolve({ correlationId, verificationToken });
   }

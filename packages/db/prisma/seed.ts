@@ -962,6 +962,28 @@ async function applySellerGraph(
     });
   }
 
+  // BG5: every canonical seller's Workspace Owner is granted an
+  // explicit DealApprover authorization. The
+  // (workspaceId, userId) unique constraint makes the operation
+  // idempotent across re-runs. The Owner is the only authorized
+  // approver per demo Workspace; the BG5 integration journey tests
+  // the approve flow through the same identity that authenticated
+  // through the magic-link adapter.
+  await tx.dealApprover.upsert({
+    where: {
+      workspaceId_userId: {
+        workspaceId: workspace.id,
+        userId: owner.id,
+      },
+    },
+    create: {
+      workspaceId: workspace.id,
+      userId: owner.id,
+      grantedByUserId: owner.id,
+    },
+    update: {},
+  });
+
   for (const offering of seller.offerings) {
     const category = await tx.serviceCategory.findUnique({
       where: { key: offering.primaryCategoryKey },
@@ -1131,6 +1153,25 @@ async function applyDemoBuyerGraph(tx: Prisma.TransactionClient): Promise<void> 
   await tx.workspaceCapability.create({
     data: { workspaceId: workspace.id, capability: "Buyer" },
   });
+
+  // BG5 demo buyer DealApprover authorization. The Owner is the
+  // only authorized approver for the demo Workspace. The
+  // (workspaceId, userId) uniqueness makes the operation idempotent
+  // across re-runs.
+  await tx.dealApprover.upsert({
+    where: {
+      workspaceId_userId: {
+        workspaceId: workspace.id,
+        userId: buyer.id,
+      },
+    },
+    create: {
+      workspaceId: workspace.id,
+      userId: buyer.id,
+      grantedByUserId: buyer.id,
+    },
+    update: {},
+  });
 }
 
 async function applyIdentityProviders(tx: Prisma.TransactionClient): Promise<void> {
@@ -1247,6 +1288,161 @@ async function applySeed(): Promise<void> {
     // capability).
     await applyDemoBuyerGraph(tx);
     await applyIdentityProviders(tx);
+
+    // BG7 deterministic audio-sample fixture. The integrated browser
+    // journey (apps/web/e2e/golden-slice.spec.ts) needs a canonical
+    // playable MP3 the buyer can preview before the seller has had a
+    // chance to upload anything via the deployed UI. The fixture is
+    // a single ServiceOfferingAudioSample row whose storageRef uses
+    // a stable identifier the deterministic storage adapter
+    // recognizes and lazily hydrates on first playback (see
+    // apps/api/src/storage/deterministic-storage-adapter.ts). The
+    // bytes themselves are generated, not committed; the seed does
+    // NOT touch the storage adapter. The label and offering id are
+    // exported from @soundhub/db/audio-sample-fixture so the seed
+    // and the adapter agree on the canonical identifiers.
+    //
+    // Per ticket #65 P1 (Codex review) the insertion boundary is
+    // fail-closed: caller-controlled env flags alone are not
+    // sufficient — the actual DATABASE_URL must resolve to the
+    // approved disposable/local PostgreSQL test target. The
+    // insertion call site refuses to mutate any row when the
+    // combined predicate returns a non-approved result.
+    await applyDeterministicAudioSamples(tx, process.env);
+  });
+}
+
+/**
+ * BG7: upsert a single canonical ServiceOfferingAudioSample row
+ * the integrated browser journey can preview. Idempotent on
+ * `(offeringId, displayOrder)`. The seeded row is included in the
+ * canonical snapshot so the disposable DB cycle proves the fixture
+ * converges to a single row across cycles.
+ *
+ * Failure-closed insertion boundary (ticket #65 P1):
+ *
+ *   1. If `shouldSeedDeterministicAudioFixtureForDatabase(env)`
+ *      returns a non-approved result, the function throws and the
+ *      caller must NOT swallow the error. Managed, Supabase, and
+ *      remote PostgreSQL URLs are never allowed to receive or
+ *      mutate the deterministic fixture regardless of caller-
+ *      controlled flags.
+ *
+ *   2. If no row exists at `(offeringId, displayOrder=1)`, create
+ *      the canonical deterministic fixture.
+ *
+ *   3. If a row already exists at `(offeringId, displayOrder=1)`
+ *      and it is the canonical deterministic fixture (its
+ *      `storageRef` already matches `BG7_FIXTURE_STORAGE_REF`),
+ *      the function is a no-op: repeated disposable test seed
+ *      cycles converge to exactly one canonical fixture row
+ *      without an unnecessary write.
+ *
+ *   4. If a different row already occupies the canonical slot, the
+ *      function throws a bounded seed/configuration error. The
+ *      existing managed or non-deterministic row is NEVER
+ *      rewritten, deleted, or otherwise mutated. The fixture
+ *      cannot overwrite arbitrary managed metadata.
+ */
+async function applyDeterministicAudioSamples(
+  tx: Prisma.TransactionClient,
+  env: Readonly<Record<string, string | undefined>>,
+): Promise<void> {
+  // The seed lives in `packages/db/prisma/`; the fixture is in
+  // `packages/db/src/audio-sample-fixture.ts`. Import via relative
+  // path so the package doesn't have to resolve `@soundhub/db` from
+  // inside itself (circular-import guard).
+  const {
+    BG7_FIXTURE_STORAGE_REF,
+    BG7_FIXTURE_OFFERING_ID,
+    BG7_FIXTURE_LABEL,
+    shouldSeedDeterministicAudioFixtureForDatabase,
+    checkApprovedDisposableTestDatabase,
+  } = await import("../src/audio-sample-fixture.js");
+
+  const decision = shouldSeedDeterministicAudioFixtureForDatabase(env);
+  if (!decision.approved) {
+    if (
+      env.BG7_DETERMINISTIC_AUDIO_FIXTURE === "1" &&
+      env.BG2_STORAGE_BACKEND === "deterministic"
+    ) {
+      // The caller asked for the deterministic fixture but the
+      // database target cannot be proven safe. Re-check the URL
+      // separately so the error message can carry the database-
+      // target reason (rather than the generic flag-off reason).
+      const dbCheck = checkApprovedDisposableTestDatabase(env.DATABASE_URL);
+      throw new Error(
+        `BG7 deterministic audio fixture refused: caller requested fixture insertion but ` +
+          `DATABASE_URL failed approved-disposable-test verification (${dbCheck.approved ? "n/a" : dbCheck.reason}). ` +
+          `The deterministic fixture must never be inserted into a managed, Supabase, or remote ` +
+          `database. Verify that DATABASE_URL points at the approved disposable local test ` +
+          `PostgreSQL or unset BG7_DETERMINISTIC_AUDIO_FIXTURE before re-running the seed.`,
+      );
+    }
+    return;
+  }
+
+  // Resolve the canonical offering id to its primary key. The
+  // canonical seed creates this ServiceOffering under the canonical
+  // SELLERS[0] (Marc-André Pierre — Creole Beats Brooklyn). The
+  // foreign-key column is the cuid, not the slug, so we look it up.
+  const offering = await tx.serviceOffering.findUnique({
+    where: { id: BG7_FIXTURE_OFFERING_ID },
+    select: { id: true },
+  });
+  if (!offering) {
+    throw new Error(
+      `BG7 audio fixture requires the canonical offering ${BG7_FIXTURE_OFFERING_ID} to exist; seed the sellers first.`,
+    );
+  }
+
+  const fixtureByteSize = 8663;
+
+  // Look up the canonical slot. We need `storageRef` so we can
+  // distinguish the canonical fixture row from any managed row
+  // that might already occupy the slot.
+  const existing = await tx.serviceOfferingAudioSample.findFirst({
+    where: {
+      offeringId: offering.id,
+      displayOrder: 1,
+    },
+    select: { id: true, storageRef: true },
+  });
+  if (existing) {
+    if (existing.storageRef === BG7_FIXTURE_STORAGE_REF) {
+      // The row already IS the canonical fixture. Repeated
+      // disposable test seed cycles converge to exactly one row
+      // without an unnecessary write — the existing label,
+      // contentType, byte size, cleanup state, and storageRef are
+      // already canonical.
+      return;
+    }
+    // A non-canonical row already occupies the canonical slot. Per
+    // ticket #65 P1 the fixture must never overwrite arbitrary
+    // managed metadata; refuse with a bounded error so the operator
+    // can investigate. The existing row is left untouched (Prisma
+    // transaction finishes without an update/delete call against
+    // it). Continuing would silently rewrite label, MIME type,
+    // byte size, storage reference, and cleanup state.
+    throw new Error(
+      `BG7 deterministic audio fixture refused: a non-canonical ServiceOfferingAudioSample ` +
+        `already occupies (offeringId=${offering.id}, displayOrder=1) with ` +
+        `storageRef=${existing.storageRef}. The deterministic fixture cannot overwrite managed ` +
+        `metadata. Remove the conflicting row or use a different offering before re-running the ` +
+        `seed.`,
+    );
+  }
+
+  await tx.serviceOfferingAudioSample.create({
+    data: {
+      offeringId: offering.id,
+      label: BG7_FIXTURE_LABEL,
+      contentType: "audio/mpeg",
+      byteSize: fixtureByteSize,
+      displayOrder: 1,
+      storageRef: BG7_FIXTURE_STORAGE_REF,
+      cleanupStatus: "Live",
+    },
   });
 }
 
@@ -1314,6 +1510,16 @@ interface CanonicalSnapshot {
         readonly unitKey: string | null;
       } | null;
     }[];
+  }[];
+  // BG7: canonical deterministic audio-sample fixture row. Captured
+  // separately from the sellers/offerings graph so a stray fixture
+  // row is observable in the snapshot.
+  readonly audioSamples: readonly {
+    readonly id: string;
+    readonly offeringId: string;
+    readonly displayOrder: number;
+    readonly storageRef: string;
+    readonly cleanupStatus: string;
   }[];
 }
 
@@ -1454,7 +1660,49 @@ export async function captureCanonicalSnapshot(): Promise<CanonicalSnapshot> {
     specialties: specialties.map((s) => ({ key: s.key, name: s.name })),
     pricingUnits: pricingUnits.map((u) => ({ key: u.key, name: u.name })),
     sellers: sellers as unknown as CanonicalSnapshot["sellers"],
+    audioSamples: await captureAudioSamplesSnapshot(),
   };
+}
+
+/**
+ * BG7 snapshot helper. Captures the canonical BG7 fixture row so
+ * the assertion can prove the fixture is present, has the stable
+ * identifiers, and converges across runs. Reads every
+ * `ServiceOfferingAudioSample` row whose `storageRef` matches the
+ * canonical fixture reference — if a stray row sneaks in, it shows
+ * up here and fails the count assertion.
+ *
+ * Uses the shared `prisma` client (matching `captureCanonicalSnapshot`)
+ * rather than a transaction; the snapshot is a read-only probe, not
+ * a write.
+ */
+async function captureAudioSamplesSnapshot(): Promise<
+  readonly {
+    readonly id: string;
+    readonly offeringId: string;
+    readonly displayOrder: number;
+    readonly storageRef: string;
+    readonly cleanupStatus: string;
+  }[]
+> {
+  const { BG7_FIXTURE_STORAGE_REF } = await import("../src/audio-sample-fixture.js");
+  const rows = await prisma.serviceOfferingAudioSample.findMany({
+    where: { storageRef: BG7_FIXTURE_STORAGE_REF },
+    select: {
+      id: true,
+      offeringId: true,
+      displayOrder: true,
+      storageRef: true,
+      cleanupStatus: true,
+    },
+  });
+  return rows.map((row) => ({
+    id: row.id,
+    offeringId: row.offeringId,
+    displayOrder: row.displayOrder,
+    storageRef: row.storageRef,
+    cleanupStatus: row.cleanupStatus,
+  }));
 }
 
 // Exported for the snapshot-probe regression test (see
@@ -1748,6 +1996,46 @@ export function assertCanonicalSnapshotCorrect(snapshot: CanonicalSnapshot): voi
         }
       }
     }
+  }
+
+  // 3. BG7 deterministic audio-sample fixture. Exactly one row must
+  // exist for the canonical BG7 storageRef; stray fixture rows fail
+  // the count assertion, and a missing row fails the existence
+  // assertion.
+  const BG7_FIXTURE_STORAGE_REF = "det:of-creole-beats-dancehall-single-remote:fixture";
+  const fixtureRows = snapshot.audioSamples;
+  const expectAudioFixture =
+    process.env.NODE_ENV === "test" &&
+    process.env.BG2_STORAGE_BACKEND === "deterministic" &&
+    process.env.BG7_DETERMINISTIC_AUDIO_FIXTURE === "1";
+  if (!expectAudioFixture) {
+    return;
+  }
+  if (fixtureRows.length !== 1) {
+    throw new Error(
+      `BG7 audio-sample fixture count mismatch: expected exactly 1 row with storageRef ${BG7_FIXTURE_STORAGE_REF}, got ${fixtureRows.length}`,
+    );
+  }
+  const fixture = fixtureRows[0]!;
+  if (fixture.storageRef !== BG7_FIXTURE_STORAGE_REF) {
+    throw new Error(
+      `BG7 audio-sample fixture storageRef drifted: expected ${BG7_FIXTURE_STORAGE_REF} got ${fixture.storageRef}`,
+    );
+  }
+  if (fixture.displayOrder !== 1) {
+    throw new Error(
+      `BG7 audio-sample fixture displayOrder drifted: expected 1 got ${fixture.displayOrder}`,
+    );
+  }
+  if (fixture.cleanupStatus !== "Live") {
+    throw new Error(
+      `BG7 audio-sample fixture cleanupStatus drifted: expected Live got ${fixture.cleanupStatus}`,
+    );
+  }
+  if (fixture.offeringId !== "of-creole-beats-dancehall-single-remote") {
+    throw new Error(
+      `BG7 audio-sample fixture offeringId drifted: expected of-creole-beats-dancehall-single-remote got ${fixture.offeringId}`,
+    );
   }
 }
 

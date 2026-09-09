@@ -1,0 +1,420 @@
+/* eslint-disable @typescript-eslint/no-floating-promises */
+// Shared route-helper unit tests for the ProjectRequest router.
+//
+// Background: ticket #62's Codex review P2-001 asked for
+// helper-focused coverage of the shared route primitives so a
+// future regression in a primitive (request-id resolution, session
+// resolution, path / query-param reading, response-schema
+// validation, error translation) is detected even if every
+// endpoint-specific test happens to bypass it.
+//
+// These tests pin the helpers' contract end to end without booting
+// the router. The endpoint-specific tests in
+// `project-requests.test.ts` continue to cover the route integration.
+
+import assert from "node:assert/strict";
+import { describe, test } from "node:test";
+import type { Response } from "express";
+import { z } from "zod";
+import {
+  resolveRequestId,
+  resolveSessionForProjectRequest,
+  readSessionCookie,
+  readPathParamForProjectRequest,
+  readActingWorkspaceIdFromQuery,
+  readJsonBodyForProjectRequest,
+  validateProjectRequestBody,
+  validateProjectRequestResponse,
+  translateProjectRequestServiceError,
+  writeProjectRequestInternalError,
+  writeProjectRequestQueryError,
+} from "./project-request-route-helpers.js";
+import { ProjectRequestError } from "../project-request/project-request.service.js";
+import { AuthorizationError } from "../services/workspace-authorization.service.js";
+
+interface CapturedResponse {
+  status: number | null;
+  body: { error?: { code?: string; message?: string } } | null;
+  headers: Record<string, string>;
+}
+
+function makeMockResponse(): { res: Response; state: CapturedResponse } {
+  const state: CapturedResponse = { status: null, body: null, headers: {} };
+  const res = {
+    setHeader(name: string, value: string | number | readonly string[]) {
+      state.headers[name.toLowerCase()] = String(value);
+      return this;
+    },
+    status(code: number) {
+      state.status = code;
+      return this;
+    },
+    json(value: unknown) {
+      state.body = value as CapturedResponse["body"];
+      return this;
+    },
+    writableEnded: false,
+  } as unknown as Response;
+  return { res, state };
+}
+
+describe("project-request-route-helpers", () => {
+  describe("resolveRequestId", () => {
+    test("uses the inbound header when it is a bounded string", () => {
+      const req = { headers: { "x-request-id": "req-abc" } } as unknown as Parameters<
+        typeof resolveRequestId
+      >[0];
+      const id = resolveRequestId(req);
+      assert.equal(id, "req-abc");
+    });
+
+    test("generates a new id when the header is missing", () => {
+      const req = { headers: {} } as unknown as Parameters<typeof resolveRequestId>[0];
+      const id = resolveRequestId(req);
+      assert.ok(typeof id === "string" && id.length > 0);
+    });
+
+    test("generates a new id when the header exceeds the 128-char cap", () => {
+      const req = {
+        headers: { "x-request-id": "x".repeat(200) },
+      } as unknown as Parameters<typeof resolveRequestId>[0];
+      const id = resolveRequestId(req);
+      assert.notEqual(id, "x".repeat(200));
+      assert.ok(typeof id === "string" && id.length > 0);
+    });
+  });
+
+  describe("readSessionCookie", () => {
+    test("decodes the bg1 session cookie verbatim", () => {
+      const req = {
+        headers: { cookie: "soundhub_session=abc%20123" },
+      } as unknown as Parameters<typeof readSessionCookie>[0];
+      assert.equal(readSessionCookie(req), "abc 123");
+    });
+
+    test("returns undefined when the cookie header is absent", () => {
+      const req = { headers: {} } as unknown as Parameters<typeof readSessionCookie>[0];
+      assert.equal(readSessionCookie(req), undefined);
+    });
+  });
+
+  describe("resolveSessionForProjectRequest", () => {
+    test("returns null when no session resolves", async () => {
+      const { res } = makeMockResponse();
+      const req = { headers: {} } as unknown as Parameters<
+        typeof resolveSessionForProjectRequest
+      >[0];
+      const result = await resolveSessionForProjectRequest(
+        req,
+        res,
+        { resolveSession: () => Promise.resolve(null) },
+        "create a ProjectRequest",
+      );
+      assert.equal(result, null);
+    });
+
+    test("returns the userAccountId and a generated requestId when the session resolves", async () => {
+      const { res } = makeMockResponse();
+      const req = { headers: {} } as unknown as Parameters<
+        typeof resolveSessionForProjectRequest
+      >[0];
+      const result = await resolveSessionForProjectRequest(
+        req,
+        res,
+        { resolveSession: () => Promise.resolve({ userAccountId: "u-1" }) },
+        "create a ProjectRequest",
+      );
+      // `requestId` is part of the helper's contract (the resolved
+      // session bundles both the authenticated user account id and
+      // the request id so the caller can reuse a single id for
+      // envelope writes and log correlation). The id is generated by
+      // `generateRequestId()` so we can only assert the shape, not
+      // the literal value.
+      assert.ok(result !== null, "result must not be null when the session resolves");
+      assert.equal(result.session.userAccountId, "u-1");
+      assert.ok(
+        typeof result.requestId === "string" && result.requestId.length > 0,
+        "result.requestId must be a non-empty string",
+      );
+    });
+  });
+
+  describe("readPathParamForProjectRequest", () => {
+    test("returns the path param when present", () => {
+      const { res } = makeMockResponse();
+      const req = { params: { id: "pr-1" } } as unknown as Parameters<
+        typeof readPathParamForProjectRequest
+      >[1];
+      assert.equal(readPathParamForProjectRequest(res, req, "id", "req-1"), "pr-1");
+    });
+
+    test("returns null and writes a safe envelope when the param is missing", () => {
+      const { res, state } = makeMockResponse();
+      const req = { params: {} } as unknown as Parameters<typeof readPathParamForProjectRequest>[1];
+      const out = readPathParamForProjectRequest(res, req, "id", "req-1");
+      assert.equal(out, null);
+      assert.equal(state.status, 400);
+      assert.equal(state.body?.error?.code, "PROJECT_REQUEST_INVALID");
+    });
+  });
+
+  describe("readActingWorkspaceIdFromQuery", () => {
+    test("returns the query value when present", () => {
+      const { res } = makeMockResponse();
+      const req = { query: { actingWorkspaceId: "ws-1" } } as unknown as Parameters<
+        typeof readActingWorkspaceIdFromQuery
+      >[1];
+      assert.equal(readActingWorkspaceIdFromQuery(res, req, "req-1"), "ws-1");
+    });
+
+    test("writes PROJECT_REQUEST_INVALID when missing", () => {
+      const { res, state } = makeMockResponse();
+      const req = { query: {} } as unknown as Parameters<typeof readActingWorkspaceIdFromQuery>[1];
+      const out = readActingWorkspaceIdFromQuery(res, req, "req-1");
+      assert.equal(out, null);
+      assert.equal(state.status, 400);
+      assert.equal(state.body?.error?.code, "PROJECT_REQUEST_INVALID");
+    });
+  });
+
+  describe("validateProjectRequestBody", () => {
+    const schema = z.object({ actingWorkspaceId: z.string().min(1) }).strict();
+
+    test("returns the parsed value when the schema accepts", () => {
+      const { res } = makeMockResponse();
+      const parsed = validateProjectRequestBody(
+        res,
+        schema,
+        { actingWorkspaceId: "ws-1" },
+        "req-1",
+        "Test",
+      );
+      assert.deepEqual(parsed, { actingWorkspaceId: "ws-1" });
+    });
+
+    test("writes PROJECT_REQUEST_INVALID and returns null on schema failure", () => {
+      const { res, state } = makeMockResponse();
+      const parsed = validateProjectRequestBody(res, schema, { unrelated: true }, "req-1", "Test");
+      assert.equal(parsed, null);
+      assert.equal(state.status, 400);
+      assert.equal(state.body?.error?.code, "PROJECT_REQUEST_INVALID");
+    });
+  });
+
+  describe("validateProjectRequestResponse", () => {
+    const schema = z.object({ ok: z.literal(true) }).strict();
+
+    test("writes the response when the schema accepts", () => {
+      const { res, state } = makeMockResponse();
+      const written = validateProjectRequestResponse(
+        res,
+        201,
+        schema,
+        { ok: true },
+        "req-1",
+        "create",
+      );
+      assert.equal(written, true);
+      assert.equal(state.status, 201);
+      assert.deepEqual(state.body, { ok: true });
+    });
+
+    test("writes the safe envelope when the schema rejects", () => {
+      const { res, state } = makeMockResponse();
+      // Schema requires { ok: true }; passing an empty object forces
+      // a schema rejection and exercises the safe-envelope fallback.
+      const written = validateProjectRequestResponse(
+        res,
+        201,
+        schema,
+        {} as { ok: true },
+        "req-1",
+        "create",
+      );
+      assert.equal(written, false);
+      // Response-schema drift is an internal server failure, NOT a
+      // malformed request from the buyer / seller. The envelope must
+      // surface as 500 PROJECT_REQUEST_FAILED rather than 400
+      // PROJECT_REQUEST_INVALID, which is reserved for malformed
+      // request payloads.
+      assert.equal(state.status, 500);
+      assert.equal(state.body?.error?.code, "PROJECT_REQUEST_FAILED");
+      // The internal Zod failure detail MUST NOT appear in the
+      // envelope; production can read the server log but the buyer /
+      // seller must not see internal validation detail. The message
+      // MUST be the generic fallback composed by
+      // `writeProjectRequestInternalError` (the context label is
+      // diagnostic, the wording is fixed). Specific Zod phrases
+      // ("invalid_type", "Required", field paths) MUST NOT appear.
+      const envelopeMessage = state.body?.error?.message ?? "";
+      assert.ok(
+        envelopeMessage.startsWith("An unexpected error occurred while "),
+        "envelope must carry the generic context-label fallback",
+      );
+      for (const phrase of ["invalid_type", "invalid_string", "Required", "received"]) {
+        assert.ok(
+          !envelopeMessage.includes(phrase),
+          `envelope message must not echo Zod phrase "${phrase}"`,
+        );
+      }
+    });
+  });
+
+  describe("translateProjectRequestServiceError", () => {
+    test("maps ProjectRequestError to its code", () => {
+      const { res, state } = makeMockResponse();
+      const err = new ProjectRequestError("not allowed", "PROJECT_REQUEST_FORBIDDEN");
+      const translated = translateProjectRequestServiceError(res, err, "req-1");
+      assert.equal(translated, true);
+      assert.equal(state.body?.error?.code, "PROJECT_REQUEST_FORBIDDEN");
+    });
+
+    test("returns false for non-ProjectRequestError types so the caller writes an internal fallback", () => {
+      // `AuthorizationError` is caught and re-thrown as a typed
+      // `ProjectRequestError` by the service layer (see
+      // `project-request.service.ts`'s `createFailureToServiceError`
+      // and `decideErrorToServiceError`). The route helper itself
+      // only collapses `ProjectRequestError` instances; any other
+      // error type falls through so the caller's generic 500
+      // envelope can take over. This is the intentional
+      // translation contract — the helper does NOT collapse
+      // `AuthorizationError` directly.
+      const { res } = makeMockResponse();
+      const authzErr = new AuthorizationError("not a member", "NOT_A_MEMBER");
+      assert.equal(translateProjectRequestServiceError(res, authzErr, "req-1"), false);
+      const genericErr = new Error("boom");
+      assert.equal(translateProjectRequestServiceError(res, genericErr, "req-1"), false);
+    });
+  });
+
+  describe("writeProjectRequestInternalError", () => {
+    test("writes PROJECT_REQUEST_FAILED with the contextual message and never echoes the underlying exception", () => {
+      const { res, state } = makeMockResponse();
+      writeProjectRequestInternalError(res, new Error("boom"), "req-1", "creating the request");
+      // Unexpected handler exceptions must surface as a 500 generic
+      // internal-error envelope, NOT as a 400 PROJECT_REQUEST_INVALID.
+      assert.equal(state.status, 500);
+      assert.equal(state.body?.error?.code, "PROJECT_REQUEST_FAILED");
+      assert.ok((state.body?.error?.message ?? "").includes("creating the request"));
+      // The underlying exception message ("boom") MUST NOT appear in
+      // the response body. Production can debug from the server log;
+      // the buyer / seller must not see internal detail.
+      assert.ok(
+        !(state.body?.error?.message ?? "").includes("boom"),
+        "envelope message must not echo the underlying exception",
+      );
+    });
+  });
+
+  describe("writeProjectRequestQueryError", () => {
+    test("writes PROJECT_REQUEST_INVALID with the supplied message", () => {
+      const { res, state } = makeMockResponse();
+      writeProjectRequestQueryError(res, "req-1", "status filter is invalid.");
+      assert.equal(state.status, 400);
+      assert.equal(state.body?.error?.code, "PROJECT_REQUEST_INVALID");
+      assert.equal(state.body?.error?.message, "status filter is invalid.");
+    });
+  });
+
+  describe("readJsonBodyForProjectRequest", () => {
+    test("returns the existing req.body when express.json already parsed it", async () => {
+      const { res } = makeMockResponse();
+      const req = { body: { actingWorkspaceId: "ws-1" } } as unknown as Parameters<
+        typeof readJsonBodyForProjectRequest
+      >[0];
+      const parsed = await readJsonBodyForProjectRequest(req, res, "req-1");
+      assert.deepEqual(parsed, { actingWorkspaceId: "ws-1" });
+    });
+
+    test("returns an empty object when there is no body and no chunks", async () => {
+      const handlers: Record<string, (chunk?: Buffer) => void> = {};
+      const { res } = makeMockResponse();
+      const req = {
+        body: undefined,
+        on(event: string, cb: (chunk?: Buffer) => void) {
+          handlers[event] = cb;
+          return this;
+        },
+        pause: () => undefined,
+      } as unknown as Parameters<typeof readJsonBodyForProjectRequest>[0];
+      const parsedPromise = readJsonBodyForProjectRequest(req, res, "req-1");
+      queueMicrotask(() => handlers["end"]?.());
+      const parsed = await parsedPromise;
+      assert.deepEqual(parsed, {});
+    });
+
+    test("returns null and writes PROJECT_REQUEST_INVALID on malformed JSON", async () => {
+      const handlers: Record<string, (chunk?: Buffer) => void> = {};
+      const { res, state } = makeMockResponse();
+      const req = {
+        body: undefined,
+        on(event: string, cb: (chunk?: Buffer) => void) {
+          handlers[event] = cb;
+          return this;
+        },
+        pause: () => undefined,
+      } as unknown as Parameters<typeof readJsonBodyForProjectRequest>[0];
+      const parsedPromise = readJsonBodyForProjectRequest(req, res, "req-1");
+      queueMicrotask(() => {
+        handlers["data"]?.(Buffer.from("not-json"));
+        handlers["end"]?.();
+      });
+      const parsed = await parsedPromise;
+      assert.equal(parsed, null);
+      assert.equal(state.body?.error?.code, "PROJECT_REQUEST_INVALID");
+    });
+
+    test("drains the request stream when the body exceeds the cap so the connection can close", async () => {
+      // The 16 KiB body cap branch MUST NOT leave the request
+      // stream paused indefinitely — a paused readable holds the
+      // underlying connection open. The fix is to switch the data
+      // handler into drain mode (no further accumulation) and call
+      // req.resume() so the remaining bytes flow through the
+      // handler (and are dropped) until the stream emits 'end' /
+      // 'close'. This test exercises that contract: pause() and
+      // resume() must be paired in the same microtask burst so
+      // the stream is never left paused / unconsumed.
+      const calls: string[] = [];
+      const handlers: Record<string, (chunk?: Buffer) => void> = {};
+      const { res, state } = makeMockResponse();
+      const req = {
+        body: undefined,
+        on(event: string, cb: (chunk?: Buffer) => void) {
+          handlers[event] = cb;
+          return this;
+        },
+        pause: () => {
+          calls.push("pause");
+        },
+        resume: () => {
+          calls.push("resume");
+        },
+      } as unknown as Parameters<typeof readJsonBodyForProjectRequest>[0];
+      const parsedPromise = readJsonBodyForProjectRequest(req, res, "req-1");
+      // Emit chunks that cross the 16 KiB cap so the oversized-
+      // body branch fires. 8 KiB + 8 KiB + 8 KiB = 24 KiB > 16 KiB.
+      queueMicrotask(() => {
+        handlers["data"]?.(Buffer.alloc(8 * 1024));
+        handlers["data"]?.(Buffer.alloc(8 * 1024));
+        handlers["data"]?.(Buffer.alloc(8 * 1024));
+      });
+      const parsed = await parsedPromise;
+      assert.equal(parsed, null);
+      // The bounded-body error envelope is preserved.
+      assert.equal(state.status, 400);
+      assert.equal(state.body?.error?.code, "PROJECT_REQUEST_INVALID");
+      // The cap-branch MUST call req.pause() to halt accumulation
+      // AND req.resume() so the stream can drain and close. A
+      // pause without a resume would leave the connection open
+      // indefinitely.
+      const pauseIdx = calls.indexOf("pause");
+      const resumeIdx = calls.indexOf("resume");
+      assert.ok(pauseIdx !== -1, "oversized-body branch must call req.pause()");
+      assert.ok(resumeIdx !== -1, "oversized-body branch must call req.resume()");
+      assert.ok(
+        resumeIdx > pauseIdx,
+        "req.resume() must be paired with req.pause() so the stream is never left paused",
+      );
+    });
+  });
+});

@@ -1,3 +1,13 @@
 @tailwind base;
 @tailwind components;
 @tailwind utilities;
+
+/* Prevent page-level horizontal overflow at narrow viewports.
+ * Long email addresses or unwrapped ids can otherwise force the
+ * viewport wider than the device. Each interactive component is
+ * also wrapped with `min-w-0` / `truncate` as a defense in depth
+ * (see SessionStatus, Navigation, seller-request-row). */
+html,
+body {
+  overflow-x: hidden;
+}
