@@ -137,9 +137,7 @@ export interface FundDealInput {
 }
 
 type FailureDetailCategory =
-  | "PROVIDER_UNAVAILABLE"
-  | "CONFIRMATION_INVALID"
-  | "CONFIRMATION_MISMATCH";
+  "PROVIDER_UNAVAILABLE" | "CONFIRMATION_INVALID" | "CONFIRMATION_MISMATCH";
 
 export class FundingService {
   private readonly repository: FundingRepository;

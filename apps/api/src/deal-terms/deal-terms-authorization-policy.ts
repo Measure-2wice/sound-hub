@@ -46,10 +46,7 @@ export type DraftingAuthorityVerdict =
   | {
       readonly ok: false;
       readonly reason:
-        | "DEAL_NOT_FOUND"
-        | "DEAL_NOT_NEGOTIATING"
-        | "NOT_A_MEMBER"
-        | "WORKSPACE_INELIGIBLE";
+        "DEAL_NOT_FOUND" | "DEAL_NOT_NEGOTIATING" | "NOT_A_MEMBER" | "WORKSPACE_INELIGIBLE";
     };
 
 /**
@@ -115,8 +112,7 @@ export function evaluateDraftingAuthority(
 // --------------------------------------------------------------------------
 
 export type DealReadAuthorityVerdict =
-  | { readonly ok: true }
-  | { readonly ok: false; readonly reason: "DEAL_NOT_FOUND" };
+  { readonly ok: true } | { readonly ok: false; readonly reason: "DEAL_NOT_FOUND" };
 
 /**
  * Pure evaluator for the BG5 Deal read path. The repository opens

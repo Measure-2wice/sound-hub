@@ -31,9 +31,8 @@ if (!connectionString) {
 process.env.DATABASE_URL = connectionString;
 process.env.TEST_DATABASE_URL = connectionString;
 
-const { captureCanonicalSnapshot, assertCanonicalSnapshotCorrect, disconnectPrisma } = await import(
-  "./seed.js"
-);
+const { captureCanonicalSnapshot, assertCanonicalSnapshotCorrect, disconnectPrisma } =
+  await import("./seed.js");
 
 async function disconnectPrismaSafely(): Promise<void> {
   try {

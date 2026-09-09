@@ -111,10 +111,7 @@ export type CreateProjectRequestFailureReason =
   | "CONCURRENCY_RETRY_EXHAUSTED";
 
 export type DecideFailureReason =
-  | "NOT_FOUND"
-  | "ALREADY_RESPONDED"
-  | "SELLER_NOT_AUTHORIZED"
-  | "CONCURRENCY_RETRY_EXHAUSTED";
+  "NOT_FOUND" | "ALREADY_RESPONDED" | "SELLER_NOT_AUTHORIZED" | "CONCURRENCY_RETRY_EXHAUSTED";
 
 export type CreateProjectRequestResult =
   | { readonly ok: true; readonly value: PersistedProjectRequest }

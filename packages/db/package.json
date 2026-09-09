@@ -5,6 +5,7 @@
   "main": "dist/index.js",
   "types": "dist/index.d.ts",
   "scripts": {
+    "predev": "pnpm --filter @soundhub/types build && pnpm --filter @soundhub/db build",
     "build": "tsc -b",
     "type-check": "tsc --noEmit",
     "db:generate": "prisma generate",
