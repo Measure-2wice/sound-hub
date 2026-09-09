@@ -118,8 +118,7 @@ function isSerializationConflict(err: unknown): boolean {
 
 interface BoundedRetryEnvelope<TValue> {
   readonly outcome:
-    | { readonly kind: "value"; readonly value: TValue }
-    | { readonly kind: "exhausted" };
+    { readonly kind: "value"; readonly value: TValue } | { readonly kind: "exhausted" };
 }
 async function runWithBoundedP2034Retry<TValue>(
   attempt: () => Promise<TValue>,
@@ -608,10 +607,7 @@ function toPersistedPaymentIntent(row: {
   acceptedAt: Date | null;
   failureReasonCode: string | null;
   failureDetailCategory:
-    | "PROVIDER_UNAVAILABLE"
-    | "CONFIRMATION_INVALID"
-    | "CONFIRMATION_MISMATCH"
-    | null;
+    "PROVIDER_UNAVAILABLE" | "CONFIRMATION_INVALID" | "CONFIRMATION_MISMATCH" | null;
   providerState: "Created" | "Confirmed" | "Failed";
   createdAt: Date;
   updatedAt: Date;

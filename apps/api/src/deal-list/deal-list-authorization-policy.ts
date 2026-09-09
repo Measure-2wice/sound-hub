@@ -45,8 +45,7 @@ export interface DealListReadAuthoritySnapshot {
 }
 
 export type DealListReadAuthorityVerdict =
-  | { readonly ok: true }
-  | { readonly ok: false; readonly reason: "DEAL_LIST_FORBIDDEN" };
+  { readonly ok: true } | { readonly ok: false; readonly reason: "DEAL_LIST_FORBIDDEN" };
 
 /**
  * Apply the list-read policy to a FOR UPDATE-locked snapshot.

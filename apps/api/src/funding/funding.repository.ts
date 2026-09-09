@@ -77,10 +77,7 @@ export interface PersistedPaymentIntent {
    * #64 P1-004.
    */
   readonly failureDetailCategory:
-    | "PROVIDER_UNAVAILABLE"
-    | "CONFIRMATION_INVALID"
-    | "CONFIRMATION_MISMATCH"
-    | null;
+    "PROVIDER_UNAVAILABLE" | "CONFIRMATION_INVALID" | "CONFIRMATION_MISMATCH" | null;
   readonly providerState: "Created" | "Confirmed" | "Failed";
   readonly createdAt: Date;
   readonly updatedAt: Date;
@@ -105,9 +102,7 @@ export interface PersistedTermsVersionForFunding {
 // ---------- Preauth read shape ----------
 
 export type FindPreauthFailureReason =
-  | "DEAL_NOT_FOUND"
-  | "CURRENT_TERMS_VERSION_NOT_FOUND"
-  | "PROJECT_REQUEST_NOT_FOUND";
+  "DEAL_NOT_FOUND" | "CURRENT_TERMS_VERSION_NOT_FOUND" | "PROJECT_REQUEST_NOT_FOUND";
 
 export type FindPreauthResult =
   | {
@@ -169,9 +164,7 @@ export interface RecordPaymentIntentFailureInput {
    * are NEVER persisted. See ticket #64 P1-004.
    */
   readonly failureDetailCategory:
-    | "PROVIDER_UNAVAILABLE"
-    | "CONFIRMATION_INVALID"
-    | "CONFIRMATION_MISMATCH";
+    "PROVIDER_UNAVAILABLE" | "CONFIRMATION_INVALID" | "CONFIRMATION_MISMATCH";
 }
 
 // ---------- fundDealInTransaction (Phase 3) ----------
