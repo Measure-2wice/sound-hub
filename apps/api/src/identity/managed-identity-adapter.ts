@@ -251,8 +251,8 @@ export class ManagedIdentityAdapter implements IdentityAdapter {
   isConfigured(): boolean {
     return Boolean(
       this.options.supabaseUrl &&
-        this.options.supabaseAnonKey &&
-        this.options.supabaseServiceRoleKey,
+      this.options.supabaseAnonKey &&
+      this.options.supabaseServiceRoleKey,
     );
   }
 

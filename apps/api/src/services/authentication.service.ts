@@ -43,10 +43,7 @@ export class AuthenticationError extends Error {
   constructor(
     message: string,
     public readonly code:
-      | "AUTH_PROVIDER_UNAVAILABLE"
-      | "AUTH_FAILED"
-      | "AUTH_RATE_LIMITED"
-      | "INVALID_AUTH_REQUEST",
+      "AUTH_PROVIDER_UNAVAILABLE" | "AUTH_FAILED" | "AUTH_RATE_LIMITED" | "INVALID_AUTH_REQUEST",
   ) {
     super(message);
     this.name = "AuthenticationError";
