@@ -27,6 +27,7 @@ import { buildApp } from "../index.js";
 import { DeterministicIdentityAdapter } from "../identity/deterministic-identity-adapter.js";
 import { InMemoryAuthRepository } from "../auth-repository/in-memory-auth-repository.js";
 import { AuthenticationService } from "../services/authentication.service.js";
+import { PersonalWorkspaceConvergenceService } from "../services/personal-workspace-convergence.service.js";
 import { WorkspaceAuthorizationService } from "../services/workspace-authorization.service.js";
 
 const BUYER_USER_ID = "user-bg1-route-buyer";
@@ -77,6 +78,9 @@ describe("BG1 auth routes (in-memory, deterministic adapter)", () => {
   const authenticationService = new AuthenticationService({
     identityAdapter: adapter,
     authRepository: authRepo,
+    personalWorkspaceConvergenceService: new PersonalWorkspaceConvergenceService({
+      authRepository: authRepo,
+    }),
   });
   const workspaceAuthorizationService = new WorkspaceAuthorizationService({
     authRepository: authRepo,
@@ -126,6 +130,9 @@ describe("BG1 auth routes (in-memory, deterministic adapter)", () => {
       authenticationService: new AuthenticationService({
         identityAdapter: restrictedAdapter,
         authRepository: authRepo,
+        personalWorkspaceConvergenceService: new PersonalWorkspaceConvergenceService({
+          authRepository: authRepo,
+        }),
       }),
       workspaceAuthorizationService,
       authRepository: authRepo,
@@ -169,8 +176,17 @@ describe("BG1 auth routes (in-memory, deterministic adapter)", () => {
       .set("Content-Type", "application/json");
     assert.equal(verify.status, 500);
     assert.equal(verify.body.error.code, "AUTH_FAILED");
-    const setCookie = verify.headers["set-cookie"];
-    assert.equal(setCookie, undefined);
+    // No session cookie is set on failure (only the
+    // return-context clear cookie). M2 (#82) clears the
+    // return-context cookie on every response so a stale value
+    // never carries across sessions.
+    const setCookie = verify.headers["set-cookie"] ?? [];
+    assert.ok(Array.isArray(setCookie));
+    assert.equal(
+      setCookie.find((c: string) => c.startsWith("soundhub_session=")),
+      undefined,
+      "session cookie must not be issued on verify-token failure",
+    );
   });
 
   test("POST /api/auth/verify-token with the private verificationToken sets the session cookie and returns the public user (P0-001, P2-001)", async () => {
@@ -183,6 +199,7 @@ describe("BG1 auth routes (in-memory, deterministic adapter)", () => {
     assert.equal(verify.status, 200);
     assert.equal(verify.body.ok, true);
     assert.equal(verify.body.user.email, "buyer-route@example.com");
+    assert.equal(verify.body.user.setupState, "converged");
     assert.deepEqual(verify.body.user.workspaces, [
       {
         workspaceId: BUYER_WORKSPACE_ID,
@@ -474,7 +491,7 @@ describe("BG1 auth routes (in-memory, deterministic adapter)", () => {
     // response was not yet sent, so the middleware runs and
     // produces a schema-valid safe envelope.
     class ExplodingAuthenticationService extends AuthenticationService {
-      override resolveSession(): Promise<null> {
+      override resolveSessionWithSetupState(): Promise<null> {
         // A rejection that none of the handler's targeted catches
         // recognise — simulates a service-layer regression. We use
         // `Promise.reject` so the lint rule that flags async
@@ -485,6 +502,9 @@ describe("BG1 auth routes (in-memory, deterministic adapter)", () => {
     const explodingAuthService = new ExplodingAuthenticationService({
       identityAdapter: adapter,
       authRepository: authRepo,
+      personalWorkspaceConvergenceService: new PersonalWorkspaceConvergenceService({
+        authRepository: authRepo,
+      }),
     });
     const { app: explodingApp } = buildApp({
       authenticationService: explodingAuthService,

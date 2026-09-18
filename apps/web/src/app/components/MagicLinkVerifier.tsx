@@ -24,6 +24,14 @@
 // reload. A failed verification throws from `verifyAndRefresh`
 // without touching session state, so the navigation cannot read
 // "signed in" for an unverified session.
+//
+// M2 (#82): the verify-token response carries a validated
+// `returnTo` field and a server-derived `setupState`. The
+// verifier applies `returnTo` when present (and only when the
+// setup is "converged" — recovery overrides the return context).
+// When `setupState === "recovery"`, the verifier routes the
+// browser to `/dashboard?recovery=1` so the dashboard renders the
+// recovery surface.
 
 import { useEffect, type ReactNode } from "react";
 import { useRouter, useSearchParams } from "next/navigation";
@@ -48,8 +56,23 @@ export function MagicLinkVerifier({ paramName, children }: MagicLinkVerifierProp
     let cancelled = false;
     void (async () => {
       try {
-        await verifyAndRefresh({ verificationToken });
-        if (!cancelled) router.replace("/dashboard");
+        const response = await verifyAndRefresh({ verificationToken });
+        if (cancelled) return;
+        // Apply return context ONLY when the setup is converged.
+        // Recovery overrides return context so a retry does not
+        // land back at an inaccessible destination.
+        // The cast to `string` is required because `router.replace`'s
+        // parameter is typed as `__next_route_internal_types__` and
+        // we build the target from a runtime decision (returnTo
+        // path or recovery destination). The server is the
+        // authoritative validator for returnTo, so the runtime
+        // value is always a safe internal path.
+        const target: string =
+          response.user.setupState === "recovery"
+            ? "/dashboard?recovery=1"
+            : (response.returnTo ?? "/dashboard");
+        // eslint-disable-next-line @typescript-eslint/no-explicit-any
+        router.replace(target as any);
       } catch {
         if (!cancelled) router.replace("/login");
       }

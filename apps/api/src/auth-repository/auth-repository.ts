@@ -19,6 +19,7 @@ import type {
   WorkspaceStatusV1,
   WorkspaceTypeV1,
 } from "@soundhub/types";
+import type { ConvergenceKind } from "../services/personal-workspace-convergence.service.js";
 
 export interface UserIdentityMapping {
   readonly provider: Bg1IdentityProviderV1;
@@ -117,4 +118,70 @@ export interface AuthRepository {
     readonly userAccountId: string;
     readonly workspaceId: string;
   }): Promise<WorkspaceMembershipView | null>;
+
+  // ---------- M2 #82: Personal Workspace convergence primitives ----------
+
+  /**
+   * First-auth path: atomically create a Personal Workspace + Owner
+   * `WorkspaceMembership` for the given UserAccount and link it via
+   * the compare-and-set UPDATE on `UserAccount.personalWorkspaceId`.
+   *
+   * Returns the new Workspace id and slug. Throws
+   * `ConvergenceRaceError` (defined in
+   * `personal-workspace-convergence.service.ts`) when the CAS loses
+   * to a concurrent transaction; the caller is expected to retry by
+   * re-reading via `findPersonalWorkspaceConvergence`.
+   *
+   * The slug is generated from the Workspace's primary identifier
+   * (server-only pure helper) so it is opaque, unique, and contains
+   * neither email nor provider subject.
+   *
+   * Pre-condition: `personalWorkspaceId` is NULL on the UserAccount
+   * (the repository does not re-check this; the caller — the
+   * convergence service — classifies first via
+   * `findPersonalWorkspaceConvergence`).
+   */
+  createInitialPersonalWorkspace(input: {
+    readonly userAccountId: string;
+  }): Promise<{ readonly workspaceId: string; readonly slug: string }>;
+
+  /**
+   * Backfill-gap path: link an existing Personal Workspace + Owner
+   * membership to the UserAccount via compare-and-set. Used when the
+   * migration left `personalWorkspaceId` NULL because the row had no
+   * candidate OR (defensively) when the migration failed mid-flight.
+   *
+   * Throws `ConvergenceRaceError` when the CAS loses.
+   *
+   * Pre-condition: the (userAccountId, workspaceId) pair has an
+   * existing Owner Personal Workspace membership; `personalWorkspaceId`
+   * is NULL.
+   */
+  attachExistingPersonalWorkspace(input: {
+    readonly userAccountId: string;
+    readonly workspaceId: string;
+  }): Promise<void>;
+
+  /**
+   * Classify the Personal Workspace state for the given UserAccount.
+   * Returns one of four `ConvergenceKind` variants (defined in
+   * `personal-workspace-convergence.service.ts`):
+   *   - `converged`: pointer is set and the Owner membership resolves.
+   *   - `none`: pointer is NULL and zero Owner Personal memberships.
+   *   - `attachable`: pointer is NULL and exactly one Owner Personal
+   *     membership exists (migration gap).
+   *   - `recovery`: any of the six broken states (see service doc).
+   *
+   * Pure read — does not write.
+   */
+  findPersonalWorkspaceConvergence(input: {
+    readonly userAccountId: string;
+  }): Promise<ConvergenceKind>;
+
+  /**
+   * Read the slug for a single Workspace by id. Used by the
+   * convergence service's CAS-loss retry path to surface the
+   * winner's slug. Returns null when the Workspace is unknown.
+   */
+  findWorkspaceSlugById(workspaceId: string): Promise<string | null>;
 }

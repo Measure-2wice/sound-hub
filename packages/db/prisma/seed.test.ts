@@ -368,6 +368,30 @@ describe("M1.1 seed regression coverage", () => {
     assert.equal(restored?.status, "Active");
   });
 
+  test("M2 #82: restores UserAccount.personalWorkspaceId for the demo buyer after a stale mutation", async () => {
+    await runSeed();
+    const buyer = await prisma.userAccount.findUnique({
+      where: { email: "demo.buyer@soundhub.example" },
+    });
+    const workspace = await prisma.workspace.findUnique({
+      where: { slug: "bg1-demo-buyer" },
+    });
+    assert.ok(buyer);
+    assert.ok(workspace);
+    assert.equal(buyer.personalWorkspaceId, workspace.id);
+
+    // Mutate: null the pointer and re-seed.
+    await prisma.userAccount.update({
+      where: { id: buyer.id },
+      data: { personalWorkspaceId: null },
+    });
+    await runSeed();
+    const restored = await prisma.userAccount.findUnique({
+      where: { id: buyer.id },
+    });
+    assert.equal(restored?.personalWorkspaceId, workspace.id);
+  });
+
   test("restores SellerProfile.status after it is set to Draft", async () => {
     await runSeed();
     const profile = await prisma.sellerProfile.findFirst({

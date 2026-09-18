@@ -9,7 +9,14 @@
 // read by the authorization path (see `WorkspaceAuthorizationService`)
 // — it remains in the schema for M1.1 backward compatibility but
 // grants no authority in any Golden Slice command.
+//
+// M2 #82: Personal Workspace convergence primitives. The repository
+// owns the compare-and-set CREATE and ATTACH transactions. The slug
+// helper lives in a server-only pure module (`personal-workspace-
+// slug.ts`) so the persistence layer is the single owner of slug
+// generation.
 
+import { randomUUID } from "node:crypto";
 import type { PrismaClient } from "@soundhub/db";
 import type {
   Bg1IdentityProviderV1,
@@ -18,6 +25,9 @@ import type {
   WorkspaceStatusV1,
   WorkspaceTypeV1,
 } from "@soundhub/types";
+import { buildPersonalWorkspaceSlug } from "../lib/personal-workspace-slug.js";
+import { ConvergenceRaceError } from "../services/personal-workspace-convergence.service.js";
+import type { ConvergenceKind } from "../services/personal-workspace-convergence.service.js";
 import type {
   AuthRepository,
   PublicUserView,
@@ -59,8 +69,7 @@ export class PrismaAuthRepository implements AuthRepository {
     assertBg1Provider(input.provider);
     // The (provider, subject) tuple is unique; if a concurrent request
     // already created the mapping, we surface the existing row rather
-    // than racing a duplicate insert. This is the durable lookup-or-
-    // create semantics the BG1 ticket requires.
+    // than racing a duplicate insert.
     const existing = await this.findUserByIdentity(input);
     if (existing) return existing;
 
@@ -69,30 +78,14 @@ export class PrismaAuthRepository implements AuthRepository {
       // when a newly verified provider identity arrives for an email
       // that already exists in SoundHub, the new mapping attaches to
       // THAT UserAccount regardless of how many other IdentityProvider
-      // mappings it already carries. A returning human changing
-      // providers therefore keeps the same marketplace identity; the
-      // (provider, subject) tuple is unique, so concurrent races
-      // surface the existing row above rather than duplicating it.
-      //
-      // Provider claims NEVER authorize a Workspace — every Workspace
-      // command reads `WorkspaceMembership` only. The linked
-      // UserAccount keeps its existing memberships and capabilities
-      // unchanged. Out-of-band ownership verification (e.g., a human
-      // reusing an email they no longer own) is owned by the
-      // application, not by the provider.
-      //
-      // When no SoundHub UserAccount yet owns the email, a fresh
-      // UserAccount is created with the email populated.
+      // mappings it already carry. A returning human changing
+      // providers therefore keeps the same marketplace identity.
       let userId: string | null = null;
       if (input.providerEmail) {
         const matchingUser = await tx.userAccount.findUnique({
           where: { email: input.providerEmail },
         });
         if (matchingUser) {
-          // Attach the new provider mapping to the existing
-          // UserAccount. The unique constraint on
-          // (provider, subject) prevents two UserAccounts from
-          // sharing the same provider credential.
           userId = matchingUser.id;
         }
       }
@@ -138,12 +131,6 @@ export class PrismaAuthRepository implements AuthRepository {
       },
     });
     if (!user) return null;
-    // Per BG1 contract, we surface the first (provider, subject)
-    // mapping as the canonical identity. Multiple providers may
-    // map to one UserAccount (e.g. a deterministic dev mapping +
-    // a managed production mapping for the same human), but the
-    // session is bound to one provider at a time so the contract
-    // surfaces only that mapping.
     const identity = user.identityProviders[0];
     if (!identity) {
       // A UserAccount without an identity provider mapping cannot
@@ -163,6 +150,10 @@ export class PrismaAuthRepository implements AuthRepository {
       displayName: null,
       identityProvider: identity.provider,
       identitySubject: identity.subject,
+      // The Personal Workspace surface carries `setupState` derived
+      // server-side from the convergence service classification. The
+      // mapper in `apps/api/src/dto/public-mappers.ts` reads this
+      // value when shaping the public DTO.
       workspaces: user.memberships.map((membership) => ({
         workspaceId: membership.workspace.id,
         slug: membership.workspace.slug,
@@ -242,6 +233,220 @@ export class PrismaAuthRepository implements AuthRepository {
       role: row.role,
       joinedAt: row.createdAt,
     };
+  }
+
+  // ---------- M2 #82: Personal Workspace convergence primitives ----------
+
+  /**
+   * First-auth path: pre-generate the Workspace id (UUID-based for
+   * collision resistance), derive the slug from it via the server-only
+   * helper, create the Workspace + Owner Membership atomically, and
+   * compare-and-set `personalWorkspaceId`. The compare-and-set is the
+   * atomic serialization point — losing it throws
+   * `ConvergenceRaceError` so the caller can retry.
+   */
+  async createInitialPersonalWorkspace(input: {
+    readonly userAccountId: string;
+  }): Promise<{ readonly workspaceId: string; readonly slug: string }> {
+    return this.prisma.$transaction(async (tx) => {
+      // Pre-generate the Workspace id. Using a server-side primitive
+      // (crypto.randomUUID) instead of relying on Prisma's `@default
+      // (cuid())` keeps the slug and the Workspace id intrinsically
+      // linked without depending on undocumented generator behavior.
+      // No new package is required: Node's built-in crypto provides
+      // the entropy. The slug remains opaque, unique, stable, and
+      // contains no email, provider subject, or display name.
+      const workspaceId = randomUUID();
+      const slug = buildPersonalWorkspaceSlug(workspaceId);
+
+      const workspace = await tx.workspace.create({
+        data: {
+          id: workspaceId,
+          slug,
+          name: "My Workspace",
+          type: "Personal",
+          status: "Active",
+          ownerUserId: input.userAccountId,
+        },
+      });
+      const membership = await tx.workspaceMembership.create({
+        data: {
+          userId: input.userAccountId,
+          workspaceId: workspace.id,
+          role: "Owner",
+        },
+      });
+
+      // Compare-and-set: only set personalWorkspaceId if it is
+      // currently NULL. PostgreSQL serializes this UPDATE at the
+      // row level. A losing UPDATE matches 0 rows → throw so the
+      // caller's transaction rolls back (and the Workspace +
+      // Membership rows are removed too).
+      const updated = await tx.userAccount.updateMany({
+        where: { id: input.userAccountId, personalWorkspaceId: null },
+        data: { personalWorkspaceId: workspace.id },
+      });
+      if (updated.count === 0) {
+        throw new ConvergenceRaceError(
+          `createInitialPersonalWorkspace: CAS lost for userAccountId=${input.userAccountId}`,
+        );
+      }
+
+      return { workspaceId: workspace.id, slug };
+      // `membership` is consumed implicitly by the CAS; the
+      // membershipId is returned from findPersonalWorkspaceConvergence
+      // when the caller re-reads.
+      void membership;
+    });
+  }
+
+  /**
+   * Backfill-gap path: link an existing Personal Workspace to the
+   * UserAccount via compare-and-set. The CAS is the atomic
+   * serialization point.
+   */
+  async attachExistingPersonalWorkspace(input: {
+    readonly userAccountId: string;
+    readonly workspaceId: string;
+  }): Promise<void> {
+    await this.prisma.$transaction(async (tx) => {
+      const updated = await tx.userAccount.updateMany({
+        where: { id: input.userAccountId, personalWorkspaceId: null },
+        data: { personalWorkspaceId: input.workspaceId },
+      });
+      if (updated.count === 0) {
+        throw new ConvergenceRaceError(
+          `attachExistingPersonalWorkspace: CAS lost for userAccountId=${input.userAccountId}`,
+        );
+      }
+    });
+  }
+
+  /**
+   * Classify the Personal Workspace state. Pure read; does not write.
+   * The classification logic enumerates the six recovery triggers
+   * explicitly so any future addition is a deliberate, named branch.
+   */
+  async findPersonalWorkspaceConvergence(input: {
+    readonly userAccountId: string;
+  }): Promise<ConvergenceKind> {
+    const user = await this.prisma.userAccount.findUnique({
+      where: { id: input.userAccountId },
+      include: {
+        memberships: {
+          where: { role: "Owner" },
+          include: { workspace: true },
+        },
+      },
+    });
+    if (!user) {
+      // Caller invariant: the UserAccount exists by the time this
+      // method is called. A missing row is a programmer error
+      // surfaced as `none` so the convergence service can re-create
+      // (the auth service must have called createUserForIdentity
+      // first). Defensive: do not throw.
+      return { kind: "none", userAccountId: input.userAccountId };
+    }
+
+    const ownerPersonalMemberships = user.memberships.filter(
+      (m) => m.workspace.type === "Personal",
+    );
+
+    // Recovery: multiple Owner Personal memberships.
+    if (ownerPersonalMemberships.length > 1) {
+      return {
+        kind: "recovery",
+        userAccountId: user.id,
+        reason: "multiple-personal-workspaces",
+      };
+    }
+
+    const pointerId = user.personalWorkspaceId;
+
+    if (pointerId === null) {
+      if (ownerPersonalMemberships.length === 0) {
+        return { kind: "none", userAccountId: user.id };
+      }
+      // Exactly one Owner Personal membership; the migration left
+      // personalWorkspaceId NULL (migration backfill gap, or the row
+      // was created after the migration but before the auth service
+      // attached it). The convergence service can link it.
+      const target = ownerPersonalMemberships[0]!;
+      return {
+        kind: "attachable",
+        userAccountId: user.id,
+        workspaceId: target.workspaceId,
+      };
+    }
+
+    // pointerId is set. Locate the matching Owner membership.
+    const ownerMembership = ownerPersonalMemberships.find((m) => m.workspaceId === pointerId);
+
+    if (!ownerMembership) {
+      // The pointed Workspace exists (validated below) but the user
+      // does not have an Owner membership on it.
+      const pointed = await this.prisma.workspace.findUnique({
+        where: { id: pointerId },
+      });
+      if (!pointed) {
+        return {
+          kind: "recovery",
+          userAccountId: user.id,
+          reason: "pointer-workspace-missing",
+        };
+      }
+      if (pointed.type !== "Personal") {
+        return {
+          kind: "recovery",
+          userAccountId: user.id,
+          reason: "pointer-not-personal",
+        };
+      }
+      // Pointer exists, is Personal, but the Owner membership is
+      // absent. Could be a membership-with-different-role case, in
+      // which case we look for a non-Owner membership on the same
+      // (user, workspace) pair before reporting `membership-not-owner`.
+      const anyMembership = await this.prisma.workspaceMembership.findUnique({
+        where: {
+          userId_workspaceId: {
+            userId: user.id,
+            workspaceId: pointerId,
+          },
+        },
+      });
+      if (anyMembership && anyMembership.role !== "Owner") {
+        return {
+          kind: "recovery",
+          userAccountId: user.id,
+          reason: "membership-not-owner",
+        };
+      }
+      return {
+        kind: "recovery",
+        userAccountId: user.id,
+        reason: "owner-membership-missing",
+      };
+    }
+
+    // The user has an Owner membership on the pointed Personal
+    // Workspace. Converged.
+    return {
+      kind: "converged",
+      workspaceId: ownerMembership.workspaceId,
+      membershipId: ownerMembership.id,
+    };
+  }
+
+  /**
+   * Read a single Workspace slug by id. Used by the convergence
+   * service's CAS-loss retry path to surface the winner's slug.
+   */
+  async findWorkspaceSlugById(workspaceId: string): Promise<string | null> {
+    const row = await this.prisma.workspace.findUnique({
+      where: { id: workspaceId },
+      select: { slug: true },
+    });
+    return row?.slug ?? null;
   }
 }
 

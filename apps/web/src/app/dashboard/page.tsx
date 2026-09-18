@@ -2,36 +2,55 @@
 
 // Dashboard page.
 //
-// Background: the BG1 integrated browser journey signs in, lands on
-// the dashboard, sees the available Workspaces, picks one to "act
-// as", and proves the GS 4 contract by calling a sample
-// consequential command that requires current WorkspaceMembership.
-// The page is intentionally simple — later Golden Slice tickets
-// will add ProjectRequest, Deal, TermsVersion, and approval flows
-// on top of this same foundation.
+// Background: the authenticated human lands on the dashboard after a
+// successful magic-link verification. M2 (#82) makes the dashboard
+// server-driven: it reads `user.setupState` (a server-derived
+// classification of the Personal Workspace convergence state) and
+// renders either the Personal Workspace surface or the recovery
+// surface. The browser NEVER infers recovery from the workspaces
+// array — only the server can classify the recovery state, and the
+// public DTO exposes it as the opaque `setupState: "converged" |
+// "recovery"` field.
 //
-// The dashboard reads the authenticated user from the shared
-// `SessionProvider` seam so a successful magic-link verification
-// (managed or deterministic) renders the dashboard signed in
-// immediately, without depending on a re-fetch on mount. Sign-out
-// uses the same seam so the navigation and dashboard clear
-// consistently without a full page reload.
+// The BG1 engineering harness controls ("Verify acting Workspace",
+// "Send consequential command") are removed entirely from the
+// customer UX per the M2 UX addendum. The Personal Workspace
+// dashboard shows the workspace identity and the readiness / next
+// action placeholder (real readiness actions land in later M2
+// tickets).
+//
+// All surfaces preserve logical keyboard order, visible focus,
+// ≥16px body text, ≥44×44px mobile hit areas, no autoplay, no
+// decorative parallax. The recovery surface uses the application
+// sans for operational copy and exposes only operable sign-out /
+// recovery actions.
 
 import { useState, type FormEvent } from "react";
 import Link from "next/link";
 import { useRouter } from "next/navigation";
 import { useSession } from "../components/SessionProvider";
-import type { Bg1ActingWorkspaceResponseV1, Bg1PublicWorkspaceV1 } from "@soundhub/types";
-import { bg1ActingWorkspaceResponseV1Schema } from "@soundhub/types";
+import type { Bg1PublicWorkspaceV1 } from "@soundhub/types";
 import { Card } from "../components/ui/Card";
 
 export default function DashboardPage() {
   const { user, loading, signOutAndRefresh } = useSession();
   const router = useRouter();
-  const [actingWorkspaceId, setActingWorkspaceId] = useState<string>("");
-  const [actingResult, setActingResult] = useState<Bg1ActingWorkspaceResponseV1 | null>(null);
-  const [actingError, setActingError] = useState<string | null>(null);
-  const [commandResult, setCommandResult] = useState<string | null>(null);
+  const [signingOut, setSigningOut] = useState(false);
+  const [signOutError, setSignOutError] = useState<string | null>(null);
+
+  const handleSignOut = async (e: FormEvent) => {
+    e.preventDefault();
+    setSigningOut(true);
+    setSignOutError(null);
+    try {
+      await signOutAndRefresh();
+      router.push("/");
+    } catch (err) {
+      setSignOutError(err instanceof Error ? err.message : "Could not sign out right now.");
+    } finally {
+      setSigningOut(false);
+    }
+  };
 
   if (loading) {
     return (
@@ -63,59 +82,49 @@ export default function DashboardPage() {
     );
   }
 
-  const handleSelectActingWorkspace = async (e: FormEvent) => {
-    e.preventDefault();
-    setActingError(null);
-    setActingResult(null);
-    try {
-      const response = await fetch("/api/auth/acting-workspace", {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        credentials: "include",
-        body: JSON.stringify({ actingWorkspaceId }),
-      });
-      if (!response.ok) {
-        const body = (await response.json()) as { error: { code: string; message: string } };
-        setActingError(body.error.message);
-        return;
-      }
-      const parsed = bg1ActingWorkspaceResponseV1Schema.parse(await response.json());
-      setActingResult(parsed);
-    } catch (err) {
-      setActingError(err instanceof Error ? err.message : "Could not select acting workspace.");
-    }
-  };
+  // M2 (#82): the recovery decision is server-derived. The browser
+  // reads ONLY `user.setupState` — it never infers recovery from the
+  // workspaces array. This prevents a future Workspace type or
+  // capability flag from silently changing the rendered surface.
+  if (user.setupState === "recovery") {
+    return (
+      <RecoverySurface
+        user={user}
+        onSignOut={handleSignOut}
+        signingOut={signingOut}
+        signOutError={signOutError}
+      />
+    );
+  }
 
-  const handleConsequentialCommand = async () => {
-    setCommandResult(null);
-    if (!actingWorkspaceId) {
-      setCommandResult("Pick an acting Workspace first.");
-      return;
-    }
-    // The BG1 sample consequential command is the
-    // POST /api/auth/acting-workspace route: it requires an
-    // authenticated session AND a current WorkspaceMembership AND
-    // is revalidated server-side on every call. Proving the route
-    // succeeds in the dashboard demonstrates the GS 4 / GS 5
-    // contract end to end.
-    try {
-      const response = await fetch("/api/auth/acting-workspace", {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        credentials: "include",
-        body: JSON.stringify({ actingWorkspaceId }),
-      });
-      if (!response.ok) {
-        const body = (await response.json()) as { error: { code: string; message: string } };
-        setCommandResult(`Rejected (${body.error.code}): ${body.error.message}`);
-        return;
-      }
-      const parsed = bg1ActingWorkspaceResponseV1Schema.parse(await response.json());
-      setCommandResult(`Authorized as ${parsed.actingWorkspace.name} (${parsed.membership.role}).`);
-    } catch (err) {
-      setCommandResult(err instanceof Error ? err.message : "Command could not be processed.");
-    }
-  };
+  return (
+    <PersonalWorkspaceSurface
+      user={user}
+      onSignOut={handleSignOut}
+      signingOut={signingOut}
+      signOutError={signOutError}
+    />
+  );
+}
+
+function PersonalWorkspaceSurface({
+  user,
+  onSignOut,
+  signingOut,
+  signOutError,
+}: {
+  user: NonNullable<ReturnType<typeof useSession>["user"]>;
+  onSignOut: (e: FormEvent) => Promise<void>;
+  signingOut: boolean;
+  signOutError: string | null;
+}) {
+  // The Personal Workspace is the new Personal Workspace created on
+  // first auth (or the existing one for a returning user). The
+  // browser renders the Personal Workspace card only — the BG1
+  // engineering acting-Workspace selector is removed.
+  const personalWorkspace = user.workspaces.find(
+    (workspace) => workspace.workspaceType === "Personal",
+  );
 
   return (
     <div className="max-w-2xl mx-auto px-6 py-12 space-y-6" data-testid="dashboard">
@@ -132,140 +141,123 @@ export default function DashboardPage() {
           </p>
           <button
             type="button"
-            onClick={() => {
-              void (async () => {
-                await signOutAndRefresh();
-                router.push("/");
-              })();
+            onClick={(e) => {
+              void onSignOut(e);
             }}
-            className="mt-3 text-sm font-medium text-gray-600 hover:text-gray-900"
+            disabled={signingOut}
+            className="mt-3 text-sm font-medium text-gray-600 hover:text-gray-900 disabled:opacity-50"
             data-testid="dashboard-sign-out"
           >
-            Sign out
+            {signingOut ? "Signing out…" : "Sign out"}
           </button>
-        </Card.Content>
-      </Card>
-
-      <Card data-testid="dashboard-workspaces">
-        <Card.Header>
-          <Card.Title>Your Workspaces</Card.Title>
-        </Card.Header>
-        <Card.Content>
-          <WorkspaceList
-            workspaces={user.workspaces}
-            actingWorkspaceId={actingWorkspaceId}
-            onSelect={setActingWorkspaceId}
-          />
-          <form
-            onSubmit={(e) => {
-              handleSelectActingWorkspace(e).catch(() => {
-                /* surfaced via setActingError above */
-              });
-            }}
-            className="mt-4 space-y-2"
-          >
-            <button
-              type="submit"
-              disabled={!actingWorkspaceId}
-              className="bg-blue-600 text-white px-3 py-1.5 rounded-md text-sm font-medium hover:bg-blue-700 disabled:opacity-50 transition-colors"
-              data-testid="dashboard-select-acting-submit"
-            >
-              Verify acting Workspace
-            </button>
-            {actingError && (
-              <p className="text-sm text-red-700" data-testid="dashboard-acting-error">
-                {actingError}
-              </p>
-            )}
-            {actingResult && (
-              <p className="text-sm text-green-700" data-testid="dashboard-acting-result">
-                Authorized: {actingResult.actingWorkspace.name} ({actingResult.membership.role})
-              </p>
-            )}
-          </form>
-        </Card.Content>
-      </Card>
-
-      <Card data-testid="dashboard-consequential-command">
-        <Card.Header>
-          <Card.Title>Consequential command</Card.Title>
-        </Card.Header>
-        <Card.Content>
-          <p className="text-sm text-gray-700">
-            This sample command requires explicit acting-Workspace and current WorkspaceMembership.
-            The server revalidates every request and rejects non-members.
-          </p>
-          <button
-            type="button"
-            onClick={() => {
-              handleConsequentialCommand().catch(() => {
-                /* surfaced via setCommandResult above */
-              });
-            }}
-            className="mt-3 bg-emerald-600 text-white px-3 py-1.5 rounded-md text-sm font-medium hover:bg-emerald-700 transition-colors"
-            data-testid="dashboard-consequential-submit"
-          >
-            Send consequential command
-          </button>
-          {commandResult && (
-            <p className="mt-2 text-sm text-gray-800" data-testid="dashboard-consequential-result">
-              {commandResult}
+          {signOutError && (
+            <p className="mt-2 text-sm text-red-700" data-testid="dashboard-sign-out-error">
+              {signOutError}
             </p>
           )}
+        </Card.Content>
+      </Card>
+
+      <Card data-testid="dashboard-personal-workspace">
+        <Card.Header>
+          <Card.Title>My Workspace</Card.Title>
+        </Card.Header>
+        <Card.Content>
+          {personalWorkspace ? (
+            <PersonalWorkspaceCard workspace={personalWorkspace} />
+          ) : (
+            <p className="text-sm text-gray-700">Your Personal Workspace is being prepared.</p>
+          )}
+          <p
+            className="mt-3 text-sm text-gray-700"
+            data-testid="dashboard-personal-workspace-next-action"
+          >
+            Choose what you want to do in SoundHub. The intent picker (Hire talent, Offer services,
+            or Both) appears here once you decide.
+          </p>
         </Card.Content>
       </Card>
     </div>
   );
 }
 
-function WorkspaceList({
-  workspaces,
-  actingWorkspaceId,
-  onSelect,
-}: {
-  workspaces: readonly Bg1PublicWorkspaceV1[];
-  actingWorkspaceId: string;
-  onSelect: (id: string) => void;
-}) {
-  if (workspaces.length === 0) {
-    return (
-      <p className="text-sm text-gray-600" data-testid="dashboard-no-workspaces">
-        You have no current Workspaces.
-      </p>
-    );
-  }
+function PersonalWorkspaceCard({ workspace }: { workspace: Bg1PublicWorkspaceV1 }) {
   return (
-    <ul className="space-y-2" data-testid="dashboard-workspace-list">
-      {workspaces.map((workspace) => (
-        <li key={workspace.workspaceId}>
-          <label
-            className={`flex items-start gap-3 border rounded-md p-3 cursor-pointer ${
-              actingWorkspaceId === workspace.workspaceId
-                ? "border-blue-500 bg-blue-50"
-                : "border-gray-200"
-            }`}
-            data-testid="dashboard-workspace-option"
-            data-workspace-id={workspace.workspaceId}
+    <div data-testid="dashboard-personal-workspace-card">
+      <p className="text-sm font-medium text-gray-900">{workspace.name}</p>
+      <p className="text-xs text-gray-500" data-testid="dashboard-personal-workspace-slug">
+        {workspace.slug}
+      </p>
+      <p className="text-xs text-gray-500">
+        {workspace.workspaceType} · {workspace.workspaceStatus} · capabilities:{" "}
+        {workspace.capabilities.length === 0 ? "(none yet)" : workspace.capabilities.join(", ")}
+      </p>
+    </div>
+  );
+}
+
+function RecoverySurface({
+  user,
+  onSignOut,
+  signingOut,
+  signOutError,
+}: {
+  user: NonNullable<ReturnType<typeof useSession>["user"]>;
+  onSignOut: (e: FormEvent) => Promise<void>;
+  signingOut: boolean;
+  signOutError: string | null;
+}) {
+  // The recovery surface is rendered ONLY when
+  // `user.setupState === "recovery"`. Per the M2 UX addendum:
+  //   - Show signed-in / recovery context (email + provider key).
+  //   - Calm explanation that SoundHub did not guess, merge, or
+  //     select.
+  //   - Operable sign-out button.
+  //   - NO fabricated acting-Workspace selector.
+  //   - NO support-process or security guarantee claims.
+  return (
+    <div className="max-w-2xl mx-auto px-6 py-12 space-y-6" data-testid="dashboard-recovery">
+      <Card>
+        <Card.Header>
+          <Card.Title data-testid="dashboard-recovery-title">
+            Workspace setup needs your attention
+          </Card.Title>
+        </Card.Header>
+        <Card.Content>
+          <p className="text-sm text-gray-700">
+            Signed in as{" "}
+            <span data-testid="dashboard-recovery-email" className="font-medium">
+              {user.email ?? "anonymous"}
+            </span>{" "}
+            (<code className="bg-gray-100 px-1 rounded text-xs">{user.identityProvider}</code>
+            ). SoundHub did not guess, merge, or automatically select a Personal Workspace for this
+            account.
+          </p>
+          <p className="mt-2 text-sm text-gray-700">
+            Sign out and try signing in again. If this keeps happening, the support team can review
+            your account.
+          </p>
+          <button
+            type="button"
+            onClick={(e) => {
+              void onSignOut(e);
+            }}
+            disabled={signingOut}
+            className="mt-3 text-sm font-medium text-gray-600 hover:text-gray-900 disabled:opacity-50"
+            data-testid="dashboard-recovery-sign-out"
           >
-            <input
-              type="radio"
-              name="actingWorkspaceId"
-              value={workspace.workspaceId}
-              checked={actingWorkspaceId === workspace.workspaceId}
-              onChange={() => onSelect(workspace.workspaceId)}
-              className="mt-1"
-              data-testid="dashboard-workspace-radio"
-            />
-            <span>
-              <span className="block text-sm font-medium text-gray-900">{workspace.name}</span>
-              <span className="block text-xs text-gray-500">
-                {workspace.workspaceType} · {workspace.workspaceStatus} · capabilities:{" "}
-                {workspace.capabilities.join(", ")}
-              </span>
-            </span>
-          </label>
-        </li>
-      ))}
-    </ul>
+            {signingOut ? "Signing out…" : "Sign out"}
+          </button>
+          {signOutError && (
+            <p
+              className="mt-2 text-sm text-red-700"
+              data-testid="dashboard-recovery-sign-out-error"
+            >
+              {signOutError}
+            </p>
+          )}
+        </Card.Content>
+      </Card>
+    </div>
   );
 }

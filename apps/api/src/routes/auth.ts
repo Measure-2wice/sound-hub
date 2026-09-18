@@ -9,7 +9,7 @@
 //
 // Routes:
 //   POST /api/auth/magic-link
-//     Body: { email }.
+//     Body: { email, return? }.
 //     Response: { ok: true, requestId, devVerificationUrl? }. Neutral
 //     on well-formed requests regardless of whether the email is
 //     registered, so the surface cannot be used to enumerate
@@ -21,8 +21,10 @@
 //     credential the browser extracted from the magic-link callback
 //     URL. The PUBLIC correlation id from `/magic-link` is NOT
 //     acceptable (per ticket #59 P2-001).
-//     Response: { ok: true, user } and a `Set-Cookie: soundhub_session`
-//     header carrying the opaque session id.
+//     Response: { ok: true, user, returnTo } and a
+//     `Set-Cookie: soundhub_session` header carrying the opaque
+//     session id. The return-context cookie is cleared on every
+//     response (success or recovery).
 //
 //   GET /api/auth/me
 //     Response: { user | null } derived from the session cookie. No
@@ -65,6 +67,12 @@ import {
   type SafeErrorResponse,
 } from "../lib/errors.js";
 import { SESSION_COOKIE, setSessionCookie, clearSessionCookie } from "../lib/session-cookie.js";
+import {
+  RETURN_CONTEXT_COOKIE,
+  readReturnContextCookie,
+  resolveAllowedOrigin,
+  setReturnContextCookie,
+} from "../lib/return-context.js";
 import type { AuthRepository } from "../auth-repository/auth-repository.js";
 import { toPublicUser } from "../dto/public-mappers.js";
 
@@ -72,10 +80,20 @@ export interface AuthRouteDeps {
   readonly authenticationService: AuthenticationService;
   readonly workspaceAuthorizationService: WorkspaceAuthorizationService;
   readonly authRepository: AuthRepository;
+  /**
+   * M2 (#82): configured application origin used for canonical URL
+   * parsing of return-context destinations. Defaults to
+   * `process.env.FRONTEND_URL` so the same value the CORS layer uses
+   * drives both protections.
+   */
+  readonly allowedReturnOrigin?: string;
 }
 
 export function createAuthRouter(deps: AuthRouteDeps): Router {
   const router = Router();
+  const allowedReturnOrigin = resolveAllowedOrigin(
+    deps.allowedReturnOrigin ?? process.env.FRONTEND_URL ?? "http://localhost:3000",
+  );
 
   // BG1 contract: route handlers MUST NOT leave promise rejections
   // unhandled. The handlers only translate recognised errors into
@@ -90,10 +108,12 @@ export function createAuthRouter(deps: AuthRouteDeps): Router {
   // the error middleware would attempt to set headers on a sent
   // response and produce ERR_HTTP_HEADERS_SENT.
   router.post("/magic-link", (req, res, next) => {
-    handleMagicLink(req, res, deps).catch((err) => forwardUnhandledRejection(req, res, next, err));
+    handleMagicLink(req, res, { ...deps, allowedReturnOrigin }).catch((err) =>
+      forwardUnhandledRejection(req, res, next, err),
+    );
   });
   router.post("/verify-token", (req, res, next) => {
-    handleVerifyToken(req, res, deps).catch((err) =>
+    handleVerifyToken(req, res, { ...deps, allowedReturnOrigin }).catch((err) =>
       forwardUnhandledRejection(req, res, next, err),
     );
   });
@@ -132,7 +152,11 @@ function forwardUnhandledRejection(
 
 // ---------- POST /api/auth/magic-link ----------
 
-async function handleMagicLink(req: Request, res: Response, deps: AuthRouteDeps): Promise<void> {
+async function handleMagicLink(
+  req: Request,
+  res: Response,
+  deps: AuthRouteDeps & { readonly allowedReturnOrigin: string },
+): Promise<void> {
   const requestId = resolveRequestId(req);
   res.setHeader("x-request-id", requestId);
 
@@ -163,6 +187,13 @@ async function handleMagicLink(req: Request, res: Response, deps: AuthRouteDeps)
       email: parsed.email,
     });
     const validated = bg1MagicLinkResponseV1Schema.parse(envelope);
+    // M2 (#82): if the request includes a validated return destination,
+    // set the short-lived HttpOnly cookie. Invalid destinations are
+    // silently dropped (no error, no cookie) so the caller never
+    // has to handle a partial state.
+    if (parsed.return) {
+      setReturnContextCookie(res, parsed.return, deps.allowedReturnOrigin);
+    }
     res.status(200).json(validated);
   } catch (err) {
     writeAuthError(res, err, requestId, "magic-link");
@@ -171,7 +202,11 @@ async function handleMagicLink(req: Request, res: Response, deps: AuthRouteDeps)
 
 // ---------- POST /api/auth/verify-token ----------
 
-async function handleVerifyToken(req: Request, res: Response, deps: AuthRouteDeps): Promise<void> {
+async function handleVerifyToken(
+  req: Request,
+  res: Response,
+  deps: AuthRouteDeps & { readonly allowedReturnOrigin: string },
+): Promise<void> {
   const requestId = resolveRequestId(req);
   res.setHeader("x-request-id", requestId);
 
@@ -197,14 +232,46 @@ async function handleVerifyToken(req: Request, res: Response, deps: AuthRouteDep
     throw err;
   }
 
+  // M2 (#82): re-validate the return-context cookie. The cookie is
+  // re-read here (not trusted from the body) so a tampered cookie
+  // value cannot grant return authority. Recovery overrides the
+  // return context: when the convergence service returns a recovery
+  // state, the route clears the cookie and the response carries
+  // `returnTo: null`.
+  const cookieHeader = req.headers.cookie;
+  const validatedReturn = readReturnContextCookie(cookieHeader, deps.allowedReturnOrigin);
+
   try {
     const { session, publicUser } = await deps.authenticationService.verifySignIn({
       verificationToken: parsed.verificationToken,
     });
+    // Append both cookies via `Set-Cookie` headers. Express's
+    // `setHeader("Set-Cookie", ...)` REPLACES the previous value, so
+    // the helpers cannot both be called back-to-back on the same
+    // response without losing the first cookie. Append the second via
+    // `appendHeader` so both reach the browser.
     setSessionCookie(res, session.sessionId, session.expiresAt);
-    const body = bg1VerifyTokenResponseV1Schema.parse({ ok: true, user: publicUser });
+    // Always clear the return-context cookie on success (recovery or
+    // converged); the response carries the validated destination.
+    res.appendHeader(
+      "Set-Cookie",
+      `${RETURN_CONTEXT_COOKIE}=; Path=/; Max-Age=0; HttpOnly; SameSite=Lax`,
+    );
+    const returnTo = publicUser.setupState === "recovery" ? null : validatedReturn;
+    const body = bg1VerifyTokenResponseV1Schema.parse({
+      ok: true,
+      user: publicUser,
+      returnTo,
+    });
     res.status(200).json(body);
   } catch (err) {
+    // Failure: also clear the return-context cookie so a stale value
+    // never carries across sessions. Use `appendHeader` (rather than
+    // `setHeader`) so a prior session cookie is not overwritten.
+    res.appendHeader(
+      "Set-Cookie",
+      `${RETURN_CONTEXT_COOKIE}=; Path=/; Max-Age=0; HttpOnly; SameSite=Lax`,
+    );
     writeAuthError(res, err, requestId, "verify-token");
   }
 }
@@ -215,8 +282,13 @@ async function handleMe(req: Request, res: Response, deps: AuthRouteDeps): Promi
   const requestId = resolveRequestId(req);
   res.setHeader("x-request-id", requestId);
   const sessionId = readSessionCookie(req);
-  const view = await deps.authenticationService.resolveSession(sessionId);
-  const body = bg1SessionInfoV1Schema.parse({ user: view ? toPublicUser(view) : null });
+  // M2 (#82): surface `setupState` on the public user so the
+  // browser renders recovery based solely on this field, never on
+  // inference from the workspaces array.
+  const resolved = await deps.authenticationService.resolveSessionWithSetupState(sessionId);
+  const body = bg1SessionInfoV1Schema.parse({
+    user: resolved ? toPublicUser(resolved.user, resolved.setupState) : null,
+  });
   res.status(200).json(body);
 }
 

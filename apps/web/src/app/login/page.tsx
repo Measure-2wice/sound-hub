@@ -15,7 +15,7 @@
 
 import { useState, type FormEvent } from "react";
 import { useRouter } from "next/navigation";
-import { requestMagicLink } from "../lib/auth-client";
+import { requestMagicLink, readReturnFromUrl } from "../lib/auth-client";
 import { useSession } from "../components/SessionProvider";
 import { Card } from "../components/ui/Card";
 
@@ -28,12 +28,21 @@ export default function LoginPage() {
   const [errorMessage, setErrorMessage] = useState<string | null>(null);
   const [devVerificationUrl, setDevVerificationUrl] = useState<string | null>(null);
 
+  // M2 (#82): read the validated internal return destination from
+  // `?return=<path>` and forward it to the magic-link route. The
+  // server is the authoritative validator; invalid destinations are
+  // silently dropped so the user never sees an error here.
+  const returnTo = readReturnFromUrl();
+
   const handleSubmit = async (e: FormEvent) => {
     e.preventDefault();
     setSubmitting(true);
     setErrorMessage(null);
     try {
-      const response = await requestMagicLink({ email });
+      const response = await requestMagicLink({
+        email,
+        ...(returnTo ? { return: returnTo } : {}),
+      });
       setStatus("sent");
       // Deterministic / test path: the adapter returns a verification
       // URL we can follow directly. In production Supabase the field
