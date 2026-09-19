@@ -68,7 +68,6 @@ import {
 } from "../lib/errors.js";
 import { SESSION_COOKIE, setSessionCookie, clearSessionCookie } from "../lib/session-cookie.js";
 import {
-  RETURN_CONTEXT_COOKIE,
   clearReturnContextCookie,
   readReturnContextCookie,
   resolveAllowedOrigin,

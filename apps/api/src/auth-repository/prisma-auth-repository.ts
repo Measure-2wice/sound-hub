@@ -1,3 +1,5 @@
+import { randomUUID } from "node:crypto";
+
 // Prisma adapter for the AuthRepository contract.
 //
 // Background: this module is the only place the auth boundary touches
@@ -25,10 +27,7 @@ import type {
   WorkspaceTypeV1,
 } from "@soundhub/types";
 import { ConvergenceRaceError } from "../lib/personal-workspace-convergence-domain.js";
-import {
-  buildPersonalWorkspaceSlug,
-  generatePersonalWorkspaceCuid,
-} from "../lib/personal-workspace-slug.js";
+import { buildPersonalWorkspaceSlug } from "../lib/personal-workspace-slug.js";
 import type {
   AuthRepository,
   PersonalWorkspaceState,
@@ -240,49 +239,61 @@ export class PrismaAuthRepository implements AuthRepository {
   // ---------- M2 #82: Personal Workspace convergence primitives ----------
 
   /**
-   * First-auth path: mint a cuid-shaped Workspace id via the
-   * server-only helper, derive the slug from the SAME id (so
-   * `slug === "personal-" + workspace.id`), create the Workspace +
-   * Owner Membership atomically, and compare-and-set
-   * `personalWorkspaceId`. The compare-and-set is the atomic
-   * serialization point — losing it throws `ConvergenceRaceError`
-   * so the caller can retry.
-   *
-   * The slug and the Workspace primary identifier are intrinsically
-   * linked by design: the same value serves both. The repository
-   * mints the id (so it can build the slug in the same
-   * transaction) and persists it as the Workspace id.
+   * First-auth path: INSERT the Workspace with a placeholder slug so
+   * Prisma's `@default(cuid())` generates the genuine Workspace
+   * primary id, derive the final slug from that id, then UPDATE the
+   * row to set the canonical slug. The whole sequence runs in a
+   * single `$transaction` so the atomicity invariants hold:
+   *   - Prisma generates the genuine cuid (the same value the rest
+   *     of the schema uses via `@default(cuid())`).
+   *   - The final slug equals `personal-<workspace.id>` exactly
+   *     (the plan-approved invariant).
+   *   - The compare-and-set on `personalWorkspaceId` is the atomic
+   *     serialization point — losing it throws
+   *     `ConvergenceRaceError` and rolls back the entire
+   *     transaction (the placeholder-slug INSERT is undone).
+   *   - The placeholder slug is unique per request (UUID-based) so
+   *     it cannot collide with a previously-committed
+   *     `personal-<cuid>` slug or another request's placeholder.
    */
   async createInitialPersonalWorkspace(input: {
     readonly userAccountId: string;
   }): Promise<{ readonly workspaceId: string; readonly slug: string }> {
     return this.prisma.$transaction(async (tx) => {
-      const workspaceId = generatePersonalWorkspaceCuid();
-      const slug = buildPersonalWorkspaceSlug(workspaceId);
+      const placeholderSlug = `personal-pending-${randomUUID()}`;
 
+      // Step 1: INSERT with a placeholder slug. Prisma's
+      // `@default(cuid())` emits the genuine Workspace id.
       const workspace = await tx.workspace.create({
         data: {
-          id: workspaceId,
-          slug,
+          slug: placeholderSlug,
           name: "My Workspace",
           type: "Personal",
           status: "Active",
           ownerUserId: input.userAccountId,
         },
       });
+
+      // Step 2: derive the canonical slug from the just-inserted
+      // Workspace id and UPDATE. The slug `personal-<workspace.id>`
+      // is unique because workspace.id is unique (cuid).
+      const slug = buildPersonalWorkspaceSlug(workspace.id);
+      const updatedWorkspace = await tx.workspace.update({
+        where: { id: workspace.id },
+        data: { slug },
+      });
+
       const membership = await tx.workspaceMembership.create({
         data: {
           userId: input.userAccountId,
-          workspaceId: workspace.id,
+          workspaceId: updatedWorkspace.id,
           role: "Owner",
         },
       });
 
-      // Compare-and-set: only set personalWorkspaceId if it is
-      // currently NULL. PostgreSQL serializes this UPDATE at the
-      // row level. A losing UPDATE matches 0 rows → throw so the
-      // caller's transaction rolls back (and the Workspace +
-      // Membership rows are removed too).
+      // Step 3: compare-and-set on `personalWorkspaceId`. The losing
+      // UPDATE matches 0 rows → throw so the caller's transaction
+      // rolls back and the Workspace + Membership rows are removed.
       const updated = await tx.userAccount.updateMany({
         where: { id: input.userAccountId, personalWorkspaceId: null },
         data: { personalWorkspaceId: workspace.id },

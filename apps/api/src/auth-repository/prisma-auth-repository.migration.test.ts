@@ -144,7 +144,18 @@ describe("PrismaAuthRepository — M2 #82 migration fixture", () => {
   before(() => {
     if (skip) return;
     assertDisposableTestDatabase(readTestDatabaseUrl());
-    prisma = createPrismaClient(readTestDatabaseUrl());
+    // The isolated-schema client uses PostgreSQL's libpq `options=`
+    // parameter to set `search_path` at CONNECTION time. Every
+    // connection the pool acquires inherits `search_path =
+    // migration_fixture_test`, so the pooled Prisma calls cannot
+    // leak into the canonical `public` schema — even across
+    // multiple connections / concurrent operations. This is the
+    // durable fix for the previous session-scoped `SET search_path`
+    // approach which only affected the single connection that
+    // happened to run the SET.
+    const baseUrl = readTestDatabaseUrl();
+    const isolatedUrl = `${baseUrl}${baseUrl.includes("?") ? "&" : "?"}options=-c%20search_path%3D${ISOLATED_SCHEMA}`;
+    prisma = createPrismaClient(isolatedUrl);
   });
 
   after(async () => {
@@ -168,14 +179,14 @@ describe("PrismaAuthRepository — M2 #82 migration fixture", () => {
     }
 
     // 1. Create the ISOLATED schema (not `public`). Drop + recreate
-    //    to ensure a clean slate.
+    //    to ensure a clean slate. The client URL already sets
+    //    `search_path` at connection time, so every subsequent
+    //    statement (including the migration SQL replay below)
+    //    lands in the isolated schema without explicit `SET
+    //    search_path` calls. We still CREATE the schema here so
+    //    it exists before the first migration statement runs.
     await prisma.$executeRawUnsafe(`DROP SCHEMA IF EXISTS "${ISOLATED_SCHEMA}" CASCADE`);
     await prisma.$executeRawUnsafe(`CREATE SCHEMA "${ISOLATED_SCHEMA}"`);
-
-    // Set the search_path for every subsequent raw query so the
-    // migration SQL (which references unqualified table names) lands
-    // in the isolated schema, not `public`.
-    await prisma.$executeRawUnsafe(`SET search_path TO "${ISOLATED_SCHEMA}"`);
 
     // 2. Apply every migration BEFORE the M2 target migration by
     //    replaying the prior `migration.sql` files in order.
@@ -412,5 +423,34 @@ describe("PrismaAuthRepository — M2 #82 migration fixture", () => {
       1,
       "exactly one UserAccount (User C) has multiple Owner Personal memberships — counting DISTINCT users, not membership rows",
     );
+
+    // 9. The CANONICAL `public` schema must be untouched. Use a
+    //    separate connection (no search_path) to prove the shared
+    //    schema is unchanged so subsequent repository tests see
+    //    the seeded state intact. The disposable test database's
+    //    seed inserts the demo buyer (one of the seeded
+    //    UserAccounts); if the test had leaked into `public` the
+    //    demo buyer would still be present (we never modified it)
+    //    AND the seeded `personalWorkspaceId` column would NOT
+    //    exist on the seeded buyer (the canonical schema was
+    //    applied before the M2 migration that adds the column).
+    //    We assert the column IS present on the canonical
+    //    UserAccount by switching to a fresh client without the
+    //    isolated-schema search_path.
+    const publicClient = createPrismaClient(readTestDatabaseUrl());
+    try {
+      const publicColumns = await publicClient.$queryRawUnsafe<Array<{ column_name: string }>>(
+        `SELECT column_name FROM information_schema.columns
+         WHERE table_schema = 'public' AND table_name = 'user_accounts'
+           AND column_name = 'personalWorkspaceId'`,
+      );
+      assert.equal(
+        publicColumns.length,
+        1,
+        "canonical 'public' schema must still have the personalWorkspaceId column (untouched by the migration fixture)",
+      );
+    } finally {
+      await publicClient.$disconnect();
+    }
   });
 });

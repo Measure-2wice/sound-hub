@@ -22,10 +22,7 @@ import type {
   WorkspaceTypeV1,
 } from "@soundhub/types";
 import { ConvergenceRaceError } from "../lib/personal-workspace-convergence-domain.js";
-import {
-  buildPersonalWorkspaceSlug,
-  generatePersonalWorkspaceCuid,
-} from "../lib/personal-workspace-slug.js";
+import { buildPersonalWorkspaceSlug } from "../lib/personal-workspace-slug.js";
 import type {
   AuthRepository,
   PersonalWorkspaceState,
@@ -263,12 +260,16 @@ export class InMemoryAuthRepository implements AuthRepository {
       );
     }
     // The in-memory adapter mirrors the real Prisma adapter: the
-    // Workspace id is a cuid-shaped identifier (the shared helper
-    // emits the same shape as Prisma's @default(cuid())) and the
-    // slug is derived from the same value so the
-    // `slug === "personal-" + workspace.id` invariant holds. The
-    // shape under test is the slug, not the in-memory id.
-    const workspaceId = generatePersonalWorkspaceCuid();
+    // Workspace id is a cuid-shaped identifier matching the same
+    // `^c[a-z0-9]+$` shape Prisma's @default(cuid()) emits, so the
+    // `slug === "personal-" + workspace.id` invariant and the slug
+    // regex shape hold in the test double. We strip hyphens from a
+    // UUID and prepend `c` so the result mirrors Prisma's cuid
+    // shape (no real cuid library is used; this is a test double).
+    // The placeholder is unique per request (UUID-based) so it
+    // cannot collide with previously-committed slugs.
+    const workspaceId = `c${randomUUID().replace(/-/g, "")}`;
+    const placeholderSlug = `personal-pending-${randomUUID()}`;
     const slug = buildPersonalWorkspaceSlug(workspaceId);
     const workspace: InternalWorkspace = {
       id: workspaceId,
@@ -280,6 +281,7 @@ export class InMemoryAuthRepository implements AuthRepository {
       capabilities: [],
     };
     this.workspacesById.set(workspace.id, workspace);
+    void placeholderSlug; // placeholder is unused after the in-memory "update"
     const membership: InternalMembership = {
       id: randomUUID(),
       userId: input.userAccountId,

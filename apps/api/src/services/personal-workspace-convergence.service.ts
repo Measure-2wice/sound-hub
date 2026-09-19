@@ -64,13 +64,10 @@ import type { AuthRepository, PersonalWorkspaceState } from "../auth-repository/
 import { ConvergenceRaceError } from "../lib/personal-workspace-convergence-domain.js";
 import type { ConvergenceKind } from "../lib/personal-workspace-convergence-domain.js";
 
-// Re-export for callers (tests, the authentication service) that
-// imported these symbols from this module before they moved to the
-// shared domain module. The internal implementation now lives below
-// both layers so the repository and the service never import from
-// each other.
-export { ConvergenceRaceError };
-export type { ConvergenceKind };
+// The shared domain types live in `personal-workspace-convergence-domain.ts`.
+// Consumers (tests, the authentication service) import them directly
+// from there — there is no compatibility facade re-exported from this
+// module. The convergence service uses them internally only.
 
 export interface PersonalWorkspaceConvergenceServiceDeps {
   readonly authRepository: AuthRepository;

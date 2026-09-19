@@ -11,10 +11,8 @@
 import assert from "node:assert/strict";
 import { beforeEach, describe, test } from "node:test";
 import { InMemoryAuthRepository } from "../auth-repository/in-memory-auth-repository.js";
-import {
-  ConvergenceRaceError,
-  PersonalWorkspaceConvergenceService,
-} from "./personal-workspace-convergence.service.js";
+import { ConvergenceRaceError } from "../lib/personal-workspace-convergence-domain.js";
+import { PersonalWorkspaceConvergenceService } from "./personal-workspace-convergence.service.js";
 
 const USER_ID = "user-1";
 const WORKSPACE_ID = "ws-personal";
