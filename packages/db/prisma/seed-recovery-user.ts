@@ -15,15 +15,21 @@
 // target. The leaf cannot reach a developer database or a remote
 // database even if invoked directly outside the wrapper —
 // every call path applies the same guard.
+//
+// M2 (#82 P2-001): the URL-only guard now lives in the sibling
+// `packages/db/src/test-database-url.ts` module (also re-exported
+// from `@soundhub/db`) so this leaf does NOT import from
+// `apps/api/`. The previous cycle — this seed importing
+// `apps/api/src/lib/test-database.ts`, which itself imports
+// `@soundhub/db` — broke the documented package ownership and is
+// pinned against re-introduction by
+// `packages/db/src/__boundaries__/db-import-boundaries.test.ts`.
 
 import { createHash } from "node:crypto";
 import { PrismaPg } from "@prisma/adapter-pg";
 import { deriveDeterministicSubject } from "@soundhub/types";
+import { assertDisposableTestDatabase, readTestDatabaseUrl } from "../src/test-database-url.js";
 import { PrismaClient } from "../src/generated/client.js";
-import {
-  assertDisposableTestDatabase,
-  readTestDatabaseUrl,
-} from "../../../apps/api/src/lib/test-database.js";
 
 export interface SeedRecoveryUserResult {
   readonly userAccountId: string;

@@ -24,6 +24,16 @@
 // decorative parallax. The recovery surface uses the application
 // sans for operational copy and exposes only operable sign-out /
 // recovery actions.
+//
+// Codex review (P1-003) flagged two sizing regressions on both the
+// Personal Workspace surface and the recovery surface: every
+// customer-facing paragraph was rendered at `text-sm` (14px) —
+// below the M2 UX addendum's ≥16px floor — and the sign-out
+// controls lacked the ≥44×44 mobile hit area the spec mandates.
+// This file now uses `text-base` (16px) for body copy and reserves
+// `text-xs` for metadata lines only (slug, type/status). Sign-out
+// buttons use `min-h-[44px]` and `min-w-[44px]` plus `py-3 px-4`
+// padding so the mobile touch target meets the spec at 375px.
 
 import { useState, type FormEvent } from "react";
 import Link from "next/link";
@@ -135,9 +145,9 @@ function PersonalWorkspaceSurface({
           </Card.Title>
         </Card.Header>
         <Card.Content>
-          <p className="text-sm text-gray-700">
+          <p className="text-base text-gray-700">
             Identity provider:{" "}
-            <code className="bg-gray-100 px-1 rounded">{user.identityProvider}</code>
+            <code className="bg-gray-100 px-1 rounded text-sm">{user.identityProvider}</code>
           </p>
           <button
             type="button"
@@ -145,13 +155,13 @@ function PersonalWorkspaceSurface({
               void onSignOut(e);
             }}
             disabled={signingOut}
-            className="mt-3 text-sm font-medium text-gray-600 hover:text-gray-900 disabled:opacity-50"
+            className="mt-3 inline-flex items-center justify-center min-h-[44px] min-w-[44px] py-3 px-4 text-base font-medium text-gray-700 hover:text-gray-900 disabled:opacity-50 focus:outline-none focus-visible:outline focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-blue-600 focus:ring-2 focus:ring-blue-600 rounded"
             data-testid="dashboard-sign-out"
           >
             {signingOut ? "Signing out…" : "Sign out"}
           </button>
           {signOutError && (
-            <p className="mt-2 text-sm text-red-700" data-testid="dashboard-sign-out-error">
+            <p className="mt-2 text-base text-red-700" data-testid="dashboard-sign-out-error">
               {signOutError}
             </p>
           )}
@@ -166,10 +176,10 @@ function PersonalWorkspaceSurface({
           {personalWorkspace ? (
             <PersonalWorkspaceCard workspace={personalWorkspace} />
           ) : (
-            <p className="text-sm text-gray-700">Your Personal Workspace is being prepared.</p>
+            <p className="text-base text-gray-700">Your Personal Workspace is being prepared.</p>
           )}
           <p
-            className="mt-3 text-sm text-gray-700"
+            className="mt-3 text-base text-gray-700"
             data-testid="dashboard-personal-workspace-next-action"
           >
             Choose what you want to do in SoundHub. The intent picker (Hire talent, Offer services,
@@ -184,7 +194,7 @@ function PersonalWorkspaceSurface({
 function PersonalWorkspaceCard({ workspace }: { workspace: Bg1PublicWorkspaceV1 }) {
   return (
     <div data-testid="dashboard-personal-workspace-card">
-      <p className="text-sm font-medium text-gray-900">{workspace.name}</p>
+      <p className="text-base font-medium text-gray-900">{workspace.name}</p>
       <p className="text-xs text-gray-500" data-testid="dashboard-personal-workspace-slug">
         {workspace.slug}
       </p>
@@ -232,7 +242,7 @@ function RecoverySurface({
           </Card.Title>
         </Card.Header>
         <Card.Content>
-          <p className="text-sm text-gray-700">
+          <p className="text-base text-gray-700">
             Signed in as{" "}
             <span data-testid="dashboard-recovery-email" className="font-medium">
               {user.email ?? "anonymous"}
@@ -241,7 +251,7 @@ function RecoverySurface({
             ). SoundHub did not guess, merge, or automatically select a Personal Workspace for this
             account.
           </p>
-          <p className="mt-2 text-sm text-gray-700" data-testid="dashboard-recovery-body">
+          <p className="mt-2 text-base text-gray-700" data-testid="dashboard-recovery-body">
             SoundHub couldn&apos;t safely confirm your Personal Workspace. Your existing Workspace
             memberships have not been changed.
           </p>
@@ -251,14 +261,14 @@ function RecoverySurface({
               void onSignOut(e);
             }}
             disabled={signingOut}
-            className="mt-3 text-sm font-medium text-gray-600 hover:text-gray-900 disabled:opacity-50"
+            className="mt-3 inline-flex items-center justify-center min-h-[44px] min-w-[44px] py-3 px-4 text-base font-medium text-gray-700 hover:text-gray-900 disabled:opacity-50 focus:outline-none focus-visible:outline focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-blue-600 focus:ring-2 focus:ring-blue-600 rounded"
             data-testid="dashboard-recovery-sign-out"
           >
             {signingOut ? "Signing out…" : "Sign out"}
           </button>
           {signOutError && (
             <p
-              className="mt-2 text-sm text-red-700"
+              className="mt-2 text-base text-red-700"
               data-testid="dashboard-recovery-sign-out-error"
             >
               {signOutError}
@@ -272,7 +282,7 @@ function RecoverySurface({
             <Card.Title>Your organization memberships</Card.Title>
           </Card.Header>
           <Card.Content>
-            <p className="text-sm text-gray-700">
+            <p className="text-base text-gray-700">
               Your existing organization memberships are unchanged. The memberships below remain
               available through your existing acting-Workspace flow.
             </p>
@@ -280,7 +290,7 @@ function RecoverySurface({
               {organizationMemberships.map((organization) => (
                 <li
                   key={organization.workspaceId}
-                  className="text-sm font-medium text-gray-900"
+                  className="text-base font-medium text-gray-900"
                   data-testid="dashboard-recovery-organization"
                 >
                   {organization.name}

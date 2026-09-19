@@ -23,7 +23,7 @@ import {
   assertDisposableTestDatabase,
   readTestDatabaseUrl,
   TestDatabaseGuardError,
-} from "../../../apps/api/src/lib/test-database.js";
+} from "../src/test-database-url.js";
 
 describe("seed-recovery-user leaf is fail-closed", () => {
   test("non-approved TEST_DATABASE_URL throws TestDatabaseGuardError without opening a Prisma connection", () => {

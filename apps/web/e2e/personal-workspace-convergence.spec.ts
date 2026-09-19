@@ -2,8 +2,22 @@ import { test, expect, type Page, type ViewportSize } from "@playwright/test";
 import { execFileSync } from "node:child_process";
 import { dirname, resolve as resolvePath } from "node:path";
 import { fileURLToPath } from "node:url";
+import {
+  APPROVED_TEST_DATABASE_NAME,
+  APPROVED_TEST_DATABASE_PORT,
+} from "../../api/src/lib/test-database.js";
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
+
+// Approved disposable test database target. Playwright's webServer.env
+// supplies the URL to the dev server, but the worker process does NOT
+// inherit webServer.env. Resolve one shared approved URL here so the
+// seed helper receives an explicit TEST_DATABASE_URL via execFileSync.
+// The wrapper (`scripts/db-seed-recovery-user.mjs`) re-validates the
+// URL through `resolveApprovedTestDatabaseUrl`, and the leaf
+// (`packages/db/prisma/seed-recovery-user.ts`) re-validates through
+// `assertDisposableTestDatabase` — both guards remain in force.
+const APPROVED_DISPOSABLE_TEST_DATABASE_URL = `postgresql://soundhub:password@localhost:${APPROVED_TEST_DATABASE_PORT}/${APPROVED_TEST_DATABASE_NAME}`;
 
 // M2 #82 — focused browser coverage for Personal Workspace
 // convergence (the approved plan deliverable).
@@ -63,12 +77,24 @@ function seedRecoveryUser(email: string): void {
   // works. The helper uses the approved disposable-test-database
   // guard for fail-closed targeting. `execFileSync` avoids shell
   // interpolation of the email argument.
+  //
+  // TEST_DATABASE_URL is forwarded explicitly because the Playwright
+  // worker process does NOT inherit `webServer.env`. Without an
+  // explicit URL the wrapper fails closed on `readTestDatabaseUrl`
+  // and the first recovery test fails, causing every later serial
+  // case to skip (this was the failure mode Codex review P1-001
+  // flagged). Both guards remain in force:
+  //   - wrapper: `resolveApprovedTestDatabaseUrl()` validates the URL
+  //   - leaf:    `assertDisposableTestDatabase()` validates the URL
   const repoRoot = resolvePath(__dirname, "..", "..", "..");
   const scriptPath = resolvePath(repoRoot, "scripts", "db-seed-recovery-user.mjs");
   const tsxBin = resolvePath(repoRoot, "apps", "api", "node_modules", ".bin", "tsx");
   execFileSync(tsxBin, [scriptPath, email], {
     stdio: "pipe",
-    env: process.env,
+    env: {
+      ...process.env,
+      TEST_DATABASE_URL: process.env.TEST_DATABASE_URL ?? APPROVED_DISPOSABLE_TEST_DATABASE_URL,
+    },
   });
 }
 
@@ -227,11 +253,19 @@ test("sequential Tab order reaches every meaningful interactive element on the P
   await signInFresh(page, email);
   await page.locator("body").click({ position: { x: 0, y: 0 } });
 
-  // Collect the test-ids of every focusable meaningful interactive
-  // element the dashboard ships. The order in which they appear
-  // in document order IS the order Tab reaches them when no
-  // explicit tabindex is set.
-  const interactiveTestIds = ["dashboard-user-email", "dashboard-sign-out"];
+  // Collect the test-ids of every NATIVE interactive element the
+  // dashboard ships. The order in which they appear in document
+  // order IS the order Tab reaches them when no explicit tabindex
+  // is set. Codex review (P1-002) flagged that the previous list
+  // included `dashboard-user-email`, which is attached to a
+  // Card.Title rendered as a non-focusable <h3>. Real keyboard
+  // navigation can never focus it; the heading is a label, not a
+  // control. The Personal Workspace dashboard currently exposes
+  // a single interactive control — the sign-out button — so the
+  // assertion below covers the only meaningful Tab target. If a
+  // future surface adds a second natively-focusable control, add
+  // its testid to this list in document order.
+  const interactiveTestIds = ["dashboard-sign-out"];
   for (const id of interactiveTestIds) {
     // Tab forward until the element is the active element or
     // we've pressed Tab too many times (defensive upper bound).
@@ -298,43 +332,82 @@ test("body text on the recovery surface meets the ≥16px minimum", async ({ pag
   expect(px).toBeGreaterThanOrEqual(16);
 });
 
-test("Personal Workspace dashboard reflows cleanly at all three required viewport widths", async ({
-  browser,
-}) => {
-  // AC14 / AC15 (responsive coverage): the recovery viewport
-  // loop above covers the recovery surface. This loop covers the
-  // Personal Workspace dashboard so a regression that breaks
-  // either surface is caught.
-  const ctx = await browser.newContext({ viewport: { width: 375, height: 720 } });
-  const page = await ctx.newPage();
-  try {
-    const email = `${FRESH_EMAIL_PREFIX}responsive-pw-${Date.now()}@example.test`;
-    await signInFresh(page, email);
-    const scrollWidth = await page.evaluate(() => document.documentElement.scrollWidth);
-    expect(scrollWidth).toBeLessThanOrEqual(376);
-    // Body text on the converged dashboard also meets the 16px
-    // floor.
-    const card = page.getByTestId("dashboard-personal-workspace-card");
-    const cardTextFontSize = await card.evaluate((el) => window.getComputedStyle(el).fontSize);
-    expect(parseFloat(cardTextFontSize)).toBeGreaterThanOrEqual(16);
-  } finally {
-    await ctx.close();
-  }
-});
+for (const { name, size } of VIEWPORTS) {
+  test(`Personal Workspace dashboard reflows cleanly at ${name} viewport without horizontal overflow`, async ({
+    browser,
+  }) => {
+    // AC14 / AC15 (responsive coverage): the recovery viewport
+    // loop above covers the recovery surface. This loop covers the
+    // Personal Workspace dashboard at the same three widths (375 /
+    // 768 / 1280) so a regression that breaks either surface at any
+    // required viewport is caught (Codex review P1-004).
+    const ctx = await browser.newContext({ viewport: size });
+    const page = await ctx.newPage();
+    try {
+      const email = `${FRESH_EMAIL_PREFIX}responsive-pw-${name}-${Date.now()}@example.test`;
+      await signInFresh(page, email);
+      const scrollWidth = await page.evaluate(() => document.documentElement.scrollWidth);
+      // Allow a single-pixel rounding tolerance for sub-pixel layout.
+      expect(scrollWidth).toBeLessThanOrEqual(size.width + 1);
+      // The Personal Workspace body text on the converged dashboard
+      // also meets the 16px floor. Sample the workspace name paragraph
+      // (the actual customer-facing copy) rather than the card
+      // container, whose computed font-size can pass via inheritance
+      // even when inner text is undersized.
+      const cardName = page
+        .getByTestId("dashboard-personal-workspace-card")
+        .getByText("My Workspace", { exact: true });
+      const cardTextFontSize = await cardName.evaluate(
+        (el) => window.getComputedStyle(el).fontSize,
+      );
+      expect(parseFloat(cardTextFontSize)).toBeGreaterThanOrEqual(16);
+    } finally {
+      await ctx.close();
+    }
+  });
+}
 
-test("semantic colors are present on the recovery copy (non-default text color)", async ({
+test("semantic colors on the recovery copy fall within the approved muted-text family", async ({
   page,
 }) => {
-  // AC15 (semantic colors): the recovery body uses the
-  // application text palette — a regression to the browser default
-  // (rgb(0, 0, 0)) would indicate the design tokens regressed.
+  // AC15 (semantic colors): the recovery body uses the application
+  // text palette — a regression to the browser default would mean
+  // the design tokens regressed. Codex review (P2-002) flagged the
+  // previous assertion as too lax (any non-black color passed).
+  // This assertion pins the recovery body to the muted-text gray
+  // family Tailwind defines as `text-gray-700` (the same family
+  // the dashboard uses for every customer-facing paragraph on both
+  // the recovery surface and the Personal Workspace surface).
   const email = `${RECOVERY_EMAIL_PREFIX}semantic-${Date.now()}@example.test`;
   seedRecoveryUser(email);
   await signInFresh(page, email);
   const color = await page
     .getByTestId("dashboard-recovery-body")
     .evaluate((el) => window.getComputedStyle(el).color);
-  // Browser default is `rgb(0, 0, 0)`; the design tokens use a
-  // non-default grey (e.g., `rgb(55, 65, 81)`).
-  expect(color).not.toBe("rgb(0, 0, 0)");
+
+  // Parse the rgb(...) string into channel components so a regression
+  // to `rgb(0, 0, 0)` (browser default) or to an out-of-family hue
+  // (e.g., pure red or pure green) is caught without depending on a
+  // specific Tailwind release.
+  const rgbMatch = color.match(/^rgba?\(\s*(\d+)\s*,\s*(\d+)\s*,\s*(\d+)/);
+  expect(rgbMatch, `expected computed color to be rgb(...), got ${color}`).not.toBeNull();
+  const [, rStr, gStr, bStr] = rgbMatch!;
+  const r = Number(rStr);
+  const g = Number(gStr);
+  const b = Number(bStr);
+
+  // The recovery body uses the muted-text gray family. Each channel
+  // must satisfy the muted-text predicate: a dark neutral channel
+  // (≥ 40 — i.e., far from pure black, which is the regression we
+  // want to catch) and the channels must be roughly balanced (no
+  // pure chromatic hue) within a bounded delta. The Tailwind
+  // `text-gray-700` value `rgb(55, 65, 81)` is the canonical
+  // customer-facing paragraph color and falls well within these
+  // bounds.
+  expect(r).toBeGreaterThanOrEqual(40);
+  expect(g).toBeGreaterThanOrEqual(40);
+  expect(b).toBeGreaterThanOrEqual(40);
+  const max = Math.max(r, g, b);
+  const min = Math.min(r, g, b);
+  expect(max - min).toBeLessThanOrEqual(40); // gray family: channels balanced
 });

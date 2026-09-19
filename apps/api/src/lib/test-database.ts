@@ -7,8 +7,35 @@
 // missing, remote, the wrong port, the wrong database name, or does not
 // match the approved M1 disposable target, the guard fails closed before
 // any query is issued.
+//
+// M2 (#82 P2-001): the URL-only guard (`assertDisposableTestDatabase`,
+// `readTestDatabaseUrl`, the approved-target constants, and the
+// same-DB-name QA isolation check) now lives in `@soundhub/db` so the
+// `packages/db/prisma/*` scripts can apply the same fail-closed check
+// without reaching into apps/api (which would create a `db → api → db`
+// module cycle). This module re-exports those symbols from
+// `@soundhub/db` for every existing apps/api/* test caller and keeps
+// the API-specific concerns (Prisma client factories, manual-QA
+// validators, manual-QA URL reading) here.
+//
+// The re-exports below use `export { x as y }` so every existing
+// apps/api/* caller keeps the same symbol identity (in particular the
+// `TestDatabaseGuardError` class, so `instanceof` checks across the
+// boundary still work).
 
 import { createPrismaClient, type PrismaClient } from "@soundhub/db";
+import {
+  APPROVED_TEST_DATABASE_HOSTS as APPROVED_TEST_DATABASE_HOSTS_SRC,
+  APPROVED_TEST_DATABASE_NAME as APPROVED_TEST_DATABASE_NAME_SRC,
+  APPROVED_TEST_DATABASE_PORT as APPROVED_TEST_DATABASE_PORT_SRC,
+  APPROVED_QA_DATABASE_NAME as APPROVED_QA_DATABASE_NAME_SRC,
+  TestDatabaseGuardError,
+  assertDisposableTestDatabase,
+  assertNotQaDatabase,
+  readTestDatabaseUrl,
+  resolveApprovedTestDatabaseUrl,
+  type ApprovedTestTarget,
+} from "@soundhub/db";
 
 export interface TestDatabaseConfig {
   readonly url: string;
@@ -18,85 +45,18 @@ export interface TestDatabaseConfig {
   readonly prisma: PrismaClient;
 }
 
-// The M1 disposable test database is a hardcoded, exact target. Any
-// deviation must fail closed so the developer database or staging data
-// can never be reached by M1.1 destructive or migration commands.
-export const APPROVED_TEST_DATABASE_NAME = "soundhub_m1_test";
-export const APPROVED_TEST_DATABASE_PORT = 5433;
-export const APPROVED_TEST_DATABASE_HOSTS: ReadonlySet<string> = new Set([
-  "localhost",
-  "127.0.0.1",
-  "::1",
-]);
-
-export class TestDatabaseGuardError extends Error {
-  constructor(message: string) {
-    super(message);
-    this.name = "TestDatabaseGuardError";
-  }
-}
-
-export function readTestDatabaseUrl(): string {
-  const url = process.env.TEST_DATABASE_URL;
-  if (!url) {
-    throw new TestDatabaseGuardError(
-      "TEST_DATABASE_URL is not set; refuse to run a test-database operation without an explicit target.",
-    );
-  }
-  return url;
-}
-
-function parsePostgresUrl(url: string): URL {
-  let parsed: URL;
-  try {
-    parsed = new URL(url);
-  } catch (err) {
-    throw new TestDatabaseGuardError(
-      `TEST_DATABASE_URL is not a valid URL: ${err instanceof Error ? err.message : String(err)}`,
-    );
-  }
-  if (parsed.protocol !== "postgresql:" && parsed.protocol !== "postgres:") {
-    throw new TestDatabaseGuardError(
-      `TEST_DATABASE_URL must be a postgresql:// URL (got ${parsed.protocol})`,
-    );
-  }
-  return parsed;
-}
-
-export interface ApprovedTestTarget {
-  readonly host: string;
-  readonly port: number;
-  readonly database: string;
-}
-
-export function assertDisposableTestDatabase(url: string): ApprovedTestTarget {
-  const parsed = parsePostgresUrl(url);
-  const host = parsed.hostname;
-  const port = Number(parsed.port || 5432);
-  const database = parsed.pathname.replace(/^\/+/, "");
-
-  // Same-DB guard runs FIRST so a misconfigured QA URL surfaces
-  // the QA-specific message rather than the generic database-name
-  // mismatch.
-  assertNotQaDatabase(url);
-
-  if (!APPROVED_TEST_DATABASE_HOSTS.has(host)) {
-    throw new TestDatabaseGuardError(
-      `Refusing to use TEST_DATABASE_URL: host ${host} is not the approved local host (${[...APPROVED_TEST_DATABASE_HOSTS].join(", ")}).`,
-    );
-  }
-  if (port !== APPROVED_TEST_DATABASE_PORT) {
-    throw new TestDatabaseGuardError(
-      `Refusing to use TEST_DATABASE_URL: port ${port} must be ${APPROVED_TEST_DATABASE_PORT}.`,
-    );
-  }
-  if (database !== APPROVED_TEST_DATABASE_NAME) {
-    throw new TestDatabaseGuardError(
-      `Refusing to use TEST_DATABASE_URL: database name '${database}' must be exactly '${APPROVED_TEST_DATABASE_NAME}'.`,
-    );
-  }
-  return { host, port, database };
-}
+// Re-exports for backward compatibility. Use the `as` form so the
+// symbol identity (class instance, ReadonlySet instance, value
+// reference) is identical to the `@soundhub/db` source.
+export const APPROVED_TEST_DATABASE_NAME = APPROVED_TEST_DATABASE_NAME_SRC;
+export const APPROVED_TEST_DATABASE_PORT = APPROVED_TEST_DATABASE_PORT_SRC;
+export const APPROVED_TEST_DATABASE_HOSTS: ReadonlySet<string> = APPROVED_TEST_DATABASE_HOSTS_SRC;
+export { TestDatabaseGuardError };
+export { assertDisposableTestDatabase };
+export { assertNotQaDatabase };
+export { readTestDatabaseUrl };
+export { resolveApprovedTestDatabaseUrl };
+export type { ApprovedTestTarget };
 
 export function createTestPrismaClient(): PrismaClient {
   const url = readTestDatabaseUrl();
@@ -126,18 +86,20 @@ export function loadTestDatabaseConfig(): TestDatabaseConfig {
  * destructive test scripts read from `TEST_DATABASE_URL`
  * (default `soundhub_m1_test`). The two never share a database name.
  */
-export const APPROVED_QA_DATABASE_NAME = "soundhub_qa";
 export const APPROVED_QA_DATABASE_PORT = 5433;
-// The manual-QA database lives on the same local Compose instance as
-// the disposable test database. Only loopback hosts are accepted; a
-// remote host (even one that happens to expose a database named
-// `soundhub_qa`) is rejected so migration and seed commands cannot
-// reach an unintended remote database.
+// The manual-QA database lives on the same local Compose instance as the
+// disposable test database. Only loopback hosts are accepted; a remote
+// host (even one that happens to expose a database named `soundhub_qa`)
+// is rejected so migration and seed commands cannot reach an unintended
+// remote database.
 export const APPROVED_QA_DATABASE_HOSTS: ReadonlySet<string> = new Set([
   "localhost",
   "127.0.0.1",
   "::1",
 ]);
+// QA database name constant comes from `@soundhub/db` (mirrored here
+// as `APPROVED_QA_DATABASE_NAME` for callers that read it directly).
+export const APPROVED_QA_DATABASE_NAME: string = APPROVED_QA_DATABASE_NAME_SRC;
 
 export function readQaDatabaseUrl(): string {
   const url = process.env.QA_DATABASE_URL;
@@ -204,31 +166,23 @@ export function resolveApprovedQaDatabaseUrl(): ApprovedTestTarget & { readonly 
   return { url, ...target };
 }
 
-/**
- * Fail closed if the destructive test target is the same database
- * as the manual-QA session. The two are required to live on
- * separate databases so a repository test cannot drop tables or
- * truncate data a running dev/QA server depends on. The check is a
- * pure same-DB-name comparison; it does not compare hosts because
- * both databases run on the same local Compose network.
- */
-export function assertNotQaDatabase(url: string): void {
-  const parsed = parsePostgresUrl(url);
-  const database = parsed.pathname.replace(/^\/+/, "");
-  if (database === APPROVED_QA_DATABASE_NAME) {
+// Local WHATWG URL parser for the manual-QA validator. The
+// disposable-test-database validator's parser is private to
+// `@soundhub/db`'s module and intentionally not exported; the QA
+// validator here needs its own so the helpers stay self-contained.
+function parsePostgresUrl(url: string): URL {
+  let parsed: URL;
+  try {
+    parsed = new URL(url);
+  } catch (err) {
     throw new TestDatabaseGuardError(
-      `Refusing to use database '${database}': this is the manual-QA target, not the destructive test target. Set TEST_DATABASE_URL to '${APPROVED_TEST_DATABASE_NAME}' (or any other non-QA database) before running repository tests.`,
+      `QA_DATABASE_URL is not a valid URL: ${err instanceof Error ? err.message : String(err)}`,
     );
   }
-}
-
-/**
- * Validate and return the approved disposable test target. Use this from
- * wrapper scripts (db:test:reset, db:test:migrate, db:test:seed) so the
- * validated URL is the only one passed to the destructive child command.
- */
-export function resolveApprovedTestDatabaseUrl(): ApprovedTestTarget & { readonly url: string } {
-  const url = readTestDatabaseUrl();
-  const target = assertDisposableTestDatabase(url);
-  return { url, ...target };
+  if (parsed.protocol !== "postgresql:" && parsed.protocol !== "postgres:") {
+    throw new TestDatabaseGuardError(
+      `QA_DATABASE_URL must be a postgresql:// URL (got ${parsed.protocol})`,
+    );
+  }
+  return parsed;
 }
