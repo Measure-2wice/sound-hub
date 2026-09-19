@@ -21,6 +21,7 @@ import { createBg6FundingRouter } from "./routes/funding.js";
 import { TalentSearchService } from "./services/talent-search.service.js";
 import { AuthenticationService } from "./services/authentication.service.js";
 import { WorkspaceAuthorizationService } from "./services/workspace-authorization.service.js";
+import { PersonalWorkspaceConvergenceService } from "./services/personal-workspace-convergence.service.js";
 import { AudioSampleService } from "./services/audio-sample.service.js";
 import { MatchmakerService } from "./services/matchmaker.service.js";
 import { ProjectRequestService } from "./project-request/project-request.service.js";
@@ -154,6 +155,14 @@ export interface AppOptions {
    * from the repository.
    */
   readonly dealListService?: DealListService;
+  /**
+   * Override for the Personal Workspace convergence service
+   * (ticket #82). When supplied, the composition root does NOT
+   * construct the service from the auth repository; the override
+   * is served directly. Tests inject an in-memory-backed service
+   * (or the service with a stub repository).
+   */
+  readonly personalWorkspaceConvergenceService?: PersonalWorkspaceConvergenceService;
 }
 
 export interface BuiltApp {
@@ -172,6 +181,11 @@ export interface BuiltApp {
   readonly projectRequestService: ProjectRequestService;
   readonly dealTermsService: DealTermsService;
   readonly dealListService: DealListService;
+  /**
+   * M2 (#82): Personal Workspace convergence service. Composed at
+   * the composition root and injected into `AuthenticationService`.
+   */
+  readonly personalWorkspaceConvergenceService: PersonalWorkspaceConvergenceService;
 }
 
 export function buildApp(options: AppOptions = {}): BuiltApp {
@@ -205,8 +219,19 @@ export function buildApp(options: AppOptions = {}): BuiltApp {
       managedSmoke: options.managedSmoke,
     });
   const identityAdapter = options.identityAdapter ?? identityAdapters.active;
+  // M2 (#82): Personal Workspace convergence service. Wired into
+  // the AuthenticationService so first-auth converges atomically and
+  // recovery is surfaced via `setupState`.
+  const personalWorkspaceConvergenceService =
+    options.personalWorkspaceConvergenceService ??
+    new PersonalWorkspaceConvergenceService({ authRepository });
   const authenticationService =
-    options.authenticationService ?? new AuthenticationService({ identityAdapter, authRepository });
+    options.authenticationService ??
+    new AuthenticationService({
+      identityAdapter,
+      authRepository,
+      personalWorkspaceConvergenceService,
+    });
   const workspaceAuthorizationService =
     options.workspaceAuthorizationService ?? new WorkspaceAuthorizationService({ authRepository });
 
@@ -353,6 +378,7 @@ export function buildApp(options: AppOptions = {}): BuiltApp {
       authenticationService,
       workspaceAuthorizationService,
       authRepository,
+      allowedReturnOrigin: process.env.FRONTEND_URL ?? "http://localhost:3000",
     }),
   );
   app.use(
@@ -444,6 +470,7 @@ export function buildApp(options: AppOptions = {}): BuiltApp {
     projectRequestService,
     dealTermsService,
     dealListService,
+    personalWorkspaceConvergenceService,
   };
 }
 

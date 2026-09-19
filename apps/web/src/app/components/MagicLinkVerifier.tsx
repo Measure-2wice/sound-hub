@@ -24,10 +24,38 @@
 // reload. A failed verification throws from `verifyAndRefresh`
 // without touching session state, so the navigation cannot read
 // "signed in" for an unverified session.
+//
+// M2 (#82): the verify-token response carries a validated
+// `returnTo` field and a server-derived `setupState`. The
+// verifier applies `returnTo` when present (and only when the
+// setup is "converged" — recovery overrides the return context).
+// When `setupState === "recovery"`, the verifier routes the
+// browser to `/dashboard?recovery=1` so the dashboard renders the
+// recovery surface.
+//
+// M2 (#82) visual-QA remediation: an invalid or expired verification
+// no longer silently redirects to `/login`. The verifier now owns
+// the in-page recovery state machine:
+//
+//   - pending verification: returns its `children` (the page-level
+//     loading surface — `role="status"`).
+//   - failed verification: returns an in-page `<Alert>` recovery
+//     surface directly, REPLACING the loading surface. The two
+//     surfaces are mutually exclusive — the loading copy never sits
+//     alongside the recovery alert.
+//   - successful verification: `router.replace(...)` from the
+//     success branch; nothing on the verify/callback page renders.
+//
+// Focus behavior: when the recovery alert renders, a `useEffect`
+// moves focus to the alert's heading (via `errorHeadingRef`). This
+// supplements `role="alert"` because role-alert alone does not move
+// focus — a screen reader user can otherwise land on stale focus
+// from the loading surface.
 
-import { useEffect, type ReactNode } from "react";
+import { useEffect, useRef, useState, type ReactNode } from "react";
 import { useRouter, useSearchParams } from "next/navigation";
 import { useSession } from "./SessionProvider";
+import { Alert } from "./ui/Alert";
 
 export interface MagicLinkVerifierProps {
   readonly paramName: string;
@@ -39,6 +67,12 @@ export function MagicLinkVerifier({ paramName, children }: MagicLinkVerifierProp
   const searchParams = useSearchParams();
   const { verifyAndRefresh } = useSession();
 
+  // In-page recovery state. When set, the verifier returns the
+  // recovery Alert instead of the loading children. The two are
+  // mutually exclusive — never both rendered.
+  const [verificationError, setVerificationError] = useState<string | null>(null);
+  const errorHeadingRef = useRef<HTMLHeadingElement>(null);
+
   useEffect(() => {
     const verificationToken = searchParams.get(paramName);
     if (!verificationToken) {
@@ -48,10 +82,30 @@ export function MagicLinkVerifier({ paramName, children }: MagicLinkVerifierProp
     let cancelled = false;
     void (async () => {
       try {
-        await verifyAndRefresh({ verificationToken });
-        if (!cancelled) router.replace("/dashboard");
+        const response = await verifyAndRefresh({ verificationToken });
+        if (cancelled) return;
+        // Apply return context ONLY when the setup is converged.
+        // Recovery overrides return context so a retry does not
+        // land back at an inaccessible destination.
+        // The cast to `string` is required because `router.replace`'s
+        // parameter is typed as `__next_route_internal_types__` and
+        // we build the target from a runtime decision (returnTo
+        // path or recovery destination). The server is the
+        // authoritative validator for returnTo, so the runtime
+        // value is always a safe internal path.
+        const target: string =
+          response.user.setupState === "recovery"
+            ? "/dashboard?recovery=1"
+            : (response.returnTo ?? "/dashboard");
+        // eslint-disable-next-line @typescript-eslint/no-explicit-any
+        router.replace(target as any);
       } catch {
-        if (!cancelled) router.replace("/login");
+        // Render the in-page recovery surface in-place. The catch
+        // branch MUST NOT redirect to /dashboard, set the user, or
+        // refresh the seam — a failed verification cannot mark the
+        // user signed in. The action button inside the recovery
+        // Alert is the user opt-in path to /login.
+        if (!cancelled) setVerificationError("This sign-in link can't be used.");
       }
     })();
     return () => {
@@ -59,5 +113,35 @@ export function MagicLinkVerifier({ paramName, children }: MagicLinkVerifierProp
     };
   }, [router, searchParams, paramName, verifyAndRefresh]);
 
+  // Move focus to the recovery alert's heading when it renders so
+  // keyboard / screen-reader users land on the error summary rather
+  // than the previous focus target. role="alert" alone does not
+  // guarantee focus movement.
+  useEffect(() => {
+    if (verificationError !== null && errorHeadingRef.current !== null) {
+      errorHeadingRef.current.focus();
+    }
+  }, [verificationError]);
+
+  if (verificationError !== null) {
+    return (
+      <Alert
+        role="alert"
+        variant="recovery"
+        testId="magic-link-verifier-error"
+        title="This sign-in link can't be used."
+        headingRef={errorHeadingRef}
+        action={{
+          label: "Request a new sign-in link",
+          onClick: () => {
+            router.replace("/login");
+          },
+          testId: "magic-link-verifier-resend",
+        }}
+      >
+        The link may have expired or already been used. You can request a new one below.
+      </Alert>
+    );
+  }
   return <>{children}</>;
 }

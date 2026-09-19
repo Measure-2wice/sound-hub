@@ -20,9 +20,16 @@
 // `verificationToken` (the one-time credential from the magic-link
 // callback) — NOT the public `correlationId` — so the provider-
 // neutral seam cannot accidentally substitute one for the other.
+//
+// M2 (#82): after identity resolution, the service invokes the
+// Personal Workspace convergence service to classify and (if
+// needed) create or link the Personal Workspace + Owner membership.
+// The session is ALWAYS issued (recovery preserves identity), and
+// the public user payload carries `setupState: "converged" |
+// "recovery"`.
 
 import { randomUUID } from "node:crypto";
-import type { Bg1IdentityProviderV1, Bg1PublicUserV1 } from "@soundhub/types";
+import type { Bg1IdentityProviderV1, Bg1PublicUserV1, Bg1SetupStateV1 } from "@soundhub/types";
 import type { IdentityAdapter, SignInRequestResult } from "../identity/identity-adapter.js";
 import type {
   AuthRepository,
@@ -30,6 +37,7 @@ import type {
   SessionRecord,
 } from "../auth-repository/auth-repository.js";
 import { toPublicUser } from "../dto/public-mappers.js";
+import type { PersonalWorkspaceConvergenceService } from "./personal-workspace-convergence.service.js";
 
 // Default session lifetime for the Buildathon Golden Slice. The ticket
 // explicitly excludes production session-lifetime policy from this
@@ -56,6 +64,12 @@ export class AuthenticationError extends Error {
 export interface AuthenticationServiceDeps {
   readonly identityAdapter: IdentityAdapter;
   readonly authRepository: AuthRepository;
+  /**
+   * M2 (#82): Personal Workspace convergence service. The auth
+   * service delegates the convergence decision + orchestration to
+   * this collaborator and reads back the resulting `setupState`.
+   */
+  readonly personalWorkspaceConvergenceService: PersonalWorkspaceConvergenceService;
   /**
    * Override for `Date.now()`; tests pass a controlled clock so
    * session-lifetime assertions are deterministic.
@@ -95,12 +109,14 @@ export interface VerifySignInResult {
 export class AuthenticationService {
   private readonly identityAdapter: IdentityAdapter;
   private readonly authRepository: AuthRepository;
+  private readonly personalWorkspaceConvergenceService: PersonalWorkspaceConvergenceService;
   private readonly now: () => number;
   private readonly sessionLifetimeMs: number;
 
   constructor(deps: AuthenticationServiceDeps) {
     this.identityAdapter = deps.identityAdapter;
     this.authRepository = deps.authRepository;
+    this.personalWorkspaceConvergenceService = deps.personalWorkspaceConvergenceService;
     this.now = deps.now ?? (() => Date.now());
     this.sessionLifetimeMs = deps.sessionLifetimeMs ?? SESSION_LIFETIME_MS;
   }
@@ -121,8 +137,9 @@ export class AuthenticationService {
 
   /**
    * Verify a magic-link verification credential, find-or-create the
-   * UserAccount, and issue a server-validated session. Returns the
-   * session record (the route maps it to an HttpOnly cookie) and
+   * UserAccount, converge the Personal Workspace (or detect
+   * recovery), and issue a server-validated session. Returns
+   * the session record (the route maps it to an HttpOnly cookie) and
    * the public user view for the post-sign-in render.
    *
    * Per ticket #59 P2-001 the input field is named
@@ -131,12 +148,11 @@ export class AuthenticationService {
    * PUBLIC `correlationId` from `requestSignIn` is NOT accepted
    * here — presenting it is rejected as an unknown credential.
    *
-   * The function is structured so the verify-token call and the
-   * session creation are not transactional in PostgreSQL but the
-   * single-use verification credential + the lookup-or-create
-   * mapping give the equivalent guarantee: the same credential
-   * cannot issue two sessions, and a stale credential cannot
-   * claim an existing user.
+   * The Personal Workspace convergence service handles the create /
+   * attach / recovery classification atomically. The session is
+   * ALWAYS issued — recovery preserves identity but withholds
+   * Personal Workspace authority. The public user payload carries
+   * `setupState: "converged" | "recovery"`.
    */
   async verifySignIn(input: { readonly verificationToken: string }): Promise<VerifySignInResult> {
     const verified = await this.dispatch(() =>
@@ -155,6 +171,12 @@ export class AuthenticationService {
       providerEmail: verified.providerEmail,
     });
 
+    // M2 (#82): converge the Personal Workspace + Owner membership.
+    // The convergence service classifies and (if needed) creates /
+    // links atomically. Recovery surfaces via `setupState` on the
+    // public user payload, not via an exception here.
+    await this.convergePersonalWorkspace(mapping.userAccountId);
+
     const session = await this.authRepository.createSession({
       userAccountId: mapping.userAccountId,
       expiresAt: new Date(this.now() + this.sessionLifetimeMs),
@@ -168,9 +190,10 @@ export class AuthenticationService {
       );
     }
 
+    const setupState = await this.resolveSetupState(mapping.userAccountId);
     return {
       session,
-      publicUser: toPublicUser(publicUserView),
+      publicUser: toPublicUser(publicUserView, setupState),
     };
   }
 
@@ -184,6 +207,22 @@ export class AuthenticationService {
     const session = await this.authRepository.getActiveSession(sessionId);
     if (!session) return null;
     return this.authRepository.getPublicUser(session.userAccountId);
+  }
+
+  /**
+   * Resolve the current session + setup state. Used by `/me` so the
+   * browser can render recovery based solely on `setupState`.
+   */
+  async resolveSessionWithSetupState(
+    sessionId: string | undefined,
+  ): Promise<{ readonly user: PublicUserView; readonly setupState: Bg1SetupStateV1 } | null> {
+    if (!sessionId) return null;
+    const session = await this.authRepository.getActiveSession(sessionId);
+    if (!session) return null;
+    const view = await this.authRepository.getPublicUser(session.userAccountId);
+    if (!view) return null;
+    const setupState = await this.resolveSetupState(session.userAccountId);
+    return { user: view, setupState };
   }
 
   /**
@@ -207,6 +246,56 @@ export class AuthenticationService {
     });
     if (existing) return existing;
     return this.authRepository.createUserForIdentity(input);
+  }
+
+  /**
+   * M2 (#82): run the convergence service to classify and (if
+   * needed) create or attach the Personal Workspace + Owner
+   * membership. Recovery is observed via `setupState` on the
+   * public user; the convergence service itself is the only
+   * orchestrator and the only owner of the CAS-retry budget.
+   */
+  private async convergePersonalWorkspace(userAccountId: string): Promise<void> {
+    const kind = await this.personalWorkspaceConvergenceService.resolveConvergence({
+      userAccountId,
+    });
+    switch (kind.kind) {
+      case "converged":
+        return;
+      case "none":
+        await this.personalWorkspaceConvergenceService.createInitialConvergence({
+          userAccountId,
+        });
+        return;
+      case "attachable":
+        await this.personalWorkspaceConvergenceService.attachExistingConvergence({
+          userAccountId,
+          workspaceId: kind.workspaceId,
+        });
+        return;
+      case "recovery":
+        // Recovery preserves identity (session is still issued).
+        // The public user payload carries `setupState: "recovery"`
+        // so the browser renders the recovery surface.
+        return;
+      default: {
+        const _exhaustive: never = kind;
+        void _exhaustive;
+        return;
+      }
+    }
+  }
+
+  /**
+   * Resolve the current setup state by classifying the Personal
+   * Workspace convergence. Always returns "converged" or "recovery"
+   * (the public DTO never surfaces the internal recovery reason).
+   */
+  private async resolveSetupState(userAccountId: string): Promise<Bg1SetupStateV1> {
+    const kind = await this.personalWorkspaceConvergenceService.resolveConvergence({
+      userAccountId,
+    });
+    return kind.kind === "recovery" ? "recovery" : "converged";
   }
 
   /**

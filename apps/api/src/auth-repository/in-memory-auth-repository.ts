@@ -7,6 +7,11 @@
 // Prisma adapter is the canonical implementation and the
 // authorization behaviour under test lives in
 // `WorkspaceAuthorizationService`, not here.
+//
+// M2 #82: the in-memory adapter mirrors the Personal Workspace
+// convergence primitives. The compare-and-set UPDATE is simulated
+// with a single-threaded lock + re-read, which is sufficient for
+// unit tests.
 
 import { randomUUID } from "node:crypto";
 import type {
@@ -16,8 +21,11 @@ import type {
   WorkspaceStatusV1,
   WorkspaceTypeV1,
 } from "@soundhub/types";
+import { ConvergenceRaceError } from "../lib/personal-workspace-convergence-domain.js";
+import { buildPersonalWorkspaceSlug } from "../lib/personal-workspace-slug.js";
 import type {
   AuthRepository,
+  PersonalWorkspaceState,
   PublicUserView,
   SessionRecord,
   UserIdentityMapping,
@@ -43,11 +51,38 @@ export interface InMemoryUserSeed {
   readonly memberships: readonly InMemoryMembershipSeed[];
 }
 
+interface InternalWorkspace {
+  readonly id: string;
+  readonly slug: string;
+  readonly name: string;
+  type: WorkspaceTypeV1;
+  status: WorkspaceStatusV1;
+  ownerUserId: string;
+  capabilities: MarketplaceCapabilityV1[];
+}
+
+interface InternalMembership {
+  readonly id: string;
+  userId: string;
+  workspaceId: string;
+  role: WorkspaceMembershipRoleV1;
+  createdAt: Date;
+}
+
+interface InternalUser {
+  email: string | null;
+  personalWorkspaceId: string | null;
+  identityProvider: Bg1IdentityProviderV1;
+  identitySubject: string;
+}
+
 export class InMemoryAuthRepository implements AuthRepository {
   private readonly usersByIdentity = new Map<string, UserIdentityMapping>();
-  private readonly usersById = new Map<string, PublicUserView>();
+  private readonly usersById = new Map<string, InternalUser>();
+  private readonly workspacesById = new Map<string, InternalWorkspace>();
+  private readonly membershipsByUserWorkspace = new Map<string, InternalMembership>();
+  private readonly membershipsById = new Map<string, InternalMembership>();
   private readonly sessions = new Map<string, SessionRecord>();
-  private readonly membershipsByUserWorkspace = new Map<string, WorkspaceMembershipView>();
   private readonly nowFn: () => number;
 
   constructor(seeds: readonly InMemoryUserSeed[] = [], now: () => number = () => Date.now()) {
@@ -61,21 +96,34 @@ export class InMemoryAuthRepository implements AuthRepository {
       };
       this.usersByIdentity.set(`${seed.identityProvider}|${seed.identitySubject}`, mapping);
       this.usersById.set(seed.userAccountId, {
-        userAccountId: seed.userAccountId,
         email: seed.email ?? null,
-        displayName: seed.displayName ?? null,
+        personalWorkspaceId: null,
         identityProvider: seed.identityProvider,
-        // The internal view retains the provider subject for lookup;
-        // the public mapper in `toPublicUser` is responsible for
-        // stripping it before crossing any public DTO.
         identitySubject: seed.identitySubject,
-        workspaces: seed.memberships.map((m) => this.toMembershipView(m)),
       });
       for (const m of seed.memberships) {
+        const workspace: InternalWorkspace = {
+          id: m.workspaceId,
+          slug: m.slug,
+          name: m.name,
+          type: m.workspaceType,
+          status: m.workspaceStatus,
+          ownerUserId: seed.userAccountId,
+          capabilities: [...m.capabilities],
+        };
+        this.workspacesById.set(workspace.id, workspace);
+        const internalMembership: InternalMembership = {
+          id: randomUUID(),
+          userId: seed.userAccountId,
+          workspaceId: m.workspaceId,
+          role: m.role,
+          createdAt: new Date(this.nowFn()),
+        };
         this.membershipsByUserWorkspace.set(
           `${seed.userAccountId}|${m.workspaceId}`,
-          this.toMembershipView(m),
+          internalMembership,
         );
+        this.membershipsById.set(internalMembership.id, internalMembership);
       }
     }
   }
@@ -94,15 +142,16 @@ export class InMemoryAuthRepository implements AuthRepository {
   }): Promise<UserIdentityMapping> {
     const existing = await this.findUserByIdentity(input);
     if (existing) return existing;
-    // Application-owned verified linking (ticket #59 P1-001): when
-    // the provider surfaces an email that already maps to a known
-    // UserAccount, the new provider mapping attaches to that same
-    // UserAccount. The (provider, subject) tuple remains unique.
     let userAccountId: string | null = null;
     if (input.providerEmail) {
       for (const candidate of this.usersById.values()) {
         if (candidate.email === input.providerEmail) {
-          userAccountId = candidate.userAccountId;
+          for (const [id, u] of this.usersById.entries()) {
+            if (u === candidate) {
+              userAccountId = id;
+              break;
+            }
+          }
           break;
         }
       }
@@ -110,17 +159,11 @@ export class InMemoryAuthRepository implements AuthRepository {
     if (!userAccountId) {
       userAccountId = randomUUID();
       this.usersById.set(userAccountId, {
-        userAccountId,
         email: input.providerEmail,
-        displayName: null,
+        personalWorkspaceId: null,
         identityProvider: input.provider,
         identitySubject: input.subject,
-        workspaces: [],
       });
-    } else {
-      // Attach the new provider identity to the existing
-      // UserAccount. The existing memberships and provider list
-      // are preserved; the (provider, subject) tuple is added.
     }
     const mapping: UserIdentityMapping = {
       provider: input.provider,
@@ -133,7 +176,23 @@ export class InMemoryAuthRepository implements AuthRepository {
   }
 
   async getPublicUser(userAccountId: string): Promise<PublicUserView | null> {
-    return Promise.resolve(this.usersById.get(userAccountId) ?? null);
+    const user = this.usersById.get(userAccountId);
+    if (!user) return null;
+    const workspaces: WorkspaceMembershipView[] = [];
+    for (const membership of this.membershipsById.values()) {
+      if (membership.userId !== userAccountId) continue;
+      const workspace = this.workspacesById.get(membership.workspaceId);
+      if (!workspace) continue;
+      workspaces.push(this.toMembershipView(membership, workspace));
+    }
+    return Promise.resolve({
+      userAccountId,
+      email: user.email,
+      displayName: null,
+      identityProvider: user.identityProvider,
+      identitySubject: user.identitySubject,
+      workspaces,
+    });
   }
 
   async getActiveSession(sessionId: string): Promise<SessionRecord | null> {
@@ -169,21 +228,163 @@ export class InMemoryAuthRepository implements AuthRepository {
     userAccountId: string;
     workspaceId: string;
   }): Promise<WorkspaceMembershipView | null> {
-    return Promise.resolve(
-      this.membershipsByUserWorkspace.get(`${input.userAccountId}|${input.workspaceId}`) ?? null,
+    const membership = this.membershipsByUserWorkspace.get(
+      `${input.userAccountId}|${input.workspaceId}`,
     );
+    if (!membership) return Promise.resolve(null);
+    const workspace = this.workspacesById.get(membership.workspaceId);
+    if (!workspace) return Promise.resolve(null);
+    return Promise.resolve(this.toMembershipView(membership, workspace));
   }
 
-  private toMembershipView(m: InMemoryMembershipSeed): WorkspaceMembershipView {
+  // ---------- M2 #82: Personal Workspace convergence primitives ----------
+
+  /**
+   * Simulates the Prisma compare-and-set transaction. In a single-
+   * threaded test environment the CAS always succeeds for the first
+   * caller; the unit tests can stage a collision manually by
+   * pre-populating `personalWorkspaceId` to force the loser path.
+   */
+  async createInitialPersonalWorkspace(input: {
+    userAccountId: string;
+  }): Promise<{ workspaceId: string; slug: string }> {
+    const user = this.usersById.get(input.userAccountId);
+    if (!user) {
+      throw new Error(`InMemoryAuthRepository: unknown userAccountId=${input.userAccountId}`);
+    }
+    if (user.personalWorkspaceId !== null) {
+      // Simulate the CAS losing. The caller (convergence service)
+      // catches and retries via `findPersonalWorkspaceState`.
+      throw new ConvergenceRaceError(
+        `createInitialPersonalWorkspace: CAS lost for userAccountId=${input.userAccountId}`,
+      );
+    }
+    // The in-memory adapter mirrors the real Prisma adapter: the
+    // Workspace id is a cuid-shaped identifier matching the same
+    // `^c[a-z0-9]+$` shape Prisma's @default(cuid()) emits, so the
+    // `slug === "personal-" + workspace.id` invariant and the slug
+    // regex shape hold in the test double. We strip hyphens from a
+    // UUID and prepend `c` so the result mirrors Prisma's cuid
+    // shape (no real cuid library is used; this is a test double).
+    // The placeholder is unique per request (UUID-based) so it
+    // cannot collide with previously-committed slugs.
+    const workspaceId = `c${randomUUID().replace(/-/g, "")}`;
+    const placeholderSlug = `personal-pending-${randomUUID()}`;
+    const slug = buildPersonalWorkspaceSlug(workspaceId);
+    const workspace: InternalWorkspace = {
+      id: workspaceId,
+      slug,
+      name: "My Workspace",
+      type: "Personal",
+      status: "Active",
+      ownerUserId: input.userAccountId,
+      capabilities: [],
+    };
+    this.workspacesById.set(workspace.id, workspace);
+    void placeholderSlug; // placeholder is unused after the in-memory "update"
+    const membership: InternalMembership = {
+      id: randomUUID(),
+      userId: input.userAccountId,
+      workspaceId: workspace.id,
+      role: "Owner",
+      createdAt: new Date(this.nowFn()),
+    };
+    this.membershipsByUserWorkspace.set(`${input.userAccountId}|${workspace.id}`, membership);
+    this.membershipsById.set(membership.id, membership);
+    user.personalWorkspaceId = workspace.id;
+    return Promise.resolve({ workspaceId: workspace.id, slug });
+  }
+
+  async attachExistingPersonalWorkspace(input: {
+    userAccountId: string;
+    workspaceId: string;
+  }): Promise<void> {
+    const user = this.usersById.get(input.userAccountId);
+    if (!user) {
+      throw new Error(`InMemoryAuthRepository: unknown userAccountId=${input.userAccountId}`);
+    }
+    if (user.personalWorkspaceId !== null) {
+      throw new ConvergenceRaceError(
+        `attachExistingPersonalWorkspace: CAS lost for userAccountId=${input.userAccountId}`,
+      );
+    }
+    user.personalWorkspaceId = input.workspaceId;
+    return Promise.resolve();
+  }
+
+  async findPersonalWorkspaceState(input: {
+    userAccountId: string;
+  }): Promise<PersonalWorkspaceState> {
+    await Promise.resolve();
+    const user = this.usersById.get(input.userAccountId);
+    if (!user) {
+      return {
+        userExists: false,
+        personalWorkspaceId: null,
+        ownerPersonalMemberships: [],
+        pointedWorkspace: null,
+        membershipOnPointedWorkspace: null,
+      };
+    }
+    const ownerPersonalMemberships: { membershipId: string; workspaceId: string }[] = [];
+    for (const membership of this.membershipsById.values()) {
+      if (membership.userId !== input.userAccountId) continue;
+      if (membership.role !== "Owner") continue;
+      const workspace = this.workspacesById.get(membership.workspaceId);
+      if (!workspace) continue;
+      if (workspace.type !== "Personal") continue;
+      ownerPersonalMemberships.push({
+        membershipId: membership.id,
+        workspaceId: membership.workspaceId,
+      });
+    }
+
+    const pointerId = user.personalWorkspaceId;
+    let pointedWorkspace: PersonalWorkspaceState["pointedWorkspace"] = null;
+    let membershipOnPointedWorkspace: PersonalWorkspaceState["membershipOnPointedWorkspace"] = null;
+
+    if (pointerId !== null) {
+      const pointed = this.workspacesById.get(pointerId);
+      if (pointed) {
+        pointedWorkspace = { id: pointed.id, type: pointed.type };
+        const anyMembership = this.membershipsByUserWorkspace.get(
+          `${input.userAccountId}|${pointerId}`,
+        );
+        if (anyMembership) {
+          membershipOnPointedWorkspace = {
+            id: anyMembership.id,
+            role: anyMembership.role,
+          };
+        }
+      }
+    }
+
     return {
-      workspaceId: m.workspaceId,
-      slug: m.slug,
-      name: m.name,
-      workspaceType: m.workspaceType,
-      workspaceStatus: m.workspaceStatus,
-      capabilities: [...m.capabilities],
-      role: m.role,
-      joinedAt: new Date(this.nowFn()),
+      userExists: true,
+      personalWorkspaceId: pointerId,
+      ownerPersonalMemberships,
+      pointedWorkspace,
+      membershipOnPointedWorkspace,
+    };
+  }
+
+  async findWorkspaceSlugById(workspaceId: string): Promise<string | null> {
+    return Promise.resolve(this.workspacesById.get(workspaceId)?.slug ?? null);
+  }
+
+  private toMembershipView(
+    membership: InternalMembership,
+    workspace: InternalWorkspace,
+  ): WorkspaceMembershipView {
+    return {
+      workspaceId: workspace.id,
+      slug: workspace.slug,
+      name: workspace.name,
+      workspaceType: workspace.type,
+      workspaceStatus: workspace.status,
+      capabilities: [...workspace.capabilities],
+      role: membership.role,
+      joinedAt: membership.createdAt,
     };
   }
 }

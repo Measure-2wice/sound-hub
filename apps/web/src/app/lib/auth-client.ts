@@ -25,6 +25,22 @@ import type {
   Bg1VerifyTokenRequestV1,
   Bg1VerifyTokenResponseV1,
 } from "@soundhub/types";
+
+export type { Bg1VerifyTokenResponseV1 };
+
+/**
+ * M2 (#82): server-derived recovery state. The convergence service
+ * classifies the Personal Workspace state into "converged" or
+ * "recovery" and surfaces it on the public user payload. The
+ * browser reads `user.setupState` to decide whether to render the
+ * dashboard or the recovery surface; it NEVER infers recovery from
+ * the workspaces array.
+ */
+export interface VerifyTokenSuccess {
+  readonly status: "ok";
+  readonly user: Bg1VerifyTokenResponseV1["user"];
+  readonly returnTo: string | null;
+}
 import {
   bg1MagicLinkResponseV1Schema,
   bg1SessionInfoV1Schema,
@@ -89,6 +105,18 @@ export async function requestMagicLink(
   return bg1MagicLinkResponseV1Schema.parse(raw);
 }
 
+/**
+ * M2 (#82): read the validated return destination from the current
+ * URL (`?return=<path>`). The server is the authoritative validator
+ * — this client helper only forwards the raw query parameter so the
+ * magic-link route can validate and set the return-context cookie.
+ */
+export function readReturnFromUrl(): string | null {
+  if (typeof window === "undefined") return null;
+  const params = new URLSearchParams(window.location.search);
+  return params.get("return");
+}
+
 export async function verifyToken(
   input: Bg1VerifyTokenRequestV1,
 ): Promise<Bg1VerifyTokenResponseV1> {
@@ -103,6 +131,15 @@ export async function verifyToken(
   }
   const raw: unknown = await response.json();
   return bg1VerifyTokenResponseV1Schema.parse(raw);
+}
+
+/**
+ * M2 (#82): read the validated `returnTo` from a verify-token
+ * response. Returns `null` when no destination was preserved
+ * (recovery override, missing cookie, invalid cookie).
+ */
+export function readReturnTo(result: Bg1VerifyTokenResponseV1): string | null {
+  return result.returnTo;
 }
 
 export async function fetchSessionInfo(): Promise<Bg1SessionInfoV1> {

@@ -174,11 +174,25 @@ model UserAccount {
   // introduces identity-only accounts (a user may sign in via a managed
   // provider without SoundHub ever having been told an email).
   email     String?  @unique
+  // M2 (#82): pointer to the Personal Workspace this human owns. The
+  // unique constraint enforces "at most one Personal Workspace per
+  // UserAccount" at the DB boundary. The compare-and-set UPDATE in
+  // PersonalWorkspaceConvergenceService is the atomic serialization
+  // point that guarantees concurrent first-auth attempts converge on
+  // the same Workspace + Owner membership without orphan rows.
+  // Nullable only because the column is added via a backfill migration;
+  // every authenticated human that completes first-auth provisioning
+  // will have this set. ON DELETE RESTRICT means a Personal Workspace
+  // cannot be detached implicitly — explicit handling is required.
+  personalWorkspaceId String?    @unique
   createdAt DateTime @default(now())
   updatedAt DateTime @updatedAt
 
   memberships             WorkspaceMembership[]
   ownedWorkspaces         Workspace[]           @relation("WorkspaceOwner")
+  // M2 (#82): reverse relation to the Personal Workspace this human
+  // owns via the `personalWorkspaceId` pointer.
+  personalWorkspace       Workspace?            @relation("UserAccountPersonalWorkspace", fields: [personalWorkspaceId], references: [id], onDelete: Restrict)
   identityProviders       IdentityProvider[]
   authSessions            AuthSession[]
   // Briefs the human authored as the buyer-side actor (BG3).
@@ -270,6 +284,13 @@ model Workspace {
   updatedAt   DateTime        @updatedAt
 
   owner                 UserAccount           @relation("WorkspaceOwner", fields: [ownerUserId], references: [id], onDelete: Restrict)
+  // M2 (#82): reverse relation. The Personal Workspace relationship
+  // is established by setting UserAccount.personalWorkspaceId (the
+  // compare-and-set UPDATE in the convergence service). This is the
+  // single source of truth for "which human owns this Personal
+  // Workspace"; the legacy `ownerUserId` column is M1.1 metadata only
+  // and never authorizes by itself (GS 5 invariant).
+  personalOwners        UserAccount[]         @relation("UserAccountPersonalWorkspace")
   memberships           WorkspaceMembership[]
   capabilities          WorkspaceCapability[]
   sellerProfile         SellerProfile?

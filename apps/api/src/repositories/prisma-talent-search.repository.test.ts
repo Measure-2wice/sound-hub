@@ -452,6 +452,17 @@ describe("PrismaTalentSearchRepository", () => {
       // seed. The seed itself is unchanged; this is purely the
       // test's cleanup ordering for the BG5-introduced table.
       await prisma.dealApprover.deleteMany({ where: { workspaceId: target.id } });
+      // M2 (#82): NULL out any `personalWorkspaceId` pointer that
+      // references this Workspace before the FK-protected delete,
+      // so the personalWorkspaceId_fkey constraint does not block
+      // teardown. This is purely the test's cleanup ordering for
+      // the M2-introduced column; the seeded pointer values are
+      // restored by the next `beforeEach` invocation via the
+      // canonical seed.
+      await prisma.userAccount.updateMany({
+        where: { personalWorkspaceId: target.id },
+        data: { personalWorkspaceId: null },
+      });
       await prisma.workspace.delete({ where: { id: target.id } });
     } finally {
       await prisma.$disconnect();

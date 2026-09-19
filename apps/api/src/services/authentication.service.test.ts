@@ -17,6 +17,7 @@
 import assert from "node:assert/strict";
 import { beforeEach, describe, test } from "node:test";
 import { AuthenticationService, AuthenticationError } from "./authentication.service.js";
+import { PersonalWorkspaceConvergenceService } from "./personal-workspace-convergence.service.js";
 import { DeterministicIdentityAdapter } from "../identity/deterministic-identity-adapter.js";
 import { InMemoryAuthRepository } from "../auth-repository/in-memory-auth-repository.js";
 
@@ -24,15 +25,20 @@ describe("AuthenticationService", () => {
   let now: number;
   let adapter: DeterministicIdentityAdapter;
   let authRepo: InMemoryAuthRepository;
+  let convergenceService: PersonalWorkspaceConvergenceService;
   let service: AuthenticationService;
 
   beforeEach(() => {
     now = 1_700_000_000_000;
     adapter = new DeterministicIdentityAdapter({ now: () => now });
     authRepo = new InMemoryAuthRepository([], () => now);
+    convergenceService = new PersonalWorkspaceConvergenceService({
+      authRepository: authRepo,
+    });
     service = new AuthenticationService({
       identityAdapter: adapter,
       authRepository: authRepo,
+      personalWorkspaceConvergenceService: convergenceService,
       now: () => now,
       sessionLifetimeMs: 60 * 60 * 1000,
     });
@@ -90,6 +96,7 @@ describe("AuthenticationService", () => {
       const localTestService = new AuthenticationService({
         identityAdapter: localTestAdapter,
         authRepository: authRepo,
+        personalWorkspaceConvergenceService: convergenceService,
         now: () => now,
       });
       const result = await localTestService.requestSignIn({ email: "buyer@example.com" });
@@ -127,7 +134,11 @@ describe("AuthenticationService", () => {
     });
     assert.equal(result.publicUser.identityProvider, "deterministic");
     assert.equal(result.publicUser.email, "buyer@example.com");
-    assert.equal(result.publicUser.workspaces.length, 0);
+    assert.equal(result.publicUser.setupState, "converged");
+    assert.equal(result.publicUser.workspaces.length, 1);
+    assert.equal(result.publicUser.workspaces[0]!.name, "My Workspace");
+    assert.equal(result.publicUser.workspaces[0]!.workspaceType, "Personal");
+    assert.equal(result.publicUser.workspaces[0]!.capabilities.length, 0);
     assert.ok(result.session.sessionId.length > 0);
     assert.equal(result.session.revokedAt, null);
   });
@@ -172,6 +183,7 @@ describe("AuthenticationService", () => {
     const brokenService = new AuthenticationService({
       identityAdapter: failingAdapter,
       authRepository: authRepo,
+      personalWorkspaceConvergenceService: convergenceService,
     });
     await assert.rejects(
       () => brokenService.verifySignIn({ verificationToken: "x" }),
