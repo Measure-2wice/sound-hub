@@ -11,19 +11,29 @@
 //
 // Running assertions against an already-migrated database is
 // INSUFFICIENT — the test must prove the migration SQL itself
-// backfills correctly. This test:
+// backfills correctly.
 //
-//   1. Opens the disposable `TEST_DATABASE_URL` (fail-closed by the
+// Isolation: this test runs in an ISOLATED PostgreSQL schema named
+// `migration_fixture_test`. Every schema object is created inside
+// that schema and dropped on teardown so the canonical `public`
+// schema (which other repository tests and the seed rely on) is
+// never touched. After this test, `pnpm test:repository` continues
+// to find the seed data intact.
+//
+// Procedure:
+//   1. Open the disposable `TEST_DATABASE_URL` (fail-closed by the
 //      test-database guard).
-//   2. Drops the public schema to start from an empty database.
-//   3. Applies every migration BEFORE the M2 migration by replaying
-//      each `migration.sql` file via `prisma.$executeRawUnsafe` in
+//   2. Drop and recreate the `migration_fixture_test` schema
+//      (isolated).
+//   3. Set `search_path` to the isolated schema and apply every
+//      migration BEFORE the M2 target migration by replaying each
+//      `migration.sql` file via `prisma.$executeRawUnsafe` in
 //      chronological order. (`prisma migrate deploy` cannot stop
 //      mid-sequence without an isolated migration set, so the
 //      supported mechanism is to replay prior SQL files directly.)
-//   4. Asserts `user_accounts.personalWorkspaceId` does not yet
-//      exist (`information_schema.columns`).
-//   5. Inserts four fixture UserAccounts in the pre-M2 state:
+//   4. Assert `user_accounts.personalWorkspaceId` does not yet
+//      exist in the isolated schema (`information_schema.columns`).
+//   5. Insert four fixture UserAccounts in the pre-M2 state:
 //        - User A: zero Owner Personal candidates → expect NULL
 //          after migration.
 //        - User B: one Owner Personal candidate → expect backfill.
@@ -31,14 +41,15 @@
 //          (recovery state — never auto-linked).
 //        - User D: Personal Workspace exists but membership role is
 //          not Owner → expect NULL per the strict rule.
-//   6. Applies the M2 migration SQL by reading the file and
-//      executing each statement via `prisma.$executeRawUnsafe`. The
-//      file contains ALTER TABLE, UPDATE, CREATE INDEX, ADD
+//   6. Apply the M2 migration SQL by reading the file and
+//      executing each statement via `prisma.$executeRawUnsafe`.
+//      The file contains ALTER TABLE, UPDATE, CREATE INDEX, ADD
 //      CONSTRAINT, and a DO $$ ... $$ block; we split on `;\n` and
 //      execute each non-empty statement.
-//   7. Asserts the resulting `personalWorkspaceId` values match the
-//      expected backfill behavior. Also asserts the unique index and
-//      foreign key now exist.
+//   7. Assert the resulting `personalWorkspaceId` values match the
+//      expected backfill behavior. Also assert the unique index
+//      and foreign key now exist in the isolated schema.
+//   8. Drop the isolated schema on teardown.
 
 /* eslint-disable @typescript-eslint/no-floating-promises */
 
@@ -51,6 +62,10 @@ import { assertDisposableTestDatabase, readTestDatabaseUrl } from "../lib/test-d
 
 const TEST_DATABASE_URL = process.env.TEST_DATABASE_URL;
 const skip = !TEST_DATABASE_URL;
+
+// ISOLATED SCHEMA — never touches `public` so other repository
+// tests that depend on the seed are unaffected.
+const ISOLATED_SCHEMA = "migration_fixture_test";
 
 const MIGRATIONS_DIR = join(
   new URL("../../../../packages/db/prisma/migrations", import.meta.url).pathname,
@@ -133,7 +148,17 @@ describe("PrismaAuthRepository — M2 #82 migration fixture", () => {
   });
 
   after(async () => {
-    if (prisma) await prisma.$disconnect();
+    if (prisma) {
+      // Tear down the isolated schema. Wrap in try/catch so a
+      // failure in the test body does not leave the schema in the
+      // database for subsequent runs.
+      try {
+        await prisma.$executeRawUnsafe(`DROP SCHEMA IF EXISTS "${ISOLATED_SCHEMA}" CASCADE`);
+      } catch {
+        /* ignore — the schema may not have been created */
+      }
+      await prisma.$disconnect();
+    }
   });
 
   test("the M2 migration backfills personalWorkspaceId strictly per the documented rule", async (t) => {
@@ -142,9 +167,15 @@ describe("PrismaAuthRepository — M2 #82 migration fixture", () => {
       return;
     }
 
-    // 1. Drop the public schema so we start from an empty database.
-    await prisma.$executeRawUnsafe("DROP SCHEMA public CASCADE");
-    await prisma.$executeRawUnsafe("CREATE SCHEMA public");
+    // 1. Create the ISOLATED schema (not `public`). Drop + recreate
+    //    to ensure a clean slate.
+    await prisma.$executeRawUnsafe(`DROP SCHEMA IF EXISTS "${ISOLATED_SCHEMA}" CASCADE`);
+    await prisma.$executeRawUnsafe(`CREATE SCHEMA "${ISOLATED_SCHEMA}"`);
+
+    // Set the search_path for every subsequent raw query so the
+    // migration SQL (which references unqualified table names) lands
+    // in the isolated schema, not `public`.
+    await prisma.$executeRawUnsafe(`SET search_path TO "${ISOLATED_SCHEMA}"`);
 
     // 2. Apply every migration BEFORE the M2 target migration by
     //    replaying the prior `migration.sql` files in order.
@@ -165,11 +196,13 @@ describe("PrismaAuthRepository — M2 #82 migration fixture", () => {
       }
     }
 
-    // 3. Verify the column does NOT yet exist on user_accounts.
+    // 3. Verify the column does NOT yet exist on user_accounts in
+    //    the isolated schema.
     const columnRows = await prisma.$queryRawUnsafe<Array<{ column_name: string }>>(
       `SELECT column_name FROM information_schema.columns
-       WHERE table_schema = 'public' AND table_name = 'user_accounts'
+       WHERE table_schema = $1 AND table_name = 'user_accounts'
          AND column_name = 'personalWorkspaceId'`,
+      ISOLATED_SCHEMA,
     );
     assert.equal(
       columnRows.length,
@@ -330,8 +363,9 @@ describe("PrismaAuthRepository — M2 #82 migration fixture", () => {
     // 7. The unique index and foreign key must now exist.
     const indexRows = await prisma.$queryRawUnsafe<Array<{ indexname: string }>>(
       `SELECT indexname FROM pg_indexes
-       WHERE schemaname = 'public' AND tablename = 'user_accounts'
+       WHERE schemaname = $1 AND tablename = 'user_accounts'
          AND indexname = 'user_accounts_personalWorkspaceId_key'`,
+      ISOLATED_SCHEMA,
     );
     assert.equal(
       indexRows.length,
@@ -341,14 +375,42 @@ describe("PrismaAuthRepository — M2 #82 migration fixture", () => {
 
     const fkRows = await prisma.$queryRawUnsafe<Array<{ constraint_name: string }>>(
       `SELECT constraint_name FROM information_schema.table_constraints
-       WHERE table_schema = 'public' AND table_name = 'user_accounts'
+       WHERE table_schema = $1 AND table_name = 'user_accounts'
          AND constraint_type = 'FOREIGN KEY'
          AND constraint_name = 'user_accounts_personalWorkspaceId_fkey'`,
+      ISOLATED_SCHEMA,
     );
     assert.equal(
       fkRows.length,
       1,
       "expected the user_accounts_personalWorkspaceId_fkey foreign key after migration",
+    );
+
+    // 8. Codex review (P2-001): the migration's operational-inventory
+    //    NOTICE block reports the count of UserAccounts with MULTIPLE
+    //    Owner Personal memberships. The corrected query counts
+    //    DISTINCT users (so a user with 2 candidates counts as 1,
+    //    not 2). Re-run the same COUNT(DISTINCT) shape here to pin
+    //    the regression: User C has 2 candidates, no other user has
+    //    multiple, so the count is 1.
+    const ambiguousCount = await prisma.$queryRawUnsafe<Array<{ count: bigint }>>(
+      `SELECT COUNT(DISTINCT m."userId") AS count
+       FROM "workspace_memberships" m
+       INNER JOIN "workspaces" w ON w."id" = m."workspaceId"
+       WHERE m."role" = 'Owner' AND w."type" = 'Personal'
+         AND EXISTS (
+           SELECT 1 FROM "workspace_memberships" m2
+           INNER JOIN "workspaces" w2 ON w2."id" = m2."workspaceId"
+           WHERE m2."userId" = m."userId"
+             AND m2."role" = 'Owner'
+             AND w2."type" = 'Personal'
+             AND m2."workspaceId" != m."workspaceId"
+         )`,
+    );
+    assert.equal(
+      Number(ambiguousCount[0]?.count ?? -1),
+      1,
+      "exactly one UserAccount (User C) has multiple Owner Personal memberships — counting DISTINCT users, not membership rows",
     );
   });
 });

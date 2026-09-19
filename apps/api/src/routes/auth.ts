@@ -69,6 +69,7 @@ import {
 import { SESSION_COOKIE, setSessionCookie, clearSessionCookie } from "../lib/session-cookie.js";
 import {
   RETURN_CONTEXT_COOKIE,
+  clearReturnContextCookie,
   readReturnContextCookie,
   resolveAllowedOrigin,
   setReturnContextCookie,
@@ -253,10 +254,7 @@ async function handleVerifyToken(
     setSessionCookie(res, session.sessionId, session.expiresAt);
     // Always clear the return-context cookie on success (recovery or
     // converged); the response carries the validated destination.
-    res.appendHeader(
-      "Set-Cookie",
-      `${RETURN_CONTEXT_COOKIE}=; Path=/; Max-Age=0; HttpOnly; SameSite=Lax`,
-    );
+    clearReturnContextCookie(res);
     const returnTo = publicUser.setupState === "recovery" ? null : validatedReturn;
     const body = bg1VerifyTokenResponseV1Schema.parse({
       ok: true,
@@ -266,12 +264,9 @@ async function handleVerifyToken(
     res.status(200).json(body);
   } catch (err) {
     // Failure: also clear the return-context cookie so a stale value
-    // never carries across sessions. Use `appendHeader` (rather than
-    // `setHeader`) so a prior session cookie is not overwritten.
-    res.appendHeader(
-      "Set-Cookie",
-      `${RETURN_CONTEXT_COOKIE}=; Path=/; Max-Age=0; HttpOnly; SameSite=Lax`,
-    );
+    // never carries across sessions. The helper uses
+    // `appendHeader` so a prior session cookie is not overwritten.
+    clearReturnContextCookie(res);
     writeAuthError(res, err, requestId, "verify-token");
   }
 }

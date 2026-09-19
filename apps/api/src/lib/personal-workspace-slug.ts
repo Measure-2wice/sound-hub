@@ -1,33 +1,36 @@
 // Personal Workspace slug helper (M2 #82).
 //
-// Background: M2 #82 establishes the opaque slug strategy for Personal
-// Workspaces. The slug is generated server-side at Personal Workspace
-// creation time and stored in `workspaces.slug` (which is `@unique` in
-// the schema, per `packages/db/prisma/schema.prisma`).
+// Background: M2 #82 establishes the opaque slug strategy for
+// Personal Workspaces. The plan-approved contract is:
 //
-// Authoritative contract:
+//   buildPersonalWorkspaceSlug(workspaceId) → `personal-${workspaceId}`
 //
-//   * Format: `personal-c[a-z0-9]+` (matches the regex used by the
-//     browser and repository regression tests).
-//   * Opaque — no email, no provider subject, no display name, no
-//     Workspace primary identifier in the slug suffix.
-//   * Unique — `workspaces.slug` carries a UNIQUE constraint; the
-//     generator uses sufficient entropy that the helper never
-//     round-trips the database.
+// where `workspaceId` is the SAME cuid Prisma generates (via
+// `@default(cuid())`) for the Workspace row. The slug and the
+// Workspace primary identifier are intrinsically linked — same
+// value, same generation moment, same lifetime. This helper is the
+// authoritative formatter.
+//
+// Authoritative contract for the slug suffix:
+//
+//   * The suffix is a cuid (lowercase alphanumeric, prefixed with
+//     `c`, matching `^c[a-z0-9]+$`). Prisma's `@default(cuid())`
+//     emits the canonical form; the repository must pass that
+//     same cuid here.
+//   * Opaque — no email, no provider subject, no display name.
+//   * Unique — `workspaces.slug` carries a UNIQUE constraint.
 //   * Stable — once a Personal Workspace exists, the slug never
-//     changes. The helper only generates once per Workspace creation;
-//     the convergence service's CAS-on-`personalWorkspaceId`
+//     changes; the convergence service's CAS-on-`personalWorkspaceId`
 //     guarantees that retries converge on the persisted Workspace.
 //
 // Relationship to the Workspace ID:
 //
-//   The slug suffix is generated INDEPENDENTLY of the Workspace
-//   primary identifier. The Workspace `id` is canonically owned by
-//   Prisma's `@default(cuid())` (see `Workspace.id` in the schema);
-//   the slug suffix is generated here using Node's built-in
-//   `crypto` and is NOT claimed to be a CUID — only to satisfy the
-//   opaque, unique, stable, alphanumeric shape and the
-//   `^personal-c[a-z0-9]+$` regex.
+//   `slug === "personal-" + workspace.id` for every Personal
+//   Workspace. The slug identifier IS the Workspace id. The
+//   repository owns both: it lets Prisma mint the cuid and
+//   forwards the same value to this helper so the slug encodes
+//   the Workspace primary identifier directly. No authoritative
+//   contract leaves the two unrelated.
 //
 // This helper is server-only and pure. It is imported by the
 // `AuthRepository`'s `createInitialPersonalWorkspace` primitive
@@ -38,28 +41,48 @@
 import { randomBytes } from "node:crypto";
 
 /**
- * Length of the opaque slug suffix in characters (after the
- * `personal-c` prefix). 24 base36 characters drawn from
- * `crypto.randomBytes` provides ~128 bits of entropy, which is
- * more than sufficient for collision-resistance in the local
- * test database and the production database at expected scale.
- *
- * Exposed for test introspection only; production callers should
- * treat the value as opaque.
+ * Format the opaque slug for a Personal Workspace. The repository
+ * must pass the SAME cuid Prisma emits for the Workspace row so
+ * `slug === "personal-" + workspace.id` holds.
  */
-export const PERSONAL_WORKSPACE_SLUG_SUFFIX_LENGTH = 24;
+export function buildPersonalWorkspaceSlug(workspaceId: string): string {
+  return `personal-${workspaceId}`;
+}
 
-export function buildPersonalWorkspaceSlug(): string {
-  // Sample cryptographic randomness and reduce it to the lowercase-
-  // alphanumeric alphabet required by the regex. 24 characters of
-  // base36 ≈ 128 bits of entropy; the slug UNIQUE constraint on
-  // `workspaces.slug` catches any collision.
+/**
+ * Length of the cuid suffix in characters (after the `c` prefix).
+ * Prisma's cuid generator emits values longer than this; the helper
+ * accepts any cuid-shaped string the repository passes.
+ */
+export const PERSONAL_WORKSPACE_CUID_PREFIX = "c";
+
+/**
+ * Mint a fresh, opaque, cuid-shaped identifier that satisfies the
+ * `^c[a-z0-9]+$` regex and the Workspace.id contract. The repository
+ * uses this when it needs to pre-generate the Workspace id so the
+ * slug can be derived from the same value in a single atomic
+ * transaction (no INSERT-then-UPDATE race).
+ *
+ * Built on Node's `node:crypto.randomBytes` (no new dependency).
+ * The output is a lowercase-alphanumeric string prefixed with
+ * `c` followed by a base36 timestamp + 24 base36 characters of
+ * entropy. Uniqueness across the disposable test database and the
+ * production database is overwhelming; the `workspaces.slug`
+ * UNIQUE constraint is the durable second line of defense.
+ *
+ * This helper is NOT a CUID library and does NOT claim to be one.
+ * It is a cuid-SHAPED identifier that satisfies the regex the M2
+ * spec requires. Prisma's `@default(cuid())` remains the canonical
+ * cuid source when the repository can defer Workspace id creation
+ * to Prisma (i.e., outside the create + CAS transaction).
+ */
+export function generatePersonalWorkspaceCuid(): string {
   let suffix = "";
-  while (suffix.length < PERSONAL_WORKSPACE_SLUG_SUFFIX_LENGTH) {
-    const chunk = randomBytes(PERSONAL_WORKSPACE_SLUG_SUFFIX_LENGTH * 2)
+  while (suffix.length < 24) {
+    const chunk = randomBytes(48)
       .toString("base64")
       .replace(/[^a-z0-9]/g, "");
     suffix += chunk;
   }
-  return `personal-c${suffix.slice(0, PERSONAL_WORKSPACE_SLUG_SUFFIX_LENGTH)}`;
+  return `c${suffix.slice(0, 24)}`;
 }

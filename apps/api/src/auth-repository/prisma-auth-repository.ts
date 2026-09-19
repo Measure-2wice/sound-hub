@@ -25,7 +25,10 @@ import type {
   WorkspaceTypeV1,
 } from "@soundhub/types";
 import { ConvergenceRaceError } from "../lib/personal-workspace-convergence-domain.js";
-import { buildPersonalWorkspaceSlug } from "../lib/personal-workspace-slug.js";
+import {
+  buildPersonalWorkspaceSlug,
+  generatePersonalWorkspaceCuid,
+} from "../lib/personal-workspace-slug.js";
 import type {
   AuthRepository,
   PersonalWorkspaceState,
@@ -237,27 +240,29 @@ export class PrismaAuthRepository implements AuthRepository {
   // ---------- M2 #82: Personal Workspace convergence primitives ----------
 
   /**
-   * First-auth path: mint an opaque slug via the server-only helper,
-   * let Prisma generate the Workspace id via `@default(cuid())`,
-   * create the Workspace + Owner Membership atomically, and
-   * compare-and-set `personalWorkspaceId`. The compare-and-set is the
-   * atomic serialization point — losing it throws
-   * `ConvergenceRaceError` so the caller can retry.
+   * First-auth path: mint a cuid-shaped Workspace id via the
+   * server-only helper, derive the slug from the SAME id (so
+   * `slug === "personal-" + workspace.id`), create the Workspace +
+   * Owner Membership atomically, and compare-and-set
+   * `personalWorkspaceId`. The compare-and-set is the atomic
+   * serialization point — losing it throws `ConvergenceRaceError`
+   * so the caller can retry.
    *
-   * The slug identifier is generated INDEPENDENTLY of the Workspace
-   * id by design. No authoritative contract asserts
-   * `slug === "personal-" + workspace.id`; only the regex shape and
-   * the opaque / unique / stable / no-leakage properties are
-   * required.
+   * The slug and the Workspace primary identifier are intrinsically
+   * linked by design: the same value serves both. The repository
+   * mints the id (so it can build the slug in the same
+   * transaction) and persists it as the Workspace id.
    */
   async createInitialPersonalWorkspace(input: {
     readonly userAccountId: string;
   }): Promise<{ readonly workspaceId: string; readonly slug: string }> {
     return this.prisma.$transaction(async (tx) => {
-      const slug = buildPersonalWorkspaceSlug();
+      const workspaceId = generatePersonalWorkspaceCuid();
+      const slug = buildPersonalWorkspaceSlug(workspaceId);
 
       const workspace = await tx.workspace.create({
         data: {
+          id: workspaceId,
           slug,
           name: "My Workspace",
           type: "Personal",

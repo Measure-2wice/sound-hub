@@ -165,10 +165,17 @@ export function setReturnContextCookie(
 /**
  * Clear the return-context cookie. Always succeeds; safe to call on
  * every verify-token response so a recovery or invalid path never
- * persists across sessions.
+ * persists across sessions. Uses `appendHeader` (not `setHeader`) so
+ * the session cookie set on the same response is preserved — the
+ * verify-token route issues both a session cookie AND this clear
+ * cookie, and Express's `setHeader("Set-Cookie", ...)` would
+ * overwrite the first one. This is the single owner of the
+ * return-context clearing serialization; the route must call it
+ * (rather than hand-build the literal) to avoid duplicating the
+ * cookie format.
  */
 export function clearReturnContextCookie(res: Response): void {
-  res.setHeader(
+  res.appendHeader(
     "Set-Cookie",
     `${RETURN_CONTEXT_COOKIE}=; Path=/; Max-Age=0; HttpOnly; SameSite=Lax`,
   );

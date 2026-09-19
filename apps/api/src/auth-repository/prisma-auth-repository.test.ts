@@ -331,11 +331,12 @@ describe("PrismaAuthRepository", () => {
     assert.equal(membership, null);
   });
 
-  test("createInitialPersonalWorkspace returns an opaque slug matching ^personal-c[a-z0-9]+$", async (t) => {
+  test("createInitialPersonalWorkspace returns an opaque slug matching ^personal-c[a-z0-9]+$ AND equals personal-<workspaceId>", async (t) => {
     // Codex review (P1-002): the slug must be opaque, lowercase
-    // alphanumeric, prefixed with `personal-c`, and free of email
-    // or provider subject fragments. The slug identifier is
-    // generated independently of the Workspace id by design.
+    // alphanumeric, prefixed with `personal-c`, free of email or
+    // provider subject fragments, AND the plan-approved invariant
+    // `slug === "personal-" + workspace.id` must hold — the slug
+    // identifier IS the Workspace id.
     if (skip || !repo || !prisma) {
       t.skip();
       return;
@@ -359,6 +360,11 @@ describe("PrismaAuthRepository", () => {
         userAccountId: freshUser.id,
       });
       assert.match(result.slug, /^personal-c[a-z0-9]+$/, "slug must match ^personal-c[a-z0-9]+$");
+      assert.equal(
+        result.slug,
+        `personal-${result.workspaceId}`,
+        "slug must equal personal-<workspaceId> per the plan-approved invariant",
+      );
       assert.equal(result.slug.includes("@"), false, "slug must not contain '@' (no email leak)");
       // Stability: a second createInitialPersonalWorkspace call on
       // the SAME UserAccount will lose the CAS (pointer is already

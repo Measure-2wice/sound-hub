@@ -275,4 +275,218 @@ describe("PersonalWorkspaceConvergenceService", () => {
     const err = new ConvergenceRaceError();
     assert.equal(err.name, "ConvergenceRaceError");
   });
+
+  // ---- All six recovery reasons are explicitly exercised so a
+  // future classifier refactor cannot silently drop one. ----
+
+  test("recovery: contradictory-personal-relationships when the pointer matches one of multiple Owner Personal memberships", async () => {
+    // Two Owner Personal memberships AND the pointer points to ONE
+    // of them — the user owns a separate Personal Workspace the
+    // pointer did not pick. This is the distinct
+    // `contradictory-personal-relationships` recovery state.
+    const contradictoryRepo = new InMemoryAuthRepository(
+      [
+        {
+          userAccountId: USER_ID,
+          email: "contradictory@example.com",
+          identityProvider: "deterministic",
+          identitySubject: "contradictory-subject",
+          memberships: [
+            {
+              workspaceId: WORKSPACE_ID,
+              slug: "personal-1",
+              name: "Personal Workspace 1",
+              workspaceType: "Personal",
+              workspaceStatus: "Active",
+              role: "Owner",
+              capabilities: [],
+            },
+            {
+              workspaceId: OTHER_PERSONAL_ID,
+              slug: "personal-2",
+              name: "Personal Workspace 2",
+              workspaceType: "Personal",
+              workspaceStatus: "Active",
+              role: "Owner",
+              capabilities: [],
+            },
+          ],
+        },
+      ],
+      () => new Date("2024-01-01T00:00:00Z").getTime(),
+    );
+    // Pre-attach so personalWorkspaceId points at WORKSPACE_ID,
+    // which is one of the two Owner Personal memberships.
+    const initService = new PersonalWorkspaceConvergenceService({
+      authRepository: contradictoryRepo,
+    });
+    await initService.attachExistingConvergence({
+      userAccountId: USER_ID,
+      workspaceId: WORKSPACE_ID,
+    });
+    const kind = await initService.resolveConvergence({ userAccountId: USER_ID });
+    assert.equal(kind.kind, "recovery");
+    if (kind.kind === "recovery") {
+      assert.equal(
+        kind.reason,
+        "contradictory-personal-relationships",
+        "pointer matching one of multiple Owner Personal memberships must emit the distinct reason",
+      );
+    }
+  });
+
+  test("recovery: pointer-workspace-missing when the pointed Workspace row is gone", async () => {
+    const repo = makeRepo();
+    const service = new PersonalWorkspaceConvergenceService({ authRepository: repo });
+    // Manually mutate the in-memory state so personalWorkspaceId
+    // points at a Workspace id that does not exist in the repo.
+    const internalUser = (
+      repo as unknown as {
+        usersById: Map<string, { personalWorkspaceId: string | null }>;
+      }
+    ).usersById.get(USER_ID);
+    if (!internalUser) throw new Error("expected seeded user");
+    internalUser.personalWorkspaceId = "ws-does-not-exist";
+    const kind = await service.resolveConvergence({ userAccountId: USER_ID });
+    assert.equal(kind.kind, "recovery");
+    if (kind.kind === "recovery") {
+      assert.equal(kind.reason, "pointer-workspace-missing");
+    }
+  });
+
+  test("recovery: pointer-not-personal when the pointed Workspace is not Personal", async () => {
+    const repo = makeRepo();
+    const service = new PersonalWorkspaceConvergenceService({ authRepository: repo });
+    // Add an Organization Workspace and point personalWorkspaceId
+    // at it. The classifier must report pointer-not-personal (the
+    // pointed Workspace exists but is not Personal).
+    const internalWorkspaces = (
+      repo as unknown as {
+        workspacesById: Map<string, { id: string; type: string }>;
+      }
+    ).workspacesById;
+    internalWorkspaces.set(ORG_WORKSPACE_ID, {
+      id: ORG_WORKSPACE_ID,
+      type: "Organization",
+    });
+    const internalUser = (
+      repo as unknown as {
+        usersById: Map<string, { personalWorkspaceId: string | null }>;
+      }
+    ).usersById.get(USER_ID);
+    if (!internalUser) throw new Error("expected seeded user");
+    internalUser.personalWorkspaceId = ORG_WORKSPACE_ID;
+    const kind = await service.resolveConvergence({ userAccountId: USER_ID });
+    assert.equal(kind.kind, "recovery");
+    if (kind.kind === "recovery") {
+      assert.equal(kind.reason, "pointer-not-personal");
+    }
+  });
+
+  test("recovery: owner-membership-missing when the pointer is set but the user has NO membership on it at all", async () => {
+    // Distinct from membership-not-owner: the pointed Workspace
+    // exists and is Personal, but the user has zero memberships on
+    // it (not even a non-Owner one). The Owner membership is
+    // therefore "missing" — there is nothing to upgrade.
+    const repo = new InMemoryAuthRepository(
+      [
+        {
+          userAccountId: USER_ID,
+          email: "no-membership@example.com",
+          identityProvider: "deterministic",
+          identitySubject: "no-membership-subject",
+          memberships: [],
+        },
+      ],
+      () => new Date("2024-01-01T00:00:00Z").getTime(),
+    );
+    // Seed a Personal Workspace the user does NOT belong to.
+    const internalWorkspaces = (
+      repo as unknown as {
+        workspacesById: Map<
+          string,
+          {
+            id: string;
+            type: string;
+            name: string;
+            slug: string;
+            status: string;
+            ownerUserId: string;
+          }
+        >;
+      }
+    ).workspacesById;
+    internalWorkspaces.set(WORKSPACE_ID, {
+      id: WORKSPACE_ID,
+      slug: "personal-orphan",
+      name: "Orphan Personal Workspace",
+      type: "Personal",
+      status: "Active",
+      ownerUserId: "someone-else",
+    });
+    const internalUser = (
+      repo as unknown as {
+        usersById: Map<string, { personalWorkspaceId: string | null }>;
+      }
+    ).usersById.get(USER_ID);
+    if (!internalUser) throw new Error("expected seeded user");
+    internalUser.personalWorkspaceId = WORKSPACE_ID;
+    const service = new PersonalWorkspaceConvergenceService({
+      authRepository: repo,
+    });
+    const kind = await service.resolveConvergence({ userAccountId: USER_ID });
+    assert.equal(kind.kind, "recovery");
+    if (kind.kind === "recovery") {
+      assert.equal(
+        kind.reason,
+        "owner-membership-missing",
+        "pointed Workspace exists and is Personal but the user has no membership on it",
+      );
+    }
+  });
+
+  test("recovery: membership-not-owner when the pointer resolves to a non-Owner membership on a Personal Workspace", async () => {
+    // Distinct from owner-membership-missing: there IS a membership
+    // on the pointed Workspace, but its role is not Owner.
+    const repo = new InMemoryAuthRepository(
+      [
+        {
+          userAccountId: USER_ID,
+          email: "not-owner@example.com",
+          identityProvider: "deterministic",
+          identitySubject: "not-owner-subject",
+          memberships: [
+            {
+              workspaceId: WORKSPACE_ID,
+              slug: "personal-as-member",
+              name: "Personal As Member",
+              workspaceType: "Personal",
+              workspaceStatus: "Active",
+              role: "Member",
+              capabilities: [],
+            },
+          ],
+        },
+      ],
+      () => new Date("2024-01-01T00:00:00Z").getTime(),
+    );
+    // Manually point at WORKSPACE_ID (which has only a Member
+    // membership). The classifier must report membership-not-owner
+    // because a membership exists but with the wrong role.
+    const internalUser = (
+      repo as unknown as {
+        usersById: Map<string, { personalWorkspaceId: string | null }>;
+      }
+    ).usersById.get(USER_ID);
+    if (!internalUser) throw new Error("expected seeded user");
+    internalUser.personalWorkspaceId = WORKSPACE_ID;
+    const service = new PersonalWorkspaceConvergenceService({
+      authRepository: repo,
+    });
+    const kind = await service.resolveConvergence({ userAccountId: USER_ID });
+    assert.equal(kind.kind, "recovery");
+    if (kind.kind === "recovery") {
+      assert.equal(kind.reason, "membership-not-owner");
+    }
+  });
 });

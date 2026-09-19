@@ -186,8 +186,14 @@ export class PersonalWorkspaceConvergenceService {
  *
  * The decision tree mirrors the M2 spec:
  *
- *   1. The user has multiple Owner Personal memberships → recovery
- *      ("multiple-personal-workspaces").
+ *   1. The user has multiple Owner Personal memberships:
+ *      - pointer is set and matches one of them → recovery
+ *        ("contradictory-personal-relationships") — the pointer
+ *        points to one Personal Workspace while the user also owns
+ *        a different Personal Workspace.
+ *      - otherwise (pointer is NULL, or pointer is set but doesn't
+ *        match any of the user's Owner Personal memberships) →
+ *        recovery ("multiple-personal-workspaces").
  *   2. The pointer is NULL:
  *      - zero Owner Personal memberships → none
  *      - exactly one Owner Personal membership → attachable
@@ -209,17 +215,34 @@ export function classifyPersonalWorkspaceState(
   }
 
   const ownerPersonalMemberships = state.ownerPersonalMemberships;
+  const pointerId = state.personalWorkspaceId;
 
-  // Recovery: multiple Owner Personal memberships.
+  // Recovery: multiple Owner Personal memberships. The sub-reason
+  // depends on whether the pointer matches one of them. When the
+  // pointer is set and matches an Owner Personal membership, the
+  // user has two Owner Personal Workspaces AND the pointer picks
+  // one of them — that is the "contradictory-personal-relationships"
+  // state. The system does not select one; it surfaces the recovery
+  // reason verbatim so ops can debug.
   if (ownerPersonalMemberships.length > 1) {
+    if (pointerId !== null) {
+      const pointerMatchesMembership = ownerPersonalMemberships.some(
+        (m) => m.workspaceId === pointerId,
+      );
+      if (pointerMatchesMembership) {
+        return {
+          kind: "recovery",
+          userAccountId,
+          reason: "contradictory-personal-relationships",
+        };
+      }
+    }
     return {
       kind: "recovery",
       userAccountId,
       reason: "multiple-personal-workspaces",
     };
   }
-
-  const pointerId = state.personalWorkspaceId;
 
   if (pointerId === null) {
     if (ownerPersonalMemberships.length === 0) {

@@ -22,7 +22,10 @@ import type {
   WorkspaceTypeV1,
 } from "@soundhub/types";
 import { ConvergenceRaceError } from "../lib/personal-workspace-convergence-domain.js";
-import { buildPersonalWorkspaceSlug } from "../lib/personal-workspace-slug.js";
+import {
+  buildPersonalWorkspaceSlug,
+  generatePersonalWorkspaceCuid,
+} from "../lib/personal-workspace-slug.js";
 import type {
   AuthRepository,
   PersonalWorkspaceState,
@@ -260,12 +263,13 @@ export class InMemoryAuthRepository implements AuthRepository {
       );
     }
     // The in-memory adapter mirrors the real Prisma adapter: the
-    // Workspace id is a UUID (a unique key for the in-memory map)
-    // and the slug is generated independently via the shared
-    // server-only helper. The shape under test is the slug, not
-    // the in-memory id.
-    const workspaceId = randomUUID();
-    const slug = buildPersonalWorkspaceSlug();
+    // Workspace id is a cuid-shaped identifier (the shared helper
+    // emits the same shape as Prisma's @default(cuid())) and the
+    // slug is derived from the same value so the
+    // `slug === "personal-" + workspace.id` invariant holds. The
+    // shape under test is the slug, not the in-memory id.
+    const workspaceId = generatePersonalWorkspaceCuid();
+    const slug = buildPersonalWorkspaceSlug(workspaceId);
     const workspace: InternalWorkspace = {
       id: workspaceId,
       slug,

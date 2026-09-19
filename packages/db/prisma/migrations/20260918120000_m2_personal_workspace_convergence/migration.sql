@@ -88,7 +88,10 @@ BEGIN
   );
 
   -- Count UserAccounts with multiple Owner Personal memberships (ambiguous).
-  SELECT COUNT(*) INTO ambiguous_count
+  -- Count DISTINCT UserAccounts so a user with two candidates contributes
+  -- one and a user with three also contributes one — counting membership
+  -- rows over-counts the affected population.
+  SELECT COUNT(DISTINCT m."userId") INTO ambiguous_count
   FROM "workspace_memberships" m
   INNER JOIN "workspaces" w ON w."id" = m."workspaceId"
   WHERE m."role" = 'Owner' AND w."type" = 'Personal'

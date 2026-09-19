@@ -34,6 +34,8 @@ import { InMemoryAuthRepository } from "../auth-repository/in-memory-auth-reposi
 import { AuthenticationService } from "../services/authentication.service.js";
 import { PersonalWorkspaceConvergenceService } from "../services/personal-workspace-convergence.service.js";
 import { WorkspaceAuthorizationService } from "../services/workspace-authorization.service.js";
+import { InMemoryDealTermsRepository } from "../deal-terms/in-memory-deal-terms.repository.js";
+import { DealTermsService } from "../deal-terms/deal-terms.service.js";
 
 const BUYER_USER_ID = "user-rc-buyer";
 const BUYER_WORKSPACE_ID = "ws-rc-buyer";
@@ -121,6 +123,16 @@ function buildTestApp(opts?: { readonly recovery?: boolean; readonly buyerSubjec
   const workspaceAuthorizationService = new WorkspaceAuthorizationService({
     authRepository: authRepo,
   });
+  // Deal boundary: the return-context authority regression test
+  // exercises the actual Deal view endpoint, so the app must carry
+  // a DealTermsService backed by an in-memory repository. Other
+  // tests in this file do not need it but they tolerate the
+  // additional wiring.
+  const dealTermsRepository = new InMemoryDealTermsRepository();
+  const dealTermsService = new DealTermsService({
+    dealTermsRepository,
+    workspaceAuthorizationService,
+  });
   const stubPrisma = new Proxy({} as never, {
     get() {
       throw new Error(
@@ -134,6 +146,7 @@ function buildTestApp(opts?: { readonly recovery?: boolean; readonly buyerSubjec
     authRepository: authRepo,
     identityAdapter: adapter,
     prismaClient: stubPrisma,
+    dealTermsService,
   });
   return { app, adapter };
 }
@@ -257,7 +270,7 @@ describe("return-context HTTP round-trip (M2 #82)", () => {
     );
   });
 
-  test("a valid Deal-detail return path is accepted by the validator but the destination's authorization still denies the user", async () => {
+  test("a valid Deal-detail return path is accepted by the validator but the Deal view endpoint denies the user", async () => {
     // The return-context validator only checks path STRUCTURE
     // (no `://`, no `..`, no backslash, same-origin canonical URL).
     // It does NOT check authority. A return path of the form
@@ -265,28 +278,22 @@ describe("return-context HTTP round-trip (M2 #82)", () => {
     // is NOT a party to that Deal.
     //
     // This test proves two things:
-    //   (a) the validator accepts `/deals/{otherUserDealId}` as a
-    //       return context (so intent is preserved);
-    //   (b) the destination's OWN authorization layer still
-    //       denies access to that Deal for the user (so return
-    //       context does NOT confer authority).
-    //
-    // We use the Deal detail endpoint's `getDeal` handler logic by
-    // exercising the existing authorization path: an authenticated
-    // user requesting a Workspace-scoped operation against a
-    // Workspace they are not a member of returns NOT_A_MEMBER
-    // (the same authority shape `WorkspaceAuthorizationService.
-    // requireDealAuthority` enforces at the Deal detail endpoint).
+    //   (a) the validator accepts `/deals/{dealId}` as a return
+    //       context (intent is preserved);
+    //   (b) the ACTUAL Deal view endpoint
+    //       (`GET /api/deals/:dealId?actingWorkspaceId=...`)
+    //       revalidates authority and denies the user with the
+    //       precise `BG5_DEAL_NOT_FOUND` envelope. The Deal
+    //       boundary — not acting-Workspace selection — is the
+    //       authorization gate the return context cannot bypass.
     const { app, adapter } = buildTestApp();
 
-    const OTHER_USER_DEAL_ID = "ws-rc-seller"; // a Workspace the
-    // buyer is NOT a member of; the Deal detail route would
-    // require membership on this Workspace to access the Deal.
+    const DEAL_ID = "deal-other-user";
 
     // (a) Validator accepts the Deal-detail return path.
     const magic = await request(app)
       .post("/api/auth/magic-link")
-      .send({ email: "rc-buyer@example.test", return: `/deals/${OTHER_USER_DEAL_ID}` })
+      .send({ email: "rc-buyer@example.test", return: `/deals/${DEAL_ID}` })
       .set("Content-Type", "application/json");
     assert.equal(magic.status, 200);
     const cookie = extractReturnContextCookie(magic.headers["set-cookie"]);
@@ -306,29 +313,32 @@ describe("return-context HTTP round-trip (M2 #82)", () => {
     assert.equal(verify.status, 200);
     assert.equal(
       verify.body.returnTo,
-      `/deals/${OTHER_USER_DEAL_ID}`,
+      `/deals/${DEAL_ID}`,
       "the response must surface the Deal-detail return path verbatim — return context preserves intent",
     );
 
-    // (b) The destination's OWN authorization layer still denies
-    // the user. Exercise the existing `acting-workspace`
-    // authorization path against the other user's Workspace —
-    // it returns AuthorizationError (NOT_A_MEMBER), proving the
-    // return context did NOT confer authority.
+    // (b) The Deal view endpoint's OWN authorization layer denies
+    // the user. We hit the actual `GET /api/deals/:dealId`
+    // endpoint — NOT acting-Workspace selection. The user names
+    // their OWN Personal Workspace as the acting context; the
+    // Deal boundary must still return BG5_DEAL_NOT_FOUND
+    // because the Deal is not visible to that Workspace. The
+    // return context preserved the intent; the Deal boundary
+    // did not grant authority.
     const sessionCookie = extractSessionCookie(verify.headers["set-cookie"]);
-    const actingWorkspace = await request(app)
-      .post("/api/auth/acting-workspace")
-      .send({ actingWorkspaceId: OTHER_USER_DEAL_ID })
-      .set("Content-Type", "application/json")
+    const dealView = await request(app)
+      .get(`/api/deals/${DEAL_ID}`)
+      .query({ actingWorkspaceId: BUYER_WORKSPACE_ID })
       .set("Cookie", sessionCookie);
     assert.notEqual(
-      actingWorkspace.status,
+      dealView.status,
       200,
-      "the destination's authorization layer MUST still deny the user — return context does not confer authority",
+      "the Deal view endpoint MUST deny the user — return context did not confer authority",
     );
-    assert.ok(
-      actingWorkspace.body?.error?.code,
-      "destination authorization must return a structured error envelope",
+    assert.equal(
+      dealView.body?.error?.code,
+      "BG5_DEAL_NOT_FOUND",
+      "the Deal boundary must surface the precise denial code",
     );
   });
 });
