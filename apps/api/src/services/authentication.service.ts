@@ -212,6 +212,17 @@ export class AuthenticationService {
   /**
    * Resolve the current session + setup state. Used by `/me` so the
    * browser can render recovery based solely on `setupState`.
+   *
+   * Tenki PR #91 hardening: the public user view is re-fetched
+   * AFTER `resolveSetupState` runs, not before. The previous
+   * implementation read the user view first, then ran the
+   * convergence service — so a user whose classification was
+   * `none` or `attachable` (no Personal Workspace pointer yet)
+   * was reported on `/me` with `setupState: "converged"` but
+   * an empty `workspaces` array. Reading the view AFTER
+   * convergence guarantees the response is internally
+   * consistent: `setupState: "converged"` implies exactly one
+   * Personal Workspace on the public user view.
    */
   async resolveSessionWithSetupState(
     sessionId: string | undefined,
@@ -219,9 +230,9 @@ export class AuthenticationService {
     if (!sessionId) return null;
     const session = await this.authRepository.getActiveSession(sessionId);
     if (!session) return null;
+    const setupState = await this.resolveSetupState(session.userAccountId);
     const view = await this.authRepository.getPublicUser(session.userAccountId);
     if (!view) return null;
-    const setupState = await this.resolveSetupState(session.userAccountId);
     return { user: view, setupState };
   }
 
@@ -288,14 +299,90 @@ export class AuthenticationService {
 
   /**
    * Resolve the current setup state by classifying the Personal
-   * Workspace convergence. Always returns "converged" or "recovery"
-   * (the public DTO never surfaces the internal recovery reason).
+   * Workspace convergence. Always returns `"converged"` or
+   * `"recovery"` (the public DTO never surfaces the internal
+   * recovery reason and never surfaces `"none"` / `"attachable"`).
+   *
+   * Tenki PR #91 hardening: the previous implementation collapsed
+   * every non-recovery kind into `"converged"`, which meant a
+   * session-holding user whose `personalWorkspaceId` pointer was
+   * NULL (a `none` or `attachable` classification) was reported
+   * as converged and the recovery surface was never shown on
+   * `/api/auth/me`. This method now runs the convergence flow
+   * before emitting `"converged"`, and handles the final
+   * classification exhaustively — no default-to-converged branch.
+   *
+   * - `converged` → public `"converged"`.
+   * - `recovery` → public `"recovery"`.
+   * - `none` → run `createInitialConvergence`, then re-classify.
+   * - `attachable` → run `attachExistingConvergence`, then
+   *   re-classify.
+   *
+   * After the flow runs, the re-classification must produce
+   * `converged` or `recovery`. Anything else (a stuck `none` /
+   * `attachable`) is a contract violation and throws — the public
+   * DTO MUST NOT be allowed to fabricate `"converged"`.
    */
   private async resolveSetupState(userAccountId: string): Promise<Bg1SetupStateV1> {
     const kind = await this.personalWorkspaceConvergenceService.resolveConvergence({
       userAccountId,
     });
-    return kind.kind === "recovery" ? "recovery" : "converged";
+    switch (kind.kind) {
+      case "converged":
+        return "converged";
+      case "recovery":
+        return "recovery";
+      case "none":
+        await this.personalWorkspaceConvergenceService.createInitialConvergence({
+          userAccountId,
+        });
+        break;
+      case "attachable":
+        await this.personalWorkspaceConvergenceService.attachExistingConvergence({
+          userAccountId,
+          workspaceId: kind.workspaceId,
+        });
+        break;
+      default: {
+        // Compile-time exhaustiveness. Reaching this branch means
+        // a new ConvergenceKind variant was added without
+        // updating this boundary; fail closed so we never emit a
+        // fabricated setupState.
+        const _exhaustive: never = kind;
+        void _exhaustive;
+        throw new AuthenticationError(
+          "Personal Workspace convergence classification produced an unrecognised variant.",
+          "AUTH_FAILED",
+        );
+      }
+    }
+    // Re-classify after the convergence flow ran. The result MUST
+    // be "converged" or "recovery" — anything else (a stuck
+    // `none` / `attachable`) is a contract violation and must
+    // NOT be silently collapsed to "converged".
+    const finalKind = await this.personalWorkspaceConvergenceService.resolveConvergence({
+      userAccountId,
+    });
+    switch (finalKind.kind) {
+      case "converged":
+        return "converged";
+      case "recovery":
+        return "recovery";
+      case "none":
+      case "attachable":
+        throw new AuthenticationError(
+          "Personal Workspace convergence could not be settled to a public state.",
+          "AUTH_FAILED",
+        );
+      default: {
+        const _exhaustive: never = finalKind;
+        void _exhaustive;
+        throw new AuthenticationError(
+          "Personal Workspace convergence produced an unrecognised variant after re-classification.",
+          "AUTH_FAILED",
+        );
+      }
+    }
   }
 
   /**

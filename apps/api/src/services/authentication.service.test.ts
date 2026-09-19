@@ -256,4 +256,149 @@ describe("AuthenticationService", () => {
     const bResult = await service.verifySignIn({ verificationToken: b.verificationToken ?? "" });
     assert.notEqual(aResult.publicUser.userAccountId, bResult.publicUser.userAccountId);
   });
+
+  // ---------- Tenki PR #91: resolveSetupState convergence boundary ----------
+  //
+  // These tests pin the new contract: `resolveSessionWithSetupState`
+  // (which feeds `/api/auth/me`) MUST NOT report
+  // `setupState: "converged"` while `personalWorkspaceId` is unset.
+  // If the convergence classification is `none` or `attachable`, the
+  // convergence flow must run before the public state is emitted.
+  // `recovery` classifications must surface as `"recovery"` directly
+  // without ever fabricating `"converged"`.
+
+  describe("resolveSetupState convergence boundary (Tenki PR #91)", () => {
+    function buildAuthService(repo: InMemoryAuthRepository): AuthenticationService {
+      const convergence = new PersonalWorkspaceConvergenceService({
+        authRepository: repo,
+      });
+      return new AuthenticationService({
+        identityAdapter: adapter,
+        authRepository: repo,
+        personalWorkspaceConvergenceService: convergence,
+        now: () => now,
+        sessionLifetimeMs: 60 * 60 * 1000,
+      });
+    }
+
+    test('reports "converged" only after convergence runs for a brand-new user with no Personal Workspace (none)', async () => {
+      const repo = new InMemoryAuthRepository([], () => now);
+      const auth = buildAuthService(repo);
+      const mapping = await repo.createUserForIdentity({
+        provider: "deterministic",
+        subject: "tenki-none-subject",
+        providerEmail: "tenki-none@example.com",
+      });
+      const session = await repo.createSession({
+        userAccountId: mapping.userAccountId,
+        expiresAt: new Date(now + 60 * 60 * 1000),
+      });
+      // Sanity: the user starts in the `none` state — pointer NULL,
+      // no Owner Personal memberships.
+      const before = await repo.findPersonalWorkspaceState({
+        userAccountId: mapping.userAccountId,
+      });
+      assert.equal(before.personalWorkspaceId, null);
+      assert.equal(before.ownerPersonalMemberships.length, 0);
+
+      const resolved = await auth.resolveSessionWithSetupState(session.sessionId);
+      assert.ok(resolved);
+      // The convergence flow must have run: setupState is
+      // "converged" AND the user now has a pointer to a Personal
+      // Workspace with one Owner membership.
+      assert.equal(resolved.setupState, "converged");
+      const after = await repo.findPersonalWorkspaceState({
+        userAccountId: mapping.userAccountId,
+      });
+      assert.notEqual(after.personalWorkspaceId, null);
+      assert.equal(after.ownerPersonalMemberships.length, 1);
+    });
+
+    test('reports "converged" after attach for a user with one Owner Personal membership but no pointer (attachable)', async () => {
+      const repo = new InMemoryAuthRepository(
+        [
+          {
+            userAccountId: "user-attachable",
+            email: "tenki-attachable@example.com",
+            identityProvider: "deterministic",
+            identitySubject: "tenki-attachable-subject",
+            memberships: [
+              {
+                workspaceId: "ws-existing-personal",
+                slug: "personal-ws-existing-personal",
+                name: "Existing Personal",
+                workspaceType: "Personal",
+                workspaceStatus: "Active",
+                role: "Owner",
+                capabilities: [],
+              },
+            ],
+          },
+        ],
+        () => now,
+      );
+      const auth = buildAuthService(repo);
+      const session = await repo.createSession({
+        userAccountId: "user-attachable",
+        expiresAt: new Date(now + 60 * 60 * 1000),
+      });
+      // Sanity: the user starts in the `attachable` state — pointer
+      // NULL, exactly one Owner Personal membership.
+      const before = await repo.findPersonalWorkspaceState({
+        userAccountId: "user-attachable",
+      });
+      assert.equal(before.personalWorkspaceId, null);
+      assert.equal(before.ownerPersonalMemberships.length, 1);
+
+      const resolved = await auth.resolveSessionWithSetupState(session.sessionId);
+      assert.ok(resolved);
+      assert.equal(resolved.setupState, "converged");
+      const after = await repo.findPersonalWorkspaceState({
+        userAccountId: "user-attachable",
+      });
+      assert.equal(after.personalWorkspaceId, "ws-existing-personal");
+    });
+
+    test('reports "recovery" when the convergence classification is recovery (multiple Owner Personal memberships)', async () => {
+      const repo = new InMemoryAuthRepository(
+        [
+          {
+            userAccountId: "user-recovery",
+            email: "tenki-recovery@example.com",
+            identityProvider: "deterministic",
+            identitySubject: "tenki-recovery-subject",
+            memberships: [
+              {
+                workspaceId: "ws-personal-a",
+                slug: "personal-ws-personal-a",
+                name: "Personal A",
+                workspaceType: "Personal",
+                workspaceStatus: "Active",
+                role: "Owner",
+                capabilities: [],
+              },
+              {
+                workspaceId: "ws-personal-b",
+                slug: "personal-ws-personal-b",
+                name: "Personal B",
+                workspaceType: "Personal",
+                workspaceStatus: "Active",
+                role: "Owner",
+                capabilities: [],
+              },
+            ],
+          },
+        ],
+        () => now,
+      );
+      const auth = buildAuthService(repo);
+      const session = await repo.createSession({
+        userAccountId: "user-recovery",
+        expiresAt: new Date(now + 60 * 60 * 1000),
+      });
+      const resolved = await auth.resolveSessionWithSetupState(session.sessionId);
+      assert.ok(resolved);
+      assert.equal(resolved.setupState, "recovery");
+    });
+  });
 });

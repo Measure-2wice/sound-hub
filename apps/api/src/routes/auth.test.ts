@@ -535,6 +535,117 @@ describe("BG1 auth routes (in-memory, deterministic adapter)", () => {
   });
 });
 
+// ---------- Tenki PR #91: /api/auth/me convergence boundary ----------
+//
+// Regression coverage for the Tenki finding on PR #91:
+// `resolveSetupState()` previously collapsed every non-recovery
+// `ConvergenceKind` into `"converged"`, so `/api/auth/me` could
+// report `setupState: "converged"` for a session-holding user
+// whose `personalWorkspaceId` pointer was NULL (a `none` state).
+//
+// This suite proves the public DTO boundary at the HTTP seam:
+// for a user whose convergence classification starts at `none`,
+// `GET /api/auth/me` MUST NOT report `setupState: "converged"`
+// until the convergence flow has actually created the canonical
+// Personal Workspace + Owner membership. The public DTO remains
+// allow-listed to only `"converged"` and `"recovery"` (asserted
+// by `bg1SessionInfoV1Schema.parse` in the route handler).
+
+describe("BG1 /api/auth/me convergence boundary (Tenki PR #91, in-memory)", () => {
+  const TENKI_EMAIL = "tenki-none-route@example.com";
+
+  function buildAppForRepo(repo: InMemoryAuthRepository): {
+    readonly app: import("express").Application;
+    readonly stubPrisma: unknown;
+  } {
+    const adapter = new DeterministicIdentityAdapter();
+    const convergence = new PersonalWorkspaceConvergenceService({
+      authRepository: repo,
+    });
+    const authenticationService = new AuthenticationService({
+      identityAdapter: adapter,
+      authRepository: repo,
+      personalWorkspaceConvergenceService: convergence,
+    });
+    const workspaceAuthorizationService = new WorkspaceAuthorizationService({
+      authRepository: repo,
+    });
+    const stubPrisma = new Proxy({} as never, {
+      get() {
+        throw new Error(
+          "Prisma client was invoked; the route tests must use the in-memory auth repository.",
+        );
+      },
+    });
+    const built = buildApp({
+      authenticationService,
+      workspaceAuthorizationService,
+      authRepository: repo,
+      identityAdapter: adapter,
+      prismaClient: stubPrisma,
+    });
+    return { app: built.app, stubPrisma };
+  }
+
+  test('GET /api/auth/me reports "converged" only after convergence actually creates a Personal Workspace for a user that started in the `none` state', async () => {
+    const repo = new InMemoryAuthRepository([], () => Date.now());
+    // Mint a user whose `personalWorkspaceId` pointer is NULL
+    // and who has no Owner Personal memberships — the `none`
+    // state. `createUserForIdentity` returns such a row.
+    const mapping = await repo.createUserForIdentity({
+      provider: "deterministic",
+      subject: "tenki-none-route-subject",
+      providerEmail: TENKI_EMAIL,
+    });
+    const tenkiUserId = mapping.userAccountId;
+    // Sanity: confirm the user really is in the `none` state
+    // (personalWorkspaceId NULL, zero Owner Personal memberships).
+    const before = await repo.findPersonalWorkspaceState({
+      userAccountId: tenkiUserId,
+    });
+    assert.equal(before.userExists, true);
+    assert.equal(before.personalWorkspaceId, null);
+    assert.equal(before.ownerPersonalMemberships.length, 0);
+
+    // Mint a session row directly. The convergence flow has
+    // NEVER run for this user; the only way `/api/auth/me` can
+    // honestly report `setupState: "converged"` is if the auth
+    // service runs the flow now.
+    const session = await repo.createSession({
+      userAccountId: tenkiUserId,
+      expiresAt: new Date(Date.now() + 60 * 60 * 1000),
+    });
+    const cookie = `soundhub_session=${encodeURIComponent(session.sessionId)}`;
+
+    const { app } = buildAppForRepo(repo);
+    const me = await request(app).get("/api/auth/me").set("Cookie", cookie);
+    assert.equal(me.status, 200);
+    assert.ok(me.body.user, "/api/auth/me MUST return the authenticated user");
+    // The public DTO is allow-listed: only "converged" or
+    // "recovery" may appear on `setupState`. After the
+    // convergence flow runs, the only legal value here is
+    // "converged" (the user is in the `none` state, not a
+    // recovery scenario).
+    assert.equal(me.body.user.setupState, "converged");
+    // The convergence flow MUST have produced a Personal
+    // Workspace + Owner membership. A response carrying
+    // `setupState: "converged"` while `workspaces.length === 0`
+    // would be a contract violation.
+    assert.ok(Array.isArray(me.body.user.workspaces));
+    assert.equal(me.body.user.workspaces.length, 1);
+    assert.equal(me.body.user.workspaces[0].workspaceType, "Personal");
+
+    // Post-condition at the repository: the pointer is now
+    // set. This is the ground-truth proof that the convergence
+    // flow ran.
+    const after = await repo.findPersonalWorkspaceState({
+      userAccountId: tenkiUserId,
+    });
+    assert.notEqual(after.personalWorkspaceId, null);
+    assert.equal(after.ownerPersonalMemberships.length, 1);
+  });
+});
+
 async function signIn(
   app: import("express").Application,
   adapter: DeterministicIdentityAdapter,
