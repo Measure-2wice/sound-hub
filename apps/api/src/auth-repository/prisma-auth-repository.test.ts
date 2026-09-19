@@ -330,4 +330,77 @@ describe("PrismaAuthRepository", () => {
     });
     assert.equal(membership, null);
   });
+
+  test("createInitialPersonalWorkspace returns an opaque slug matching ^personal-c[a-z0-9]+$", async (t) => {
+    // Codex review (P1-002): the slug must be opaque, lowercase
+    // alphanumeric, prefixed with `personal-c`, and free of email
+    // or provider subject fragments. The slug identifier is
+    // generated independently of the Workspace id by design.
+    if (skip || !repo || !prisma) {
+      t.skip();
+      return;
+    }
+    // Clean up any leftover rows from a previous run so this test
+    // is hermetic.
+    const TEST_EMAIL = "slug-shape@example.test";
+    await prisma.workspaceMembership.deleteMany({
+      where: { user: { email: TEST_EMAIL } },
+    });
+    await prisma.workspace.deleteMany({
+      where: { slug: { startsWith: "personal-c" }, owner: { email: TEST_EMAIL } },
+    });
+    await prisma.userAccount.deleteMany({ where: { email: TEST_EMAIL } });
+
+    const freshUser = await prisma.userAccount.create({
+      data: { email: TEST_EMAIL },
+    });
+    try {
+      const result = await repo.createInitialPersonalWorkspace({
+        userAccountId: freshUser.id,
+      });
+      assert.match(result.slug, /^personal-c[a-z0-9]+$/, "slug must match ^personal-c[a-z0-9]+$");
+      assert.equal(result.slug.includes("@"), false, "slug must not contain '@' (no email leak)");
+      // Stability: a second createInitialPersonalWorkspace call on
+      // the SAME UserAccount will lose the CAS (pointer is already
+      // set) and throw ConvergenceRaceError — the repository's
+      // atomic boundary. The convergence service catches this and
+      // re-reads the winner's records. We catch here too so the
+      // assertion is hermetic.
+      let second: { workspaceId: string; slug: string } | null = null;
+      try {
+        second = await repo.createInitialPersonalWorkspace({
+          userAccountId: freshUser.id,
+        });
+      } catch (err) {
+        if (!(err instanceof Error) || err.name !== "ConvergenceRaceError") {
+          throw err;
+        }
+      }
+      // Whether the second call succeeded or hit the CAS boundary,
+      // the persisted slug (the one returned from the first call)
+      // must be the canonical one the UserAccount is linked to.
+      const persisted = await prisma.workspace.findUnique({
+        where: { id: result.workspaceId },
+      });
+      assert.ok(persisted, "the persisted Workspace must still exist");
+      assert.equal(
+        persisted.slug,
+        result.slug,
+        "the persisted slug must equal the first call's slug",
+      );
+      // If the second call succeeded (e.g., pointer was reset),
+      // both must agree.
+      if (second) {
+        assert.equal(second.slug, result.slug, "second call must agree on slug");
+      }
+    } finally {
+      await prisma.userAccount.update({
+        where: { id: freshUser.id },
+        data: { personalWorkspaceId: null },
+      });
+      await prisma.workspaceMembership.deleteMany({ where: { userId: freshUser.id } });
+      await prisma.workspace.deleteMany({ where: { ownerUserId: freshUser.id } });
+      await prisma.userAccount.delete({ where: { id: freshUser.id } });
+    }
+  });
 });

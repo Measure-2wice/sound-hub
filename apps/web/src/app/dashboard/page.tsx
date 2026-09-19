@@ -215,6 +215,14 @@ function RecoverySurface({
   //   - Operable sign-out button.
   //   - NO fabricated acting-Workspace selector.
   //   - NO support-process or security guarantee claims.
+  //   - Surface truthful customer-facing Organization identity
+  //     (name only — no slug, no raw capabilities, no internal
+  //     role vocabulary) for any current Organization memberships
+  //     so the customer knows those relationships remain.
+  const organizationMemberships = user.workspaces.filter(
+    (workspace) => workspace.workspaceType === "Organization",
+  );
+
   return (
     <div className="max-w-2xl mx-auto px-6 py-12 space-y-6" data-testid="dashboard-recovery">
       <Card>
@@ -233,9 +241,9 @@ function RecoverySurface({
             ). SoundHub did not guess, merge, or automatically select a Personal Workspace for this
             account.
           </p>
-          <p className="mt-2 text-sm text-gray-700">
-            Sign out and try signing in again. If this keeps happening, the support team can review
-            your account.
+          <p className="mt-2 text-sm text-gray-700" data-testid="dashboard-recovery-body">
+            SoundHub couldn&apos;t safely confirm your Personal Workspace. Your existing Workspace
+            memberships have not been changed.
           </p>
           <button
             type="button"
@@ -258,6 +266,30 @@ function RecoverySurface({
           )}
         </Card.Content>
       </Card>
+      {organizationMemberships.length > 0 && (
+        <Card data-testid="dashboard-recovery-organizations">
+          <Card.Header>
+            <Card.Title>Your organization memberships</Card.Title>
+          </Card.Header>
+          <Card.Content>
+            <p className="text-sm text-gray-700">
+              Your existing organization memberships are unchanged. The memberships below remain
+              available through your existing acting-Workspace flow.
+            </p>
+            <ul className="mt-3 space-y-2" data-testid="dashboard-recovery-organizations-list">
+              {organizationMemberships.map((organization) => (
+                <li
+                  key={organization.workspaceId}
+                  className="text-sm font-medium text-gray-900"
+                  data-testid="dashboard-recovery-organization"
+                >
+                  {organization.name}
+                </li>
+              ))}
+            </ul>
+          </Card.Content>
+        </Card>
+      )}
     </div>
   );
 }

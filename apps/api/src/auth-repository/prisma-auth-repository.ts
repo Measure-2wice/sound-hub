@@ -16,7 +16,6 @@
 // slug.ts`) so the persistence layer is the single owner of slug
 // generation.
 
-import { randomUUID } from "node:crypto";
 import type { PrismaClient } from "@soundhub/db";
 import type {
   Bg1IdentityProviderV1,
@@ -25,11 +24,11 @@ import type {
   WorkspaceStatusV1,
   WorkspaceTypeV1,
 } from "@soundhub/types";
+import { ConvergenceRaceError } from "../lib/personal-workspace-convergence-domain.js";
 import { buildPersonalWorkspaceSlug } from "../lib/personal-workspace-slug.js";
-import { ConvergenceRaceError } from "../services/personal-workspace-convergence.service.js";
-import type { ConvergenceKind } from "../services/personal-workspace-convergence.service.js";
 import type {
   AuthRepository,
+  PersonalWorkspaceState,
   PublicUserView,
   SessionRecord,
   UserIdentityMapping,
@@ -238,30 +237,27 @@ export class PrismaAuthRepository implements AuthRepository {
   // ---------- M2 #82: Personal Workspace convergence primitives ----------
 
   /**
-   * First-auth path: pre-generate the Workspace id (UUID-based for
-   * collision resistance), derive the slug from it via the server-only
-   * helper, create the Workspace + Owner Membership atomically, and
+   * First-auth path: mint an opaque slug via the server-only helper,
+   * let Prisma generate the Workspace id via `@default(cuid())`,
+   * create the Workspace + Owner Membership atomically, and
    * compare-and-set `personalWorkspaceId`. The compare-and-set is the
    * atomic serialization point — losing it throws
    * `ConvergenceRaceError` so the caller can retry.
+   *
+   * The slug identifier is generated INDEPENDENTLY of the Workspace
+   * id by design. No authoritative contract asserts
+   * `slug === "personal-" + workspace.id`; only the regex shape and
+   * the opaque / unique / stable / no-leakage properties are
+   * required.
    */
   async createInitialPersonalWorkspace(input: {
     readonly userAccountId: string;
   }): Promise<{ readonly workspaceId: string; readonly slug: string }> {
     return this.prisma.$transaction(async (tx) => {
-      // Pre-generate the Workspace id. Using a server-side primitive
-      // (crypto.randomUUID) instead of relying on Prisma's `@default
-      // (cuid())` keeps the slug and the Workspace id intrinsically
-      // linked without depending on undocumented generator behavior.
-      // No new package is required: Node's built-in crypto provides
-      // the entropy. The slug remains opaque, unique, stable, and
-      // contains no email, provider subject, or display name.
-      const workspaceId = randomUUID();
-      const slug = buildPersonalWorkspaceSlug(workspaceId);
+      const slug = buildPersonalWorkspaceSlug();
 
       const workspace = await tx.workspace.create({
         data: {
-          id: workspaceId,
           slug,
           name: "My Workspace",
           type: "Personal",
@@ -294,7 +290,7 @@ export class PrismaAuthRepository implements AuthRepository {
 
       return { workspaceId: workspace.id, slug };
       // `membership` is consumed implicitly by the CAS; the
-      // membershipId is returned from findPersonalWorkspaceConvergence
+      // membershipId is returned from findPersonalWorkspaceState
       // when the caller re-reads.
       void membership;
     });
@@ -323,13 +319,14 @@ export class PrismaAuthRepository implements AuthRepository {
   }
 
   /**
-   * Classify the Personal Workspace state. Pure read; does not write.
-   * The classification logic enumerates the six recovery triggers
-   * explicitly so any future addition is a deliberate, named branch.
+   * Read the raw Personal Workspace state. Pure read; does not write.
+   * The repository returns the data; the convergence service
+   * classifies it. This keeps classification and persistence on
+   * different layers per the approved M2 #82 architecture.
    */
-  async findPersonalWorkspaceConvergence(input: {
+  async findPersonalWorkspaceState(input: {
     readonly userAccountId: string;
-  }): Promise<ConvergenceKind> {
+  }): Promise<PersonalWorkspaceState> {
     const user = await this.prisma.userAccount.findUnique({
       where: { id: input.userAccountId },
       include: {
@@ -341,99 +338,56 @@ export class PrismaAuthRepository implements AuthRepository {
     });
     if (!user) {
       // Caller invariant: the UserAccount exists by the time this
-      // method is called. A missing row is a programmer error
-      // surfaced as `none` so the convergence service can re-create
-      // (the auth service must have called createUserForIdentity
-      // first). Defensive: do not throw.
-      return { kind: "none", userAccountId: input.userAccountId };
-    }
-
-    const ownerPersonalMemberships = user.memberships.filter(
-      (m) => m.workspace.type === "Personal",
-    );
-
-    // Recovery: multiple Owner Personal memberships.
-    if (ownerPersonalMemberships.length > 1) {
+      // method is called. A missing row is a programmer error the
+      // service surfaces as `none` (the auth service must have
+      // called createUserForIdentity first). Defensive: do not throw.
       return {
-        kind: "recovery",
-        userAccountId: user.id,
-        reason: "multiple-personal-workspaces",
+        userExists: false,
+        personalWorkspaceId: null,
+        ownerPersonalMemberships: [],
+        pointedWorkspace: null,
+        membershipOnPointedWorkspace: null,
       };
     }
+
+    const ownerPersonalMemberships = user.memberships
+      .filter((m) => m.workspace.type === "Personal")
+      .map((m) => ({ membershipId: m.id, workspaceId: m.workspaceId }));
 
     const pointerId = user.personalWorkspaceId;
 
-    if (pointerId === null) {
-      if (ownerPersonalMemberships.length === 0) {
-        return { kind: "none", userAccountId: user.id };
-      }
-      // Exactly one Owner Personal membership; the migration left
-      // personalWorkspaceId NULL (migration backfill gap, or the row
-      // was created after the migration but before the auth service
-      // attached it). The convergence service can link it.
-      const target = ownerPersonalMemberships[0]!;
-      return {
-        kind: "attachable",
-        userAccountId: user.id,
-        workspaceId: target.workspaceId,
-      };
-    }
+    let pointedWorkspace: PersonalWorkspaceState["pointedWorkspace"] = null;
+    let membershipOnPointedWorkspace: PersonalWorkspaceState["membershipOnPointedWorkspace"] = null;
 
-    // pointerId is set. Locate the matching Owner membership.
-    const ownerMembership = ownerPersonalMemberships.find((m) => m.workspaceId === pointerId);
-
-    if (!ownerMembership) {
-      // The pointed Workspace exists (validated below) but the user
-      // does not have an Owner membership on it.
+    if (pointerId !== null) {
       const pointed = await this.prisma.workspace.findUnique({
         where: { id: pointerId },
       });
-      if (!pointed) {
-        return {
-          kind: "recovery",
-          userAccountId: user.id,
-          reason: "pointer-workspace-missing",
-        };
-      }
-      if (pointed.type !== "Personal") {
-        return {
-          kind: "recovery",
-          userAccountId: user.id,
-          reason: "pointer-not-personal",
-        };
-      }
-      // Pointer exists, is Personal, but the Owner membership is
-      // absent. Could be a membership-with-different-role case, in
-      // which case we look for a non-Owner membership on the same
-      // (user, workspace) pair before reporting `membership-not-owner`.
-      const anyMembership = await this.prisma.workspaceMembership.findUnique({
-        where: {
-          userId_workspaceId: {
-            userId: user.id,
-            workspaceId: pointerId,
+      if (pointed) {
+        pointedWorkspace = { id: pointed.id, type: pointed.type };
+        const anyMembership = await this.prisma.workspaceMembership.findUnique({
+          where: {
+            userId_workspaceId: {
+              userId: user.id,
+              workspaceId: pointerId,
+            },
           },
-        },
-      });
-      if (anyMembership && anyMembership.role !== "Owner") {
-        return {
-          kind: "recovery",
-          userAccountId: user.id,
-          reason: "membership-not-owner",
-        };
+        });
+        if (anyMembership) {
+          membershipOnPointedWorkspace = {
+            id: anyMembership.id,
+            role: anyMembership.role,
+          };
+        }
       }
-      return {
-        kind: "recovery",
-        userAccountId: user.id,
-        reason: "owner-membership-missing",
-      };
     }
 
-    // The user has an Owner membership on the pointed Personal
-    // Workspace. Converged.
     return {
-      kind: "converged",
-      workspaceId: ownerMembership.workspaceId,
-      membershipId: ownerMembership.id,
+      userExists: true,
+      personalWorkspaceId: pointerId,
+      ownerPersonalMemberships,
+      pointedWorkspace,
+      membershipOnPointedWorkspace,
     };
   }
 

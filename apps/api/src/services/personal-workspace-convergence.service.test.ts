@@ -116,8 +116,10 @@ describe("PersonalWorkspaceConvergenceService", () => {
       userAccountId: "user-fresh",
     });
     assert.ok(workspaceId);
-    assert.match(slug, /^personal-[a-zA-Z0-9-]+$/);
-    // Slug contains no @ (no email) and no provider subject fragment.
+    // The slug is opaque, stable, lowercase-alphanumeric, and
+    // prefixed with `personal-c`. No email or provider subject
+    // fragment may appear.
+    assert.match(slug, /^personal-c[a-z0-9]+$/);
     assert.equal(slug.includes("@"), false);
     const kind = await freshService.resolveConvergence({
       userAccountId: "user-fresh",

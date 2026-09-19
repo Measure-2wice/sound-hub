@@ -21,11 +21,11 @@ import type {
   WorkspaceStatusV1,
   WorkspaceTypeV1,
 } from "@soundhub/types";
+import { ConvergenceRaceError } from "../lib/personal-workspace-convergence-domain.js";
 import { buildPersonalWorkspaceSlug } from "../lib/personal-workspace-slug.js";
-import { ConvergenceRaceError } from "../services/personal-workspace-convergence.service.js";
-import type { ConvergenceKind } from "../services/personal-workspace-convergence.service.js";
 import type {
   AuthRepository,
+  PersonalWorkspaceState,
   PublicUserView,
   SessionRecord,
   UserIdentityMapping,
@@ -254,13 +254,18 @@ export class InMemoryAuthRepository implements AuthRepository {
     }
     if (user.personalWorkspaceId !== null) {
       // Simulate the CAS losing. The caller (convergence service)
-      // catches and retries via `findPersonalWorkspaceConvergence`.
+      // catches and retries via `findPersonalWorkspaceState`.
       throw new ConvergenceRaceError(
         `createInitialPersonalWorkspace: CAS lost for userAccountId=${input.userAccountId}`,
       );
     }
+    // The in-memory adapter mirrors the real Prisma adapter: the
+    // Workspace id is a UUID (a unique key for the in-memory map)
+    // and the slug is generated independently via the shared
+    // server-only helper. The shape under test is the slug, not
+    // the in-memory id.
     const workspaceId = randomUUID();
-    const slug = buildPersonalWorkspaceSlug(workspaceId);
+    const slug = buildPersonalWorkspaceSlug();
     const workspace: InternalWorkspace = {
       id: workspaceId,
       slug,
@@ -301,79 +306,59 @@ export class InMemoryAuthRepository implements AuthRepository {
     return Promise.resolve();
   }
 
-  async findPersonalWorkspaceConvergence(input: {
+  async findPersonalWorkspaceState(input: {
     userAccountId: string;
-  }): Promise<ConvergenceKind> {
+  }): Promise<PersonalWorkspaceState> {
     await Promise.resolve();
     const user = this.usersById.get(input.userAccountId);
     if (!user) {
-      return { kind: "none", userAccountId: input.userAccountId };
+      return {
+        userExists: false,
+        personalWorkspaceId: null,
+        ownerPersonalMemberships: [],
+        pointedWorkspace: null,
+        membershipOnPointedWorkspace: null,
+      };
     }
-    const ownerPersonalMemberships: InternalMembership[] = [];
+    const ownerPersonalMemberships: { membershipId: string; workspaceId: string }[] = [];
     for (const membership of this.membershipsById.values()) {
       if (membership.userId !== input.userAccountId) continue;
       if (membership.role !== "Owner") continue;
       const workspace = this.workspacesById.get(membership.workspaceId);
       if (!workspace) continue;
       if (workspace.type !== "Personal") continue;
-      ownerPersonalMemberships.push(membership);
+      ownerPersonalMemberships.push({
+        membershipId: membership.id,
+        workspaceId: membership.workspaceId,
+      });
     }
-    if (ownerPersonalMemberships.length > 1) {
-      return {
-        kind: "recovery",
-        userAccountId: input.userAccountId,
-        reason: "multiple-personal-workspaces",
-      };
-    }
+
     const pointerId = user.personalWorkspaceId;
-    if (pointerId === null) {
-      if (ownerPersonalMemberships.length === 0) {
-        return { kind: "none", userAccountId: input.userAccountId };
-      }
-      const target = ownerPersonalMemberships[0]!;
-      return {
-        kind: "attachable",
-        userAccountId: input.userAccountId,
-        workspaceId: target.workspaceId,
-      };
-    }
-    const ownerMembership = ownerPersonalMemberships.find((m) => m.workspaceId === pointerId);
-    if (!ownerMembership) {
+    let pointedWorkspace: PersonalWorkspaceState["pointedWorkspace"] = null;
+    let membershipOnPointedWorkspace: PersonalWorkspaceState["membershipOnPointedWorkspace"] = null;
+
+    if (pointerId !== null) {
       const pointed = this.workspacesById.get(pointerId);
-      if (!pointed) {
-        return {
-          kind: "recovery",
-          userAccountId: input.userAccountId,
-          reason: "pointer-workspace-missing",
-        };
+      if (pointed) {
+        pointedWorkspace = { id: pointed.id, type: pointed.type };
+        const anyMembership = this.membershipsByUserWorkspace.get(
+          `${input.userAccountId}|${pointerId}`,
+        );
+        if (anyMembership) {
+          membershipOnPointedWorkspace = {
+            id: anyMembership.id,
+            role: anyMembership.role,
+          };
+        }
       }
-      if (pointed.type !== "Personal") {
-        return {
-          kind: "recovery",
-          userAccountId: input.userAccountId,
-          reason: "pointer-not-personal",
-        };
-      }
-      const anyMembership = this.membershipsByUserWorkspace.get(
-        `${input.userAccountId}|${pointerId}`,
-      );
-      if (anyMembership && anyMembership.role !== "Owner") {
-        return {
-          kind: "recovery",
-          userAccountId: input.userAccountId,
-          reason: "membership-not-owner",
-        };
-      }
-      return {
-        kind: "recovery",
-        userAccountId: input.userAccountId,
-        reason: "owner-membership-missing",
-      };
     }
+
     return {
-      kind: "converged",
-      workspaceId: ownerMembership.workspaceId,
-      membershipId: ownerMembership.id,
+      userExists: true,
+      personalWorkspaceId: pointerId,
+      ownerPersonalMemberships,
+      pointedWorkspace,
+      membershipOnPointedWorkspace,
     };
   }
 

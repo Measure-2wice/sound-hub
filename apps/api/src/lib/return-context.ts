@@ -32,7 +32,6 @@
 // `returnTo` to `null` in the verify-token response. The browser
 // navigates to `/dashboard?recovery=1` regardless of the cookie.
 
-import { randomUUID } from "node:crypto";
 import type { Response } from "express";
 
 export const RETURN_CONTEXT_COOKIE = "soundhub_return_context";
@@ -74,12 +73,7 @@ export function isValidReturnPath(path: unknown, allowedOrigin: string): boolean
   // a control-character regex (the linter rejects the latter for
   // safety). Control characters are 0x00–0x1F (excluding whitespace
   // tab/newline/CR which we reject explicitly) and 0x7F (DEL).
-  if (path.includes("\0")) return false;
-  for (const ch of path) {
-    if (ch === " " || ch === "\t" || ch === "\n" || ch === "\r") return false;
-    const code = ch.charCodeAt(0);
-    if ((code >= 0 && code <= 0x1f) || code === 0x7f) return false;
-  }
+  if (containsForbiddenCharacters(path)) return false;
 
   // Decode percent-encoding iteratively (up to 3 levels) to catch
   // encoded bypass attempts (e.g., %2F%2Fevil.com, %252F%252Fevil.com,
@@ -96,12 +90,7 @@ export function isValidReturnPath(path: unknown, allowedOrigin: string): boolean
   }
 
   // Reject control characters and whitespace in any decoded form.
-  if (decoded.includes("\0")) return false;
-  for (const ch of decoded) {
-    if (ch === " " || ch === "\t" || ch === "\n" || ch === "\r") return false;
-    const code = ch.charCodeAt(0);
-    if ((code >= 0 && code <= 0x1f) || code === 0x7f) return false;
-  }
+  if (containsForbiddenCharacters(decoded)) return false;
 
   // Structural checks on the decoded path:
   //   - Must start with a single "/" (not "//", not "/\", not "\").
@@ -212,9 +201,21 @@ export function readReturnContextCookie(
   return null;
 }
 
-// Re-export a generator so callers who need a fresh opaque request id
-// (e.g. for log correlation) can use the same primitive this module
-// uses internally.
-export function generateReturnContextId(): string {
-  return randomUUID();
+/**
+ * Single forbidden-character predicate shared by the raw-input scan
+ * and the post-decode scan in `isValidReturnPath`. Returns true when
+ * the value contains a NUL byte, a tab/newline/CR whitespace
+ * character, or any 0x00–0x1F / 0x7F control byte. Explicit
+ * character checks are used (rather than a control-character regex)
+ * because the project's lint policy rejects control-character regex
+ * patterns.
+ */
+function containsForbiddenCharacters(value: string): boolean {
+  if (value.includes("\0")) return true;
+  for (const ch of value) {
+    if (ch === " " || ch === "\t" || ch === "\n" || ch === "\r") return true;
+    const code = ch.charCodeAt(0);
+    if ((code >= 0 && code <= 0x1f) || code === 0x7f) return true;
+  }
+  return false;
 }
