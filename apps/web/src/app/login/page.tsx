@@ -1,3 +1,5 @@
+"use client";
+
 // Login page.
 //
 // Background: the BG1 integrated browser journey signs in by
@@ -10,14 +12,20 @@
 // UserAccount. The only state the browser maintains is the email
 // form value; every authority decision happens server-side after the
 // session cookie is set.
-
-"use client";
+//
+// M2 (#82) visual-QA remediation: the submit button uses the
+// aubergine semantic-action family (authentication actions are
+// structural / management). Error surfaces render the in-page
+// `Alert` primitive with role="alert" and variant=failure — bounded
+// copy, no gold accent (genuine operation failure). The warm
+// parchment canvas wrapper is scoped to this #82 page only.
 
 import { useState, type FormEvent } from "react";
 import { useRouter } from "next/navigation";
 import { requestMagicLink, readReturnFromUrl } from "../lib/auth-client";
 import { useSession } from "../components/SessionProvider";
 import { Card } from "../components/ui/Card";
+import { Alert } from "../components/ui/Alert";
 
 export default function LoginPage() {
   const router = useRouter();
@@ -83,77 +91,79 @@ export default function LoginPage() {
   };
 
   return (
-    <div className="max-w-md mx-auto px-6 py-12">
-      <h1 className="text-3xl font-bold text-gray-900 mb-4">Sign in to SoundHub</h1>
-      <p className="text-gray-600 mb-6">
-        Enter your email. We&apos;ll send you a one-time link to sign in.
-      </p>
-      <Card>
-        <Card.Content>
-          <form
-            onSubmit={(e) => {
-              handleSubmit(e).catch(() => {
-                /* surfaced via setErrorMessage/setStatus */
-              });
-            }}
-            className="space-y-4"
-            data-testid="login-form"
-          >
-            <label className="block">
-              <span className="text-sm font-medium text-gray-700">Email</span>
-              <input
-                type="email"
-                required
-                value={email}
-                onChange={(e) => setEmail(e.target.value)}
-                disabled={submitting}
-                className="mt-1 block w-full rounded-md border border-gray-300 px-3 py-2 text-sm focus:border-blue-500 focus:outline-none focus:ring-1 focus:ring-blue-500"
-                data-testid="login-email"
-                autoComplete="email"
-              />
-            </label>
-            <button
-              type="submit"
-              disabled={submitting || status === "sent"}
-              className="w-full bg-blue-600 text-white py-2 px-4 rounded-md text-sm font-medium hover:bg-blue-700 disabled:opacity-50 transition-colors"
-              data-testid="login-submit"
+    <div className="min-h-screen bg-canvas">
+      <div className="max-w-md mx-auto px-6 py-12">
+        <h1 className="text-3xl font-bold text-ink mb-4">Sign in to SoundHub</h1>
+        <p className="text-base text-muted mb-6">
+          Enter your email. We&apos;ll send you a one-time link to sign in.
+        </p>
+        <Card variant="parchment">
+          <Card.Content>
+            <form
+              onSubmit={(e) => {
+                handleSubmit(e).catch(() => {
+                  /* surfaced via setErrorMessage/setStatus */
+                });
+              }}
+              className="space-y-4"
+              data-testid="login-form"
             >
-              {submitting ? "Sending…" : status === "sent" ? "Link sent" : "Send magic link"}
-            </button>
-          </form>
-        </Card.Content>
-      </Card>
-
-      {status === "sent" && (
-        <Card className="mt-6" data-testid="login-sent">
-          <Card.Content>
-            <p className="text-sm text-gray-700">
-              If the address is registered, a sign-in link is on its way. The link works once and
-              expires shortly.
-            </p>
-            {devVerificationUrl && (
+              <label className="block">
+                <span className="text-sm font-medium text-ink">Email</span>
+                <input
+                  type="email"
+                  required
+                  value={email}
+                  onChange={(e) => setEmail(e.target.value)}
+                  disabled={submitting}
+                  className="mt-1 block w-full rounded-md border border-borderWarm bg-white px-3 py-2 text-base focus:border-aubergine focus:outline-none focus:ring-1 focus:ring-aubergine"
+                  data-testid="login-email"
+                  autoComplete="email"
+                />
+              </label>
               <button
-                type="button"
-                onClick={() => {
-                  void handleDevVerification();
-                }}
-                className="mt-3 inline-flex bg-amber-100 text-amber-900 px-3 py-2 rounded-md text-sm font-medium hover:bg-amber-200 transition-colors"
-                data-testid="login-dev-verify"
+                type="submit"
+                disabled={submitting || status === "sent"}
+                className="w-full bg-aubergine text-white py-2 px-4 rounded-md text-base font-medium hover:bg-aubergine-hover disabled:opacity-50 transition-colors focus:outline-none focus-visible:outline focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-aubergine"
+                data-testid="login-submit"
               >
-                Continue with dev verification URL
+                {submitting ? "Sending…" : status === "sent" ? "Link sent" : "Send magic link"}
               </button>
-            )}
+            </form>
           </Card.Content>
         </Card>
-      )}
 
-      {status === "error" && errorMessage && (
-        <Card className="mt-6 border-red-200 bg-red-50" data-testid="login-error">
-          <Card.Content>
-            <p className="text-sm text-red-800">{errorMessage}</p>
-          </Card.Content>
-        </Card>
-      )}
+        {status === "sent" && (
+          <Card variant="parchment" className="mt-6" data-testid="login-sent">
+            <Card.Content>
+              <p className="text-base text-muted">
+                If the address is registered, a sign-in link is on its way. The link works once and
+                expires shortly.
+              </p>
+              {devVerificationUrl && (
+                <button
+                  type="button"
+                  onClick={() => {
+                    void handleDevVerification();
+                  }}
+                  className="mt-3 inline-flex items-center justify-center min-h-[44px] min-w-[44px] py-2 px-4 rounded-md text-base font-medium text-aubergine hover:text-aubergine-hover border border-gold/40 hover:bg-surface transition-colors focus:outline-none focus-visible:outline focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-aubergine"
+                  data-testid="login-dev-verify"
+                >
+                  Continue with dev verification URL
+                </button>
+              )}
+            </Card.Content>
+          </Card>
+        )}
+
+        {status === "error" && errorMessage && (
+          <div className="mt-6" data-testid="login-error">
+            <Alert role="alert" variant="failure" title="Could not sign in">
+              {errorMessage}
+            </Alert>
+          </div>
+        )}
+      </div>
     </div>
   );
 }
