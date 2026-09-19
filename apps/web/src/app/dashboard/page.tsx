@@ -34,6 +34,16 @@
 // `text-xs` for metadata lines only (slug, type/status). Sign-out
 // buttons use `min-h-[44px]` and `min-w-[44px]` plus `py-3 px-4`
 // padding so the mobile touch target meets the spec at 375px.
+//
+// Codex review (P2-001) flagged a semantic-color regression on the
+// sign-out controls: they rendered in neutral gray with blue focus
+// styling instead of the aubergine semantic family the M2 UX
+// addendum assigns to recovery and management actions
+// (`docs/specs/milestone-2-reconciled-ux.md:269-274`). The base
+// reference is around `#3B1E3E`; hover, focus, and disabled
+// variants follow. The recovery body copy keeps the muted-text gray
+// family because paragraph copy is operational, not actionable —
+// only the action itself must read as aubergine.
 
 import { useState, type FormEvent } from "react";
 import Link from "next/link";
@@ -155,7 +165,14 @@ function PersonalWorkspaceSurface({
               void onSignOut(e);
             }}
             disabled={signingOut}
-            className="mt-3 inline-flex items-center justify-center min-h-[44px] min-w-[44px] py-3 px-4 text-base font-medium text-gray-700 hover:text-gray-900 disabled:opacity-50 focus:outline-none focus-visible:outline focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-blue-600 focus:ring-2 focus:ring-blue-600 rounded"
+            // M2 UX addendum assigns recovery and management actions
+            // (including the dashboard sign-out control) to the
+            // aubergine semantic family (`docs/specs/milestone-2-reconciled-ux.md:269-274`).
+            // The base visual reference is around `#3B1E3E`. Hover,
+            // keyboard focus, and disabled variants follow the
+            // addendum's "foreground, hover, focus, disabled" rule
+            // for each functional family.
+            className="mt-3 inline-flex items-center justify-center min-h-[44px] min-w-[44px] py-3 px-4 text-base font-medium text-[#3B1E3E] hover:text-[#5a3061] disabled:opacity-50 focus:outline-none focus-visible:outline focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-[#3B1E3E] focus:ring-2 focus:ring-[#3B1E3E] rounded"
             data-testid="dashboard-sign-out"
           >
             {signingOut ? "Signing out…" : "Sign out"}
@@ -261,7 +278,11 @@ function RecoverySurface({
               void onSignOut(e);
             }}
             disabled={signingOut}
-            className="mt-3 inline-flex items-center justify-center min-h-[44px] min-w-[44px] py-3 px-4 text-base font-medium text-gray-700 hover:text-gray-900 disabled:opacity-50 focus:outline-none focus-visible:outline focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-blue-600 focus:ring-2 focus:ring-blue-600 rounded"
+            // Same aubergine treatment as the Personal Workspace
+            // dashboard sign-out — see comment there. Recovery
+            // actions are explicitly listed in the M2 UX addendum's
+            // aubergine semantic family (`docs/specs/milestone-2-reconciled-ux.md:271`).
+            className="mt-3 inline-flex items-center justify-center min-h-[44px] min-w-[44px] py-3 px-4 text-base font-medium text-[#3B1E3E] hover:text-[#5a3061] disabled:opacity-50 focus:outline-none focus-visible:outline focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-[#3B1E3E] focus:ring-2 focus:ring-[#3B1E3E] rounded"
             data-testid="dashboard-recovery-sign-out"
           >
             {signingOut ? "Signing out…" : "Sign out"}

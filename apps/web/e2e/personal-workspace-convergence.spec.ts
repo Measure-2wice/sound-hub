@@ -367,47 +367,80 @@ for (const { name, size } of VIEWPORTS) {
   });
 }
 
-test("semantic colors on the recovery copy fall within the approved muted-text family", async ({
+test("recovery and management actions use the approved aubergine semantic family", async ({
   page,
 }) => {
-  // AC15 (semantic colors): the recovery body uses the application
-  // text palette — a regression to the browser default would mean
-  // the design tokens regressed. Codex review (P2-002) flagged the
-  // previous assertion as too lax (any non-black color passed).
-  // This assertion pins the recovery body to the muted-text gray
-  // family Tailwind defines as `text-gray-700` (the same family
-  // the dashboard uses for every customer-facing paragraph on both
-  // the recovery surface and the Personal Workspace surface).
-  const email = `${RECOVERY_EMAIL_PREFIX}semantic-${Date.now()}@example.test`;
-  seedRecoveryUser(email);
-  await signInFresh(page, email);
-  const color = await page
-    .getByTestId("dashboard-recovery-body")
-    .evaluate((el) => window.getComputedStyle(el).color);
+  // AC15 (semantic colors, action contract). Codex review (P2-001)
+  // flagged that the previous assertion inspected only the recovery
+  // paragraph's neutral gray. The M2 UX addendum
+  // (`docs/specs/milestone-2-reconciled-ux.md:269-274`) assigns
+  // recovery and management actions to the aubergine semantic
+  // family with a base reference around `#3B1E3E` = `rgb(59, 30, 62)`.
+  // Sign-out is the only recovery/management control on the
+  // surfaces this ticket owns; this test pins its color so a
+  // regression to neutral gray or to a blue focus utility fails
+  // the assertion.
+  //
+  // The two sign-out controls live on DIFFERENT surfaces
+  // (`dashboard-sign-out` on the converged Personal Workspace
+  // surface, `dashboard-recovery-sign-out` on the recovery
+  // surface), so the assertion runs two separate sign-in flows
+  // against the same page to reach each surface in turn.
+  const surfaces: ReadonlyArray<{
+    readonly actionId: string;
+    readonly surface: "fresh" | "recovery";
+  }> = [
+    { actionId: "dashboard-sign-out", surface: "fresh" },
+    { actionId: "dashboard-recovery-sign-out", surface: "recovery" },
+  ];
 
-  // Parse the rgb(...) string into channel components so a regression
-  // to `rgb(0, 0, 0)` (browser default) or to an out-of-family hue
-  // (e.g., pure red or pure green) is caught without depending on a
-  // specific Tailwind release.
-  const rgbMatch = color.match(/^rgba?\(\s*(\d+)\s*,\s*(\d+)\s*,\s*(\d+)/);
-  expect(rgbMatch, `expected computed color to be rgb(...), got ${color}`).not.toBeNull();
-  const [, rStr, gStr, bStr] = rgbMatch!;
-  const r = Number(rStr);
-  const g = Number(gStr);
-  const b = Number(bStr);
+  for (const { actionId, surface } of surfaces) {
+    const email =
+      surface === "recovery"
+        ? `${RECOVERY_EMAIL_PREFIX}semantic-action-${Date.now()}@example.test`
+        : `${FRESH_EMAIL_PREFIX}semantic-action-${Date.now()}@example.test`;
+    if (surface === "recovery") seedRecoveryUser(email);
+    await signInFresh(page, email);
 
-  // The recovery body uses the muted-text gray family. Each channel
-  // must satisfy the muted-text predicate: a dark neutral channel
-  // (≥ 40 — i.e., far from pure black, which is the regression we
-  // want to catch) and the channels must be roughly balanced (no
-  // pure chromatic hue) within a bounded delta. The Tailwind
-  // `text-gray-700` value `rgb(55, 65, 81)` is the canonical
-  // customer-facing paragraph color and falls well within these
-  // bounds.
-  expect(r).toBeGreaterThanOrEqual(40);
-  expect(g).toBeGreaterThanOrEqual(40);
-  expect(b).toBeGreaterThanOrEqual(40);
-  const max = Math.max(r, g, b);
-  const min = Math.min(r, g, b);
-  expect(max - min).toBeLessThanOrEqual(40); // gray family: channels balanced
+    const color = await page
+      .getByTestId(actionId)
+      .evaluate((el) => window.getComputedStyle(el).color);
+    // Parse the rgb(...) string into channel components.
+    const rgbMatch = color.match(/^rgba?\(\s*(\d+)\s*,\s*(\d+)\s*,\s*(\d+)/);
+    expect(
+      rgbMatch,
+      `expected computed color for ${actionId} to be rgb(...), got ${color}`,
+    ).not.toBeNull();
+    const [, rStr, gStr, bStr] = rgbMatch!;
+    const r = Number(rStr);
+    const g = Number(gStr);
+    const b = Number(bStr);
+
+    // Aubergine family predicate (the M2 UX base is `#3B1E3E` =
+    // rgb(59, 30, 62), the hover variant is `#5a3061` = rgb(90, 48, 97),
+    // both within the same hue family):
+    //   - Dark mid-channel: each channel between 25 and 110 (a dark
+    //     semantic-action hue, not light text and not black).
+    //   - Purple tilt: G is the LOWEST channel (R > G, B > G), so
+    //     the hue reads as aubergine / magenta and not red, green,
+    //     blue, or neutral gray.
+    //   - Red/blue balance: |R - B| ≤ 25 — aubergine is not pure
+    //     red or pure blue; the two outer channels stay in lockstep.
+    //   - Not browser default: all channels non-zero.
+    expect(r, `${actionId} red channel must be ≥ 25`).toBeGreaterThanOrEqual(25);
+    expect(g, `${actionId} green channel must be ≥ 25`).toBeGreaterThanOrEqual(25);
+    expect(b, `${actionId} blue channel must be ≥ 25`).toBeGreaterThanOrEqual(25);
+    expect(r, `${actionId} must not regress to gray (R must exceed G)`).toBeGreaterThan(g);
+    expect(b, `${actionId} must not regress to gray (B must exceed G)`).toBeGreaterThan(g);
+    expect(
+      Math.abs(r - b),
+      `${actionId} must stay in the aubergine hue family (|R-B| ≤ 25)`,
+    ).toBeLessThanOrEqual(25);
+
+    // Sign out so the next loop iteration signs in as a fresh user
+    // without the serial-config dependency on the recovery-bound
+    // session cookie.
+    await page.getByTestId(actionId).click();
+    await page.waitForURL("/");
+  }
 });
