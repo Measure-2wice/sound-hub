@@ -217,6 +217,151 @@ describe("BG1 auth routes (in-memory, deterministic adapter)", () => {
     assert.ok(cookieHeader.toLowerCase().includes("httponly"));
   });
 
+  test("POST /api/auth/verify-token links the existing Personal Workspace for an `attachable` user (no duplicate created)", async () => {
+    // Tenki PR #91 hardening: build a self-contained fixture
+    // so the test is independent of other tests in this suite
+    // that may have already converged the shared buyer / seller
+    // rows. The fixture user starts in the `attachable` state
+    // (one Owner Personal membership, NULL pointer). The
+    // convergence flow MUST link the existing workspace via
+    // `attachExistingConvergence`, NOT create a new Personal
+    // Workspace. The repository's persisted state is the ground
+    // truth: exactly one Owner Personal membership, pointer
+    // set to the pre-existing workspace.
+    const ATTACHABLE_WORKSPACE_ID = "ws-attachable-existing-personal";
+    const ATTACHABLE_EMAIL = "tenki-attachable-route@example.com";
+    const attachableRepo = new InMemoryAuthRepository(
+      [
+        {
+          userAccountId: "user-attachable-route",
+          email: ATTACHABLE_EMAIL,
+          identityProvider: "deterministic",
+          identitySubject: deterministicSubjectFor(ATTACHABLE_EMAIL),
+          memberships: [
+            {
+              workspaceId: ATTACHABLE_WORKSPACE_ID,
+              slug: "personal-ws-attachable-existing-personal",
+              name: "Existing Personal",
+              workspaceType: "Personal",
+              workspaceStatus: "Active",
+              role: "Owner",
+              capabilities: [],
+            },
+          ],
+        },
+      ],
+      () => Date.now(),
+    );
+    const attachableAdapter = new DeterministicIdentityAdapter({
+      allowDevVerificationUrl: true,
+    });
+    const attachableConvergence = new PersonalWorkspaceConvergenceService({
+      authRepository: attachableRepo,
+    });
+    const attachableAuth = new AuthenticationService({
+      identityAdapter: attachableAdapter,
+      authRepository: attachableRepo,
+      personalWorkspaceConvergenceService: attachableConvergence,
+    });
+    const attachableWzAuth = new WorkspaceAuthorizationService({
+      authRepository: attachableRepo,
+    });
+    const stubPrisma = new Proxy({} as never, {
+      get() {
+        throw new Error(
+          "Prisma client was invoked; the route tests must use the in-memory auth repository.",
+        );
+      },
+    });
+    const { app: attachableApp } = buildApp({
+      authenticationService: attachableAuth,
+      workspaceAuthorizationService: attachableWzAuth,
+      authRepository: attachableRepo,
+      identityAdapter: attachableAdapter,
+      prismaClient: stubPrisma,
+    });
+
+    // Sanity: the user starts in the `attachable` state.
+    const before = await attachableRepo.findPersonalWorkspaceState({
+      userAccountId: "user-attachable-route",
+    });
+    assert.equal(before.personalWorkspaceId, null);
+    assert.equal(before.ownerPersonalMemberships.length, 1);
+
+    const magic = await attachableAdapter.requestSignIn({ email: ATTACHABLE_EMAIL });
+    assert.ok(magic.verificationToken);
+    const verify = await request(attachableApp)
+      .post("/api/auth/verify-token")
+      .send({ verificationToken: magic.verificationToken })
+      .set("Content-Type", "application/json");
+    assert.equal(verify.status, 200);
+    assert.equal(verify.body.user.setupState, "converged");
+
+    const after = await attachableRepo.findPersonalWorkspaceState({
+      userAccountId: "user-attachable-route",
+    });
+    assert.equal(after.personalWorkspaceId, ATTACHABLE_WORKSPACE_ID);
+    assert.equal(after.ownerPersonalMemberships.length, 1);
+    assert.equal(after.ownerPersonalMemberships[0]!.workspaceId, ATTACHABLE_WORKSPACE_ID);
+  });
+
+  test("POST /api/auth/verify-token is idempotent: repeated convergence leaves exactly one Personal Workspace + Owner membership", async () => {
+    // Idempotency pin for Tenki PR #91. A user who signs in
+    // repeatedly must end up with EXACTLY one Personal
+    // Workspace and EXACTLY one Owner membership. Convergence
+    // is owned by POST /verify-token, so each new sign-in is
+    // expected to either no-op (already converged) or settle
+    // from `none` / `attachable` to `converged`. It must
+    // never produce a duplicate.
+    const FRESH_EMAIL = "tenki-idempotent-route@example.com";
+    const FRESH_SUBJECT = deterministicSubjectFor(FRESH_EMAIL);
+
+    // First sign-in: user starts in `none` (no UserAccount row
+    // exists), the convergence flow creates one Personal
+    // Workspace + Owner membership.
+    const first = await adapter.requestSignIn({ email: FRESH_EMAIL });
+    assert.ok(first.verificationToken);
+    const firstVerify = await request(app)
+      .post("/api/auth/verify-token")
+      .send({ verificationToken: first.verificationToken })
+      .set("Content-Type", "application/json");
+    assert.equal(firstVerify.status, 200);
+    assert.equal(firstVerify.body.user.setupState, "converged");
+    const firstMapping = await authRepo.findUserByIdentity({
+      provider: "deterministic",
+      subject: FRESH_SUBJECT,
+    });
+    assert.ok(firstMapping);
+    const afterFirst = await authRepo.findPersonalWorkspaceState({
+      userAccountId: firstMapping.userAccountId,
+    });
+    assert.notEqual(afterFirst.personalWorkspaceId, null);
+    const firstPointer = afterFirst.personalWorkspaceId;
+    assert.equal(afterFirst.ownerPersonalMemberships.length, 1);
+
+    // Second sign-in: the same identity, fresh magic link. The
+    // convergence flow MUST be a no-op — pointer unchanged, no
+    // new Owner membership, no new Personal Workspace.
+    const second = await adapter.requestSignIn({ email: FRESH_EMAIL });
+    assert.ok(second.verificationToken);
+    const secondVerify = await request(app)
+      .post("/api/auth/verify-token")
+      .send({ verificationToken: second.verificationToken })
+      .set("Content-Type", "application/json");
+    assert.equal(secondVerify.status, 200);
+    assert.equal(secondVerify.body.user.setupState, "converged");
+
+    const afterSecond = await authRepo.findPersonalWorkspaceState({
+      userAccountId: firstMapping.userAccountId,
+    });
+    assert.equal(afterSecond.personalWorkspaceId, firstPointer);
+    assert.equal(afterSecond.ownerPersonalMemberships.length, 1);
+    assert.equal(
+      afterSecond.ownerPersonalMemberships[0]!.workspaceId,
+      firstPointer,
+    );
+  });
+
   test("POST /api/auth/verify-token rejects a request body with the wrong field name (P2-001)", async () => {
     // The legacy `requestId` field is no longer accepted; the
     // shared contract is strict and uses `verificationToken`
@@ -535,28 +680,35 @@ describe("BG1 auth routes (in-memory, deterministic adapter)", () => {
   });
 });
 
-// ---------- Tenki PR #91: /api/auth/me convergence boundary ----------
+// ---------- Tenki PR #91: /api/auth/me is strictly read-only ----------
 //
-// Regression coverage for the Tenki finding on PR #91:
-// `resolveSetupState()` previously collapsed every non-recovery
-// `ConvergenceKind` into `"converged"`, so `/api/auth/me` could
-// report `setupState: "converged"` for a session-holding user
-// whose `personalWorkspaceId` pointer was NULL (a `none` state).
+// Regression coverage for the Tenki finding on PR #91 (final
+// hardening): `GET /api/auth/me` MUST be strictly read-only. It
+// may only classify current persisted state into `"converged" |
+// "recovery"`; it MUST NOT invoke `createInitialConvergence`,
+// `attachExistingConvergence`, or any repository mutation
+// primitive. Convergence creation / attachment is owned
+// exclusively by `POST /api/auth/verify-token`.
 //
-// This suite proves the public DTO boundary at the HTTP seam:
-// for a user whose convergence classification starts at `none`,
-// `GET /api/auth/me` MUST NOT report `setupState: "converged"`
-// until the convergence flow has actually created the canonical
-// Personal Workspace + Owner membership. The public DTO remains
-// allow-listed to only `"converged"` and `"recovery"` (asserted
-// by `bg1SessionInfoV1Schema.parse` in the route handler).
+// The earlier Tenki PR #91 round asserted that `/me + none`
+// produced `"converged"` after `resolveSetupState` ran the
+// convergence flow. That was the wrong direction: a `GET`
+// endpoint must not mutate. The corrected contract:
+//
+//   - internal `converged`  → public `"converged"`
+//   - internal `recovery`   → public `"recovery"`
+//   - internal `none`       → public `"recovery"` (no mutation)
+//   - internal `attachable` → public `"recovery"` (no mutation)
+//
+// This suite bypasses `/verify-token` and mints a session row
+// directly via the repository so the convergence flow has never
+// run for these fixtures. Every test then asserts both the
+// public DTO classification AND the absence of mutation in the
+// repository's persisted state.
 
-describe("BG1 /api/auth/me convergence boundary (Tenki PR #91, in-memory)", () => {
-  const TENKI_EMAIL = "tenki-none-route@example.com";
-
+describe("BG1 /api/auth/me is strictly read-only (Tenki PR #91, in-memory)", () => {
   function buildAppForRepo(repo: InMemoryAuthRepository): {
     readonly app: import("express").Application;
-    readonly stubPrisma: unknown;
   } {
     const adapter = new DeterministicIdentityAdapter();
     const convergence = new PersonalWorkspaceConvergenceService({
@@ -584,64 +736,220 @@ describe("BG1 /api/auth/me convergence boundary (Tenki PR #91, in-memory)", () =
       identityAdapter: adapter,
       prismaClient: stubPrisma,
     });
-    return { app: built.app, stubPrisma };
+    return { app: built.app };
   }
 
-  test('GET /api/auth/me reports "converged" only after convergence actually creates a Personal Workspace for a user that started in the `none` state', async () => {
+  async function mintSessionCookie(
+    repo: InMemoryAuthRepository,
+    userAccountId: string,
+  ): Promise<string> {
+    const session = await repo.createSession({
+      userAccountId,
+      expiresAt: new Date(Date.now() + 60 * 60 * 1000),
+    });
+    return `soundhub_session=${encodeURIComponent(session.sessionId)}`;
+  }
+
+  test('GET /api/auth/me reports "recovery" for a `none` user and does NOT mutate state', async () => {
+    // `none` state: pointer NULL, zero Owner Personal memberships.
     const repo = new InMemoryAuthRepository([], () => Date.now());
-    // Mint a user whose `personalWorkspaceId` pointer is NULL
-    // and who has no Owner Personal memberships — the `none`
-    // state. `createUserForIdentity` returns such a row.
     const mapping = await repo.createUserForIdentity({
       provider: "deterministic",
-      subject: "tenki-none-route-subject",
-      providerEmail: TENKI_EMAIL,
+      subject: "tenki-me-none-subject",
+      providerEmail: "tenki-me-none@example.com",
     });
-    const tenkiUserId = mapping.userAccountId;
-    // Sanity: confirm the user really is in the `none` state
-    // (personalWorkspaceId NULL, zero Owner Personal memberships).
-    const before = await repo.findPersonalWorkspaceState({
-      userAccountId: tenkiUserId,
-    });
+    const userAccountId = mapping.userAccountId;
+    // Sanity: the user is in the `none` state.
+    const before = await repo.findPersonalWorkspaceState({ userAccountId });
     assert.equal(before.userExists, true);
     assert.equal(before.personalWorkspaceId, null);
     assert.equal(before.ownerPersonalMemberships.length, 0);
 
-    // Mint a session row directly. The convergence flow has
-    // NEVER run for this user; the only way `/api/auth/me` can
-    // honestly report `setupState: "converged"` is if the auth
-    // service runs the flow now.
-    const session = await repo.createSession({
-      userAccountId: tenkiUserId,
-      expiresAt: new Date(Date.now() + 60 * 60 * 1000),
-    });
-    const cookie = `soundhub_session=${encodeURIComponent(session.sessionId)}`;
-
+    const cookie = await mintSessionCookie(repo, userAccountId);
     const { app } = buildAppForRepo(repo);
     const me = await request(app).get("/api/auth/me").set("Cookie", cookie);
     assert.equal(me.status, 200);
-    assert.ok(me.body.user, "/api/auth/me MUST return the authenticated user");
-    // The public DTO is allow-listed: only "converged" or
-    // "recovery" may appear on `setupState`. After the
-    // convergence flow runs, the only legal value here is
-    // "converged" (the user is in the `none` state, not a
-    // recovery scenario).
-    assert.equal(me.body.user.setupState, "converged");
-    // The convergence flow MUST have produced a Personal
-    // Workspace + Owner membership. A response carrying
-    // `setupState: "converged"` while `workspaces.length === 0`
-    // would be a contract violation.
-    assert.ok(Array.isArray(me.body.user.workspaces));
-    assert.equal(me.body.user.workspaces.length, 1);
-    assert.equal(me.body.user.workspaces[0].workspaceType, "Personal");
+    assert.ok(me.body.user);
+    // Public DTO: collapsed to "recovery" because /me MUST NOT
+    // run createInitialConvergence on a read path.
+    assert.equal(me.body.user.setupState, "recovery");
+    // The public user view reflects the actual (unmutated)
+    // persisted state: no workspaces yet, pointer still NULL.
+    assert.equal(Array.isArray(me.body.user.workspaces), true);
+    assert.equal(me.body.user.workspaces.length, 0);
 
-    // Post-condition at the repository: the pointer is now
-    // set. This is the ground-truth proof that the convergence
-    // flow ran.
-    const after = await repo.findPersonalWorkspaceState({
-      userAccountId: tenkiUserId,
+    // Ground-truth post-condition: repository state is byte-
+    // identical to the pre-condition. /me MUST NOT mutate.
+    const after = await repo.findPersonalWorkspaceState({ userAccountId });
+    assert.equal(after.personalWorkspaceId, null);
+    assert.equal(after.ownerPersonalMemberships.length, 0);
+  });
+
+  test('GET /api/auth/me reports "recovery" for an `attachable` user and does NOT mutate state', async () => {
+    // `attachable` state: pointer NULL, exactly one Owner Personal
+    // membership on an existing Personal Workspace.
+    const EXISTING_WORKSPACE_ID = "ws-me-existing-personal";
+    const repo = new InMemoryAuthRepository(
+      [
+        {
+          userAccountId: "user-me-attachable",
+          email: "tenki-me-attachable@example.com",
+          identityProvider: "deterministic",
+          identitySubject: "tenki-me-attachable-subject",
+          memberships: [
+            {
+              workspaceId: EXISTING_WORKSPACE_ID,
+              slug: "personal-ws-me-existing-personal",
+              name: "Existing Personal",
+              workspaceType: "Personal",
+              workspaceStatus: "Active",
+              role: "Owner",
+              capabilities: [],
+            },
+          ],
+        },
+      ],
+      () => Date.now(),
+    );
+    // Sanity: the user is in the `attachable` state.
+    const before = await repo.findPersonalWorkspaceState({
+      userAccountId: "user-me-attachable",
     });
-    assert.notEqual(after.personalWorkspaceId, null);
+    assert.equal(before.userExists, true);
+    assert.equal(before.personalWorkspaceId, null);
+    assert.equal(before.ownerPersonalMemberships.length, 1);
+
+    const cookie = await mintSessionCookie(repo, "user-me-attachable");
+    const { app } = buildAppForRepo(repo);
+    const me = await request(app).get("/api/auth/me").set("Cookie", cookie);
+    assert.equal(me.status, 200);
+    assert.ok(me.body.user);
+    // Public DTO: collapsed to "recovery" because /me MUST NOT
+    // run attachExistingConvergence on a read path.
+    assert.equal(me.body.user.setupState, "recovery");
+    // The user DOES have one workspace membership (the existing
+    // Personal Workspace from the seed). The view is allowed
+    // to surface it; convergence does not depend on it being
+    // hidden. What MUST stay true is that the pointer is NULL
+    // and no NEW membership was created.
+    assert.equal(me.body.user.workspaces.length, 1);
+    assert.equal(me.body.user.workspaces[0].workspaceId, EXISTING_WORKSPACE_ID);
+
+    // Ground-truth post-condition: pointer still NULL, EXACTLY
+    // one Owner Personal membership (no duplicate created by /me).
+    const after = await repo.findPersonalWorkspaceState({
+      userAccountId: "user-me-attachable",
+    });
+    assert.equal(after.personalWorkspaceId, null);
+    assert.equal(after.ownerPersonalMemberships.length, 1);
+    assert.equal(after.ownerPersonalMemberships[0]!.workspaceId, EXISTING_WORKSPACE_ID);
+  });
+
+  test('GET /api/auth/me reports "recovery" for a true `recovery` user (multiple Owner Personal memberships)', async () => {
+    // Recovery state: multiple Owner Personal memberships on
+    // distinct Personal Workspaces. No mutation should occur.
+    const repo = new InMemoryAuthRepository(
+      [
+        {
+          userAccountId: "user-me-recovery",
+          email: "tenki-me-recovery@example.com",
+          identityProvider: "deterministic",
+          identitySubject: "tenki-me-recovery-subject",
+          memberships: [
+            {
+              workspaceId: "ws-me-personal-a",
+              slug: "personal-ws-me-personal-a",
+              name: "Personal A",
+              workspaceType: "Personal",
+              workspaceStatus: "Active",
+              role: "Owner",
+              capabilities: [],
+            },
+            {
+              workspaceId: "ws-me-personal-b",
+              slug: "personal-ws-me-personal-b",
+              name: "Personal B",
+              workspaceType: "Personal",
+              workspaceStatus: "Active",
+              role: "Owner",
+              capabilities: [],
+            },
+          ],
+        },
+      ],
+      () => Date.now(),
+    );
+    const before = await repo.findPersonalWorkspaceState({
+      userAccountId: "user-me-recovery",
+    });
+    assert.equal(before.userExists, true);
+    assert.equal(before.ownerPersonalMemberships.length, 2);
+
+    const cookie = await mintSessionCookie(repo, "user-me-recovery");
+    const { app } = buildAppForRepo(repo);
+    const me = await request(app).get("/api/auth/me").set("Cookie", cookie);
+    assert.equal(me.status, 200);
+    assert.ok(me.body.user);
+    assert.equal(me.body.user.setupState, "recovery");
+    // Pointer stays NULL — recovery does not auto-link.
+    const after = await repo.findPersonalWorkspaceState({
+      userAccountId: "user-me-recovery",
+    });
+    assert.equal(after.personalWorkspaceId, null);
+    assert.equal(after.ownerPersonalMemberships.length, 2);
+  });
+
+  test('GET /api/auth/me reports "converged" for a converged user and does NOT mutate state', async () => {
+    // `converged` state: pointer set, exactly one Owner Personal
+    // membership on the pointed workspace. /me MUST classify and
+    // leave the converged state untouched.
+    const CONVERGED_WORKSPACE_ID = "ws-me-converged";
+    const repo = new InMemoryAuthRepository(
+      [
+        {
+          userAccountId: "user-me-converged",
+          email: "tenki-me-converged@example.com",
+          identityProvider: "deterministic",
+          identitySubject: "tenki-me-converged-subject",
+          memberships: [
+            {
+              workspaceId: CONVERGED_WORKSPACE_ID,
+              slug: "personal-ws-me-converged",
+              name: "Converged Personal",
+              workspaceType: "Personal",
+              workspaceStatus: "Active",
+              role: "Owner",
+              capabilities: [],
+            },
+          ],
+        },
+      ],
+      () => Date.now(),
+    );
+    // Stage the converged state by linking the existing workspace.
+    await repo.attachExistingPersonalWorkspace({
+      userAccountId: "user-me-converged",
+      workspaceId: CONVERGED_WORKSPACE_ID,
+    });
+    const before = await repo.findPersonalWorkspaceState({
+      userAccountId: "user-me-converged",
+    });
+    assert.equal(before.personalWorkspaceId, CONVERGED_WORKSPACE_ID);
+
+    const cookie = await mintSessionCookie(repo, "user-me-converged");
+    const { app } = buildAppForRepo(repo);
+    const me = await request(app).get("/api/auth/me").set("Cookie", cookie);
+    assert.equal(me.status, 200);
+    assert.ok(me.body.user);
+    assert.equal(me.body.user.setupState, "converged");
+    assert.equal(me.body.user.workspaces.length, 1);
+    assert.equal(me.body.user.workspaces[0].workspaceId, CONVERGED_WORKSPACE_ID);
+
+    // Post-condition: state unchanged.
+    const after = await repo.findPersonalWorkspaceState({
+      userAccountId: "user-me-converged",
+    });
+    assert.equal(after.personalWorkspaceId, CONVERGED_WORKSPACE_ID);
     assert.equal(after.ownerPersonalMemberships.length, 1);
   });
 });

@@ -210,19 +210,30 @@ export class AuthenticationService {
   }
 
   /**
-   * Resolve the current session + setup state. Used by `/me` so the
-   * browser can render recovery based solely on `setupState`.
+   * Resolve the current session + setup state. Used by
+   * `GET /api/auth/me` so the browser can render recovery based
+   * solely on `setupState`.
    *
-   * Tenki PR #91 hardening: the public user view is re-fetched
-   * AFTER `resolveSetupState` runs, not before. The previous
-   * implementation read the user view first, then ran the
-   * convergence service — so a user whose classification was
-   * `none` or `attachable` (no Personal Workspace pointer yet)
-   * was reported on `/me` with `setupState: "converged"` but
-   * an empty `workspaces` array. Reading the view AFTER
-   * convergence guarantees the response is internally
-   * consistent: `setupState: "converged"` implies exactly one
-   * Personal Workspace on the public user view.
+   * **STRICTLY READ-ONLY.** This method MUST NOT call
+   * `createInitialConvergence`, `attachExistingConvergence`, or any
+   * repository mutation primitive. Convergence creation and
+   * attachment are owned exclusively by `verifySignIn` (mutation
+   * boundary: `POST /api/auth/verify-token`). Recovery resolution
+   * beyond re-authentication is explicitly out of scope for #82.
+   *
+   * The classification is the public DTO mapping:
+   *
+   *   - internal `converged`  → public `"converged"`
+   *   - internal `recovery`   → public `"recovery"`
+   *   - internal `none`       → public `"recovery"` (read-only: do
+   *                             not run `createInitialConvergence`)
+   *   - internal `attachable` → public `"recovery"` (read-only: do
+   *                             not run `attachExistingConvergence`)
+   *
+   * The internal `none` / `attachable` values MUST NEVER cross the
+   * public DTO boundary; the read-only contract collapses them to
+   * `"recovery"` so the browser can still render the recovery
+   * surface without forcing the read path to mutate.
    */
   async resolveSessionWithSetupState(
     sessionId: string | undefined,
@@ -230,7 +241,7 @@ export class AuthenticationService {
     if (!sessionId) return null;
     const session = await this.authRepository.getActiveSession(sessionId);
     if (!session) return null;
-    const setupState = await this.resolveSetupState(session.userAccountId);
+    const setupState = await this.classifySetupStateReadOnly(session.userAccountId);
     const view = await this.authRepository.getPublicUser(session.userAccountId);
     if (!view) return null;
     return { user: view, setupState };
@@ -244,6 +255,63 @@ export class AuthenticationService {
   async signOut(sessionId: string | undefined): Promise<boolean> {
     if (!sessionId) return false;
     return this.authRepository.revokeSession(sessionId);
+  }
+
+  /**
+   * Read-only classification of the Personal Workspace convergence
+   * state into the public `setupState` DTO. Used by
+   * `resolveSessionWithSetupState` (which feeds `GET /api/auth/me`)
+   * so the route stays strictly read-only.
+   *
+   * **STRICTLY READ-ONLY.** This method MUST NOT call
+   * `createInitialConvergence` or `attachExistingConvergence`, and
+   * MUST NOT invoke any repository mutation primitive. Convergence
+   * creation / attachment is owned exclusively by `verifySignIn`
+   * (mutation boundary: `POST /api/auth/verify-token`).
+   *
+   * Mapping:
+   *   - `converged`  → public `"converged"`.
+   *   - `recovery`   → public `"recovery"`.
+   *   - `none`       → public `"recovery"` (read-only: the user
+   *     must complete convergence via `POST /api/auth/verify-token`,
+   *     not via the `GET` path).
+   *   - `attachable` → public `"recovery"` (same reasoning).
+   *
+   * The internal `none` / `attachable` values MUST NEVER cross the
+   * public DTO boundary. Collapsing them to `"recovery"` here keeps
+   * the read path honest — a `GET` cannot create or link a Personal
+   * Workspace, and a stuck `none` / `attachable` is rendered as a
+   * recovery surface so the browser prompts the user to re-
+   * authenticate.
+   *
+   * This method MUST stay separate from `resolveSetupState`
+   * (mutating variant used by `verifySignIn`) so future readers
+   * cannot mistake a read-only path for a mutation boundary.
+   */
+  private async classifySetupStateReadOnly(userAccountId: string): Promise<Bg1SetupStateV1> {
+    const kind = await this.personalWorkspaceConvergenceService.resolveConvergence({
+      userAccountId,
+    });
+    switch (kind.kind) {
+      case "converged":
+        return "converged";
+      case "recovery":
+      case "none":
+      case "attachable":
+        return "recovery";
+      default: {
+        // Compile-time exhaustiveness. Reaching this branch means
+        // a new ConvergenceKind variant was added without updating
+        // this boundary; fail closed so we never emit a fabricated
+        // setupState.
+        const _exhaustive: never = kind;
+        void _exhaustive;
+        throw new AuthenticationError(
+          "Personal Workspace convergence classification produced an unrecognised variant.",
+          "AUTH_FAILED",
+        );
+      }
+    }
   }
 
   private async resolveOrCreateUser(input: {
@@ -299,18 +367,16 @@ export class AuthenticationService {
 
   /**
    * Resolve the current setup state by classifying the Personal
-   * Workspace convergence. Always returns `"converged"` or
-   * `"recovery"` (the public DTO never surfaces the internal
-   * recovery reason and never surfaces `"none"` / `"attachable"`).
+   * Workspace convergence. **MUTATING VARIANT** — this method runs
+   * `createInitialConvergence` / `attachExistingConvergence` when
+   * the classification is `none` / `attachable`. It is the only
+   * convergence path that mutates state, and it is used exclusively
+   * by `verifySignIn`. `GET /api/auth/me` MUST NOT call this
+   * method — it uses `classifySetupStateReadOnly` instead.
    *
-   * Tenki PR #91 hardening: the previous implementation collapsed
-   * every non-recovery kind into `"converged"`, which meant a
-   * session-holding user whose `personalWorkspaceId` pointer was
-   * NULL (a `none` or `attachable` classification) was reported
-   * as converged and the recovery surface was never shown on
-   * `/api/auth/me`. This method now runs the convergence flow
-   * before emitting `"converged"`, and handles the final
-   * classification exhaustively — no default-to-converged branch.
+   * Always returns `"converged"` or `"recovery"` (the public DTO
+   * never surfaces the internal recovery reason and never surfaces
+   * `"none"` / `"attachable"`).
    *
    * - `converged` → public `"converged"`.
    * - `recovery` → public `"recovery"`.

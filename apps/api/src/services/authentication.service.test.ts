@@ -257,17 +257,134 @@ describe("AuthenticationService", () => {
     assert.notEqual(aResult.publicUser.userAccountId, bResult.publicUser.userAccountId);
   });
 
-  // ---------- Tenki PR #91: resolveSetupState convergence boundary ----------
-  //
-  // These tests pin the new contract: `resolveSessionWithSetupState`
-  // (which feeds `/api/auth/me`) MUST NOT report
-  // `setupState: "converged"` while `personalWorkspaceId` is unset.
-  // If the convergence classification is `none` or `attachable`, the
-  // convergence flow must run before the public state is emitted.
-  // `recovery` classifications must surface as `"recovery"` directly
-  // without ever fabricating `"converged"`.
+  test("verifySignIn links the existing Personal Workspace for an `attachable` user (no duplicate created)", async () => {
+    // Tenki PR #91 hardening: the convergence flow must settle
+    // an `attachable` user by linking the existing Personal
+    // Workspace via `attachExistingConvergence`. The repository
+    // must end with EXACTLY one Owner Personal membership — no
+    // duplicate created.
+    const EXISTING_WORKSPACE_ID = "ws-attachable-existing-personal";
+    const repo = new InMemoryAuthRepository(
+      [
+        {
+          userAccountId: "user-svc-verify-attachable",
+          email: "tenki-svc-verify-attachable@example.com",
+          identityProvider: "deterministic",
+          identitySubject: "tenki-svc-verify-attachable-subject",
+          memberships: [
+            {
+              workspaceId: EXISTING_WORKSPACE_ID,
+              slug: "personal-ws-attachable-existing-personal",
+              name: "Existing Personal",
+              workspaceType: "Personal",
+              workspaceStatus: "Active",
+              role: "Owner",
+              capabilities: [],
+            },
+          ],
+        },
+      ],
+      () => now,
+    );
+    const convergence = new PersonalWorkspaceConvergenceService({
+      authRepository: repo,
+    });
+    const auth = new AuthenticationService({
+      identityAdapter: adapter,
+      authRepository: repo,
+      personalWorkspaceConvergenceService: convergence,
+      now: () => now,
+      sessionLifetimeMs: 60 * 60 * 1000,
+    });
+    // Sanity: the user starts in the `attachable` state.
+    const before = await repo.findPersonalWorkspaceState({
+      userAccountId: "user-svc-verify-attachable",
+    });
+    assert.equal(before.personalWorkspaceId, null);
+    assert.equal(before.ownerPersonalMemberships.length, 1);
 
-  describe("resolveSetupState convergence boundary (Tenki PR #91)", () => {
+    const request = await adapter.requestSignIn({
+      email: "tenki-svc-verify-attachable@example.com",
+    });
+    assert.ok(request.verificationToken);
+    const result = await auth.verifySignIn({
+      verificationToken: request.verificationToken,
+    });
+    assert.equal(result.publicUser.setupState, "converged");
+    const after = await repo.findPersonalWorkspaceState({
+      userAccountId: "user-svc-verify-attachable",
+    });
+    assert.equal(after.personalWorkspaceId, EXISTING_WORKSPACE_ID);
+    assert.equal(after.ownerPersonalMemberships.length, 1);
+    assert.equal(after.ownerPersonalMemberships[0]!.workspaceId, EXISTING_WORKSPACE_ID);
+  });
+
+  test("verifySignIn is idempotent across repeated sign-ins for the same identity (Tenki PR #91)", async () => {
+    // Idempotency pin: a user who signs in repeatedly must end
+    // up with EXACTLY one Personal Workspace and EXACTLY one
+    // Owner membership. Convergence is owned by `verifySignIn`,
+    // so each new sign-in is expected to either no-op
+    // (already converged) or settle from `none` to `converged`.
+    // It must never produce a duplicate.
+    const FRESH_EMAIL = "tenki-svc-idempotent@example.com";
+
+    const request1 = await adapter.requestSignIn({ email: FRESH_EMAIL });
+    assert.ok(request1.verificationToken);
+    const first = await service.verifySignIn({
+      verificationToken: request1.verificationToken,
+    });
+    assert.equal(first.publicUser.setupState, "converged");
+    const afterFirst = await authRepo.findPersonalWorkspaceState({
+      userAccountId: first.publicUser.userAccountId,
+    });
+    assert.notEqual(afterFirst.personalWorkspaceId, null);
+    const firstPointer = afterFirst.personalWorkspaceId;
+    assert.equal(afterFirst.ownerPersonalMemberships.length, 1);
+
+    const request2 = await adapter.requestSignIn({ email: FRESH_EMAIL });
+    assert.ok(request2.verificationToken);
+    const second = await service.verifySignIn({
+      verificationToken: request2.verificationToken,
+    });
+    assert.equal(second.publicUser.setupState, "converged");
+    assert.equal(second.publicUser.userAccountId, first.publicUser.userAccountId);
+
+    const afterSecond = await authRepo.findPersonalWorkspaceState({
+      userAccountId: first.publicUser.userAccountId,
+    });
+    assert.equal(afterSecond.personalWorkspaceId, firstPointer);
+    assert.equal(afterSecond.ownerPersonalMemberships.length, 1);
+    assert.equal(
+      afterSecond.ownerPersonalMemberships[0]!.workspaceId,
+      firstPointer,
+    );
+  });
+
+  // ---------- Tenki PR #91: resolveSessionWithSetupState is strictly read-only ----------
+  //
+  // These tests pin the corrected contract: `resolveSessionWithSetupState`
+  // (which feeds `GET /api/auth/me`) MUST be strictly read-only. It
+  // may classify current persisted state into `"converged" |
+  // "recovery"`; it MUST NOT invoke `createInitialConvergence`,
+  // `attachExistingConvergence`, or any repository mutation primitive.
+  // Convergence creation / attachment is owned exclusively by
+  // `verifySignIn` (mutation boundary: `POST /api/auth/verify-token`).
+  //
+  // The earlier Tenki PR #91 round asserted that
+  // `resolveSessionWithSetupState + none` produced `"converged"` after
+  // `resolveSetupState` ran the convergence flow. That was the wrong
+  // direction: a read path used by a `GET` route must not mutate.
+  // The corrected contract:
+  //
+  //   - internal `converged`  → public `"converged"`
+  //   - internal `recovery`   → public `"recovery"`
+  //   - internal `none`       → public `"recovery"` (no mutation)
+  //   - internal `attachable` → public `"recovery"` (no mutation)
+  //
+  // Each test below asserts both the public DTO classification AND
+  // the absence of mutation in the repository's persisted state.
+
+  describe("resolveSessionWithSetupState is strictly read-only (Tenki PR #91)", () => {
     function buildAuthService(repo: InMemoryAuthRepository): AuthenticationService {
       const convergence = new PersonalWorkspaceConvergenceService({
         authRepository: repo,
@@ -281,51 +398,56 @@ describe("AuthenticationService", () => {
       });
     }
 
-    test('reports "converged" only after convergence runs for a brand-new user with no Personal Workspace (none)', async () => {
+    async function mintSession(
+      repo: InMemoryAuthRepository,
+      userAccountId: string,
+    ): Promise<string> {
+      const session = await repo.createSession({
+        userAccountId,
+        expiresAt: new Date(now + 60 * 60 * 1000),
+      });
+      return session.sessionId;
+    }
+
+    test('classifies `none` as public "recovery" without mutating (no createInitialConvergence)', async () => {
       const repo = new InMemoryAuthRepository([], () => now);
       const auth = buildAuthService(repo);
       const mapping = await repo.createUserForIdentity({
         provider: "deterministic",
-        subject: "tenki-none-subject",
-        providerEmail: "tenki-none@example.com",
+        subject: "tenki-svc-none-subject",
+        providerEmail: "tenki-svc-none@example.com",
       });
-      const session = await repo.createSession({
-        userAccountId: mapping.userAccountId,
-        expiresAt: new Date(now + 60 * 60 * 1000),
-      });
-      // Sanity: the user starts in the `none` state — pointer NULL,
-      // no Owner Personal memberships.
       const before = await repo.findPersonalWorkspaceState({
         userAccountId: mapping.userAccountId,
       });
       assert.equal(before.personalWorkspaceId, null);
       assert.equal(before.ownerPersonalMemberships.length, 0);
 
-      const resolved = await auth.resolveSessionWithSetupState(session.sessionId);
+      const sessionId = await mintSession(repo, mapping.userAccountId);
+      const resolved = await auth.resolveSessionWithSetupState(sessionId);
       assert.ok(resolved);
-      // The convergence flow must have run: setupState is
-      // "converged" AND the user now has a pointer to a Personal
-      // Workspace with one Owner membership.
-      assert.equal(resolved.setupState, "converged");
+      assert.equal(resolved.setupState, "recovery");
+      // No mutation: pointer still NULL, zero Owner memberships.
       const after = await repo.findPersonalWorkspaceState({
         userAccountId: mapping.userAccountId,
       });
-      assert.notEqual(after.personalWorkspaceId, null);
-      assert.equal(after.ownerPersonalMemberships.length, 1);
+      assert.equal(after.personalWorkspaceId, null);
+      assert.equal(after.ownerPersonalMemberships.length, 0);
     });
 
-    test('reports "converged" after attach for a user with one Owner Personal membership but no pointer (attachable)', async () => {
+    test('classifies `attachable` as public "recovery" without mutating (no attachExistingConvergence)', async () => {
+      const EXISTING_WORKSPACE_ID = "ws-svc-existing-personal";
       const repo = new InMemoryAuthRepository(
         [
           {
-            userAccountId: "user-attachable",
-            email: "tenki-attachable@example.com",
+            userAccountId: "user-svc-attachable",
+            email: "tenki-svc-attachable@example.com",
             identityProvider: "deterministic",
-            identitySubject: "tenki-attachable-subject",
+            identitySubject: "tenki-svc-attachable-subject",
             memberships: [
               {
-                workspaceId: "ws-existing-personal",
-                slug: "personal-ws-existing-personal",
+                workspaceId: EXISTING_WORKSPACE_ID,
+                slug: "personal-ws-svc-existing-personal",
                 name: "Existing Personal",
                 workspaceType: "Personal",
                 workspaceStatus: "Active",
@@ -338,39 +460,39 @@ describe("AuthenticationService", () => {
         () => now,
       );
       const auth = buildAuthService(repo);
-      const session = await repo.createSession({
-        userAccountId: "user-attachable",
-        expiresAt: new Date(now + 60 * 60 * 1000),
-      });
-      // Sanity: the user starts in the `attachable` state — pointer
-      // NULL, exactly one Owner Personal membership.
       const before = await repo.findPersonalWorkspaceState({
-        userAccountId: "user-attachable",
+        userAccountId: "user-svc-attachable",
       });
       assert.equal(before.personalWorkspaceId, null);
       assert.equal(before.ownerPersonalMemberships.length, 1);
 
-      const resolved = await auth.resolveSessionWithSetupState(session.sessionId);
+      const sessionId = await mintSession(repo, "user-svc-attachable");
+      const resolved = await auth.resolveSessionWithSetupState(sessionId);
       assert.ok(resolved);
-      assert.equal(resolved.setupState, "converged");
+      assert.equal(resolved.setupState, "recovery");
+      // No mutation: pointer still NULL, EXACTLY one Owner
+      // membership on the pre-existing workspace — no duplicate
+      // created.
       const after = await repo.findPersonalWorkspaceState({
-        userAccountId: "user-attachable",
+        userAccountId: "user-svc-attachable",
       });
-      assert.equal(after.personalWorkspaceId, "ws-existing-personal");
+      assert.equal(after.personalWorkspaceId, null);
+      assert.equal(after.ownerPersonalMemberships.length, 1);
+      assert.equal(after.ownerPersonalMemberships[0]!.workspaceId, EXISTING_WORKSPACE_ID);
     });
 
-    test('reports "recovery" when the convergence classification is recovery (multiple Owner Personal memberships)', async () => {
+    test('classifies `recovery` (multiple Owner Personal memberships) as public "recovery" without mutating', async () => {
       const repo = new InMemoryAuthRepository(
         [
           {
-            userAccountId: "user-recovery",
-            email: "tenki-recovery@example.com",
+            userAccountId: "user-svc-recovery",
+            email: "tenki-svc-recovery@example.com",
             identityProvider: "deterministic",
-            identitySubject: "tenki-recovery-subject",
+            identitySubject: "tenki-svc-recovery-subject",
             memberships: [
               {
-                workspaceId: "ws-personal-a",
-                slug: "personal-ws-personal-a",
+                workspaceId: "ws-svc-personal-a",
+                slug: "personal-ws-svc-personal-a",
                 name: "Personal A",
                 workspaceType: "Personal",
                 workspaceStatus: "Active",
@@ -378,8 +500,8 @@ describe("AuthenticationService", () => {
                 capabilities: [],
               },
               {
-                workspaceId: "ws-personal-b",
-                slug: "personal-ws-personal-b",
+                workspaceId: "ws-svc-personal-b",
+                slug: "personal-ws-svc-personal-b",
                 name: "Personal B",
                 workspaceType: "Personal",
                 workspaceStatus: "Active",
@@ -392,13 +514,64 @@ describe("AuthenticationService", () => {
         () => now,
       );
       const auth = buildAuthService(repo);
-      const session = await repo.createSession({
-        userAccountId: "user-recovery",
-        expiresAt: new Date(now + 60 * 60 * 1000),
+      const before = await repo.findPersonalWorkspaceState({
+        userAccountId: "user-svc-recovery",
       });
-      const resolved = await auth.resolveSessionWithSetupState(session.sessionId);
+      assert.equal(before.ownerPersonalMemberships.length, 2);
+
+      const sessionId = await mintSession(repo, "user-svc-recovery");
+      const resolved = await auth.resolveSessionWithSetupState(sessionId);
       assert.ok(resolved);
       assert.equal(resolved.setupState, "recovery");
+      // Recovery does not auto-link: pointer still NULL, both
+      // Owner memberships intact. Recovery resolution beyond
+      // re-authentication is explicitly out of scope for #82.
+      const after = await repo.findPersonalWorkspaceState({
+        userAccountId: "user-svc-recovery",
+      });
+      assert.equal(after.personalWorkspaceId, null);
+      assert.equal(after.ownerPersonalMemberships.length, 2);
+    });
+
+    test('classifies `converged` as public "converged" without mutating', async () => {
+      const CONVERGED_WORKSPACE_ID = "ws-svc-converged";
+      const repo = new InMemoryAuthRepository(
+        [
+          {
+            userAccountId: "user-svc-converged",
+            email: "tenki-svc-converged@example.com",
+            identityProvider: "deterministic",
+            identitySubject: "tenki-svc-converged-subject",
+            memberships: [
+              {
+                workspaceId: CONVERGED_WORKSPACE_ID,
+                slug: "personal-ws-svc-converged",
+                name: "Converged Personal",
+                workspaceType: "Personal",
+                workspaceStatus: "Active",
+                role: "Owner",
+                capabilities: [],
+              },
+            ],
+          },
+        ],
+        () => now,
+      );
+      // Stage the converged state by linking the existing workspace.
+      await repo.attachExistingPersonalWorkspace({
+        userAccountId: "user-svc-converged",
+        workspaceId: CONVERGED_WORKSPACE_ID,
+      });
+      const auth = buildAuthService(repo);
+      const sessionId = await mintSession(repo, "user-svc-converged");
+      const resolved = await auth.resolveSessionWithSetupState(sessionId);
+      assert.ok(resolved);
+      assert.equal(resolved.setupState, "converged");
+      const after = await repo.findPersonalWorkspaceState({
+        userAccountId: "user-svc-converged",
+      });
+      assert.equal(after.personalWorkspaceId, CONVERGED_WORKSPACE_ID);
+      assert.equal(after.ownerPersonalMemberships.length, 1);
     });
   });
 });

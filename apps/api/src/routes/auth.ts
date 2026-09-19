@@ -27,8 +27,11 @@
 //     response (success or recovery).
 //
 //   GET /api/auth/me
-//     Response: { user | null } derived from the session cookie. No
-//     write side effects.
+//     Response: { user | null } derived from the session cookie.
+//     STRICTLY READ-ONLY: classifies current persisted state into
+//     `setupState: "converged" | "recovery"` but does NOT invoke
+//     convergence creation/attachment. Convergence is owned
+//     exclusively by POST /api/auth/verify-token.
 //
 //   POST /api/auth/sign-out
 //     Revokes the current session. Idempotent. Clears the session
