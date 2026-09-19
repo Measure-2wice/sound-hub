@@ -31,10 +31,7 @@ export class AuthorizationError extends Error {
   constructor(
     message: string,
     public readonly code:
-      | "WORKSPACE_NOT_FOUND"
-      | "WORKSPACE_INELIGIBLE"
-      | "NOT_A_MEMBER"
-      | "MISSING_CAPABILITY",
+      "WORKSPACE_NOT_FOUND" | "WORKSPACE_INELIGIBLE" | "NOT_A_MEMBER" | "MISSING_CAPABILITY",
   ) {
     super(message);
     this.name = "AuthorizationError";
