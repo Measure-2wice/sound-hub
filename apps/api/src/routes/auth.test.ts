@@ -20,7 +20,7 @@
 
 import assert from "node:assert/strict";
 import { createHash } from "node:crypto";
-import { before, describe, test } from "node:test";
+import { before, beforeEach, describe, test } from "node:test";
 import { createPrismaClient } from "@soundhub/db";
 import request from "supertest";
 import { buildApp } from "../index.js";
@@ -93,12 +93,24 @@ describe("BG1 auth routes (in-memory, deterministic adapter)", () => {
       );
     },
   });
-  const { app } = buildApp({
-    authenticationService,
-    workspaceAuthorizationService,
-    authRepository: authRepo,
-    identityAdapter: adapter,
-    prismaClient: stubPrisma,
+
+  // Per-test app construction: the auth router mounts the rate
+  // limiters (CodeQL `js/missing-rate-limiting` remediation) inside
+  // `createAuthRouter` and each constructed router owns fresh
+  // `MemoryStore`s. Constructing the app per test prevents the
+  // global 30/5-min circuit breakers from carrying state across
+  // tests — otherwise the suite would exhaust the global budget
+  // mid-run and assert "AUTH_FAILED 500" against "AUTH_RATE_LIMITED
+  // 429" responses.
+  let app: import("express").Application;
+  beforeEach(() => {
+    app = buildApp({
+      authenticationService,
+      workspaceAuthorizationService,
+      authRepository: authRepo,
+      identityAdapter: adapter,
+      prismaClient: stubPrisma,
+    }).app;
   });
 
   test("POST /api/auth/magic-link returns the neutral envelope with the public correlation id (P0-001, P2-001)", async () => {

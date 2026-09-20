@@ -44,7 +44,9 @@
 //     every request and rejects a user without it, regardless of any
 //     legacy ownerUserId match.
 
+import { createHash } from "node:crypto";
 import { Router, type NextFunction, type Request, type Response } from "express";
+import rateLimit, { MemoryStore, type RateLimitRequestHandler } from "express-rate-limit";
 import {
   bg1MagicLinkRequestV1Schema,
   bg1MagicLinkResponseV1Schema,
@@ -98,6 +100,78 @@ export function createAuthRouter(deps: AuthRouteDeps): Router {
     deps.allowedReturnOrigin ?? process.env.FRONTEND_URL ?? "http://localhost:3000",
   );
 
+  // Body parser for the auth router. Mounted as the first router
+  // middleware so the per-route rate-limit keyGenerators (registered
+  // immediately after this) observe `req.body` populated. The handler
+  // short-circuits its own streaming reader when this middleware has
+  // already parsed the body (same pattern as `matchmaker.ts`).
+  //
+  // 8 KiB cap matches the limit the inline streaming reader enforces;
+  // overflow + invalid-JSON failures translate to the same
+  // `INVALID_AUTH_REQUEST` safe envelope the handler would have
+  // produced. Reusing a single body-parsing path means the rate-limit
+  // `keyGenerator` and the schema validator observe the same parsed
+  // object — there is no second stream read.
+  router.use(parseAuthRequestBody);
+
+  // Rate limiters (CodeQL `js/missing-rate-limiting` remediation).
+  // Each instance owns a fresh `MemoryStore`; constructing the router
+  // twice produces two independent buckets, so tests can isolate by
+  // constructing a fresh router per `describe`.
+  //
+  // SoundHub's measured Railway topology does NOT preserve the
+  // browser IP to Express:
+  //   1. Railway web edge sees the browser IP
+  //   2. Next.js creates a new server-side request
+  //   3. Railway API edge sees the web service's SNAT address
+  //   4. Express sees Railway CGNAT / forwarded service identity
+  // Therefore req.ip cannot provide independent client identity and
+  // per-email / per-IP keying on `/magic-link` would collapse
+  // every legitimate browser onto the same bucket under the
+  // current deploy. Per-client abuse protection for magic-link
+  // therefore REQUIRES a trustworthy client identity at the
+  // public boundary (deferred — out of scope for #82).
+  //
+  // The remaining protection is two route-wide circuit breakers
+  // (30 / 5 min each, independent buckets) that bound total
+  // SoundHub + upstream work under the current low-volume
+  // single-replica beta. These are temporary M2 safeguards, NOT
+  // final per-client abuse controls.
+  //
+  // `/verify-token` retains a SHA-256 per-token limiter (3 / 60 s)
+  // in addition to the global circuit breaker. The per-token
+  // bucket is keyed by the PRIVATE verificationToken the browser
+  // extracted from the magic-link callback URL (canonicalized by
+  // `.min(1).max(512)`) so it never retains a plaintext token and
+  // bounded-retry is preserved.
+  const magicLinkGlobalLimiter: RateLimitRequestHandler = rateLimit({
+    windowMs: 5 * 60_000,
+    limit: 30,
+    standardHeaders: "draft-7",
+    legacyHeaders: false,
+    store: new MemoryStore(),
+    keyGenerator: () => "magic-link:global",
+    handler: (req, res) => rateLimitHandler(req, res, "magic-link"),
+  });
+  const verifyTokenPerTokenLimiter: RateLimitRequestHandler = rateLimit({
+    windowMs: 60_000,
+    limit: 3,
+    standardHeaders: "draft-7",
+    legacyHeaders: false,
+    store: new MemoryStore(),
+    keyGenerator: tokenRateLimitKey,
+    handler: (req, res) => rateLimitHandler(req, res, "verify-token"),
+  });
+  const verifyTokenGlobalLimiter: RateLimitRequestHandler = rateLimit({
+    windowMs: 5 * 60_000,
+    limit: 30,
+    standardHeaders: "draft-7",
+    legacyHeaders: false,
+    store: new MemoryStore(),
+    keyGenerator: () => "verify-token:global",
+    handler: (req, res) => rateLimitHandler(req, res, "verify-token"),
+  });
+
   // BG1 contract: route handlers MUST NOT leave promise rejections
   // unhandled. The handlers only translate recognised errors into
   // safe-envelope responses; any unexpected throw escapes the
@@ -110,16 +184,27 @@ export function createAuthRouter(deps: AuthRouteDeps): Router {
   // the wrapper logs and returns instead of calling `next(err)` —
   // the error middleware would attempt to set headers on a sent
   // response and produce ERR_HTTP_HEADERS_SENT.
-  router.post("/magic-link", (req, res, next) => {
+  //
+  // Per-route rate-limit middleware runs immediately before each
+  // handler. Attaching it directly to the `router.post(...)` chain
+  // (rather than via `router.use(...)` above the limiter) keeps the
+  // protection visible to CodeQL in the same declaration as the
+  // route.
+  router.post("/magic-link", magicLinkGlobalLimiter, (req, res, next) => {
     handleMagicLink(req, res, { ...deps, allowedReturnOrigin }).catch((err) =>
       forwardUnhandledRejection(req, res, next, err),
     );
   });
-  router.post("/verify-token", (req, res, next) => {
-    handleVerifyToken(req, res, { ...deps, allowedReturnOrigin }).catch((err) =>
-      forwardUnhandledRejection(req, res, next, err),
-    );
-  });
+  router.post(
+    "/verify-token",
+    verifyTokenPerTokenLimiter,
+    verifyTokenGlobalLimiter,
+    (req, res, next) => {
+      handleVerifyToken(req, res, { ...deps, allowedReturnOrigin }).catch((err) =>
+        forwardUnhandledRejection(req, res, next, err),
+      );
+    },
+  );
   router.get("/me", (req, res, next) => {
     handleMe(req, res, deps).catch((err) => forwardUnhandledRejection(req, res, next, err));
   });
@@ -407,6 +492,22 @@ function readSessionCookie(req: Request): string | undefined {
 }
 
 async function readJsonBody(req: Request, res: Response, requestId: string): Promise<unknown> {
+  // When the body has already been parsed by the router-level
+  // `parseAuthRequestBody` middleware (the production path) reuse it
+  // instead of re-reading the stream. Reading again would hang
+  // because the stream has already been consumed. The pre-parsed
+  // shape is the same `unknown` the streaming path returns, so the
+  // downstream schema validator sees an identical object.
+  //
+  // `null` is a legitimate JSON payload (a literal `null` body) that
+  // MUST reach `schema.parse(null)` so the Zod validator returns its
+  // normal `INVALID_AUTH_REQUEST` envelope rather than the handler
+  // silently treating it as "stop signal". The matchmaker short-
+  // circuit intentionally excludes `null`; the auth short-circuit
+  // intentionally includes it.
+  const existing: unknown = req.body;
+  if (existing !== undefined) return existing;
+
   const chunks: Buffer[] = [];
   let total = 0;
   const limit = 8 * 1024;
@@ -512,5 +613,112 @@ function writeAuthError(res: Response, err: unknown, requestId: string, route: s
       undefined,
       requestId,
     ),
+  );
+}
+
+// ---------- Body parser middleware ----------
+//
+// Reads the request body once and assigns the parsed value to
+// `req.body`, then continues the middleware chain. Mounted as the
+// first router-level middleware on `/api/auth` so the rate-limit
+// `keyGenerator` (attached immediately after) observes the same
+// parsed object the schema validator will see.
+//
+// Failures write the existing `INVALID_AUTH_REQUEST` safe envelope
+// and end the response. Reusing the existing envelope keeps the
+// public error contract identical to the inline streaming reader's
+// behaviour.
+
+const AUTH_REQUEST_BODY_LIMIT = 8 * 1024;
+
+function parseAuthRequestBody(req: Request, res: Response, next: NextFunction): void {
+  // Mirror the streaming reader's short-circuit: if some other
+  // middleware (a test harness's `express.json()`, for example) has
+  // already populated `req.body`, skip parsing. This keeps the
+  // router's body contract compatible with upstream parsers without
+  // requiring every test to know about the internal middleware.
+  const existing: unknown = req.body;
+  if (existing !== undefined && existing !== null) {
+    next();
+    return;
+  }
+
+  const requestId = resolveRequestId(req);
+  const chunks: Buffer[] = [];
+  let total = 0;
+
+  req.on("data", (chunk: Buffer) => {
+    total += chunk.length;
+    if (total > AUTH_REQUEST_BODY_LIMIT) {
+      req.pause();
+      res.setHeader("x-request-id", requestId);
+      writeSafeError(
+        res,
+        buildSafeError(
+          "INVALID_AUTH_REQUEST",
+          "Request body exceeds the limit.",
+          undefined,
+          requestId,
+        ),
+      );
+      req.destroy();
+      return;
+    }
+    chunks.push(chunk);
+  });
+  req.on("end", () => {
+    if (res.writableEnded) return;
+    res.setHeader("x-request-id", requestId);
+    if (chunks.length === 0) {
+      (req as Request & { body?: unknown }).body = {};
+      next();
+      return;
+    }
+    try {
+      const parsed = JSON.parse(Buffer.concat(chunks).toString("utf8")) as unknown;
+      (req as Request & { body?: unknown }).body = parsed;
+      next();
+    } catch {
+      writeSafeError(
+        res,
+        buildSafeError(
+          "INVALID_AUTH_REQUEST",
+          "Request body is not valid JSON.",
+          undefined,
+          requestId,
+        ),
+      );
+    }
+  });
+  req.on("error", (err: Error) => {
+    next(err);
+  });
+}
+
+// ---------- Rate-limit helpers ----------
+
+const FALLBACK_TOKEN_KEY = "__invalid_token__";
+
+function tokenRateLimitKey(req: Request): string {
+  const body: unknown = req.body;
+  if (typeof body !== "object" || body === null) return FALLBACK_TOKEN_KEY;
+  const candidate: unknown = (body as Record<string, unknown>).verificationToken;
+  const parsed = bg1VerifyTokenRequestV1Schema.shape.verificationToken.safeParse(candidate);
+  if (!parsed.success) return FALLBACK_TOKEN_KEY;
+  return createHash("sha256").update(parsed.data).digest("hex");
+}
+
+function rateLimitHandler(req: Request, res: Response, route: "magic-link" | "verify-token"): void {
+  // Express-rate-limit has already set the standard rate-limit
+  // headers (`RateLimit`, `RateLimit-Policy`) and `Retry-After` on
+  // the response before invoking `handler`; this function only needs
+  // to write the safe-error envelope so the public 429 contract
+  // matches the rest of the auth surface.
+  const requestId = resolveRequestId(req);
+  res.setHeader("x-request-id", requestId);
+  console.error(`[auth:${route}] requestId=${requestId} code=AUTH_RATE_LIMITED`);
+  writeSafeError(
+    res,
+    buildSafeError("AUTH_RATE_LIMITED", "Too many requests.", undefined, requestId),
   );
 }
