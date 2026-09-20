@@ -2,33 +2,42 @@
 // remediation for PR #91, Tenki remediation revision).
 //
 // Background: every test in this file constructs a fresh Express
-// app + fresh `createAuthRouter` instance so the three remaining
-// limiters each receive a fresh `MemoryStore`. This isolation is
-// automatic — there is no `resetKey()` import and no production
-// middleware re-use — because the limiter middleware is
-// instantiated inside `createAuthRouter` and never exported.
+// app + fresh `createAuthRouter` instance so the per-token
+// `MemoryStore` on `/verify-token` is fresh for each `describe`.
+// This isolation is automatic — there is no `resetKey()` import and
+// no production middleware re-use — because the limiter middleware
+// is instantiated inside `createAuthRouter` and never exported.
 //
-// POST /api/auth/magic-link is intentionally protected by ONLY a
-// route-wide circuit breaker (30 / 5 min, constant key). The
-// earlier per-email hash-keyed limiter was removed in the Tenki
-// remediation because SoundHub's measured Railway topology does
-// NOT preserve the browser IP to Express (Railway web edge sees
-// the browser IP; Next.js creates a new server-side request;
-// Railway API edge sees the web service's SNAT address; Express
-// sees Railway CGNAT / forwarded service identity). Per-email /
-// per-IP keying on top of that hop would collapse every
-// legitimate browser onto the same bucket and produce a single-
-// tenant rate limit for the whole beta. Targeted per-email abuse
-// protection is therefore deferred until a trustworthy client
-// identity is available at the public boundary.
+// `POST /api/auth/magic-link` mounts NO SoundHub-side rate
+// limiter. SoundHub's measured Railway topology does NOT preserve
+// the browser IP to Express (Railway web edge → Next.js → Railway
+// API edge → Express sees CGNAT / forwarded service identity),
+// so per-email or per-IP keying would collapse every legitimate
+// browser onto the same bucket and produce a single-tenant rate
+// limit for the whole beta. A route-wide constant-key circuit
+// breaker (the earlier 30/5 min cap) was rated High by Tenki
+// because any unauthenticated client could exhaust the shared
+// bucket and deny authentication to all users. Targeted per-client
+// abuse protection is deferred to the future public-boundary
+// security ticket — see the limiter construction comment in
+// `auth.ts` for the full reasoning.
+//
+// `POST /api/auth/verify-token` retains the SHA-256 per-token
+// limiter (3 / 60 s) attached directly to the route middleware
+// chain. The per-token bucket is keyed by the PRIVATE
+// verificationToken the browser extracted from the magic-link
+// callback URL (canonicalized by `.min(1).max(512)`) so it never
+// retains a plaintext token and bounded-retry is preserved.
+// Distinct tokens are independent — there is NO global circuit
+// breaker on this route.
 //
 // Tests assert behavioral coverage only: below-threshold requests
 // are NOT rejected by the limiter; the threshold-crossing request
-// is rejected with the standard `AUTH_RATE_LIMITED` envelope.
-// The verify-token tests deliberately do NOT require HTTP 200
-// below the threshold because the deterministic auth handler
-// legitimately rejects unknown tokens with `AUTH_FAILED`; the
-// limiter and the handler are independent concerns.
+// is rejected with the standard `AUTH_RATE_LIMITED` envelope. The
+// verify-token tests deliberately do NOT require HTTP 200 below
+// the threshold because the deterministic auth handler legitimately
+// rejects unknown tokens with `AUTH_FAILED`; the limiter and the
+// handler are independent concerns.
 
 /* eslint-disable @typescript-eslint/no-floating-promises */
 /* eslint-disable @typescript-eslint/no-unsafe-member-access */
@@ -107,45 +116,38 @@ function buildFreshApp(): {
   return { app, adapter, authRepo };
 }
 
-describe("POST /api/auth/magic-link — no per-email SoundHub-side bucket (Tenki remediation)", () => {
+describe("POST /api/auth/magic-link — no SoundHub-side rate limiter (Tenki remediation)", () => {
   let app: Application;
 
   beforeEach(() => {
     ({ app } = buildFreshApp());
   });
 
-  test("repeated same email: 30 requests all pass the limiter, 31st is the first 429 (global breaker, not email-specific)", async () => {
-    // Tenki remediation: there is intentionally no per-email
-    // limiter on /magic-link. The route-wide circuit breaker is
-    // the ONLY SoundHub-side protection. 30 distinct requests
-    // for one email must therefore pass the limiter without
-    // hitting an email-specific 429. The 31st request is the
-    // GLOBAL breaker — not an email-specific decision.
-    for (let i = 0; i < 30; i += 1) {
+  test("repeated same email: no SoundHub-side 429 across many requests (no per-email bucket)", async () => {
+    // Tenki remediation: there is intentionally NO SoundHub-side
+    // rate limiter on /magic-link. Per-email keying would collapse
+    // every legitimate browser onto the same bucket under the
+    // current Railway topology, and a route-wide constant-key
+    // circuit breaker would create a shared bucket that any
+    // unauthenticated client could exhaust to deny authentication
+    // to all users. The route therefore accepts every well-formed
+    // request through the limiter, leaving application-level
+    // per-client abuse protection for the future public-boundary
+    // security ticket.
+    for (let i = 0; i < 50; i += 1) {
       const response = await request(app)
         .post("/api/auth/magic-link")
         .send({ email: "buyer@example.com" })
         .set("Content-Type", "application/json");
       assert.notEqual(response.status, 429, `request #${i + 1} must not be rate-limited`);
     }
-    const thirtyFirst = await request(app)
-      .post("/api/auth/magic-link")
-      .send({ email: "buyer@example.com" })
-      .set("Content-Type", "application/json");
-    assert.equal(
-      thirtyFirst.status,
-      429,
-      "31st request must hit the route-wide global circuit breaker",
-    );
-    assert.equal(thirtyFirst.body.error.code, "AUTH_RATE_LIMITED");
   });
 
-  test("repeated same email with case + surrounding whitespace variation: never hits a SoundHub email-specific 429 before the global breaker", async () => {
-    // Belt-and-braces companion to the test above: even when the
-    // caller varies case + whitespace (which a single human
-    // might genuinely do), the limiter must NOT introduce a
-    // SoundHub-side email-specific bucket. The first 30 requests
-    // through this app pass; the 31st is the global breaker.
+  test("repeated same email with case + surrounding whitespace variation: still no SoundHub-side 429", async () => {
+    // Belt-and-braces companion: even when the caller varies case
+    // + whitespace (which a single human might genuinely do), the
+    // route MUST NOT introduce a SoundHub-side email-specific
+    // bucket.
     const variants = [
       "buyer@example.com",
       "Buyer@Example.com",
@@ -153,19 +155,27 @@ describe("POST /api/auth/magic-link — no per-email SoundHub-side bucket (Tenki
       "BUYER@example.com",
       "buyer@EXAMPLE.com",
     ];
-    for (let i = 0; i < 30; i += 1) {
+    for (let i = 0; i < 50; i += 1) {
       const response = await request(app)
         .post("/api/auth/magic-link")
         .send({ email: variants[i % variants.length] })
         .set("Content-Type", "application/json");
       assert.notEqual(response.status, 429, `request #${i + 1} must not be rate-limited`);
     }
-    const thirtyFirst = await request(app)
-      .post("/api/auth/magic-link")
-      .send({ email: "buyer@example.com" })
-      .set("Content-Type", "application/json");
-    assert.equal(thirtyFirst.status, 429);
-    assert.equal(thirtyFirst.body.error.code, "AUTH_RATE_LIMITED");
+  });
+
+  test("distinct emails are all accepted — no global circuit breaker", async () => {
+    // Independent bucket proof from the email side: distinct
+    // emails each pass independently. Send 50 distinct-email
+    // requests; all 50 pass. There is no global cap that could
+    // be tripped by total request count.
+    for (let i = 0; i < 50; i += 1) {
+      const response = await request(app)
+        .post("/api/auth/magic-link")
+        .send({ email: `distinct-${i}@example.com` })
+        .set("Content-Type", "application/json");
+      assert.notEqual(response.status, 429);
+    }
   });
 });
 
@@ -193,7 +203,10 @@ describe("POST /api/auth/verify-token — per-token rate limit", () => {
     assert.equal(fourth.body.error.code, "AUTH_RATE_LIMITED");
   });
 
-  test("distinct tokens are independent", async () => {
+  test("distinct tokens are independent — no global circuit breaker", async () => {
+    // Two distinct tokens, each hit once: both pass the limiter.
+    // Distinct tokens share no bucket; there is no global cap on
+    // /verify-token.
     const tokenA = `tok-a-${randomUUID()}`;
     const tokenB = `tok-b-${randomUUID()}`;
     const a = await request(app)
@@ -206,6 +219,20 @@ describe("POST /api/auth/verify-token — per-token rate limit", () => {
       .set("Content-Type", "application/json");
     assert.notEqual(a.status, 429);
     assert.notEqual(b.status, 429);
+  });
+
+  test("many distinct tokens are all accepted — no global circuit breaker", async () => {
+    // Independent bucket proof from the token side: distinct
+    // tokens each pass independently. Send 50 distinct-token
+    // requests; all 50 pass. There is no global cap that could
+    // be tripped by total request count.
+    for (let i = 0; i < 50; i += 1) {
+      const response = await request(app)
+        .post("/api/auth/verify-token")
+        .send({ verificationToken: `tok-${i}-${randomUUID()}` })
+        .set("Content-Type", "application/json");
+      assert.notEqual(response.status, 429);
+    }
   });
 
   test("malformed body falls through to the bounded fallback key — not an open-ended enumeration", async () => {
@@ -233,91 +260,6 @@ describe("POST /api/auth/verify-token — per-token rate limit", () => {
   });
 });
 
-describe("Auth route rate limits — global circuit breakers", () => {
-  test("magic-link global: 30 distinct emails pass the global cap, 31st is blocked at the global", async () => {
-    const { app } = buildFreshApp();
-    for (let i = 0; i < 30; i += 1) {
-      const response = await request(app)
-        .post("/api/auth/magic-link")
-        .send({ email: `user-${i}@example.com` })
-        .set("Content-Type", "application/json");
-      assert.notEqual(response.status, 429, `request #${i + 1} must pass the global cap`);
-    }
-    const thirtyFirst = await request(app)
-      .post("/api/auth/magic-link")
-      .send({ email: "user-30@example.com" })
-      .set("Content-Type", "application/json");
-    assert.equal(thirtyFirst.status, 429);
-    assert.equal(thirtyFirst.body.error.code, "AUTH_RATE_LIMITED");
-  });
-
-  test("verify-token global: 30 distinct tokens pass the global cap, 31st is blocked at the global", async () => {
-    const { app } = buildFreshApp();
-    for (let i = 0; i < 30; i += 1) {
-      const response = await request(app)
-        .post("/api/auth/verify-token")
-        .send({ verificationToken: `tok-${i}-${randomUUID()}` })
-        .set("Content-Type", "application/json");
-      assert.notEqual(response.status, 429, `request #${i + 1} must pass the global cap`);
-    }
-    const thirtyFirst = await request(app)
-      .post("/api/auth/verify-token")
-      .send({ verificationToken: `tok-30-${randomUUID()}` })
-      .set("Content-Type", "application/json");
-    assert.equal(thirtyFirst.status, 429);
-    assert.equal(thirtyFirst.body.error.code, "AUTH_RATE_LIMITED");
-  });
-
-  test("magic-link and verify-token global buckets are independent", async () => {
-    const { app } = buildFreshApp();
-    // Drive the magic-link global to exhaustion. The
-    // verify-token global must still accept the next request
-    // because each limiter owns its own MemoryStore and
-    // constant key.
-    for (let i = 0; i < 30; i += 1) {
-      await request(app)
-        .post("/api/auth/magic-link")
-        .send({ email: `user-${i}@example.com` })
-        .set("Content-Type", "application/json");
-    }
-    const magicLinkBlocked = await request(app)
-      .post("/api/auth/magic-link")
-      .send({ email: "user-30@example.com" })
-      .set("Content-Type", "application/json");
-    assert.equal(magicLinkBlocked.status, 429);
-
-    const verifyTokenStillAllowed = await request(app)
-      .post("/api/auth/verify-token")
-      .send({ verificationToken: `tok-${randomUUID()}` })
-      .set("Content-Type", "application/json");
-    assert.notEqual(verifyTokenStillAllowed.status, 429);
-  });
-
-  test("magic-link global is hit only via total request count, not per-email enumeration", async () => {
-    // Independent bucket proof from the email side: distinct
-    // emails each pass independently. Send 15 distinct-email
-    // requests then 15 more distinct-email requests; all 30
-    // pass. The 31st distinct email request is the one that
-    // trips the global. This guards against an accidental
-    // re-introduction of a per-email limiter (which would
-    // produce 29 200s + 1 429 from a different position).
-    const { app } = buildFreshApp();
-    for (let i = 0; i < 30; i += 1) {
-      const response = await request(app)
-        .post("/api/auth/magic-link")
-        .send({ email: `distinct-${i}@example.com` })
-        .set("Content-Type", "application/json");
-      assert.notEqual(response.status, 429);
-    }
-    const thirtyFirst = await request(app)
-      .post("/api/auth/magic-link")
-      .send({ email: "distinct-30@example.com" })
-      .set("Content-Type", "application/json");
-    assert.equal(thirtyFirst.status, 429);
-    assert.equal(thirtyFirst.body.error.code, "AUTH_RATE_LIMITED");
-  });
-});
-
 describe("429 envelope shape — standard rate-limit headers + requestId", () => {
   let app: Application;
 
@@ -325,20 +267,21 @@ describe("429 envelope shape — standard rate-limit headers + requestId", () =>
     ({ app } = buildFreshApp());
   });
 
-  test("draft-7 headers and AUTH_RATE_LIMITED envelope on the magic-link global", async () => {
-    // Drive the magic-link global to exhaustion by sending 30
-    // distinct emails, then inspect the 31st response — the
-    // per-email limiter is intentionally absent so this is the
-    // cleanest way to observe the envelope.
-    for (let i = 0; i < 30; i += 1) {
+  test("draft-7 headers and AUTH_RATE_LIMITED envelope on the verify-token per-token bucket", async () => {
+    // Drive the per-token bucket to exhaustion by submitting the
+    // same token 4 times, then inspect the 4th response — the
+    // only limiter on /verify-token is the per-token bucket, so
+    // this is the cleanest way to observe the envelope.
+    const token = `envelope-tok-${randomUUID()}`;
+    for (let i = 0; i < 3; i += 1) {
       await request(app)
-        .post("/api/auth/magic-link")
-        .send({ email: `envelope-${i}@example.com` })
+        .post("/api/auth/verify-token")
+        .send({ verificationToken: token })
         .set("Content-Type", "application/json");
     }
     const limited = await request(app)
-      .post("/api/auth/magic-link")
-      .send({ email: "envelope-30@example.com" })
+      .post("/api/auth/verify-token")
+      .send({ verificationToken: token })
       .set("Content-Type", "application/json");
 
     assert.equal(limited.status, 429);
@@ -358,36 +301,9 @@ describe("429 envelope shape — standard rate-limit headers + requestId", () =>
     // The response's `x-request-id` matches the envelope.
     assert.equal(limited.headers["x-request-id"], limited.body.error.requestId);
   });
-
-  test("draft-7 headers and AUTH_RATE_LIMITED envelope on the verify-token global", async () => {
-    // Symmetric coverage for the verify-token global.
-    for (let i = 0; i < 30; i += 1) {
-      await request(app)
-        .post("/api/auth/verify-token")
-        .send({ verificationToken: `envelope-tok-${i}-${randomUUID()}` })
-        .set("Content-Type", "application/json");
-    }
-    const limited = await request(app)
-      .post("/api/auth/verify-token")
-      .send({ verificationToken: `envelope-tok-30-${randomUUID()}` })
-      .set("Content-Type", "application/json");
-
-    assert.equal(limited.status, 429);
-    assert.equal(limited.body.error.code, "AUTH_RATE_LIMITED");
-    assert.equal(typeof limited.body.error.message, "string");
-    assert.ok(limited.body.error.requestId, "envelope carries requestId");
-
-    const rateLimitHeader = limited.headers["ratelimit"];
-    const rateLimitPolicyHeader = limited.headers["ratelimit-policy"];
-    const retryAfterHeader = limited.headers["retry-after"];
-    assert.ok(rateLimitHeader, "RateLimit header (draft-7) must be present on 429");
-    assert.ok(rateLimitPolicyHeader, "RateLimit-Policy header (draft-7) must be present on 429");
-    assert.ok(retryAfterHeader, "Retry-After header must be present on 429");
-    assert.equal(limited.headers["x-request-id"], limited.body.error.requestId);
-  });
 });
 
-describe("OPTIONS preflight is unaffected by the rate limiters", () => {
+describe("OPTIONS preflight is unaffected by the rate limiter", () => {
   test("OPTIONS to /magic-link is not 429", async () => {
     const { app } = buildFreshApp();
     const response = await request(app).options("/api/auth/magic-link");

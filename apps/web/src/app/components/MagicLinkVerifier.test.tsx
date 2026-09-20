@@ -67,14 +67,19 @@ describe("BG1 magic-link callback pages (P0-001 producer/consumer alignment)", (
   });
 
   test("the login page extracts the credential from ?token= in the dev verification URL", () => {
-    const source = readPage("login/page.tsx");
+    // The login page is a thin production wrapper that delegates
+    // to `LoginPageContent` for the credential extraction. The
+    // source-pattern assertion pins the extraction at the
+    // composable layer so a future refactor cannot silently swap
+    // the `?token=` parameter for the public `?request_id`.
+    const source = readPage("login/page-content.tsx");
     assert.ok(
       /searchParams\.get\("token"\)/.test(source),
-      "login page MUST extract the credential from the dev verification URL's ?token= parameter",
+      "login page-content MUST extract the credential from the dev verification URL's ?token= parameter",
     );
     assert.ok(
       !/searchParams\.get\("request_id"/.test(source),
-      "login page MUST NOT read the public correlation id 'request_id' as the credential",
+      "login page-content MUST NOT read the public correlation id 'request_id' as the credential",
     );
   });
 

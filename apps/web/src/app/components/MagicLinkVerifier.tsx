@@ -53,10 +53,10 @@
 // from the loading surface.
 
 import { useEffect, useRef, useState, type ReactNode } from "react";
-import type { Route } from "next";
 import { useRouter, useSearchParams } from "next/navigation";
 import { useSession } from "./SessionProvider";
 import { Alert } from "./ui/Alert";
+import { navigateAfterVerify } from "../login/navigate-after-verify";
 
 export interface MagicLinkVerifierProps {
   readonly paramName: string;
@@ -85,33 +85,13 @@ export function MagicLinkVerifier({ paramName, children }: MagicLinkVerifierProp
       try {
         const response = await verifyAndRefresh({ verificationToken });
         if (cancelled) return;
-        // Apply return context ONLY when the setup is converged.
-        // Recovery overrides return context so a retry does not
-        // land back at an inaccessible destination.
-        //
-        // The verifier branches per case so each literal /
-        // validated-path value lands at a Next-typed-route
-        // boundary directly. The recovery literal matches
-        // `${StaticRoutes}${SearchOrHash}` (`/dashboard` +
-        // `?recovery=1`) and `/dashboard` matches `StaticRoutes`,
-        // so both pass through without a cast. For the
-        // `response.returnTo` branch, the cast
-        // `(response.returnTo as Route) ?? "/dashboard"` keeps
-        // `response.returnTo` typed as `string | null` until the
-        // cast point — `null` is not assignable to either
-        // `Route = string & {}` (un-augmented) or
-        // `Route = RouteImpl<string>` (augmented), so the cast
-        // is structurally necessary in both environments and the
-        // `@typescript-eslint/no-unnecessary-type-assertion`
-        // rule does not flag it. The runtime `?? "/dashboard"`
-        // collapses the null case to the canonical dashboard;
-        // the cast is a type-level assertion only (no runtime
-        // coercion), so a null value still routes safely.
-        if (response.user.setupState === "recovery") {
-          router.replace("/dashboard?recovery=1");
-        } else {
-          router.replace((response.returnTo as Route) ?? "/dashboard");
-        }
+        // Converged navigation contract: shared with the login
+        // page's dev-verification button (see
+        // `navigate-after-verify`). The callback path uses
+        // `replace` so the verification surface never stays in
+        // history — pressing back must not return to a one-shot
+        // URL.
+        navigateAfterVerify({ router, response, method: "replace" });
       } catch {
         // Render the in-page recovery surface in-place. The catch
         // branch MUST NOT redirect to /dashboard, set the user, or

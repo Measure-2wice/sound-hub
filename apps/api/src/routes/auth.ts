@@ -132,27 +132,25 @@ export function createAuthRouter(deps: AuthRouteDeps): Router {
   // therefore REQUIRES a trustworthy client identity at the
   // public boundary (deferred — out of scope for #82).
   //
-  // The remaining protection is two route-wide circuit breakers
-  // (30 / 5 min each, independent buckets) that bound total
-  // SoundHub + upstream work under the current low-volume
-  // single-replica beta. These are temporary M2 safeguards, NOT
-  // final per-client abuse controls.
+  // `POST /magic-link` therefore mounts NO SoundHub-side
+  // limiter. A route-wide constant-key circuit breaker would
+  // create a single shared bucket that any unauthenticated
+  // client could exhaust and deny authentication to every
+  // legitimate user — exactly the failure mode Tenki flagged as
+  // High. The original CodeQL finding is mitigated for the
+  // surface it actually covers (`POST /verify-token`); targeted
+  // per-client `/magic-link` abuse protection is deferred to
+  // the future public-boundary security ticket.
   //
-  // `/verify-token` retains a SHA-256 per-token limiter (3 / 60 s)
-  // in addition to the global circuit breaker. The per-token
-  // bucket is keyed by the PRIVATE verificationToken the browser
-  // extracted from the magic-link callback URL (canonicalized by
-  // `.min(1).max(512)`) so it never retains a plaintext token and
-  // bounded-retry is preserved.
-  const magicLinkGlobalLimiter: RateLimitRequestHandler = rateLimit({
-    windowMs: 5 * 60_000,
-    limit: 30,
-    standardHeaders: "draft-7",
-    legacyHeaders: false,
-    store: new MemoryStore(),
-    keyGenerator: () => "magic-link:global",
-    handler: (req, res) => rateLimitHandler(req, res, "magic-link"),
-  });
+  // `POST /verify-token` retains a SHA-256 per-token limiter
+  // (3 / 60 s) attached directly to the route middleware chain
+  // so the original CodeQL `js/missing-rate-limiting` finding
+  // remains mitigated. The per-token bucket is keyed by the
+  // PRIVATE verificationToken the browser extracted from the
+  // magic-link callback URL (canonicalized by `.min(1).max(512)`)
+  // so it never retains a plaintext token and bounded-retry is
+  // preserved. No global circuit breaker is mounted — distinct
+  // tokens are independent.
   const verifyTokenPerTokenLimiter: RateLimitRequestHandler = rateLimit({
     windowMs: 60_000,
     limit: 3,
@@ -160,16 +158,7 @@ export function createAuthRouter(deps: AuthRouteDeps): Router {
     legacyHeaders: false,
     store: new MemoryStore(),
     keyGenerator: tokenRateLimitKey,
-    handler: (req, res) => rateLimitHandler(req, res, "verify-token"),
-  });
-  const verifyTokenGlobalLimiter: RateLimitRequestHandler = rateLimit({
-    windowMs: 5 * 60_000,
-    limit: 30,
-    standardHeaders: "draft-7",
-    legacyHeaders: false,
-    store: new MemoryStore(),
-    keyGenerator: () => "verify-token:global",
-    handler: (req, res) => rateLimitHandler(req, res, "verify-token"),
+    handler: (req, res) => rateLimitHandler(req, res),
   });
 
   // BG1 contract: route handlers MUST NOT leave promise rejections
@@ -190,21 +179,19 @@ export function createAuthRouter(deps: AuthRouteDeps): Router {
   // (rather than via `router.use(...)` above the limiter) keeps the
   // protection visible to CodeQL in the same declaration as the
   // route.
-  router.post("/magic-link", magicLinkGlobalLimiter, (req, res, next) => {
+  //
+  // `/magic-link` mounts NO SoundHub-side limiter. See the limiter
+  // construction comment above for the reasoning.
+  router.post("/magic-link", (req, res, next) => {
     handleMagicLink(req, res, { ...deps, allowedReturnOrigin }).catch((err) =>
       forwardUnhandledRejection(req, res, next, err),
     );
   });
-  router.post(
-    "/verify-token",
-    verifyTokenPerTokenLimiter,
-    verifyTokenGlobalLimiter,
-    (req, res, next) => {
-      handleVerifyToken(req, res, { ...deps, allowedReturnOrigin }).catch((err) =>
-        forwardUnhandledRejection(req, res, next, err),
-      );
-    },
-  );
+  router.post("/verify-token", verifyTokenPerTokenLimiter, (req, res, next) => {
+    handleVerifyToken(req, res, { ...deps, allowedReturnOrigin }).catch((err) =>
+      forwardUnhandledRejection(req, res, next, err),
+    );
+  });
   router.get("/me", (req, res, next) => {
     handleMe(req, res, deps).catch((err) => forwardUnhandledRejection(req, res, next, err));
   });
@@ -708,15 +695,16 @@ function tokenRateLimitKey(req: Request): string {
   return createHash("sha256").update(parsed.data).digest("hex");
 }
 
-function rateLimitHandler(req: Request, res: Response, route: "magic-link" | "verify-token"): void {
+function rateLimitHandler(req: Request, res: Response): void {
   // Express-rate-limit has already set the standard rate-limit
   // headers (`RateLimit`, `RateLimit-Policy`) and `Retry-After` on
   // the response before invoking `handler`; this function only needs
   // to write the safe-error envelope so the public 429 contract
-  // matches the rest of the auth surface.
+  // matches the rest of the auth surface. Only `POST /verify-token`
+  // mounts a limiter, so the route tag is fixed.
   const requestId = resolveRequestId(req);
   res.setHeader("x-request-id", requestId);
-  console.error(`[auth:${route}] requestId=${requestId} code=AUTH_RATE_LIMITED`);
+  console.error(`[auth:verify-token] requestId=${requestId} code=AUTH_RATE_LIMITED`);
   writeSafeError(
     res,
     buildSafeError("AUTH_RATE_LIMITED", "Too many requests.", undefined, requestId),

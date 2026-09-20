@@ -94,14 +94,13 @@ describe("BG1 auth routes (in-memory, deterministic adapter)", () => {
     },
   });
 
-  // Per-test app construction: the auth router mounts the rate
-  // limiters (CodeQL `js/missing-rate-limiting` remediation) inside
-  // `createAuthRouter` and each constructed router owns fresh
-  // `MemoryStore`s. Constructing the app per test prevents the
-  // global 30/5-min circuit breakers from carrying state across
-  // tests — otherwise the suite would exhaust the global budget
-  // mid-run and assert "AUTH_FAILED 500" against "AUTH_RATE_LIMITED
-  // 429" responses.
+  // Per-test app construction: the auth router mounts the per-token
+  // rate limiter (CodeQL `js/missing-rate-limiting` remediation)
+  // inside `createAuthRouter` and each constructed router owns a
+  // fresh `MemoryStore`. Constructing the app per test prevents the
+  // per-token bucket from carrying state across tests — otherwise a
+  // token reused across multiple cases would trip the 3/60 s cap
+  // mid-suite.
   let app: import("express").Application;
   beforeEach(() => {
     app = buildApp({

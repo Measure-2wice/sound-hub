@@ -89,18 +89,30 @@ describe("BG1 magic-link verifier → navigation synchronization", () => {
   });
 
   test("login page's dev verification handler calls the shared verifyAndRefresh helper, NOT verifyToken directly", () => {
-    const source = readFile("login/page.tsx");
+    // The login page is a thin production wrapper that delegates
+    // to `LoginPageContent` for the dev-verification handler. The
+    // assertion pins both layers: the wrapper must consume the
+    // shared session seam (`useSession`), and the composable
+    // inner component must call `verifyAndRefresh` (never
+    // `verifyToken` directly) so a successful verification
+    // refreshes the navigation seam.
+    const pageSource = readFile("login/page.tsx");
+    const contentSource = readFile("login/page-content.tsx");
     assert.ok(
-      /useSession\(\)/.test(source),
+      /useSession\(\)/.test(pageSource),
       "the login page MUST consume the shared session seam so the dev verification path refreshes the navigation",
     );
     assert.ok(
-      /verifyAndRefresh\(/.test(source),
-      "the login page's dev verification handler MUST call verifyAndRefresh from the seam",
+      /<LoginPageContent/.test(pageSource),
+      "the login page MUST delegate to the LoginPageContent component",
     );
     assert.ok(
-      !/await\s+verifyToken\(/.test(source),
-      "the login page MUST NOT call verifyToken directly — that path bypasses the seam and leaves the navigation stale",
+      /verifyAndRefresh\(/.test(contentSource),
+      "LoginPageContent's dev verification handler MUST call verifyAndRefresh from the seam",
+    );
+    assert.ok(
+      !/await\s+verifyToken\(/.test(contentSource),
+      "LoginPageContent MUST NOT call verifyToken directly — that path bypasses the seam and leaves the navigation stale",
     );
   });
 });
