@@ -48,6 +48,8 @@ export default [
             "packages/db/prisma.config.ts",
             "packages/db/prisma/seed.test.ts",
             "packages/db/prisma/snapshot-probe.ts",
+            "packages/db/prisma/seed-recovery-user.ts",
+            "packages/db/prisma/seed-recovery-user.test.ts",
           ],
         },
         tsconfigRootDir: import.meta.dirname,

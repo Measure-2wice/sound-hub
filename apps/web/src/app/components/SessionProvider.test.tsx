@@ -89,18 +89,30 @@ describe("BG1 magic-link verifier → navigation synchronization", () => {
   });
 
   test("login page's dev verification handler calls the shared verifyAndRefresh helper, NOT verifyToken directly", () => {
-    const source = readFile("login/page.tsx");
+    // The login page is a thin production wrapper that delegates
+    // to `LoginPageContent` for the dev-verification handler. The
+    // assertion pins both layers: the wrapper must consume the
+    // shared session seam (`useSession`), and the composable
+    // inner component must call `verifyAndRefresh` (never
+    // `verifyToken` directly) so a successful verification
+    // refreshes the navigation seam.
+    const pageSource = readFile("login/page.tsx");
+    const contentSource = readFile("login/page-content.tsx");
     assert.ok(
-      /useSession\(\)/.test(source),
+      /useSession\(\)/.test(pageSource),
       "the login page MUST consume the shared session seam so the dev verification path refreshes the navigation",
     );
     assert.ok(
-      /verifyAndRefresh\(/.test(source),
-      "the login page's dev verification handler MUST call verifyAndRefresh from the seam",
+      /<LoginPageContent/.test(pageSource),
+      "the login page MUST delegate to the LoginPageContent component",
     );
     assert.ok(
-      !/await\s+verifyToken\(/.test(source),
-      "the login page MUST NOT call verifyToken directly — that path bypasses the seam and leaves the navigation stale",
+      /verifyAndRefresh\(/.test(contentSource),
+      "LoginPageContent's dev verification handler MUST call verifyAndRefresh from the seam",
+    );
+    assert.ok(
+      !/await\s+verifyToken\(/.test(contentSource),
+      "LoginPageContent MUST NOT call verifyToken directly — that path bypasses the seam and leaves the navigation stale",
     );
   });
 });
@@ -140,16 +152,20 @@ describe("BG1 sign-out → navigation synchronization", () => {
 });
 
 describe("BG1 failed verification cannot mark the user signed in", () => {
-  test("MagicLinkVerifier never refreshes or navigates to /dashboard on a failed verify", () => {
+  test("MagicLinkVerifier renders an in-page recovery Alert on a failed verify and never lands on /dashboard or mutates session state", () => {
     const source = readFile("components/MagicLinkVerifier.tsx");
-    // The catch branch redirects to /login (never /dashboard) and
-    // never calls refresh / setUser — so a rejected token cannot
-    // leave the navigation reading "signed in".
+    // M2 (#82) visual-QA: the catch branch no longer silently
+    // redirects to /login. Instead, it sets `verificationError` so
+    // the verifier renders an in-page `<Alert role="alert">`
+    // recovery surface in place. The catch branch MUST still NOT
+    // redirect to /dashboard, set the user, or refresh the seam —
+    // a failed verification cannot sign the user in. The recovery
+    // Alert's action button is the user opt-in path to /login.
     const catchBranch = source.match(/catch\s*\{[\s\S]*?\}\s*\)/);
     assert.ok(catchBranch, "MagicLinkVerifier MUST have a catch branch for failed verification");
     assert.ok(
-      /router\.replace\(\s*"\/login"\s*\)/.test(catchBranch[0]),
-      "the catch branch MUST redirect to /login so a failed verification never lands on the dashboard",
+      /setVerificationError\(/.test(catchBranch[0]),
+      "the catch branch MUST set verificationError so the in-page recovery Alert renders",
     );
     assert.ok(
       !/router\.replace\(\s*"\/dashboard"\s*\)/.test(catchBranch[0]),
@@ -162,6 +178,19 @@ describe("BG1 failed verification cannot mark the user signed in", () => {
     assert.ok(
       !/refresh\(/.test(catchBranch[0]),
       "the catch branch MUST NOT call refresh — the authoritative session did not change",
+    );
+    // The in-page recovery surface exists and is provider-neutral.
+    // The verifier passes the testid to the Alert primitive which
+    // emits it as data-testid; we assert on the literal identifier
+    // so the contract is pinned at the call site regardless of
+    // whether the Alert primitive ever renames its emission.
+    assert.ok(
+      /"magic-link-verifier-error"/.test(source),
+      "the in-page recovery surface MUST carry the magic-link-verifier-error identifier (passed to the Alert primitive)",
+    );
+    assert.ok(
+      /Request a new sign-in link/.test(source),
+      "the recovery action label MUST be 'Request a new sign-in link' (truthful — the action only navigates back to /login)",
     );
   });
 

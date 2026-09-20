@@ -897,6 +897,17 @@ async function applySellerGraph(
     update: { role: "Owner" },
   });
 
+  // M2 (#82): restore the Personal Workspace pointer for Personal
+  // sellers. The pointer is the canonical source of truth for
+  // "which Personal Workspace does this human own" and is consulted
+  // by the convergence service on first auth.
+  if (seller.workspaceType === "Personal") {
+    await tx.userAccount.update({
+      where: { id: owner.id },
+      data: { personalWorkspaceId: workspace.id },
+    });
+  }
+
   // Replace the canonical capability set so re-running the seed
   // converges on the approved capability set (canonical: ["Seller"];
   // negative fixtures: ["Buyer"] or whatever the excluded state needs).
@@ -1143,6 +1154,14 @@ async function applyDemoBuyerGraph(tx: Prisma.TransactionClient): Promise<void> 
       role: "Owner",
     },
     update: { role: "Owner" },
+  });
+
+  // M2 (#82): set the Personal Workspace pointer on the demo buyer
+  // so the convergence service classifies this user as "converged"
+  // on first auth.
+  await tx.userAccount.update({
+    where: { id: buyer.id },
+    data: { personalWorkspaceId: workspace.id },
   });
 
   // Replace the canonical capability set so a stale mutation cannot
@@ -1467,6 +1486,7 @@ interface CanonicalSnapshot {
   readonly sellers: readonly {
     readonly userEmail: string;
     readonly userId: string;
+    readonly personalWorkspaceId: string | null;
     readonly workspaceSlug: string;
     readonly workspaceId: string;
     readonly workspaceName: string;
@@ -1596,6 +1616,7 @@ export async function captureCanonicalSnapshot(): Promise<CanonicalSnapshot> {
     sellers.push({
       userEmail: user.email,
       userId: user.id,
+      personalWorkspaceId: user.personalWorkspaceId ?? null,
       workspaceSlug: workspace.slug,
       workspaceId: workspace.id,
       workspaceName: workspace.name,
@@ -1788,6 +1809,19 @@ export function assertCanonicalSnapshotCorrect(snapshot: CanonicalSnapshot): voi
     if (actual.sellerCapability !== "Seller") {
       throw new Error(
         `WorkspaceCapability for ${seller.workspaceSlug} drifted: expected Seller got ${actual.sellerCapability}`,
+      );
+    }
+    // M2 (#82): canonical Personal Sellers must carry the
+    // personalWorkspaceId pointer on their UserAccount. The seed
+    // restores this on every run; a drift surfaces here.
+    if (seller.workspaceType === "Personal" && actual.personalWorkspaceId !== actual.workspaceId) {
+      throw new Error(
+        `UserAccount.personalWorkspaceId drifted for ${seller.workspaceSlug}: expected ${actual.workspaceId} got ${actual.personalWorkspaceId}`,
+      );
+    }
+    if (seller.workspaceType !== "Personal" && actual.personalWorkspaceId !== null) {
+      throw new Error(
+        `UserAccount.personalWorkspaceId leaked for non-Personal ${seller.workspaceSlug}: got ${actual.personalWorkspaceId}`,
       );
     }
     // Stable field values.

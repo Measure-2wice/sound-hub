@@ -18,25 +18,33 @@
 // `emailRedirectTo` URL; this page reads the same `token`
 // parameter. `requestId` is reserved for the PUBLIC correlation id
 // emitted by `/api/auth/magic-link` and is NOT accepted here.
+//
+// M2 (#82) visual-QA remediation: the page-level loading surface
+// is rendered AS `children` of `MagicLinkVerifier`. On invalid or
+// expired verification the verifier replaces the loading surface
+// with an in-page recovery alert — the two are mutually exclusive.
+// The `role="status"` loading paragraph never sits alongside the
+// recovery alert. The warm parchment canvas wrapper is scoped to
+// this #82 page only — the global layout body color is untouched.
 
 import { Suspense } from "react";
 import { MagicLinkVerifier } from "../../components/MagicLinkVerifier";
-import { Card } from "../../components/ui/Card";
 
 export default function AuthCallbackPage() {
   return (
-    <div className="max-w-md mx-auto px-6 py-12">
-      <h1 className="text-3xl font-bold text-gray-900 mb-4">Signing you in…</h1>
-      <Card>
-        <Card.Content>
-          <p className="text-sm text-gray-700">
-            Verifying your magic link. You will be redirected shortly.
-          </p>
-        </Card.Content>
-      </Card>
-      <Suspense fallback={null}>
-        <MagicLinkVerifier paramName="token" />
-      </Suspense>
+    <div className="min-h-screen bg-canvas">
+      <div className="max-w-md mx-auto px-6 py-12">
+        <Suspense fallback={null}>
+          <MagicLinkVerifier paramName="token">
+            <h1 className="text-3xl font-bold text-ink mb-4">Signing you in…</h1>
+            <div className="rounded-lg bg-surface border border-borderWarm p-4">
+              <p role="status" className="text-base text-muted">
+                We&apos;re confirming your sign-in. You&apos;ll be redirected shortly.
+              </p>
+            </div>
+          </MagicLinkVerifier>
+        </Suspense>
+      </div>
     </div>
   );
 }

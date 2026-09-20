@@ -244,6 +244,15 @@ function mapStatus(code: ApiErrorCodeV1): number {
       // surface. The underlying message is logged server side but
       // never echoed to the response envelope.
       return 500;
+    // M2 (#82): Personal Workspace convergence surface (reserved).
+    // The normal recovery path surfaces recovery via `setupState:
+    // "recovery"` on the public user payload, NOT via an error
+    // envelope from /verify-token. These codes are mapped to safe
+    // statuses for the boundary-condition paths.
+    case "PERSONAL_WORKSPACE_RECOVERY_REQUIRED":
+      return 403;
+    case "PERSONAL_WORKSPACE_CONVERGENCE_CONFLICT":
+      return 409;
   }
 }
 

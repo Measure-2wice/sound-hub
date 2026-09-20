@@ -235,6 +235,19 @@ The following behavior is existing baseline, not new Milestone 2 implementation 
   candidate causes atomic creation. Multiple candidates, contradictory ownership/membership, or
   other ambiguity causes an explicit recovery state; the system does not select, merge, delete, or
   rewrite authority relationships automatically.
+- **Recovery reason classification.** When the Personal Workspace convergence classification
+  cannot link the authenticated human to exactly one unambiguous Personal Workspace + current
+  Owner membership, the server classifies the contradiction as one of the server-internal
+  recovery reasons defined alongside the convergence service. The existing six reasons retain
+  their current definitions and precedence: `pointer-workspace-missing`, `pointer-not-personal`,
+  `owner-membership-missing`, `membership-not-owner`, `contradictory-personal-relationships`,
+  `multiple-personal-workspaces`. When an existing contradiction already applies, that reason
+  keeps its precedence.
+  - `co-owned-personal-workspace` — A Personal Workspace considered for the user's Personal
+    Workspace authority has current Owner memberships belonging to more than one distinct
+    UserAccount. This reason blocks otherwise-safe `attachable` and `converged` classifications.
+    Public behavior is unchanged: `setupState: "recovery"`. The reason remains server-internal and
+    never crosses the HTTP boundary.
 - The same logical provisioning or repair attempt is retry-safe and converges on the same records.
   Exact keys, uniqueness constraints, receipts, and transaction mechanics are deferred to the
   implementation specification and must be verified against the current schema.

@@ -15,8 +15,8 @@
 // because client-side route changes never re-run mount-time fetches.
 //
 // `SessionProvider` is the single seam every auth-aware client
-// component reads from. It owns the user state, fetches it from the
-// authoritative endpoint on mount, and exposes a `refresh()` that
+// component reads from. It owns the user state, fetches it from
+// the authoritative endpoint on mount, and exposes a `refresh()` that
 // any caller can invoke after a state-changing auth action. The
 // helper methods (`verifyAndRefresh`, `signOutAndRefresh`) wrap the
 // auth-client calls so the refresh can never drift from the action:
@@ -24,6 +24,11 @@
 // sign-out always clears it; a failed verify never marks the user
 // signed in. Both the managed (Supabase) callback and the
 // deterministic dev verification URL flow through the same seam.
+//
+// M2 (#82): the `verifyAndRefresh` helper returns the full verify-
+// token response (including the server-derived `setupState` and the
+// validated `returnTo`) so callers can navigate appropriately
+// without an additional round-trip.
 
 import {
   createContext,
@@ -49,7 +54,9 @@ export interface SessionContextValue {
   // session info so every consumer (navigation, dashboard) reflects
   // the new identity without a full page reload. Throws on failure
   // without mutating state — failed verifications MUST NOT mark the
-  // user signed in.
+  // user signed in. Returns the full verify-token response so
+  // callers can read `returnTo` and `user.setupState` without an
+  // additional round-trip.
   readonly verifyAndRefresh: (input: Bg1VerifyTokenRequestV1) => Promise<Bg1VerifyTokenResponseV1>;
   // Run sign-out, then re-pull the session so every consumer clears
   // the signed-in state consistently.

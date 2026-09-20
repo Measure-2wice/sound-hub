@@ -522,6 +522,18 @@ export const apiErrorCodeV1Schema = z.enum([
   "DEAL_LIST_INVALID",
   // 500 — unexpected internal failure outside the typed surfaces.
   "DEAL_LIST_FAILED",
+  // M2 (#82): Personal Workspace convergence surface. These codes
+  // are RESERVED for distinct boundary conditions; the normal
+  // recovery path surfaces recovery via `setupState: "recovery"` on
+  // the public user payload, NOT via an error envelope from
+  // /verify-token.
+  // 403 — Personal Workspace recovery is required and the normal
+  // verifySignIn path cannot proceed (e.g., ops-side intervention).
+  "PERSONAL_WORKSPACE_RECOVERY_REQUIRED",
+  // 409 — an unexpected concurrent-write race escaped the
+  // compare-and-set + retry budget. Defensive code; the safe envelope
+  // covers it if it occurs.
+  "PERSONAL_WORKSPACE_CONVERGENCE_CONFLICT",
 ]);
 export type ApiErrorCodeV1 = z.infer<typeof apiErrorCodeV1Schema>;
 
@@ -667,6 +679,14 @@ export const bg1MagicLinkRequestV1Schema = z
     // Optional human-friendly hint carried into the session metadata
     // for diagnostics. Never returned to other members.
     displayName: z.string().min(1).max(120).optional(),
+    // M2 (#82): optional validated internal return destination. The
+    // server validates against the configured application origin
+    // (canonical URL parsing) and stores the path in a short-lived
+    // HttpOnly cookie. The cookie is re-validated and surfaced as the
+    // `returnTo` field on the verify-token response. Invalid values
+    // are silently dropped so the caller never has to handle a
+    // partial cookie set.
+    return: z.string().min(1).max(256).optional(),
   })
   .strict();
 export type Bg1MagicLinkRequestV1 = z.infer<typeof bg1MagicLinkRequestV1Schema>;
@@ -735,13 +755,24 @@ export const bg1PublicWorkspaceV1Schema = z
     name: z.string().min(1).max(200),
     workspaceType: z.enum(["Personal", "Organization"]),
     workspaceStatus: z.enum(["Active", "Suspended"]),
-    capabilities: z
-      .array(z.enum(["Buyer", "Seller"]))
-      .min(1)
-      .max(8),
+    // M2 (#82): relaxed from `.min(1)` to `.max(8)`. A freshly
+    // converged Personal Workspace has no capabilities until the
+    // human chooses an intent (later M2 ticket #83). The mapper
+    // produces an empty array; the schema permits it.
+    capabilities: z.array(z.enum(["Buyer", "Seller"])).max(8),
   })
   .strict();
 export type Bg1PublicWorkspaceV1 = z.infer<typeof bg1PublicWorkspaceV1Schema>;
+
+// M2 (#82): server-derived Personal Workspace setup state. The
+// convergence service classifies the state into "converged" or
+// "recovery" and surfaces it here. The browser reads ONLY this field
+// to render the Personal Workspace dashboard or the recovery
+// surface — it never infers recovery from the workspaces array
+// (which would let a future Workspace type or capability flag
+// silently change the result).
+export const bg1SetupStateValuesV1 = ["converged", "recovery"] as const;
+export type Bg1SetupStateV1 = (typeof bg1SetupStateValuesV1)[number];
 
 export const bg1PublicUserV1Schema = z
   .object({
@@ -760,6 +791,12 @@ export const bg1PublicUserV1Schema = z
     // Workspace — only the server-validated UserAccount does.
     identityProvider: z.string().min(1).max(64),
     workspaces: z.array(bg1PublicWorkspaceV1Schema).max(64),
+    // M2 (#82): server-derived setup state. The convergence service
+    // classifies the Personal Workspace state into "converged" or
+    // "recovery" — never "recovery" with the internal reason
+    // (pointer-workspace-missing, pointer-not-personal, etc.) which
+    // is server-internal only.
+    setupState: z.enum(bg1SetupStateValuesV1),
   })
   .strict();
 export type Bg1PublicUserV1 = z.infer<typeof bg1PublicUserV1Schema>;
@@ -768,6 +805,12 @@ export const bg1VerifyTokenResponseV1Schema = z
   .object({
     ok: z.literal(true),
     user: bg1PublicUserV1Schema,
+    // M2 (#82): validated internal return destination. The browser
+    // navigates to this path after successful authentication. `null`
+    // means no destination was preserved (or it was overridden by
+    // recovery, or the cookie was invalid). The browser falls back
+    // to `/dashboard` (or `/dashboard?recovery=1` on recovery).
+    returnTo: z.string().min(1).max(256).nullable(),
   })
   .strict();
 export type Bg1VerifyTokenResponseV1 = z.infer<typeof bg1VerifyTokenResponseV1Schema>;
