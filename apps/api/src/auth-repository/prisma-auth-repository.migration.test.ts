@@ -33,14 +33,21 @@
 //      supported mechanism is to replay prior SQL files directly.)
 //   4. Assert `user_accounts.personalWorkspaceId` does not yet
 //      exist in the isolated schema (`information_schema.columns`).
-//   5. Insert four fixture UserAccounts in the pre-M2 state:
+//   5. Insert fixture UserAccounts in the pre-M2 state:
 //        - User A: zero Owner Personal candidates → expect NULL
 //          after migration.
 //        - User B: one Owner Personal candidate → expect backfill.
 //        - User C: two Owner Personal candidates → expect NULL
-//          (recovery state — never auto-linked).
+//          (per-user recovery state — never auto-linked).
 //        - User D: Personal Workspace exists but membership role is
 //          not Owner → expect NULL per the strict rule.
+//        - User co-A, co-B: both Owner members of the same Personal
+//          Workspace W → expect NULL after migration (cross-user
+//          co-ownership — the workspace has 2+ distinct Owner
+//          UserAccounts and is therefore never auto-linked).
+//        - User co-C: sole Owner of a separate Personal Workspace
+//          W2 → expect backfill (positive control proving the
+//          workspace-direction gate only excludes W, not W2).
 //   6. Apply the M2 migration SQL by reading the file and
 //      executing each statement via `prisma.$executeRawUnsafe`.
 //      The file contains ALTER TABLE, UPDATE, CREATE INDEX, ADD
@@ -221,16 +228,28 @@ describe("PrismaAuthRepository — M2 #82 migration fixture", () => {
       "expected personalWorkspaceId to NOT exist before the M2 migration is applied",
     );
 
-    // 4. Insert the four fixture UserAccounts in the pre-M2 state.
-    //    The Prisma client is generated from the post-M2 schema, so
-    //    we use raw SQL to insert rows in the pre-M2 shape (no
-    //    personalWorkspaceId). Each fixture requires its own
-    //    UserAccount + Workspace(s) + WorkspaceMembership(s).
+    // 4. Insert the four pre-existing fixtures (A/B/C/D) PLUS the
+    //    three co-ownership fixtures (co-A/co-B/co-C) in the pre-M2
+    //    state. The Prisma client is generated from the post-M2
+    //    schema, so we use raw SQL to insert rows in the pre-M2
+    //    shape (no personalWorkspaceId). Each fixture requires its
+    //    own UserAccount + Workspace(s) + WorkspaceMembership(s).
+    //
+    //    The co-ownership fixtures are distinct from the pre-existing
+    //    per-user ambiguous User C — User C has 2 Owner Personal
+    //    memberships for one UserAccount (per-user ambiguity), while
+    //    co-A/co-B/co-C exercise the cross-user co-ownership shape
+    //    where two distinct UserAccounts share Owner membership on
+    //    the same Personal Workspace. Distinct IDs/names are used so
+    //    the two fixtures do not collide conceptually or literally.
     const insertedUserIds: {
       readonly a: string;
       readonly b: string;
       readonly c: string;
       readonly d: string;
+      readonly coA: string;
+      readonly coB: string;
+      readonly coC: string;
     } = await prisma.$transaction(async (tx) => {
       const userA = await tx.$queryRawUnsafe<Array<{ id: string }>>(
         `INSERT INTO "user_accounts" ("id", "email", "createdAt", "updatedAt")
@@ -252,11 +271,29 @@ describe("PrismaAuthRepository — M2 #82 migration fixture", () => {
            VALUES (gen_random_uuid()::text, 'fixture-d@example.test', now(), now())
            RETURNING "id"`,
       );
+      const coOwnedUserA = await tx.$queryRawUnsafe<Array<{ id: string }>>(
+        `INSERT INTO "user_accounts" ("id", "email", "createdAt", "updatedAt")
+           VALUES (gen_random_uuid()::text, 'fixture-co-a@example.test', now(), now())
+           RETURNING "id"`,
+      );
+      const coOwnedUserB = await tx.$queryRawUnsafe<Array<{ id: string }>>(
+        `INSERT INTO "user_accounts" ("id", "email", "createdAt", "updatedAt")
+           VALUES (gen_random_uuid()::text, 'fixture-co-b@example.test', now(), now())
+           RETURNING "id"`,
+      );
+      const coOwnedUserC = await tx.$queryRawUnsafe<Array<{ id: string }>>(
+        `INSERT INTO "user_accounts" ("id", "email", "createdAt", "updatedAt")
+           VALUES (gen_random_uuid()::text, 'fixture-co-c@example.test', now(), now())
+           RETURNING "id"`,
+      );
 
       const aId = userA[0]!.id;
       const bId = userB[0]!.id;
       const cId = userC[0]!.id;
       const dId = userD[0]!.id;
+      const coAId = coOwnedUserA[0]!.id;
+      const coBId = coOwnedUserB[0]!.id;
+      const coCId = coOwnedUserC[0]!.id;
 
       // Workspace for User B (single Owner Personal candidate).
       const workspaceB = await tx.$queryRawUnsafe<Array<{ id: string }>>(
@@ -314,13 +351,60 @@ describe("PrismaAuthRepository — M2 #82 migration fixture", () => {
         workspaceD[0]!.id,
       );
 
-      return { a: aId, b: bId, c: cId, d: dId };
+      // Co-ownership fixture: User co-A and User co-B are both
+      // Owner members of the same Personal Workspace W. User co-C
+      // is the sole Owner of a separate Personal Workspace W2.
+      // Distinct IDs/names from the per-user ambiguous User C so
+      // the two fixtures do not collide.
+      const workspaceW = await tx.$queryRawUnsafe<Array<{ id: string }>>(
+        `INSERT INTO "workspaces" ("id", "slug", "name", "type", "status", "ownerUserId", "createdAt", "updatedAt")
+           VALUES (gen_random_uuid()::text, 'personal-co-w', 'Co-owned Personal', 'Personal', 'Active', $1, now(), now())
+           RETURNING "id"`,
+        coAId,
+      );
+      await tx.$executeRawUnsafe(
+        `INSERT INTO "workspace_memberships" ("id", "userId", "workspaceId", "role", "createdAt")
+           VALUES (gen_random_uuid()::text, $1, $2, 'Owner', now())`,
+        coAId,
+        workspaceW[0]!.id,
+      );
+      await tx.$executeRawUnsafe(
+        `INSERT INTO "workspace_memberships" ("id", "userId", "workspaceId", "role", "createdAt")
+           VALUES (gen_random_uuid()::text, $1, $2, 'Owner', now())`,
+        coBId,
+        workspaceW[0]!.id,
+      );
+      const workspaceW2 = await tx.$queryRawUnsafe<Array<{ id: string }>>(
+        `INSERT INTO "workspaces" ("id", "slug", "name", "type", "status", "ownerUserId", "createdAt", "updatedAt")
+           VALUES (gen_random_uuid()::text, 'personal-co-w2', 'Sole-owned Personal', 'Personal', 'Active', $1, now(), now())
+           RETURNING "id"`,
+        coCId,
+      );
+      await tx.$executeRawUnsafe(
+        `INSERT INTO "workspace_memberships" ("id", "userId", "workspaceId", "role", "createdAt")
+           VALUES (gen_random_uuid()::text, $1, $2, 'Owner', now())`,
+        coCId,
+        workspaceW2[0]!.id,
+      );
+
+      return {
+        a: aId,
+        b: bId,
+        c: cId,
+        d: dId,
+        coA: coAId,
+        coB: coBId,
+        coC: coCId,
+      };
     });
 
     const userAId = insertedUserIds.a;
     const userBId = insertedUserIds.b;
     const userCId = insertedUserIds.c;
     const userDId = insertedUserIds.d;
+    const userCoAId = insertedUserIds.coA;
+    const userCoBId = insertedUserIds.coB;
+    const userCoCId = insertedUserIds.coC;
 
     // 5. Apply the M2 migration SQL by reading the file and
     //    executing each statement via $executeRawUnsafe.
@@ -350,6 +434,18 @@ describe("PrismaAuthRepository — M2 #82 migration fixture", () => {
       `SELECT "personalWorkspaceId" FROM "user_accounts" WHERE "id" = $1`,
       userDId,
     );
+    const afterCoA = await prisma.$queryRawUnsafe<Array<{ personalWorkspaceId: string | null }>>(
+      `SELECT "personalWorkspaceId" FROM "user_accounts" WHERE "id" = $1`,
+      userCoAId,
+    );
+    const afterCoB = await prisma.$queryRawUnsafe<Array<{ personalWorkspaceId: string | null }>>(
+      `SELECT "personalWorkspaceId" FROM "user_accounts" WHERE "id" = $1`,
+      userCoBId,
+    );
+    const afterCoC = await prisma.$queryRawUnsafe<Array<{ personalWorkspaceId: string | null }>>(
+      `SELECT "personalWorkspaceId" FROM "user_accounts" WHERE "id" = $1`,
+      userCoCId,
+    );
 
     assert.equal(
       afterA[0]?.personalWorkspaceId ?? null,
@@ -369,6 +465,24 @@ describe("PrismaAuthRepository — M2 #82 migration fixture", () => {
       afterD[0]?.personalWorkspaceId ?? null,
       null,
       "User D (Personal type but non-Owner membership) must remain NULL per the strict rule",
+    );
+    // Co-ownership fixtures: the cross-user ambiguous shape is
+    // never auto-resolved. The migration must leave the pointer
+    // NULL for both co-owners (the workspace has 2+ distinct Owner
+    // UserAccounts), and the sole Owner of W2 must still backfill.
+    assert.equal(
+      afterCoA[0]?.personalWorkspaceId ?? null,
+      null,
+      "User co-A (Owner of co-owned W) must remain NULL after migration",
+    );
+    assert.equal(
+      afterCoB[0]?.personalWorkspaceId ?? null,
+      null,
+      "User co-B (Owner of co-owned W) must remain NULL after migration",
+    );
+    assert.ok(
+      afterCoC[0]?.personalWorkspaceId,
+      "User co-C (sole Owner of W2) must be backfilled to a non-NULL id",
     );
 
     // 7. The unique index and foreign key must now exist.
@@ -397,7 +511,51 @@ describe("PrismaAuthRepository — M2 #82 migration fixture", () => {
       "expected the user_accounts_personalWorkspaceId_fkey foreign key after migration",
     );
 
-    // 8. Codex review (P2-001): the migration's operational-inventory
+    // 8. Authority records are not rewritten: every Workspaces row
+    //    and every WorkspaceMembership row the fixture inserted must
+    //    still exist after the migration. Co-ownership in particular
+    //    must NOT cause the migration to delete or rewrite memberships
+    //    — both co-A and co-B retain their Owner memberships on W.
+    const workspaceCount = await prisma.$queryRawUnsafe<Array<{ count: bigint }>>(
+      `SELECT COUNT(*) AS count FROM "workspaces"`,
+    );
+    assert.equal(
+      Number(workspaceCount[0]?.count ?? -1),
+      6,
+      "exactly six Workspaces must survive the migration (B, C1, C2, D, W, W2)",
+    );
+    const membershipRows = await prisma.$queryRawUnsafe<
+      Array<{ userId: string; workspaceId: string; role: string }>
+    >(
+      `SELECT "userId", "workspaceId", "role" FROM "workspace_memberships"
+       WHERE "userId" IN ($1, $2, $3, $4, $5, $6, $7)
+       ORDER BY "userId", "workspaceId"`,
+      userAId,
+      userBId,
+      userCId,
+      userDId,
+      userCoAId,
+      userCoBId,
+      userCoCId,
+    );
+    assert.equal(
+      membershipRows.length,
+      7,
+      "every fixture membership must survive the migration (B→1, C→2, D→1, co-A→1, co-B→1, co-C→1)",
+    );
+    const coOwnershipMemberships = membershipRows.filter(
+      (m) => m.userId === userCoAId || m.userId === userCoBId,
+    );
+    assert.equal(
+      coOwnershipMemberships.length,
+      2,
+      "co-A and co-B must each retain their Owner membership on W",
+    );
+    for (const m of coOwnershipMemberships) {
+      assert.equal(m.role, "Owner", "co-ownership memberships must remain Owner after migration");
+    }
+
+    // 9. Codex review (P2-001): the migration's operational-inventory
     //    NOTICE block reports the count of UserAccounts with MULTIPLE
     //    Owner Personal memberships. The corrected query counts
     //    DISTINCT users (so a user with 2 candidates counts as 1,
@@ -424,19 +582,43 @@ describe("PrismaAuthRepository — M2 #82 migration fixture", () => {
       "exactly one UserAccount (User C) has multiple Owner Personal memberships — counting DISTINCT users, not membership rows",
     );
 
-    // 9. The CANONICAL `public` schema must be untouched. Use a
-    //    separate connection (no search_path) to prove the shared
-    //    schema is unchanged so subsequent repository tests see
-    //    the seeded state intact. The disposable test database's
-    //    seed inserts the demo buyer (one of the seeded
-    //    UserAccounts); if the test had leaked into `public` the
-    //    demo buyer would still be present (we never modified it)
-    //    AND the seeded `personalWorkspaceId` column would NOT
-    //    exist on the seeded buyer (the canonical schema was
-    //    applied before the M2 migration that adds the column).
-    //    We assert the column IS present on the canonical
-    //    UserAccount by switching to a fresh client without the
-    //    isolated-schema search_path.
+    // 10. Co-ownership counter: the migration's
+    //     `co_owned_workspace_count` reports Personal Workspaces
+    //     whose Owner-membership set contains 2+ distinct
+    //     UserAccounts. The fixture has exactly one such workspace
+    //     (W); the count is therefore 1. co-A and co-B must NOT be
+    //     counted because they are per-user-unambiguous (each has
+    //     exactly one Owner Personal membership).
+    const coOwnedWorkspaceCount = await prisma.$queryRawUnsafe<Array<{ count: bigint }>>(
+      `SELECT COUNT(*) AS count
+       FROM (
+         SELECT m."workspaceId" AS ws_id
+         FROM "workspace_memberships" m
+         INNER JOIN "workspaces" w ON w."id" = m."workspaceId"
+         WHERE m."role" = 'Owner' AND w."type" = 'Personal'
+         GROUP BY m."workspaceId"
+         HAVING COUNT(DISTINCT m."userId") >= 2
+       ) co_owned`,
+    );
+    assert.equal(
+      Number(coOwnedWorkspaceCount[0]?.count ?? -1),
+      1,
+      "exactly one Personal Workspace (W) is co-owned — the co-ownership counter pin",
+    );
+
+    // 11. The CANONICAL `public` schema must be untouched. Use a
+    //     separate connection (no search_path) to prove the shared
+    //     schema is unchanged so subsequent repository tests see
+    //     the seeded state intact. The disposable test database's
+    //     seed inserts the demo buyer (one of the seeded
+    //     UserAccounts); if the test had leaked into `public` the
+    //     demo buyer would still be present (we never modified it)
+    //     AND the seeded `personalWorkspaceId` column would NOT
+    //     exist on the seeded buyer (the canonical schema was
+    //     applied before the M2 migration that adds the column).
+    //     We assert the column IS present on the canonical
+    //     UserAccount by switching to a fresh client without the
+    //     isolated-schema search_path.
     const publicClient = createPrismaClient(readTestDatabaseUrl());
     try {
       const publicColumns = await publicClient.$queryRawUnsafe<Array<{ column_name: string }>>(

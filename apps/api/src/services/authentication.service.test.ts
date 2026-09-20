@@ -354,10 +354,7 @@ describe("AuthenticationService", () => {
     });
     assert.equal(afterSecond.personalWorkspaceId, firstPointer);
     assert.equal(afterSecond.ownerPersonalMemberships.length, 1);
-    assert.equal(
-      afterSecond.ownerPersonalMemberships[0]!.workspaceId,
-      firstPointer,
-    );
+    assert.equal(afterSecond.ownerPersonalMemberships[0]!.workspaceId, firstPointer);
   });
 
   // ---------- Tenki PR #91: resolveSessionWithSetupState is strictly read-only ----------
@@ -572,6 +569,76 @@ describe("AuthenticationService", () => {
       });
       assert.equal(after.personalWorkspaceId, CONVERGED_WORKSPACE_ID);
       assert.equal(after.ownerPersonalMemberships.length, 1);
+    });
+
+    test('classifies co-owned Personal Workspace as public "recovery" for both users without mutating (Tenki PR #91)', async () => {
+      // Co-ownership defense on the read path: two distinct
+      // UserAccounts both Owner of the same Personal Workspace.
+      // The read path MUST surface public `recovery` for both,
+      // and MUST NOT auto-link either user's pointer.
+      const CO_OWNED_WORKSPACE_ID = "ws-svc-co-owned";
+      const repo = new InMemoryAuthRepository(
+        [
+          {
+            userAccountId: "user-svc-co-a",
+            email: "tenki-svc-co-a@example.com",
+            identityProvider: "deterministic",
+            identitySubject: "tenki-svc-co-a-subject",
+            memberships: [
+              {
+                workspaceId: CO_OWNED_WORKSPACE_ID,
+                slug: "personal-ws-svc-co-owned",
+                name: "Co-owned Personal",
+                workspaceType: "Personal",
+                workspaceStatus: "Active",
+                role: "Owner",
+                capabilities: [],
+              },
+            ],
+          },
+          {
+            userAccountId: "user-svc-co-b",
+            email: "tenki-svc-co-b@example.com",
+            identityProvider: "deterministic",
+            identitySubject: "tenki-svc-co-b-subject",
+            memberships: [
+              {
+                workspaceId: CO_OWNED_WORKSPACE_ID,
+                slug: "personal-ws-svc-co-owned",
+                name: "Co-owned Personal",
+                workspaceType: "Personal",
+                workspaceStatus: "Active",
+                role: "Owner",
+                capabilities: [],
+              },
+            ],
+          },
+        ],
+        () => now,
+      );
+      const auth = buildAuthService(repo);
+      const sessionA = await mintSession(repo, "user-svc-co-a");
+      const sessionB = await mintSession(repo, "user-svc-co-b");
+      const resolvedA = await auth.resolveSessionWithSetupState(sessionA);
+      const resolvedB = await auth.resolveSessionWithSetupState(sessionB);
+      assert.ok(resolvedA);
+      assert.ok(resolvedB);
+      assert.equal(resolvedA.setupState, "recovery");
+      assert.equal(resolvedB.setupState, "recovery");
+      // No mutation: pointers remain NULL for both users; both
+      // Owner memberships remain intact.
+      const afterA = await repo.findPersonalWorkspaceState({
+        userAccountId: "user-svc-co-a",
+      });
+      const afterB = await repo.findPersonalWorkspaceState({
+        userAccountId: "user-svc-co-b",
+      });
+      assert.equal(afterA.personalWorkspaceId, null);
+      assert.equal(afterB.personalWorkspaceId, null);
+      assert.equal(afterA.ownerPersonalMemberships.length, 1);
+      assert.equal(afterB.ownerPersonalMemberships.length, 1);
+      assert.equal(afterA.coOwnedPersonalWorkspaceIds.has(CO_OWNED_WORKSPACE_ID), true);
+      assert.equal(afterB.coOwnedPersonalWorkspaceIds.has(CO_OWNED_WORKSPACE_ID), true);
     });
   });
 });

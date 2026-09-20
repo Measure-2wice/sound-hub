@@ -11,41 +11,59 @@
 --
 -- Backfill rule (strict — no guessing):
 --   Link `personalWorkspaceId` only when exactly ONE qualifying Owner
---   Personal Workspace membership exists for the UserAccount. Zero or
---   multiple candidates → leave `personalWorkspaceId` NULL (the latter
---   is the recovery state — multiple candidates must not auto-select
---   per the M2 spec). `ownerUserId` may assist reconciliation by joining
---   to the legacy Personal Workspace (mirroring the BG1 pattern), but
+--   Personal Workspace membership exists for the UserAccount AND that
+--   Personal Workspace has exactly ONE Owner UserAccount. Zero or
+--   multiple candidates on either side → leave `personalWorkspaceId`
+--   NULL (the latter cases are the recovery state — multiple
+--   candidates and co-owned workspaces must not auto-select per the
+--   M2 spec). `ownerUserId` may assist reconciliation by joining to
+--   the legacy Personal Workspace (mirroring the BG1 pattern), but
 --   `ownerUserId` never establishes authority by itself.
 --
 -- Bounded operational inventory (NOTICE block): the migration reports
--- `linked_count`, `zero_candidate_count`, and `ambiguous_count`. These
--- are bounded counts; the migration does NOT assert specific values
--- because the migration may run on a fresh DB before any seed data is
--- present. Operators inspect the NOTICE for unexpected patterns.
+-- `linked_count`, `zero_candidate_count`, `ambiguous_count`, and
+-- `co_owned_workspace_count`. These are bounded counts; the migration
+-- does NOT assert specific values because the migration may run on a
+-- fresh DB before any seed data is present. Operators inspect the
+-- NOTICE for unexpected patterns. `co_owned_workspace_count` is a
+-- separately named counter for the cross-user co-ownership shape;
+-- `ambiguous_count` retains its per-user semantics.
 
 -- Step 1: add the column nullable (no constraint yet, so legacy rows
 -- can coexist during backfill).
 ALTER TABLE "user_accounts" ADD COLUMN "personalWorkspaceId" TEXT;
 
 -- Step 2: backfill. The CTE picks each UserAccount's unique Personal
--- Workspace Owner membership. The NOT EXISTS subquery rejects any user
--- with 2+ candidates so ambiguous legacy rows are NEVER auto-linked.
+-- Workspace Owner membership. The first NOT EXISTS subquery rejects
+-- any user with 2+ candidates so per-user ambiguous legacy rows are
+-- NEVER auto-linked. The INNER JOIN on `ws_owner_counts` enforces the
+-- workspace-direction gate: the candidate Personal Workspace must
+-- have exactly ONE Owner UserAccount. If two distinct UserAccounts
+-- share Owner membership on a Personal Workspace, neither row is a
+-- backfill candidate; the migration does not auto-select.
 UPDATE "user_accounts" AS ua
 SET "personalWorkspaceId" = sub.ws_id
 FROM (
   SELECT m."userId" AS uid, m."workspaceId" AS ws_id
   FROM "workspace_memberships" m
   INNER JOIN "workspaces" w ON w."id" = m."workspaceId"
+  INNER JOIN (
+    SELECT "workspaceId" AS ws_id, COUNT(DISTINCT "userId") AS owner_count
+    FROM "workspace_memberships"
+    INNER JOIN "workspaces" ON "workspaces"."id" = "workspace_memberships"."workspaceId"
+    WHERE "workspace_memberships"."role" = 'Owner' AND "workspaces"."type" = 'Personal'
+    GROUP BY "workspaceId"
+  ) ws_owner_counts ON ws_owner_counts.ws_id = m."workspaceId"
   WHERE m."role" = 'Owner' AND w."type" = 'Personal'
-  AND NOT EXISTS (
-    SELECT 1 FROM "workspace_memberships" m2
-    INNER JOIN "workspaces" w2 ON w2."id" = m2."workspaceId"
-    WHERE m2."userId" = m."userId"
-      AND m2."role" = 'Owner'
-      AND w2."type" = 'Personal'
-      AND m2."workspaceId" != m."workspaceId"
-  )
+    AND ws_owner_counts.owner_count = 1
+    AND NOT EXISTS (
+      SELECT 1 FROM "workspace_memberships" m2
+      INNER JOIN "workspaces" w2 ON w2."id" = m2."workspaceId"
+      WHERE m2."userId" = m."userId"
+        AND m2."role" = 'Owner'
+        AND w2."type" = 'Personal'
+        AND m2."workspaceId" != m."workspaceId"
+    )
 ) AS sub
 WHERE ua."id" = sub.uid AND ua."personalWorkspaceId" IS NULL;
 
@@ -71,6 +89,7 @@ DECLARE
   linked_count INTEGER;
   zero_candidate_count INTEGER;
   ambiguous_count INTEGER;
+  co_owned_workspace_count INTEGER;
 BEGIN
   -- Count UserAccounts that were backfilled (now non-NULL).
   SELECT COUNT(*) INTO linked_count
@@ -104,6 +123,20 @@ BEGIN
       AND m2."workspaceId" != m."workspaceId"
   );
 
-  RAISE NOTICE 'M2 personal workspace backfill: linked_count=%, zero_candidate_count=%, ambiguous_count=%',
-    linked_count, zero_candidate_count, ambiguous_count;
+  -- Count Personal Workspaces whose Owner-membership set contains
+  -- 2+ distinct UserAccounts. Distinct from `ambiguous_count` which
+  -- is per-user; this counts co-owned workspaces themselves so
+  -- operators can audit cross-user legacy ambiguity separately.
+  SELECT COUNT(*) INTO co_owned_workspace_count
+  FROM (
+    SELECT m."workspaceId" AS ws_id
+    FROM "workspace_memberships" m
+    INNER JOIN "workspaces" w ON w."id" = m."workspaceId"
+    WHERE m."role" = 'Owner' AND w."type" = 'Personal'
+    GROUP BY m."workspaceId"
+    HAVING COUNT(DISTINCT m."userId") >= 2
+  ) co_owned;
+
+  RAISE NOTICE 'M2 personal workspace backfill: linked_count=%, zero_candidate_count=%, ambiguous_count=%, co_owned_workspace_count=%',
+    linked_count, zero_candidate_count, ambiguous_count, co_owned_workspace_count;
 END $$;

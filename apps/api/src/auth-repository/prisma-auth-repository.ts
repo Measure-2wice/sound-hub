@@ -363,6 +363,7 @@ export class PrismaAuthRepository implements AuthRepository {
         ownerPersonalMemberships: [],
         pointedWorkspace: null,
         membershipOnPointedWorkspace: null,
+        coOwnedPersonalWorkspaceIds: new Set<string>(),
       };
     }
 
@@ -398,12 +399,49 @@ export class PrismaAuthRepository implements AuthRepository {
       }
     }
 
+    // Workspace-side co-ownership gate: for every Personal Workspace
+    // the user is an Owner of, count distinct Owner UserAccounts on
+    // that workspace. Any workspace with > 1 distinct Owner UserAccount
+    // is added to `coOwnedPersonalWorkspaceIds` so the convergence
+    // service can block the otherwise-safe `attachable` / `converged`
+    // classifications and surface `recovery(co-owned-personal-
+    // workspace)` instead. This is the runtime defense for the
+    // legacy cross-user ambiguity that the M2 migration's
+    // workspace-side NOT EXISTS subquery guards at the database level.
+    const coOwnedPersonalWorkspaceIds = new Set<string>();
+    if (ownerPersonalMemberships.length > 0) {
+      const candidateWorkspaceIds = ownerPersonalMemberships.map((m) => m.workspaceId);
+      const coOwnershipRows = await this.prisma.workspaceMembership.findMany({
+        where: {
+          role: "Owner",
+          workspaceId: { in: candidateWorkspaceIds },
+          workspace: { type: "Personal" },
+        },
+        select: {
+          workspaceId: true,
+          userId: true,
+        },
+      });
+      const distinctOwnersByWorkspace = new Map<string, Set<string>>();
+      for (const row of coOwnershipRows) {
+        const set = distinctOwnersByWorkspace.get(row.workspaceId) ?? new Set<string>();
+        set.add(row.userId);
+        distinctOwnersByWorkspace.set(row.workspaceId, set);
+      }
+      for (const [workspaceId, owners] of distinctOwnersByWorkspace) {
+        if (owners.size > 1) {
+          coOwnedPersonalWorkspaceIds.add(workspaceId);
+        }
+      }
+    }
+
     return {
       userExists: true,
       personalWorkspaceId: pointerId,
       ownerPersonalMemberships,
       pointedWorkspace,
       membershipOnPointedWorkspace,
+      coOwnedPersonalWorkspaceIds,
     };
   }
 

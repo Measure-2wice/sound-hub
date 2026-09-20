@@ -102,7 +102,14 @@ export class InMemoryAuthRepository implements AuthRepository {
         identitySubject: seed.identitySubject,
       });
       for (const m of seed.memberships) {
-        const workspace: InternalWorkspace = {
+        // Preserve a workspace that is already seeded (e.g. by an
+        // earlier seed for a different UserAccount) so co-ownership
+        // fixtures do not have the second seed's `ownerUserId`
+        // clobber the first one's metadata. The first seed's
+        // metadata wins; subsequent seeds only contribute their
+        // membership row.
+        const existingWorkspace = this.workspacesById.get(m.workspaceId);
+        const workspace: InternalWorkspace = existingWorkspace ?? {
           id: m.workspaceId,
           slug: m.slug,
           name: m.name,
@@ -324,6 +331,7 @@ export class InMemoryAuthRepository implements AuthRepository {
         ownerPersonalMemberships: [],
         pointedWorkspace: null,
         membershipOnPointedWorkspace: null,
+        coOwnedPersonalWorkspaceIds: new Set<string>(),
       };
     }
     const ownerPersonalMemberships: { membershipId: string; workspaceId: string }[] = [];
@@ -359,12 +367,35 @@ export class InMemoryAuthRepository implements AuthRepository {
       }
     }
 
+    // Workspace-side co-ownership gate: for every Personal Workspace
+    // the user is an Owner of, count distinct Owner UserAccounts on
+    // that workspace across all in-memory membership rows. Mirrors
+    // the Prisma adapter's workspace-side check.
+    const coOwnedPersonalWorkspaceIds = new Set<string>();
+    if (ownerPersonalMemberships.length > 0) {
+      const distinctOwnersByWorkspace = new Map<string, Set<string>>();
+      for (const membership of this.membershipsById.values()) {
+        if (membership.role !== "Owner") continue;
+        const workspace = this.workspacesById.get(membership.workspaceId);
+        if (!workspace || workspace.type !== "Personal") continue;
+        const set = distinctOwnersByWorkspace.get(membership.workspaceId) ?? new Set<string>();
+        set.add(membership.userId);
+        distinctOwnersByWorkspace.set(membership.workspaceId, set);
+      }
+      for (const [workspaceId, owners] of distinctOwnersByWorkspace) {
+        if (owners.size > 1) {
+          coOwnedPersonalWorkspaceIds.add(workspaceId);
+        }
+      }
+    }
+
     return {
       userExists: true,
       personalWorkspaceId: pointerId,
       ownerPersonalMemberships,
       pointedWorkspace,
       membershipOnPointedWorkspace,
+      coOwnedPersonalWorkspaceIds,
     };
   }
 

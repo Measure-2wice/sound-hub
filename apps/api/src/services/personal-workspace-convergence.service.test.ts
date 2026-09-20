@@ -18,6 +18,10 @@ const USER_ID = "user-1";
 const WORKSPACE_ID = "ws-personal";
 const ORG_WORKSPACE_ID = "ws-org";
 const OTHER_PERSONAL_ID = "ws-personal-2";
+// Stable clock for the co-ownership fixtures so the
+// InMemoryAuthRepository's `createdAt` is deterministic across
+// runs and the test never depends on the wall clock.
+const now = 1_700_000_000_000;
 
 function makeRepo(): InMemoryAuthRepository {
   return new InMemoryAuthRepository([
@@ -486,5 +490,228 @@ describe("PersonalWorkspaceConvergenceService", () => {
     if (kind.kind === "recovery") {
       assert.equal(kind.reason, "membership-not-owner");
     }
+  });
+
+  // ---- co-owned-personal-workspace defense (Tenki PR #91) ----
+  //
+  // The pre-existing recovery reasons cover per-user contradictions
+  // (a single UserAccount in an inconsistent state). The
+  // cross-user shape — two distinct UserAccounts both Owner of the
+  // same Personal Workspace — is a separate contradiction. The
+  // classifier MUST block both `attachable` (NULL pointer, candidate
+  // workspace co-owned) and `converged` (pointer set to a co-owned
+  // workspace) and surface the distinct
+  // `recovery(co-owned-personal-workspace)` reason.
+
+  test("recovery: co-owned-personal-workspace blocks attachable when the candidate Personal Workspace has another Owner", async () => {
+    const CO_OWNED_WORKSPACE_ID = "ws-co-owned";
+    const CO_OWNED_USER_A = "user-co-owned-a";
+    const CO_OWNED_USER_B = "user-co-owned-b";
+    const repo = new InMemoryAuthRepository(
+      [
+        {
+          userAccountId: CO_OWNED_USER_A,
+          email: "tenki-co-a@example.com",
+          identityProvider: "deterministic",
+          identitySubject: "tenki-co-a-subject",
+          memberships: [
+            {
+              workspaceId: CO_OWNED_WORKSPACE_ID,
+              slug: "personal-co-owned",
+              name: "Co-owned Personal",
+              workspaceType: "Personal",
+              workspaceStatus: "Active",
+              role: "Owner",
+              capabilities: [],
+            },
+          ],
+        },
+        {
+          userAccountId: CO_OWNED_USER_B,
+          email: "tenki-co-b@example.com",
+          identityProvider: "deterministic",
+          identitySubject: "tenki-co-b-subject",
+          memberships: [
+            {
+              workspaceId: CO_OWNED_WORKSPACE_ID,
+              slug: "personal-co-owned",
+              name: "Co-owned Personal",
+              workspaceType: "Personal",
+              workspaceStatus: "Active",
+              role: "Owner",
+              capabilities: [],
+            },
+          ],
+        },
+      ],
+      () => now,
+    );
+    const service = new PersonalWorkspaceConvergenceService({
+      authRepository: repo,
+    });
+    // For User A: pointer is NULL, exactly one Owner Personal
+    // membership on the co-owned workspace. Without the
+    // workspace-side gate this would classify as `attachable`;
+    // the new gate MUST surface `recovery(co-owned-personal-
+    // workspace)` instead.
+    const kindA = await service.resolveConvergence({
+      userAccountId: CO_OWNED_USER_A,
+    });
+    assert.equal(
+      kindA.kind,
+      "recovery",
+      "User A: candidate Personal Workspace is co-owned — must classify recovery, never attachable",
+    );
+    if (kindA.kind === "recovery") {
+      assert.equal(kindA.reason, "co-owned-personal-workspace");
+    }
+    // For User B: identical situation, identical classification.
+    const kindB = await service.resolveConvergence({
+      userAccountId: CO_OWNED_USER_B,
+    });
+    assert.equal(kindB.kind, "recovery");
+    if (kindB.kind === "recovery") {
+      assert.equal(kindB.reason, "co-owned-personal-workspace");
+    }
+    // Authority records are intact: no pointer, both Owner
+    // memberships remain.
+    const afterA = await repo.findPersonalWorkspaceState({
+      userAccountId: CO_OWNED_USER_A,
+    });
+    assert.equal(afterA.personalWorkspaceId, null);
+    assert.equal(afterA.ownerPersonalMemberships.length, 1);
+    assert.equal(afterA.coOwnedPersonalWorkspaceIds.has(CO_OWNED_WORKSPACE_ID), true);
+    const afterB = await repo.findPersonalWorkspaceState({
+      userAccountId: CO_OWNED_USER_B,
+    });
+    assert.equal(afterB.personalWorkspaceId, null);
+    assert.equal(afterB.ownerPersonalMemberships.length, 1);
+    assert.equal(afterB.coOwnedPersonalWorkspaceIds.has(CO_OWNED_WORKSPACE_ID), true);
+  });
+
+  test("recovery: co-owned-personal-workspace blocks converged when the pointed Workspace has another Owner", async () => {
+    // Defense against the deferred-ambiguity scenario: User A
+    // authenticates first, the migration/runtime already linked
+    // A's pointer to the co-owned workspace (legacy), then User B
+    // tries to authenticate. The classifier MUST NOT report
+    // `converged` for A's stale pointer; it MUST surface the
+    // recovery reason and refuse to act on the unsafe state.
+    const CO_OWNED_WORKSPACE_ID = "ws-co-owned-2";
+    const CO_OWNED_USER_A = "user-co-owned-2a";
+    const CO_OWNED_USER_B = "user-co-owned-2b";
+    const repo = new InMemoryAuthRepository(
+      [
+        {
+          userAccountId: CO_OWNED_USER_A,
+          email: "tenki-co-2a@example.com",
+          identityProvider: "deterministic",
+          identitySubject: "tenki-co-2a-subject",
+          memberships: [
+            {
+              workspaceId: CO_OWNED_WORKSPACE_ID,
+              slug: "personal-co-owned-2",
+              name: "Co-owned Personal 2",
+              workspaceType: "Personal",
+              workspaceStatus: "Active",
+              role: "Owner",
+              capabilities: [],
+            },
+          ],
+        },
+        {
+          userAccountId: CO_OWNED_USER_B,
+          email: "tenki-co-2b@example.com",
+          identityProvider: "deterministic",
+          identitySubject: "tenki-co-2b-subject",
+          memberships: [
+            {
+              workspaceId: CO_OWNED_WORKSPACE_ID,
+              slug: "personal-co-owned-2",
+              name: "Co-owned Personal 2",
+              workspaceType: "Personal",
+              workspaceStatus: "Active",
+              role: "Owner",
+              capabilities: [],
+            },
+          ],
+        },
+      ],
+      () => now,
+    );
+    // Stage the legacy "User A already won the pointer" state by
+    // attaching the existing co-owned workspace to A. This is the
+    // exact scenario the migration's workspace-side gate now
+    // prevents at the database level; here we exercise the
+    // runtime defense against the same shape surviving in a
+    // legacy / pre-migration database.
+    await repo.attachExistingPersonalWorkspace({
+      userAccountId: CO_OWNED_USER_A,
+      workspaceId: CO_OWNED_WORKSPACE_ID,
+    });
+    const service = new PersonalWorkspaceConvergenceService({
+      authRepository: repo,
+    });
+    const kindA = await service.resolveConvergence({
+      userAccountId: CO_OWNED_USER_A,
+    });
+    assert.equal(
+      kindA.kind,
+      "recovery",
+      "User A: pointer set to a co-owned workspace — must classify recovery, never converged",
+    );
+    if (kindA.kind === "recovery") {
+      assert.equal(kindA.reason, "co-owned-personal-workspace");
+    }
+    // User B's pointer is still NULL; the candidate is the same
+    // co-owned workspace; classification remains recovery.
+    const kindB = await service.resolveConvergence({
+      userAccountId: CO_OWNED_USER_B,
+    });
+    assert.equal(kindB.kind, "recovery");
+    if (kindB.kind === "recovery") {
+      assert.equal(kindB.reason, "co-owned-personal-workspace");
+    }
+  });
+
+  test("does not classify a sole-Owner Personal Workspace as co-owned", async () => {
+    // Sanity check: a Personal Workspace with exactly ONE Owner
+    // UserAccount must NOT appear in `coOwnedPersonalWorkspaceIds`
+    // and the classification must remain `attachable` for a user
+    // with NULL pointer + single Owner Personal membership.
+    const SOLE_WORKSPACE_ID = "ws-sole-owned";
+    const SOLE_USER = "user-sole";
+    const repo = new InMemoryAuthRepository(
+      [
+        {
+          userAccountId: SOLE_USER,
+          email: "tenki-sole@example.com",
+          identityProvider: "deterministic",
+          identitySubject: "tenki-sole-subject",
+          memberships: [
+            {
+              workspaceId: SOLE_WORKSPACE_ID,
+              slug: "personal-sole-owned",
+              name: "Sole-owned Personal",
+              workspaceType: "Personal",
+              workspaceStatus: "Active",
+              role: "Owner",
+              capabilities: [],
+            },
+          ],
+        },
+      ],
+      () => now,
+    );
+    const service = new PersonalWorkspaceConvergenceService({
+      authRepository: repo,
+    });
+    const state = await repo.findPersonalWorkspaceState({
+      userAccountId: SOLE_USER,
+    });
+    assert.equal(state.coOwnedPersonalWorkspaceIds.size, 0);
+    const kind = await service.resolveConvergence({
+      userAccountId: SOLE_USER,
+    });
+    assert.equal(kind.kind, "attachable");
   });
 });

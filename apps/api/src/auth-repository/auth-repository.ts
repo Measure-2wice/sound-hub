@@ -90,6 +90,13 @@ export interface SessionRecord {
  *     membership this user holds on the pointed Workspace, or
  *     `null`. Used by the service to distinguish
  *     `membership-not-owner` from `owner-membership-missing`.
+ *   - `coOwnedPersonalWorkspaceIds`: the workspaceIds of every
+ *     Personal Workspace the user is an Owner member of AND that
+ *     also has another distinct Owner UserAccount. Authority on
+ *     any workspace in this set is not the user's alone; the
+ *     convergence service MUST classify `recovery(co-owned-
+ *     personal-workspace)` and block otherwise-safe `attachable`
+ *     and `converged` classifications.
  */
 export interface PersonalWorkspaceState {
   readonly userExists: boolean;
@@ -103,6 +110,7 @@ export interface PersonalWorkspaceState {
     readonly id: string;
     readonly role: WorkspaceMembershipRoleV1;
   } | null;
+  readonly coOwnedPersonalWorkspaceIds: ReadonlySet<string>;
 }
 
 export interface AuthRepository {

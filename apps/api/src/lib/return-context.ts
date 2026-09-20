@@ -62,6 +62,35 @@ export function resolveAllowedOrigin(raw: string): string {
  * http(s) application path. Combines structural checks with canonical
  * URL parsing. Returns false for any bypass attempt; never throws so
  * it is safe to use on every request.
+ *
+ * Two-layer percent-encoding defense:
+ *
+ *   1. Submitted-syntax preflight: the raw submitted path must be
+ *      syntactically valid percent encoding. Any malformed `%` (a
+ *      bare `%`, a `%` followed by fewer than two hex digits, or a
+ *      `%` followed by two non-hex characters) causes
+ *      `decodeURIComponent` to throw `URIError`, and the validator
+ *      fails closed with `false`. The preflight ONLY validates the
+ *      submitted value — its decoded result is intentionally
+ *      discarded so the iterative decoder still starts from the
+ *      original raw input. This catches `/foo%`, `/foo%2`, `/foo%GG`,
+ *      and `/foo%2G` before the iterative loop runs.
+ *
+ *   2. Iterative percent-decoding (bounded to 3 levels): the loop
+ *      only advances another layer when the current string still
+ *      contains a syntactically valid `%HH` percent-escape that
+ *      decodes to a different string. After every decoded level the
+ *      full structural, forbidden-character, and same-origin checks
+ *      re-run, so an attacker cannot smuggle a payload by hiding it
+ *      behind an extra `%25` layer. The percent-syntax check is
+ *      intentionally NOT re-run on later decoded forms: a legitimate
+ *      `%25` may decode to a literal `%` which is harmless.
+ *
+ * Together these preserve the documented defense against encoded
+ * bypass attempts (`%2F%2Fevil.com`, `%252F%252Fevil.com`,
+ * `%5C%5Cevil.com`, `%2e%2e/etc/passwd`) and reject malformed
+ * submitted syntax, without over-decoding legitimate literal percent
+ * sequences such as `/search?q=50%25`.
  */
 export function isValidReturnPath(path: unknown, allowedOrigin: string): boolean {
   if (typeof path !== "string") return false;
@@ -75,11 +104,42 @@ export function isValidReturnPath(path: unknown, allowedOrigin: string): boolean
   // tab/newline/CR which we reject explicitly) and 0x7F (DEL).
   if (containsForbiddenCharacters(path)) return false;
 
-  // Decode percent-encoding iteratively (up to 3 levels) to catch
-  // encoded bypass attempts (e.g., %2F%2Fevil.com, %252F%252Fevil.com,
-  // %5C%5Cevil.com, %2e%2e/etc/passwd).
+  // Normalize the configured origin ONCE so per-iteration revalidation
+  // does not re-parse it. A malformed origin is a configuration error
+  // and we fail closed (reject every destination).
+  let normalizedOrigin: string;
+  try {
+    normalizedOrigin = new URL(allowedOrigin).origin;
+  } catch {
+    return false;
+  }
+
+  // Submitted-syntax preflight: the raw submitted path must be
+  // syntactically valid percent encoding. Any malformed escape (`%`,
+  // `%X`, `%GG`, `%2G`) makes `decodeURIComponent` throw `URIError`.
+  // The decoded result is intentionally discarded — the iterative
+  // decoder below still operates on the original raw input. This
+  // preflight is the single owner of submitted-syntax validation;
+  // the iterative loop must NOT re-validate percent syntax on later
+  // decoded forms because a legitimate `%25` is allowed to decode
+  // into a literal `%`.
+  try {
+    decodeURIComponent(path);
+  } catch {
+    return false;
+  }
+
+  // Iterative decoding. The loop advances one layer only when:
+  //   1. the current string still contains a syntactically valid
+  //      percent-escape (`%HH`), AND
+  //   2. that layer decodes to a different string.
+  // After every decoded layer, the full structural + forbidden-
+  // character + same-origin revalidation runs so a hidden payload
+  // cannot survive a multi-layer decode by being valid only at the
+  // final layer.
   let decoded = path;
   for (let i = 0; i < 3; i++) {
+    if (!containsPercentEscape(decoded)) break;
     try {
       const next = decodeURIComponent(decoded);
       if (next === decoded) break;
@@ -87,34 +147,60 @@ export function isValidReturnPath(path: unknown, allowedOrigin: string): boolean
     } catch {
       return false;
     }
+    if (!passesStructuralChecks(decoded, normalizedOrigin)) {
+      return false;
+    }
   }
 
-  // Reject control characters and whitespace in any decoded form.
-  if (containsForbiddenCharacters(decoded)) return false;
-
-  // Structural checks on the decoded path:
-  //   - Must start with a single "/" (not "//", not "/\", not "\").
-  if (!decoded.startsWith("/")) return false;
-  if (decoded.length >= 2 && (decoded[1] === "/" || decoded[1] === "\\")) return false;
-  //   - No backslash anywhere in the path (encoded or decoded).
-  if (decoded.includes("\\")) return false;
-  //   - No path traversal segments.
-  if (decoded.includes("..")) return false;
-  //   - No protocol separator.
-  if (decoded.includes("://")) return false;
-
-  // Canonical URL parsing against the configured origin is the FINAL
-  // authority. Catches anything the regex misses (e.g., encoded host-
-  // name tricks, unusual URL schemes that survive `startsWith("/")`).
-  // The configured origin is normalized via `new URL(origin).origin`
-  // so harmless formatting (trailing slash, default ports) cannot
-  // invalidate every return destination.
-  let normalizedOrigin: string;
-  try {
-    normalizedOrigin = new URL(allowedOrigin).origin;
-  } catch {
+  // Final pass on the stable decoded form. The structural checks
+  // were already re-applied after every decoded layer, so this is
+  // a defense-in-depth re-check for the case where the loop exited
+  // without any decode (the raw input was stable from the start).
+  if (!passesStructuralChecks(decoded, normalizedOrigin)) {
     return false;
   }
+  return true;
+}
+
+/**
+ * Predicate for "this string still contains a syntactically valid
+ * percent-escape that decodes to a non-trivial byte". Used to gate
+ * the iterative decoder so a literal `%25` at the end of a legitimate
+ * path does not force another decode that would throw `URIError` on
+ * a trailing `%`. Anchored against `%` followed by exactly two
+ * hex digits so a bare `%` (which `decodeURIComponent` rejects) does
+ * not advance the loop.
+ *
+ * This predicate is intentionally strict: malformed escapes such as
+ * `%`, `%2`, `%GG`, or `%2G` never advance the loop. The submitted-
+ * syntax preflight in `isValidReturnPath` is the layer that rejects
+ * those malformed escapes; this predicate is a loop-boundary guard
+ * for subsequent decoded layers where a literal `%` is permitted.
+ */
+function containsPercentEscape(value: string): boolean {
+  return /%[0-9A-Fa-f]{2}/.test(value);
+}
+
+/**
+ * Single structural + forbidden-character + same-origin revalidation
+ * used inside the iterative decoder. Returns true when `value` is a
+ * safe same-origin http(s) application path; false otherwise.
+ */
+function passesStructuralChecks(decoded: string, normalizedOrigin: string): boolean {
+  if (containsForbiddenCharacters(decoded)) return false;
+  // Must start with a single "/" (not "//", not "/\", not "\").
+  if (!decoded.startsWith("/")) return false;
+  if (decoded.length >= 2 && (decoded[1] === "/" || decoded[1] === "\\")) return false;
+  // No backslash anywhere in the path (encoded or decoded).
+  if (decoded.includes("\\")) return false;
+  // No path traversal segments.
+  if (decoded.includes("..")) return false;
+  // No protocol separator.
+  if (decoded.includes("://")) return false;
+  // Canonical URL parsing against the configured origin is the FINAL
+  // authority. Catches anything the structural checks miss (e.g.,
+  // encoded hostname tricks, unusual URL schemes that survive
+  // `startsWith("/")`).
   let parsed: URL;
   try {
     parsed = new URL(decoded, normalizedOrigin);

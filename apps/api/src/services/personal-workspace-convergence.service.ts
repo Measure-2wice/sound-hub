@@ -54,6 +54,14 @@
 //   membership-not-owner
 //   contradictory-personal-relationships
 //   multiple-personal-workspaces
+//   co-owned-personal-workspace
+//
+// `co-owned-personal-workspace` blocks otherwise-safe `attachable` and
+// `converged` classifications when a Personal Workspace the user is an
+// Owner of (candidate or pointed) has another distinct Owner UserAccount.
+// When an existing contradiction already applies, the existing reason
+// keeps its precedence — this reason only fires when no other recovery
+// trigger matches.
 //
 // Recovery is not a 403 envelope from /verify-token — the auth route
 // always issues a session, and the public DTO carries
@@ -248,8 +256,19 @@ export function classifyPersonalWorkspaceState(
     // Exactly one Owner Personal membership; the migration left
     // personalWorkspaceId NULL (migration backfill gap, or the row
     // was created after the migration but before the auth service
-    // attached it). The convergence service can link it.
+    // attached it). The convergence service can link it — UNLESS the
+    // candidate Personal Workspace is co-owned by another UserAccount.
+    // In that case authority is not the user's alone and convergence
+    // must not link the pointer; we surface the server-internal
+    // `co-owned-personal-workspace` recovery reason.
     const target = ownerPersonalMemberships[0]!;
+    if (state.coOwnedPersonalWorkspaceIds.has(target.workspaceId)) {
+      return {
+        kind: "recovery",
+        userAccountId,
+        reason: "co-owned-personal-workspace",
+      };
+    }
     return {
       kind: "attachable",
       userAccountId,
@@ -295,7 +314,18 @@ export function classifyPersonalWorkspaceState(
   }
 
   // The user has an Owner membership on the pointed Personal
-  // Workspace. Converged.
+  // Workspace. Converged — UNLESS the pointed Workspace is co-owned by
+  // another UserAccount. In that case authority on this Workspace is
+  // not the user's alone even though the pointer happens to match an
+  // Owner membership, so the convergence classification cannot return
+  // `converged`; surface the server-internal recovery reason instead.
+  if (state.coOwnedPersonalWorkspaceIds.has(ownerMembership.workspaceId)) {
+    return {
+      kind: "recovery",
+      userAccountId,
+      reason: "co-owned-personal-workspace",
+    };
+  }
   return {
     kind: "converged",
     workspaceId: ownerMembership.workspaceId,

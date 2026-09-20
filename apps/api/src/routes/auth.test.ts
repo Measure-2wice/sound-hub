@@ -356,10 +356,7 @@ describe("BG1 auth routes (in-memory, deterministic adapter)", () => {
     });
     assert.equal(afterSecond.personalWorkspaceId, firstPointer);
     assert.equal(afterSecond.ownerPersonalMemberships.length, 1);
-    assert.equal(
-      afterSecond.ownerPersonalMemberships[0]!.workspaceId,
-      firstPointer,
-    );
+    assert.equal(afterSecond.ownerPersonalMemberships[0]!.workspaceId, firstPointer);
   });
 
   test("POST /api/auth/verify-token rejects a request body with the wrong field name (P2-001)", async () => {
@@ -951,6 +948,88 @@ describe("BG1 /api/auth/me is strictly read-only (Tenki PR #91, in-memory)", () 
     });
     assert.equal(after.personalWorkspaceId, CONVERGED_WORKSPACE_ID);
     assert.equal(after.ownerPersonalMemberships.length, 1);
+  });
+
+  test('GET /api/auth/me reports "recovery" for both co-owners of a co-owned Personal Workspace and does NOT mutate state (Tenki PR #91)', async () => {
+    // Cross-user co-ownership on the read path: two distinct
+    // UserAccounts both Owner of the same Personal Workspace. /me
+    // MUST surface public "recovery" for both users and MUST NOT
+    // mutate either pointer.
+    const CO_OWNED_WORKSPACE_ID = "ws-me-co-owned";
+    const repo = new InMemoryAuthRepository(
+      [
+        {
+          userAccountId: "user-me-co-a",
+          email: "tenki-me-co-a@example.com",
+          identityProvider: "deterministic",
+          identitySubject: "tenki-me-co-a-subject",
+          memberships: [
+            {
+              workspaceId: CO_OWNED_WORKSPACE_ID,
+              slug: "personal-ws-me-co-owned",
+              name: "Co-owned Personal",
+              workspaceType: "Personal",
+              workspaceStatus: "Active",
+              role: "Owner",
+              capabilities: [],
+            },
+          ],
+        },
+        {
+          userAccountId: "user-me-co-b",
+          email: "tenki-me-co-b@example.com",
+          identityProvider: "deterministic",
+          identitySubject: "tenki-me-co-b-subject",
+          memberships: [
+            {
+              workspaceId: CO_OWNED_WORKSPACE_ID,
+              slug: "personal-ws-me-co-owned",
+              name: "Co-owned Personal",
+              workspaceType: "Personal",
+              workspaceStatus: "Active",
+              role: "Owner",
+              capabilities: [],
+            },
+          ],
+        },
+      ],
+      () => Date.now(),
+    );
+    const cookieA = await mintSessionCookie(repo, "user-me-co-a");
+    const cookieB = await mintSessionCookie(repo, "user-me-co-b");
+    const { app } = buildAppForRepo(repo);
+
+    const meA = await request(app).get("/api/auth/me").set("Cookie", cookieA);
+    const meB = await request(app).get("/api/auth/me").set("Cookie", cookieB);
+    assert.equal(meA.status, 200);
+    assert.equal(meB.status, 200);
+    assert.ok(meA.body.user);
+    assert.ok(meB.body.user);
+    assert.equal(meA.body.user.setupState, "recovery");
+    assert.equal(meB.body.user.setupState, "recovery");
+    // Both users see the co-owned workspace in their workspace
+    // list (it is a real Personal Workspace they are both Owner
+    // members of), but the public DTO carries recovery.
+    assert.equal(meA.body.user.workspaces.length, 1);
+    assert.equal(meB.body.user.workspaces.length, 1);
+    assert.equal(meA.body.user.workspaces[0].workspaceId, CO_OWNED_WORKSPACE_ID);
+    assert.equal(meB.body.user.workspaces[0].workspaceId, CO_OWNED_WORKSPACE_ID);
+
+    // Post-condition: both pointers remain NULL; both Owner
+    // memberships remain intact; both workspaces remain
+    // classified as co-owned.
+    const afterA = await repo.findPersonalWorkspaceState({
+      userAccountId: "user-me-co-a",
+    });
+    const afterB = await repo.findPersonalWorkspaceState({
+      userAccountId: "user-me-co-b",
+    });
+    assert.equal(afterA.personalWorkspaceId, null);
+    assert.equal(afterB.personalWorkspaceId, null);
+    assert.equal(afterA.ownerPersonalMemberships.length, 1);
+    assert.equal(afterB.ownerPersonalMemberships.length, 1);
+    assert.equal(afterA.coOwnedPersonalWorkspaceIds.has(CO_OWNED_WORKSPACE_ID), true);
+    assert.equal(afterB.coOwnedPersonalWorkspaceIds.has(CO_OWNED_WORKSPACE_ID), true);
   });
 });
 

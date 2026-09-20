@@ -34,7 +34,8 @@ export type ConvergenceKind =
         | "owner-membership-missing"
         | "membership-not-owner"
         | "contradictory-personal-relationships"
-        | "multiple-personal-workspaces";
+        | "multiple-personal-workspaces"
+        | "co-owned-personal-workspace";
     };
 
 /**
