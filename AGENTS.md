@@ -86,6 +86,24 @@ abstraction or introduce a new storage provider.
 # Install
 pnpm install
 
+## Feedback loop
+
+Use the narrowest useful verification during implementation.
+
+1. After a meaningful change, run the closest affected test or package test.
+2. Before declaring work ready for review, run `pnpm check:fast`.
+3. Run `pnpm test:repository` when repository, persistence, migration,
+   transaction, or concurrency behavior changes.
+4. Run focused Playwright/E2E coverage when user-visible behavior changes.
+5. Run `pnpm build` when build/runtime integration is relevant.
+6. Do not repeatedly run the full repository suite while debugging one
+   focused failure.
+7. If an unrelated required check fails, classify it before modifying code:
+   - FIX HERE
+   - FOLLOW-UP TICKET
+   - PRE-EXISTING / FLAKE
+8. GitHub CI is the final broad merge gate.
+
 # Development
 pnpm dev
 pnpm dev:web
