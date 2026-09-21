@@ -17,6 +17,7 @@
     "lint": "eslint .",
     "lint:fix": "eslint . --fix",
     "check": "pnpm type-check && pnpm lint && pnpm test && pnpm build",
+    "check:fast": "pnpm format:check && pnpm type-check && pnpm --filter @soundhub/api test && pnpm --filter @soundhub/web test && pnpm test:forbidden-deps && pnpm test:db-qa-env",
     "format": "prettier --write .",
     "format:check": "prettier --check .",
     "prisma:generate": "pnpm --filter @soundhub/db db:generate",
@@ -34,13 +35,25 @@
     "db:qa:seed": "pnpm db:qa:wait && apps/api/node_modules/.bin/tsx scripts/db-qa-seed.mjs",
     "dev:qa": "apps/api/node_modules/.bin/tsx scripts/dev-qa.mjs",
     "check:forbidden-deps": "node scripts/check-forbidden-deps.mjs",
-    "acceptance-gate": "node scripts/acceptance-gate.mjs"
+    "acceptance-gate": "node scripts/acceptance-gate.mjs",
+    "prepare": "husky"
+  },
+  "lint-staged": {
+    "*.{ts,tsx}": [
+      "prettier --write",
+      "eslint"
+    ],
+    "*.{json,md,yml,yaml,css,scss}": [
+      "prettier --write"
+    ]
   },
   "devDependencies": {
     "@eslint/js": "^9.37.0",
     "concurrently": "^9.0.0",
     "eslint": "^9.10.0",
     "eslint-config-prettier": "^9.1.2",
+    "husky": "^9.1.7",
+    "lint-staged": "^17.5.1",
     "prettier": "^3.3.3",
     "typescript": "^5.6.3",
     "typescript-eslint": "^8.0.0"
