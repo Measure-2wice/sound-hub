@@ -42,7 +42,11 @@
 //     and a current WorkspaceMembership. Proves the GS 4 / GS 5 /
 //     GS 6 contracts: the route revalidates current membership on
 //     every request and rejects a user without it, regardless of any
-//     legacy ownerUserId match.
+//     legacy ownerUserId match. Returns the server-resolved
+//     `safeReturnTo` against the fresh post-switch user payload;
+//     `Cancel` does NOT call this route — it is a safe in-page
+//     exit to `/dashboard` under the still-committed current
+//     Workspace.
 
 import { createHash } from "node:crypto";
 import { Router, type NextFunction, type Request, type Response } from "express";
@@ -60,6 +64,7 @@ import {
 } from "@soundhub/types";
 import { ZodError } from "zod";
 import type { AuthenticationService } from "../services/authentication.service.js";
+import type { AuthRepository } from "../auth-repository/auth-repository.js";
 import {
   AuthorizationError,
   type WorkspaceAuthorizationService,
@@ -78,7 +83,6 @@ import {
   resolveAllowedOrigin,
   setReturnContextCookie,
 } from "../lib/return-context.js";
-import type { AuthRepository } from "../auth-repository/auth-repository.js";
 import { toPublicUser } from "../dto/public-mappers.js";
 
 export interface AuthRouteDeps {
@@ -425,6 +429,11 @@ async function handleActingWorkspace(
       userAccountId: view.userAccountId,
       workspaceId: parsed.actingWorkspaceId,
     });
+    // The acting-workspace route does NOT carry a `returnTo` in
+    // the request body — the switch page's "Cancel" exits in-page
+    // to `/dashboard` and "Switch and continue" uses the route
+    // result to refresh state. `safeReturnTo` is therefore `null`;
+    // the bounded resolver is exercised by the intent route path.
     const body = bg1ActingWorkspaceResponseV1Schema.parse({
       ok: true,
       actingWorkspace: membership.workspace,
@@ -432,6 +441,7 @@ async function handleActingWorkspace(
         role: membership.role,
         joinedAt: membership.joinedAt.toISOString(),
       },
+      safeReturnTo: null,
     });
     res.status(200).json(body);
   } catch (err) {

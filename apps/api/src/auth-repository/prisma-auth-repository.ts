@@ -591,6 +591,75 @@ export class PrismaAuthRepository implements AuthRepository {
       acceptedAt: existing.acceptedAt,
     };
   }
+
+  /**
+   * M2 #83 remediation: atomic intent provisioning. ONE Prisma
+   * `$transaction` covers every capability upsert and the acceptance
+   * insert. Either all writes commit, or the transaction rolls back
+   * to zero rows. The natural unique constraints provide idempotency;
+   * this primitive is the single source of atomicity.
+   *
+   * The transaction callback may throw (e.g., a real FK violation when
+   * `acceptance.grantedByUserId` references a deleted UserAccount).
+   * In that case Prisma's $transaction rolls back the transaction
+   * and re-throws the error. The Prisma atomicity test fails a real
+   * FK inside this transaction to prove the rollback — no wrapper is
+   * required.
+   *
+   * Concurrent whole-command callers converge on a single row via the
+   * in-transaction `tx.sellerParticipationAcceptance.upsert` against
+   * the natural unique index. Concurrent duplicate inserts inside
+   * one transaction are absorbed by the unique constraint; the loser
+   * observes the winner's row.
+   */
+  async provisionIntentAtomically(input: {
+    readonly workspaceId: string;
+    readonly userAccountId: string;
+    readonly capabilities: readonly MarketplaceCapabilityV1[];
+    readonly acceptance: {
+      readonly termsVersion: string;
+      readonly termsContentHash: string;
+      readonly grantedByUserId: string;
+    } | null;
+  }): Promise<void> {
+    await this.prisma.$transaction(async (tx) => {
+      for (const capability of input.capabilities) {
+        await tx.workspaceCapability.upsert({
+          where: {
+            workspaceId_capability: {
+              workspaceId: input.workspaceId,
+              capability,
+            },
+          },
+          create: { workspaceId: input.workspaceId, capability },
+          update: {},
+        });
+      }
+      if (input.acceptance) {
+        // In-transaction upsert against the natural unique index
+        // (workspaceId, termsVersion). The `acceptedByUserId` and
+        // `grantedByUserId` foreign keys are enforced by the
+        // database; a failure (e.g., a deleted UserAccount) rolls
+        // back the entire transaction.
+        await tx.sellerParticipationAcceptance.upsert({
+          where: {
+            workspaceId_termsVersion: {
+              workspaceId: input.workspaceId,
+              termsVersion: input.acceptance.termsVersion,
+            },
+          },
+          create: {
+            workspaceId: input.workspaceId,
+            termsVersion: input.acceptance.termsVersion,
+            termsContentHash: input.acceptance.termsContentHash,
+            acceptedByUserId: input.userAccountId,
+            grantedByUserId: input.acceptance.grantedByUserId,
+          },
+          update: {},
+        });
+      }
+    });
+  }
 }
 
 function assertBg1Provider(provider: string): asserts provider is Bg1IdentityProviderV1 {

@@ -7,6 +7,18 @@
 // module is the registration seam and is intentionally empty until
 // product/legal supplies and registers the approved text.
 //
+// TODO(legal-blocker): Offer/Both acceptance requires the registered
+// Seller participation terms. This module is the registration seam.
+//
+//   Owner: Product + Legal.
+//   Unblocking step: call
+//     `registerSellerParticipationTerms({ version, content })`
+//     from an approved admin bootstrap (out of scope for #83).
+//   Post-condition: until that call lands, every `Offer services`
+//     and `Both` submission returns `INTENT_LEGAL_BLOCKED` with the
+//     neutral retryable copy. #83 cannot mark Offer/Both
+//     production-complete against production text.
+//
 // State machine:
 //
 //   - unregistered (default): `getCurrentSellerParticipationTerms()`

@@ -265,6 +265,86 @@ describe("Intent route (in-memory)", () => {
     assert.equal(response.body.error.code, "INTENT_INVALID");
   });
 
+  test("Organization inverse authorization: POST /api/workspaces/<orgId>/intent returns 403 with INTENT_FORBIDDEN; zero mutation", async () => {
+    // M2 #83 remediation §2: a valid Organization Owner
+    // membership does NOT permit intent provisioning. Re-seed
+    // the in-memory repository with both a Personal Workspace
+    // AND an Organization Workspace (both Owner); POST to the
+    // Organization id; assert the inverse and re-read the
+    // Organization surface — it stays zero-capability.
+    __resetSellerParticipationTermsForTests();
+    const ORG_ID = "ws-intent-route-org";
+    authRepo = new InMemoryAuthRepository([
+      {
+        userAccountId: USER_ID,
+        email: EMAIL,
+        identityProvider: "deterministic",
+        identitySubject: SUBJECT,
+        memberships: [
+          {
+            workspaceId: WS_ID,
+            slug: "intent-route-personal",
+            name: "Intent Route Personal",
+            workspaceType: "Personal",
+            workspaceStatus: "Active",
+            role: "Owner",
+            capabilities: [],
+          },
+          {
+            workspaceId: ORG_ID,
+            slug: "intent-route-org",
+            name: "Intent Route Organization",
+            workspaceType: "Organization",
+            workspaceStatus: "Active",
+            role: "Owner",
+            capabilities: [],
+          },
+        ],
+      },
+    ]);
+    personalWorkspaceConvergenceService = new PersonalWorkspaceConvergenceService({
+      authRepository: authRepo,
+    });
+    authenticationService = new AuthenticationService({
+      identityAdapter: adapter,
+      authRepository: authRepo,
+      personalWorkspaceConvergenceService,
+    });
+    workspaceAuthorizationService = new WorkspaceAuthorizationService({
+      authRepository: authRepo,
+    });
+    intentService = new IntentService({
+      authRepository: authRepo,
+      workspaceAuthorizationService,
+    });
+    app = buildApp({
+      authenticationService,
+      workspaceAuthorizationService,
+      authRepository: authRepo,
+      identityAdapter: adapter,
+      intentService,
+      personalWorkspaceConvergenceService,
+      prismaClient: stubPrisma,
+    }).app;
+
+    const cookie = await signIn();
+    const response = await request(app)
+      .post(`/api/workspaces/${ORG_ID}/intent`)
+      .send({ intent: "Hire" })
+      .set("Content-Type", "application/json")
+      .set("Cookie", cookie);
+    assert.equal(response.status, 403);
+    assert.equal(response.body.error.code, "INTENT_FORBIDDEN");
+
+    // Re-read the user payload: Organization has zero
+    // capabilities; Personal is untouched.
+    const view = await authRepo.getPublicUser(USER_ID);
+    const org = view!.workspaces.find((w) => w.workspaceId === ORG_ID);
+    assert.deepEqual(org?.capabilities, []);
+    const personal = view!.workspaces.find((w) => w.workspaceId === WS_ID);
+    assert.deepEqual(personal?.capabilities, []);
+  });
+
   test("Not a current member returns INTENT_FORBIDDEN (translated from AuthorizationError)", async () => {
     const cookie = await signIn();
     const response = await request(app)

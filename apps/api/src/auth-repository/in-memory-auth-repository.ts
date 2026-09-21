@@ -479,6 +479,74 @@ export class InMemoryAuthRepository implements AuthRepository {
     return Promise.resolve(toAcceptanceRecord(row));
   }
 
+  /**
+   * M2 #83 remediation: symmetric in-memory implementation of the
+   * Prisma transactional primitive. Real-world transaction atomicity
+   * is not testable in a single-threaded in-memory store, so this
+   * implementation enforces atomicity by snapshotting the affected
+   * workspace + acceptance key before the writes and rolling back if
+   * any step throws. Tests that exercise real atomicity run against
+   * `PrismaAuthRepository` (see the `prisma-auth-repository.intent.
+   * atomicity.test.ts` file).
+   */
+  async provisionIntentAtomically(input: {
+    readonly workspaceId: string;
+    readonly userAccountId: string;
+    readonly capabilities: readonly MarketplaceCapabilityV1[];
+    readonly acceptance: {
+      readonly termsVersion: string;
+      readonly termsContentHash: string;
+      readonly grantedByUserId: string;
+    } | null;
+  }): Promise<void> {
+    // Snapshot the workspace capabilities so a mid-write failure
+    // can roll back to the pre-call state.
+    const workspace = this.workspacesById.get(input.workspaceId);
+    if (!workspace) {
+      throw new Error(
+        `InMemoryAuthRepository.provisionIntentAtomically: unknown workspaceId=${input.workspaceId}`,
+      );
+    }
+    const beforeCapabilities = [...workspace.capabilities];
+    const acceptanceKey = input.acceptance
+      ? `${input.workspaceId}::${input.acceptance.termsVersion}`
+      : null;
+    const beforeAcceptance = acceptanceKey
+      ? (this.sellerAcceptances.get(acceptanceKey) ?? null)
+      : null;
+
+    try {
+      for (const capability of input.capabilities) {
+        await this.upsertCapability({ workspaceId: input.workspaceId, capability });
+      }
+      if (input.acceptance) {
+        // Simulate the in-transaction upsert by writing through
+        // `recordSellerParticipationAcceptance`. The natural unique
+        // key already absorbs the duplicate.
+        await this.recordSellerParticipationAcceptance({
+          workspaceId: input.workspaceId,
+          termsVersion: input.acceptance.termsVersion,
+          termsContentHash: input.acceptance.termsContentHash,
+          acceptedByUserId: input.userAccountId,
+          grantedByUserId: input.acceptance.grantedByUserId,
+        });
+      }
+    } catch (err) {
+      // Roll back capability changes; preserve the existing
+      // acceptance row (creating a new one would duplicate the
+      // natural unique key).
+      workspace.capabilities = beforeCapabilities;
+      if (acceptanceKey) {
+        if (beforeAcceptance) {
+          this.sellerAcceptances.set(acceptanceKey, beforeAcceptance);
+        } else {
+          this.sellerAcceptances.delete(acceptanceKey);
+        }
+      }
+      throw err;
+    }
+  }
+
   private toMembershipView(
     membership: InternalMembership,
     workspace: InternalWorkspace,

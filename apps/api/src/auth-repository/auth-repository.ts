@@ -287,6 +287,35 @@ export interface AuthRepository {
     readonly acceptedByUserId: string;
     readonly grantedByUserId: string;
   }): Promise<SellerParticipationAcceptanceRecord>;
+
+  /**
+   * M2 #83 remediation (Codex CHANGES_REQUESTED P0): atomic intent
+   * provisioning. Single Prisma `$transaction` covering every
+   * capability upsert and the acceptance insert. Either ALL writes
+   * commit, or the transaction rolls back to zero rows.
+   *
+   * `Hire`   — `{ capabilities: ["Buyer"],               acceptance: null }`
+   * `Offer`  — `{ capabilities: ["Seller"],              acceptance: { ... } }`
+   * `Both`   — `{ capabilities: ["Buyer", "Seller"],     acceptance: { ... } }`
+   *
+   * The acceptance insert uses an in-transaction `upsert` against the
+   * natural `(workspaceId, termsVersion)` unique index so concurrent
+   * whole-command callers converge on the same single row.
+   *
+   * The natural unique constraints provide idempotency, NOT
+   * transaction atomicity. This primitive is the single source of
+   * atomicity for intent provisioning.
+   */
+  provisionIntentAtomically(input: {
+    readonly workspaceId: string;
+    readonly userAccountId: string;
+    readonly capabilities: readonly MarketplaceCapabilityV1[];
+    readonly acceptance: {
+      readonly termsVersion: string;
+      readonly termsContentHash: string;
+      readonly grantedByUserId: string;
+    } | null;
+  }): Promise<void>;
 }
 
 /**

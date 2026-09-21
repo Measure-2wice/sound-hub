@@ -13,56 +13,76 @@
 //
 // Authorization rules:
 //
-//   - The remembered selection is CLIENT convenience only. The
+//   - The committed selection is CLIENT convenience only. The
 //     server does not persist it; the `Switch and continue`
-//     button calls the existing #82 `POST /api/auth/acting-workspace`
-//     route to revalidate current membership against the target
-//     Workspace before navigating forward. The route is
-//     NOT Owner-only: any current Owner/Admin/Member role
-//     passes.
-//
-// Scoped-form containment:
-//
-//   - Workspace-scoped transient input does NOT transfer across
-//     a switch. The browser enforces this naturally — component
-//     state is unmounted when the user navigates away from the
-//     surface. A user retrying an action from a different
-//     Workspace must re-enter the form.
+//     button calls `commitPendingTarget` which calls the existing
+//     #82 `POST /api/auth/acting-workspace` route (membership
+//     not Owner-only per #82) and only writes localStorage on
+//     success.
+//   - Cancel calls `cancelPendingTarget` and navigates to
+//     `/dashboard` — the committed value is NEVER touched by
+//     cancel.
+//   - The query-string `target` parameter is a recovery hint only.
+//     The acting-workspace context provider is the source of truth;
+//     the query is consulted only when context is stale (e.g., a
+//     hard reload mid-transit). The candidate is revalidated
+//     against `user.workspaces` before any action.
 
-import { useEffect, useMemo, useRef, useState } from "react";
+import { Suspense, useEffect, useMemo, useRef, useState } from "react";
 import { useRouter, useSearchParams } from "next/navigation";
 import { Card } from "../../components/ui/Card";
 import { Alert } from "../../components/ui/Alert";
-import { selectActingWorkspace } from "../../lib/auth-client";
-import { useSession, useSetActingWorkspace } from "../../components/SessionProvider";
+import {
+  useActingWorkspace,
+  useSession,
+  useSetActingWorkspace,
+} from "../../components/SessionProvider";
 
 export default function WorkspaceSwitchPage() {
+  // `useSearchParams` requires a Suspense boundary at static-export
+  // time. The page is client-rendered and dynamic; the inner
+  // component reads `useSearchParams` so the route's static
+  // generation can resolve.
+  return (
+    <Suspense fallback={<WorkspaceSwitchLoading />}>
+      <WorkspaceSwitchPageInner />
+    </Suspense>
+  );
+}
+
+function WorkspaceSwitchLoading() {
+  return (
+    <div className="min-h-screen bg-canvas">
+      <div className="max-w-2xl mx-auto px-6 py-12" data-testid="switch-loading">
+        <Alert role="status" variant="status" title="Loading…">
+          Just a moment.
+        </Alert>
+      </div>
+    </div>
+  );
+}
+
+function WorkspaceSwitchPageInner() {
   const router = useRouter();
   const searchParams = useSearchParams();
-  const { user, refresh } = useSession();
-  const setActingWorkspaceId = useSetActingWorkspace();
+  const { user } = useSession();
+  const { actingWorkspace, pendingTarget } = useActingWorkspace();
+  const { commitPendingTarget, cancelPendingTarget } = useSetActingWorkspace();
 
-  // Read target + return. The page DOES NOT trust raw query
-  // params for the post-switch destination — the user can return
-  // to the dashboard via the Cancel link. The `return` value is
-  // surfaced for completeness but not used as a navigation
-  // authority.
-  const targetId = searchParams.get("target");
-  const returnPath = searchParams.get("return");
+  // Query-string target is a recovery hint; context wins in the
+  // live case (the selector already set pendingTarget via the
+  // provider before navigating here).
+  const queryTargetId = searchParams.get("target");
+
+  const target = useMemo(() => {
+    if (pendingTarget) return pendingTarget;
+    if (!user || !queryTargetId) return null;
+    return user.workspaces.find((w) => w.workspaceId === queryTargetId) ?? null;
+  }, [pendingTarget, queryTargetId, user]);
 
   const [submitting, setSubmitting] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const switchButtonRef = useRef<HTMLButtonElement>(null);
-
-  const currentWorkspace = useMemo(() => {
-    if (!user) return null;
-    return user.workspaces[0] ?? null;
-  }, [user]);
-
-  const targetWorkspace = useMemo(() => {
-    if (!user || !targetId) return null;
-    return user.workspaces.find((w) => w.workspaceId === targetId) ?? null;
-  }, [user, targetId]);
 
   // Page-entry focus: the first focusable element (the
   // `Switch and continue` button) receives focus on mount.
@@ -72,7 +92,38 @@ export default function WorkspaceSwitchPage() {
     switchButtonRef.current?.focus();
   }, []);
 
-  if (!targetWorkspace || !currentWorkspace) {
+  // If the candidate is missing OR no longer a current member of
+  // the user's accessible Workspaces, render the unavailable
+  // surface (the selector / future switch retries must come from
+  // a fresh drop-down click).
+  if (!user) {
+    return (
+      <div className="min-h-screen bg-canvas">
+        <div className="max-w-2xl mx-auto px-6 py-12" data-testid="switch-unavailable">
+          <Card variant="parchment">
+            <Card.Header>
+              <Card.Title>Workspace switch unavailable</Card.Title>
+            </Card.Header>
+            <Card.Content>
+              <p className="text-base text-muted mb-4">
+                You are not signed in. Return to the dashboard.
+              </p>
+              <button
+                type="button"
+                onClick={() => router.replace("/dashboard")}
+                className="inline-flex items-center justify-center min-h-[44px] min-w-[44px] py-3 px-6 text-base font-medium text-aubergine hover:text-aubergine-hover border border-aubergine rounded focus:outline-none focus-visible:outline focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-aubergine"
+                data-testid="switch-back-to-dashboard"
+              >
+                Return to dashboard
+              </button>
+            </Card.Content>
+          </Card>
+        </div>
+      </div>
+    );
+  }
+
+  if (!actingWorkspace || !target) {
     return (
       <div className="min-h-screen bg-canvas">
         <div className="max-w-2xl mx-auto px-6 py-12" data-testid="switch-unavailable">
@@ -87,7 +138,10 @@ export default function WorkspaceSwitchPage() {
               </p>
               <button
                 type="button"
-                onClick={() => router.replace("/dashboard")}
+                onClick={() => {
+                  cancelPendingTarget();
+                  router.replace("/dashboard");
+                }}
                 className="inline-flex items-center justify-center min-h-[44px] min-w-[44px] py-3 px-6 text-base font-medium text-aubergine hover:text-aubergine-hover border border-aubergine rounded focus:outline-none focus-visible:outline focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-aubergine"
                 data-testid="switch-back-to-dashboard"
               >
@@ -107,21 +161,18 @@ export default function WorkspaceSwitchPage() {
 
     void (async () => {
       try {
-        await selectActingWorkspace({ actingWorkspaceId: targetWorkspace.workspaceId });
-        setActingWorkspaceId(targetWorkspace.workspaceId);
-        await refresh();
-        // After a successful revalidation, navigate to the
-        // requested return path. If the return path is the
-        // dashboard itself (the typical case), navigate there;
-        // otherwise honour it.
-        const safeReturn =
-          returnPath && returnPath.startsWith("/") && !returnPath.startsWith("//")
-            ? returnPath
-            : "/dashboard";
-        // `safeReturn` is a known internal path; cast through the
-        // runtime Route type.
-        router.replace(safeReturn as Parameters<typeof router.replace>[0]);
+        await commitPendingTarget();
+        // Commit succeeded — committed + localStorage are updated
+        // and pendingTarget is cleared by the provider. Navigate
+        // to /dashboard under the new acting Workspace. (The
+        // bounded #83 destination set covers `/dashboard`; the
+        // server-resolved destination contract is exercised by
+        // the intent route path.)
+        router.replace("/dashboard");
       } catch {
+        // Commit failed — leave both committed state AND
+        // pendingTarget untouched. Pending remains so the user
+        // can retry, OR cancel.
         setError("SoundHub could not switch to this Workspace. Please try again.");
       } finally {
         setSubmitting(false);
@@ -130,6 +181,9 @@ export default function WorkspaceSwitchPage() {
   };
 
   const handleCancel = () => {
+    // Cancel never touches committed state. `cancelPendingTarget`
+    // clears the in-memory candidate only.
+    cancelPendingTarget();
     router.replace("/dashboard");
   };
 
@@ -151,7 +205,7 @@ export default function WorkspaceSwitchPage() {
               <div>
                 <dt className="inline font-medium text-muted">Currently acting as: </dt>
                 <dd className="inline text-ink" data-testid="workspace-switch-current-name">
-                  {currentWorkspace.name}
+                  {actingWorkspace.name}
                 </dd>
               </div>
             </dl>
@@ -164,17 +218,17 @@ export default function WorkspaceSwitchPage() {
               <div>
                 <dt className="inline font-medium text-muted">Switch to: </dt>
                 <dd className="inline text-ink" data-testid="workspace-switch-target-name">
-                  {targetWorkspace.name}
+                  {target.name}
                 </dd>
               </div>
               <div>
                 <dt className="inline font-medium text-muted">Type: </dt>
-                <dd className="inline text-ink">{targetWorkspace.workspaceType}</dd>
+                <dd className="inline text-ink">{target.workspaceType}</dd>
               </div>
-              {targetWorkspace.capabilities.length > 0 && (
+              {target.capabilities.length > 0 && (
                 <div>
                   <dt className="inline font-medium text-muted">Capabilities: </dt>
-                  <dd className="inline text-ink">{targetWorkspace.capabilities.join(", ")}</dd>
+                  <dd className="inline text-ink">{target.capabilities.join(", ")}</dd>
                 </div>
               )}
             </dl>

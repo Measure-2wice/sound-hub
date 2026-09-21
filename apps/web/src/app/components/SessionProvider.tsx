@@ -15,8 +15,8 @@
 // because client-side route changes never re-run mount-time fetches.
 //
 // `SessionProvider` is the single seam every auth-aware client
-// component reads from. It owns the user state, fetches it from
-// the authoritative endpoint on mount, and exposes a `refresh()` that
+// component reads from. It owns the user state, fetches it from the
+// authoritative endpoint on mount, and exposes a `refresh()` that
 // any caller can invoke after a state-changing auth action. The
 // helper methods (`verifyAndRefresh`, `signOutAndRefresh`) wrap the
 // auth-client calls so the refresh can never drift from the action:
@@ -30,14 +30,33 @@
 // validated `returnTo`) so callers can navigate appropriately
 // without an additional round-trip.
 //
-// M2 (#83): the acting-Workspace id is a CLIENT convenience only.
-// The `actingWorkspaceId` exposed here is derived from localStorage
-// (via `remembered-acting-workspace.ts`) and falls back to the
-// user's Personal Workspace. The server does NOT persist this
-// value; every consequential command names its acting Workspace
-// explicitly and the server revalidates current membership on
-// every request via the existing #82 `requireActingMembership`
-// route (which accepts any Owner/Admin/Member role).
+// M2 (#83) — Acting-Workspace context model:
+//
+//   The browser remembers one acting-Workspace id in localStorage
+//   ("soundhub.actingWorkspaceId"). The provider splits that into:
+//
+//     - `actingWorkspaceId`: the COMMITTED value (localStorage-
+//       backed). All consumers (Shell, switch page, dashboard) read
+//       this value.
+//     - `pendingTargetId`: a CANDIDATE the selector chose but the
+//       user has not yet confirmed. No localStorage write.
+//
+//   Three update methods cover the surface:
+//
+//     - `setPendingTarget(id)`: selector → in-memory only. The
+//       switch page reads this as its pending candidate.
+//     - `commitPendingTarget()`: switch page → call the existing
+//       `selectActingWorkspace` API; on success, write localStorage
+//       and clear pending. On failure, leave both untouched so
+//       Cancel-or-error leaves the committed state unchanged.
+//     - `cancelPendingTarget()`: switch page Cancel → clears
+//       pending without touching committed state.
+//     - `clearActingWorkspace()`: sign-out → clears committed.
+//
+//   The `useActingWorkspace()` consumer hook returns the four
+//   surfaces Shell / switch page / dashboard read from: committed
+//   + pending (or null each). Cancel must never touch the
+//   committed state.
 
 import {
   createContext,
@@ -53,10 +72,16 @@ import type {
   Bg1VerifyTokenRequestV1,
   Bg1VerifyTokenResponseV1,
 } from "@soundhub/types";
-import { fetchSessionInfo, signOut as signOutRequest, verifyToken } from "../lib/auth-client";
+import {
+  fetchSessionInfo,
+  signOut as signOutRequest,
+  verifyToken,
+  selectActingWorkspace as selectActingWorkspaceRequest,
+} from "../lib/auth-client";
 import {
   clearRememberedActingWorkspaceId,
   readRememberedActingWorkspaceId,
+  writeRememberedActingWorkspaceId,
 } from "../lib/remembered-acting-workspace";
 
 export interface SessionContextValue {
@@ -79,7 +104,7 @@ export interface SessionContextValue {
 const SessionContext = createContext<SessionContextValue | null>(null);
 
 /**
- * Resolve the current acting-Workspace id from the user's
+ * Resolve the committed acting-Workspace id from the user's
  * accessible workspaces plus a remembered localStorage value.
  * Falls back to the user's Personal Workspace when the remembered
  * value is not accessible or no remembered value exists. Returns
@@ -107,16 +132,44 @@ function resolveActingWorkspaceId(
 export interface ActingWorkspaceContextValue {
   readonly actingWorkspaceId: string | null;
   readonly actingWorkspace: Bg1PublicUserV1["workspaces"][number] | null;
+  readonly pendingTargetId: string | null;
+  readonly pendingTarget: Bg1PublicUserV1["workspaces"][number] | null;
 }
 
 const ActingWorkspaceContext = createContext<ActingWorkspaceContextValue>({
   actingWorkspaceId: null,
   actingWorkspace: null,
+  pendingTargetId: null,
+  pendingTarget: null,
+});
+
+export interface ActingWorkspaceUpdateContextValue {
+  /** Selector → set the in-memory candidate; no localStorage write. */
+  readonly setPendingTarget: (workspaceId: string | null) => void;
+  /**
+   * Switch page "Switch and continue". Calls the
+   * `selectActingWorkspace` API; on success, writes localStorage
+   * and clears pending. On failure, throws and leaves both
+   * committed + pending untouched.
+   */
+  readonly commitPendingTarget: () => Promise<void>;
+  /** Switch page "Cancel". Clears pending without touching committed. */
+  readonly cancelPendingTarget: () => void;
+  /** Sign-out + edge cases. Clears the committed localStorage value. */
+  readonly clearActingWorkspace: () => void;
+}
+
+const ActingWorkspaceUpdateContext = createContext<ActingWorkspaceUpdateContextValue>({
+  setPendingTarget: () => undefined,
+  commitPendingTarget: () => Promise.resolve(),
+  cancelPendingTarget: () => undefined,
+  clearActingWorkspace: () => undefined,
 });
 
 export function ActingWorkspaceProvider({ children }: { readonly children: ReactNode }) {
   const { user } = useSession();
   const [remembered, setRemembered] = useState<string | null>(null);
+  const [pendingTargetId, setPendingTargetId] = useState<string | null>(null);
 
   // Read localStorage on mount. Server-rendered HTML cannot
   // access localStorage; the value is `null` on the first render
@@ -135,50 +188,69 @@ export function ActingWorkspaceProvider({ children }: { readonly children: React
     return user.workspaces.find((w) => w.workspaceId === actingWorkspaceId) ?? null;
   }, [user, actingWorkspaceId]);
 
-  // Expose a way for the selector to update the remembered value
-  // and trigger re-derivation.
-  const setActingWorkspaceId = useCallback((workspaceId: string | null) => {
-    if (workspaceId === null) {
-      clearRememberedActingWorkspaceId();
-    } else {
-      // Use the dynamic import via window.localStorage to avoid
-      // the SSR-safe path.
-      try {
-        if (typeof window !== "undefined") {
-          window.localStorage.setItem("soundhub.actingWorkspaceId", workspaceId);
-        }
-      } catch {
-        // Best-effort.
-      }
+  const pendingTarget = useMemo(() => {
+    if (!user || !pendingTargetId) return null;
+    return user.workspaces.find((w) => w.workspaceId === pendingTargetId) ?? null;
+  }, [user, pendingTargetId]);
+
+  const setPendingTarget = useCallback((workspaceId: string | null) => {
+    setPendingTargetId(workspaceId);
+  }, []);
+
+  const commitPendingTarget = useCallback(async (): Promise<void> => {
+    if (!pendingTargetId) return;
+    // Validate the candidate is still a current member of the
+    // user's accessible Workspaces BEFORE calling the network.
+    if (!user || !user.workspaces.some((w) => w.workspaceId === pendingTargetId)) {
+      throw new Error("Pending target is no longer a current Workspace; refusing to commit.");
     }
-    setRemembered(workspaceId);
+    // Server-side revalidation via the #82 acting-workspace route
+    // (membership-not-Owner-only). On failure, leave both untouched.
+    await selectActingWorkspaceRequest({ actingWorkspaceId: pendingTargetId });
+    writeRememberedActingWorkspaceId(pendingTargetId);
+    setRemembered(pendingTargetId);
+    setPendingTargetId(null);
+  }, [pendingTargetId, user]);
+
+  const cancelPendingTarget = useCallback(() => {
+    setPendingTargetId(null);
+  }, []);
+
+  const clearActingWorkspace = useCallback(() => {
+    clearRememberedActingWorkspaceId();
+    setRemembered(null);
+    setPendingTargetId(null);
   }, []);
 
   const value = useMemo<ActingWorkspaceContextValue>(
-    () => ({ actingWorkspaceId, actingWorkspace }),
-    [actingWorkspaceId, actingWorkspace],
+    () => ({ actingWorkspaceId, actingWorkspace, pendingTargetId, pendingTarget }),
+    [actingWorkspaceId, actingWorkspace, pendingTargetId, pendingTarget],
+  );
+
+  const updateValue = useMemo<ActingWorkspaceUpdateContextValue>(
+    () => ({
+      setPendingTarget,
+      commitPendingTarget,
+      cancelPendingTarget,
+      clearActingWorkspace,
+    }),
+    [setPendingTarget, commitPendingTarget, cancelPendingTarget, clearActingWorkspace],
   );
 
   return (
     <ActingWorkspaceContext.Provider value={value}>
-      <ActingWorkspaceUpdateContext.Provider value={setActingWorkspaceId}>
+      <ActingWorkspaceUpdateContext.Provider value={updateValue}>
         {children}
       </ActingWorkspaceUpdateContext.Provider>
     </ActingWorkspaceContext.Provider>
   );
 }
 
-const ActingWorkspaceUpdateContext = createContext<(id: string | null) => void>(() => {
-  // Default no-op; the provider overrides it. Used by the
-  // selector to write the remembered value without exposing
-  // localStorage to the rest of the tree.
-});
-
 export function useActingWorkspace(): ActingWorkspaceContextValue {
   return useContext(ActingWorkspaceContext);
 }
 
-export function useSetActingWorkspace(): (id: string | null) => void {
+export function useSetActingWorkspace(): ActingWorkspaceUpdateContextValue {
   return useContext(ActingWorkspaceUpdateContext);
 }
 

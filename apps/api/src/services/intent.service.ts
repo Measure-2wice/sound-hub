@@ -6,40 +6,49 @@
 // Seller capability. The intent service is the single owner of
 // that provision:
 //
-//   - `Hire`         → Buyer capability (no attestation).
-//   - `Offer`        → Seller capability + versioned Seller
-//                      participation acceptance evidence.
-//   - `Both`         → Buyer capability + Seller capability +
-//                      Seller participation acceptance evidence,
-//                      all in ONE atomic transaction. Failure
-//                      rolls all three back.
+//   - `Hire`   → Buyer capability (no attestation).
+//   - `Offer`  → Seller capability + versioned Seller participation
+//                acceptance evidence.
+//   - `Both`   → Buyer capability + Seller capability + Seller
+//                participation acceptance evidence, all in ONE
+//                atomic transaction.
 //
 // Authorization invariants:
 //
-//   - The acting human MUST be a current member of the target
-//     Personal Workspace. The route revalidates current membership
-//     via `WorkspaceAuthorizationService.requireActingMembership`,
-//     which accepts any Owner/Admin/Member role (the route is NOT
-//     Owner-only per ticket #82).
+//   - Intent self-service is Personal-Workspace ONLY. The acting
+//     human MUST be a current member of a `Personal` Workspace;
+//     a valid Organization membership is rejected via
+//     `requirePersonalActingMembership` (which throws
+//     `INTENT_NOT_PERSONAL`, translated to `INTENT_FORBIDDEN`).
+//   - Any current Owner/Admin/Member role on the Personal
+//     Workspace passes (the route is NOT Owner-only per ticket #82).
 //   - Buyer capability requires no attestation.
 //   - Seller capability requires the registered Seller
 //     participation terms (`getCurrentSellerParticipationTerms`).
-//     Until product/legal supplies the text, `Offer` and `Both`
-//     return `INTENT_LEGAL_BLOCKED`.
 //   - `DealApprover` is NEVER created by this service.
 //
-// Concurrency invariants:
+// TODO(legal-blocker): Offer/Both acceptance requires the
+// registered Seller participation terms. #83 keeps the seam
+// (`apps/api/src/lib/seller-participation-terms.ts`). #83 cannot
+// mark Offer/Both production-complete until product/legal calls
+// `registerSellerParticipationTerms({ version, content })` from an
+// approved admin bootstrap. Until that call lands, Offer/Both
+// return `INTENT_LEGAL_BLOCKED`. Owner: Product + Legal.
 //
-//   - `Both` provisions Buyer + Seller + acceptance; the natural
-//     unique indexes on `WorkspaceCapability (workspaceId,
-//     capability)` and `seller_participation_acceptances
-//     (workspace_id, terms_version)` are the concurrency authority.
-//   - `recordSellerParticipationAcceptance` uses
-//     `INSERT ... ON CONFLICT DO NOTHING RETURNING *`; a concurrent
-//     duplicate submission reads back the existing row and is
-//     treated as success — same evidence, no duplicate. The
-//     application does NOT rely on a find-then-insert pre-check for
-//     race correctness.
+// Atomicity invariants (Codex CHANGES_REQUESTED P0):
+//
+//   - `Hire`, `Offer`, and `Both` route through
+//     `AuthRepository.provisionIntentAtomically`, which wraps the
+//     capability upserts and the acceptance insert in a single
+//     Prisma `$transaction`. Either ALL writes commit, or the
+//     transaction rolls back to zero rows.
+//   - The natural unique indexes provide idempotency. The
+//     transaction is the single source of atomicity; if a write
+//     inside the transaction throws (e.g., a real FK constraint
+//     violation), Prisma rolls back every write the transaction
+//     issued, including the capability upserts.
+//   - The application does NOT rely on find-then-insert pre-checks
+//     for race correctness.
 //
 // `setupState` is read-only on this path. The route derives it
 // via `PersonalWorkspaceConvergenceService.resolveConvergence` and
@@ -62,6 +71,7 @@ import { toPublicUser } from "../dto/public-mappers.js";
 import type { AuthRepository, PublicUserView } from "../auth-repository/auth-repository.js";
 import {
   AuthorizationError,
+  PersonalActingMembershipError,
   type WorkspaceAuthorizationService,
 } from "./workspace-authorization.service.js";
 import { getCurrentSellerParticipationTerms } from "../lib/seller-participation-terms.js";
@@ -78,13 +88,22 @@ export class IntentServiceError extends Error {
 
 /**
  * Translate a `WorkspaceAuthorizationService` `AuthorizationError`
- * into the intent service's stable code set. The route layer
- * applies the safe-envelope mapping; this translation keeps the
- * service's contract readable at the call site.
+ * OR a `PersonalActingMembershipError` into the intent service's
+ * stable code set. The route layer applies the safe-envelope
+ * mapping; this translation keeps the service's contract
+ * readable at the call site.
+ *
+ * Coverage: `AuthorizationError` (generic non-membership /
+ * ineligible / capability gates) AND `PersonalActingMembershipError`
+ * (the Personal-Workspace boundary — see #83 remediation §2).
+ * Both surface to the customer as `INTENT_FORBIDDEN` so the route
+ * layer renders a single safe-envelope copy.
  */
 export function translateAuthorizationError(err: unknown): IntentServiceError | null {
-  if (!(err instanceof AuthorizationError)) return null;
-  return new IntentServiceError(err.message, "INTENT_FORBIDDEN");
+  if (err instanceof AuthorizationError || err instanceof PersonalActingMembershipError) {
+    return new IntentServiceError(err.message, "INTENT_FORBIDDEN");
+  }
+  return null;
 }
 
 export interface IntentServiceDeps {
@@ -115,12 +134,13 @@ export class IntentService {
   constructor(private readonly deps: IntentServiceDeps) {}
 
   async submitIntent(input: SubmitIntentInput): Promise<SubmitIntentResult> {
-    // Step 1: revalidate current membership on the target Workspace.
-    // `requireActingMembership` accepts any current Owner/Admin/
-    // Member role (the route is not Owner-only per ticket #82).
+    // Step 1: revalidate current membership on the target Personal
+    // Workspace. A valid Organization membership is rejected here
+    // (`INTENT_NOT_PERSONAL` translated to `INTENT_FORBIDDEN`),
+    // before any capability write.
     let acting;
     try {
-      acting = await this.deps.workspaceAuthorizationService.requireActingMembership({
+      acting = await this.deps.workspaceAuthorizationService.requirePersonalActingMembership({
         userAccountId: input.userAccountId,
         workspaceId: input.workspaceId,
       });
@@ -147,126 +167,65 @@ export class IntentService {
       );
     }
 
-    // Step 3: Buyer capability route. No attestation required.
-    if (intent === "Hire") {
-      await this.deps.authRepository.upsertCapability({
-        workspaceId: acting.workspace.workspaceId,
-        capability: "Buyer",
-      });
-      return {
-        user: await this.loadPublicUser(input.userAccountId, input.setupState),
-        returnTo: requestedReturn,
-      };
-    }
+    // Step 3: build the canonical capability + acceptance payload.
+    // For Seller/Both, verify the registered terms first. The
+    // service NEVER invents legal copy; the registered-terms seam
+    // is the single explicit product/legal blocker.
+    const capabilities: readonly MarketplaceCapabilityV1[] =
+      intent === "Hire" ? ["Buyer"] : intent === "Offer" ? ["Seller"] : ["Buyer", "Seller"];
 
-    // Step 4: Seller capability route(s). The registered Seller
-    // participation terms are the single explicit product/legal
-    // blocker. Until product/legal supplies the text, the route
-    // refuses with INTENT_LEGAL_BLOCKED — the customer-facing
-    // message is "Seller setup is temporarily unavailable. Please
-    // try again later." and is owned by the web layer.
-    const registered = getCurrentSellerParticipationTerms();
-    if (!registered) {
-      throw new IntentServiceError(
-        "Seller participation terms are not yet registered. Cannot provision Seller capability.",
-        "INTENT_LEGAL_BLOCKED",
-      );
-    }
-    if (sellerAcceptance) {
-      // The request-supplied `termsContentHash` MUST equal the
-      // hash of the registered content; mismatched hashes would
-      // let a caller assert acceptance of a document they did not
-      // actually see. The schema enforces the 64-char hex format;
-      // this service enforces equality against the registered
-      // document.
-      if (sellerAcceptance.termsVersion !== registered.version) {
+    let acceptance: {
+      readonly termsVersion: string;
+      readonly termsContentHash: string;
+      readonly grantedByUserId: string;
+    } | null = null;
+
+    if (intent === "Offer" || intent === "Both") {
+      const registered = getCurrentSellerParticipationTerms();
+      if (!registered) {
         throw new IntentServiceError(
-          `sellerAcceptance.termsVersion does not match the registered version (got ${sellerAcceptance.termsVersion}, expected ${registered.version}).`,
-          "INTENT_INVALID",
+          "Seller participation terms are not yet registered. Cannot provision Seller capability.",
+          "INTENT_LEGAL_BLOCKED",
         );
       }
-      if (sellerAcceptance.termsContentHash !== registered.contentHash) {
-        throw new IntentServiceError(
-          "sellerAcceptance.termsContentHash does not match the registered content hash.",
-          "INTENT_INVALID",
-        );
-      }
-    }
-
-    // Step 5: provision. `Offer` writes only Seller + acceptance;
-    // `Both` writes Buyer + Seller + acceptance in one transaction.
-    if (intent === "Offer") {
-      await this.deps.authRepository.upsertCapability({
-        workspaceId: acting.workspace.workspaceId,
-        capability: "Seller",
-      });
       if (sellerAcceptance) {
-        await this.deps.authRepository.recordSellerParticipationAcceptance({
-          workspaceId: acting.workspace.workspaceId,
+        if (sellerAcceptance.termsVersion !== registered.version) {
+          throw new IntentServiceError(
+            `sellerAcceptance.termsVersion does not match the registered version (got ${sellerAcceptance.termsVersion}, expected ${registered.version}).`,
+            "INTENT_INVALID",
+          );
+        }
+        if (sellerAcceptance.termsContentHash !== registered.contentHash) {
+          throw new IntentServiceError(
+            "sellerAcceptance.termsContentHash does not match the registered content hash.",
+            "INTENT_INVALID",
+          );
+        }
+        acceptance = {
           termsVersion: sellerAcceptance.termsVersion,
           termsContentHash: sellerAcceptance.termsContentHash,
-          acceptedByUserId: input.userAccountId,
           grantedByUserId: input.userAccountId,
-        });
+        };
       }
-    } else {
-      // `Both` — atomic via the natural unique constraints.
-      // Buyer upsert, Seller upsert, acceptance ON CONFLICT
-      // DO NOTHING — any failure rolls back per the transaction
-      // boundary at the route layer.
-      await this.provisionBothAtomically({
-        workspaceId: acting.workspace.workspaceId,
-        userAccountId: input.userAccountId,
-        sellerAcceptance,
-      });
     }
+
+    // Step 4: single atomic repository call. Either every write
+    // commits, or the transaction rolls back to zero rows. A real
+    // FK violation inside the transaction (e.g., acceptance's
+    // grantedByUserId references a deleted UserAccount) triggers a
+    // Prisma P2003 — the atomicity test exercises this path to
+    // prove the rollback.
+    await this.deps.authRepository.provisionIntentAtomically({
+      workspaceId: acting.workspace.workspaceId,
+      userAccountId: input.userAccountId,
+      capabilities,
+      acceptance,
+    });
 
     return {
       user: await this.loadPublicUser(input.userAccountId, input.setupState),
       returnTo: requestedReturn,
     };
-  }
-
-  /**
-   * Atomic Both path. The repository primitives are individually
-   * idempotent — `upsertCapability` against the
-   * `(workspaceId, capability)` unique constraint, and
-   * `recordSellerParticipationAcceptance` against the
-   * `(workspaceId, termsVersion)` unique constraint. The application
-   * relies on the database, not on application-level pre-checks,
-   * for race correctness.
-   *
-   * Concurrent `recordSellerParticipationAcceptance` calls against
-   * the same `(workspaceId, termsVersion)` resolve via the database
-   * ON CONFLICT path; the application reads back the existing row.
-   */
-  private async provisionBothAtomically(input: {
-    workspaceId: string;
-    userAccountId: string;
-    sellerAcceptance:
-      | {
-          readonly termsVersion: string;
-          readonly termsContentHash: string;
-        }
-      | undefined;
-  }): Promise<void> {
-    await this.deps.authRepository.upsertCapability({
-      workspaceId: input.workspaceId,
-      capability: "Buyer",
-    });
-    await this.deps.authRepository.upsertCapability({
-      workspaceId: input.workspaceId,
-      capability: "Seller",
-    });
-    if (input.sellerAcceptance) {
-      await this.deps.authRepository.recordSellerParticipationAcceptance({
-        workspaceId: input.workspaceId,
-        termsVersion: input.sellerAcceptance.termsVersion,
-        termsContentHash: input.sellerAcceptance.termsContentHash,
-        acceptedByUserId: input.userAccountId,
-        grantedByUserId: input.userAccountId,
-      });
-    }
   }
 
   private async loadPublicUser(

@@ -880,6 +880,14 @@ export const bg1ActingWorkspaceResponseV1Schema = z
         joinedAt: z.string().datetime(),
       })
       .strict(),
+    // M2 #83 remediation (§5): server-resolved safe return
+    // destination. Bounded by
+    // `apps/api/src/lib/post-command-return-destination.ts` to the
+    // explicit #83 route shapes. The browser consumes only this
+    // value; it does NOT read raw query parameters or pattern-match
+    // paths. `null` when no returnTo was supplied or none passes
+    // the bounded revalidation.
+    safeReturnTo: z.string().min(1).max(256).nullable(),
   })
   .strict();
 export type Bg1ActingWorkspaceResponseV1 = z.infer<typeof bg1ActingWorkspaceResponseV1Schema>;
@@ -987,15 +995,20 @@ export type IntentRequestV1 = z.infer<typeof intentRequestV1Schema>;
 // ---------- Intent response ----------
 
 // The successful intent response. Carries the updated public user
-// payload and the validated `returnTo` (or `null` when none was
-// supplied / validation dropped it). The contract does NOT carry
-// `setupState` — recovery is already surfaced via the user payload's
-// existing `setupState` field; intent is capability-only.
+// payload, the validated `returnTo` (or `null` when none was
+// supplied / validation dropped it), and the server-resolved
+// `safeReturnTo`. `safeReturnTo` represents CONTEXTUAL
+// authorization against the fresh post-provision user — it is the
+// destination the browser should consume (route + capability +
+// Workspace all revalidated). The contract does NOT carry
+// `setupState` — recovery is already surfaced via the user
+// payload's existing `setupState` field; intent is capability-only.
 export const intentResponseV1Schema = z
   .object({
     ok: z.literal(true),
     user: bg1PublicUserV1Schema,
     returnTo: z.string().min(1).max(256).nullable(),
+    safeReturnTo: z.string().min(1).max(256).nullable(),
   })
   .strict();
 export type IntentResponseV1 = z.infer<typeof intentResponseV1Schema>;

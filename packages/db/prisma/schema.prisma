@@ -1204,25 +1204,25 @@ model PaymentIntent {
 // creates a new acceptance row alongside the existing Seller capability.
 // ===========================================================================
 model SellerParticipationAcceptance {
-  id                String   @id @default(cuid())
-  workspaceId       String
+  id                String   @id @default(cuid())            @map("id")
+  workspaceId       String                                  @map("workspace_id")
   // Versioned Seller participation terms identifier. Distinct from
   // TermsVersion (BG5) which governs Deal-level scope; this version
   // identifies the participation / platform-level terms the human
   // accepted to obtain Seller capability on this Personal Workspace.
-  termsVersion      String
+  termsVersion      String                                  @map("terms_version")
   // SHA-256 of the immutable document content corresponding to
   // termsVersion. The application never reads this as authorization;
   // it is the durable evidence the accepted text cannot change
   // retroactively.
-  termsContentHash  String
+  termsContentHash  String                                  @map("terms_content_hash")
   // Explicit human actor. Required.
-  acceptedByUserId  String
+  acceptedByUserId  String                                  @map("accepted_by_user_id")
   // The user who recorded the acceptance in this session. Equal to
   // acceptedByUserId for the M2 self-service flow. Always populated.
   // (Reserved for future operator-assisted grant paths.)
-  grantedByUserId   String
-  acceptedAt        DateTime @default(now())
+  grantedByUserId   String                                  @map("granted_by_user_id")
+  acceptedAt        DateTime @default(now())                @map("accepted_at")
 
   workspace   Workspace   @relation(fields: [workspaceId], references: [id], onDelete: Restrict)
   acceptedBy  UserAccount @relation("SellerParticipationAcceptanceAcceptedBy", fields: [acceptedByUserId], references: [id], onDelete: Restrict)

@@ -193,7 +193,32 @@ describe("IntentService", () => {
     assert.deepEqual(memberships!.capabilities, ["Seller"]);
   });
 
-  test("Both with registered terms provisions Buyer + Seller + acceptance atomically", async () => {
+  test("Valid Offer (current registered terms) provisions Seller + acceptance", async () => {
+    // M2 #83 remediation §3 / C2: deterministic test-only
+    // registration path. Production Seller terms stay
+    // unregistered; this case uses `registerSellerParticipationTerms`
+    // ONLY inside the test.
+    const { service, authRepo } = buildService();
+    const registered = registerSellerParticipationTerms(SAMPLE_TERMS);
+    const result = await service.submitIntent({
+      userAccountId: USER_ID,
+      workspaceId: WS_ID,
+      setupState: "converged",
+      intent: {
+        intent: "Offer",
+        sellerAcceptance: {
+          termsVersion: registered.version,
+          termsContentHash: registered.contentHash,
+        },
+      },
+    });
+    assert.deepEqual(result.user.workspaces[0]!.capabilities, ["Seller"]);
+    const view = await authRepo.getPublicUser(USER_ID);
+    const memberships = view!.workspaces.find((w) => w.workspaceId === WS_ID);
+    assert.deepEqual(memberships!.capabilities, ["Seller"]);
+  });
+
+  test("Valid Both (current registered terms) provisions Buyer + Seller + acceptance atomically", async () => {
     const { service, authRepo } = buildService();
     const registered = registerSellerParticipationTerms(SAMPLE_TERMS);
     const result = await service.submitIntent({
@@ -214,7 +239,7 @@ describe("IntentService", () => {
     assert.deepEqual(memberships!.capabilities, ["Buyer", "Seller"]);
   });
 
-  test("Mismatched termsVersion throws INTENT_INVALID", async () => {
+  test("Offer with stale termsVersion throws INTENT_INVALID", async () => {
     const { service } = buildService();
     registerSellerParticipationTerms(SAMPLE_TERMS);
     await assert.rejects(
@@ -239,7 +264,7 @@ describe("IntentService", () => {
     );
   });
 
-  test("Mismatched termsContentHash throws INTENT_INVALID", async () => {
+  test("Offer with mismatched termsContentHash throws INTENT_INVALID", async () => {
     const { service } = buildService();
     const registered = registerSellerParticipationTerms(SAMPLE_TERMS);
     await assert.rejects(

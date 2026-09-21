@@ -12,9 +12,10 @@
 //     A missing or invalid session returns `SESSION_INVALID`.
 //   - The route revalidates current membership on the target
 //     Personal Workspace via
-//     `WorkspaceAuthorizationService.requireActingMembership`. The
-//     route is NOT Owner-only per ticket #82: any current
-//     Owner/Admin/Member role passes.
+//     `WorkspaceAuthorizationService.requirePersonalActingMembership`.
+//     A valid current Owner/Admin/Member role on an Organization
+//     Workspace does NOT grant intent authority — the route is
+//     Personal-Workspace-only.
 //   - The acting Workspace id comes from the URL path
 //     (`/api/workspaces/:workspaceId/intent`).
 //
@@ -28,7 +29,8 @@
 //   - `returnTo`: optional. The route revalidates it via the
 //     existing internal-return validation rules
 //     (`isValidReturnPath`); invalid values are silently dropped.
-//     The successful response echoes only the validated `returnTo`.
+//     The successful response echoes only the validated `returnTo`
+//     AND the SERVER-RESOLVED `safeReturnTo`.
 //
 // Response contract:
 //
@@ -37,23 +39,34 @@
 //     contract does NOT carry a separate `setupState` field —
 //     recovery is already surfaced via the user payload's existing
 //     `setupState` field.
-//   - `returnTo`: the validated `returnTo` (or `null`).
+//   - `returnTo`: the schema-validated path (or `null`).
+//   - `safeReturnTo`: the post-command server-resolved destination
+//     against the FRESH post-provision user. The browser consumes
+//     ONLY this value (see `apps/web/src/app/lib/navigate-after-
+//     intent.ts`).
 //
 // Error contract:
 //
 //   - `INTENT_INVALID` (400): malformed request body.
 //   - `INTENT_FORBIDDEN` (403): authorization rejection (collapsed
-//     by the safe envelope).
+//     by the safe envelope). Includes Personal-Workspace boundary
+//     (`INTENT_NOT_PERSONAL` translated to `INTENT_FORBIDDEN`).
 //   - `INTENT_LEGAL_BLOCKED` (503): Seller participation terms are
 //     not yet registered. The customer-facing message is
 //     "Seller setup is temporarily unavailable. Please try again
 //     later." — owned by the web layer.
 //
-// M2 (#83): the route is the single HTTP entry point for intent
-// provisioning. There is exactly one rate-limited path; the
-// existing per-token rate-limit pattern from `apps/api/src/routes/
-// auth.ts` is reused for the bounded abuse surface (token-shaped
-// idempotency keys, not per-IP).
+// TODO(legal-blocker): Offer/Both acceptance requires the
+// registered Seller participation terms. #83 keeps the seam
+// (`apps/api/src/lib/seller-participation-terms.ts`). #83 cannot
+// mark Offer/Both production-complete until product/legal calls
+// `registerSellerParticipationTerms({ version, content })` from an
+// approved admin bootstrap. Until that call lands, Offer/Both
+// return `INTENT_LEGAL_BLOCKED`. Owner: Product + Legal.
+//
+// M2 (#83) abuse surface: rate-limiting is intentionally deferred
+// to a future ticket. The route does NOT introduce a limiter in
+// this slice.
 
 import { Router, type Request, type Response } from "express";
 import { ZodError } from "zod";
@@ -74,6 +87,10 @@ import {
 } from "../lib/errors.js";
 import { SESSION_COOKIE } from "../lib/session-cookie.js";
 import { isValidReturnPath } from "../lib/return-context.js";
+import {
+  SafeReturnToFallback,
+  resolvePostCommandReturnDestination,
+} from "../lib/post-command-return-destination.js";
 
 export interface IntentRouteDeps {
   readonly authenticationService: AuthenticationService;
@@ -159,13 +176,12 @@ async function handleIntent(req: Request, res: Response, deps: IntentRouteDeps):
     throw err;
   }
 
-  // Validate `returnTo` server-side using the existing internal-
-  // return validation rules. Invalid values are silently dropped
-  // — the response echoes `null` so the browser never receives an
-  // authority-tainted value. The body parser also enforced the
-  // 1..256 char length; this validator adds the structural and
-  // same-origin checks.
-  const validatedReturn = parsed.returnTo
+  // Validate `returnTo` shape server-side. The post-command
+  // SERVER-RESOLVED `safeReturnTo` (workspace + capability +
+  // route-shape authorization) is computed after the service
+  // resolves, against the FRESH post-provision user payload.
+  // The browser consumes ONLY `safeReturnTo`.
+  const shapeValidatedReturn = parsed.returnTo
     ? isValidReturnPath(parsed.returnTo, deps.allowedReturnOrigin)
       ? parsed.returnTo
       : null
@@ -186,14 +202,34 @@ async function handleIntent(req: Request, res: Response, deps: IntentRouteDeps):
       userAccountId: resolved.userAccountId,
       workspaceId,
       setupState,
-      // Pass the schema-validated request body; the route has
-      // already re-validated `returnTo` separately.
       intent: parsed,
     });
+
+    // Resolve `safeReturnTo` against the FRESH post-provision
+    // user payload. The browser consumes only this value.
+    let safeReturnTo: string | null = null;
+    try {
+      const resolvedDestination = resolvePostCommandReturnDestination({
+        returnTo: shapeValidatedReturn,
+        freshUser: result.user,
+        actingWorkspaceId:
+          result.user.workspaces.find((w) => w.workspaceType === "Personal")?.workspaceId ?? null,
+        allowedOrigin: deps.allowedReturnOrigin,
+      });
+      safeReturnTo = resolvedDestination?.path ?? null;
+    } catch (err) {
+      if (err instanceof SafeReturnToFallback) {
+        safeReturnTo = "/dashboard";
+      } else {
+        throw err;
+      }
+    }
+
     const body = intentResponseV1Schema.parse({
       ok: true,
       user: result.user,
-      returnTo: validatedReturn,
+      returnTo: shapeValidatedReturn,
+      safeReturnTo,
     });
     res.status(200).json(body);
   } catch (err) {

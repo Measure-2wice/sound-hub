@@ -37,7 +37,7 @@ import Link from "next/link";
 import type { Route } from "next";
 import { useCallback, useEffect, useMemo, useState } from "react";
 import type { Bg1PublicUserV1, MarketplaceCapabilityV1 } from "@soundhub/types";
-import { useSession } from "./SessionProvider";
+import { useActingWorkspace } from "./SessionProvider";
 import { SessionStatus } from "./SessionStatus";
 import { ActingWorkspaceSelector } from "./ActingWorkspaceSelector";
 
@@ -48,25 +48,20 @@ type NavigationDestination = {
 };
 
 function deriveNavigationDestinations({
-  user,
-  loading,
+  actingWorkspace,
 }: {
-  readonly user: Bg1PublicUserV1 | null;
-  readonly loading: boolean;
+  readonly actingWorkspace: Bg1PublicUserV1["workspaces"][number] | null;
 }): readonly NavigationDestination[] {
-  if (loading || !user) return [];
   const out: NavigationDestination[] = [
     { href: "/dashboard", label: "Home", testId: "nav-home-link" },
     { href: "/talent", label: "Talent", testId: "nav-talent-link" },
   ];
-  // Read capabilities off the acting Workspace — use the first
-  // accessible Workspace as the canonical acting surface for
-  // navigation rendering. The user can still switch Workspaces,
-  // and the destination visibility will re-derive on the next
-  // render.
-  const acting = user.workspaces[0];
-  if (!acting) return out;
-  const capabilities: readonly MarketplaceCapabilityV1[] = acting.capabilities;
+  // Read capabilities off the COMMITTED acting Workspace. The
+  // Shell renders destinations for the Workspace the user is
+  // currently acting as; switching re-derives the destinations
+  // on the next render.
+  if (!actingWorkspace) return out;
+  const capabilities: readonly MarketplaceCapabilityV1[] = actingWorkspace.capabilities;
   if (capabilities.includes("Buyer")) {
     out.push({ href: "/deals", label: "Deals", testId: "nav-deals-link" });
   }
@@ -78,12 +73,12 @@ function deriveNavigationDestinations({
 }
 
 export function Shell() {
-  const { user, loading } = useSession();
+  const { actingWorkspace } = useActingWorkspace();
 
   // Single source of truth for capability-gated navigation.
   const destinations = useMemo(
-    () => deriveNavigationDestinations({ user, loading }),
-    [user, loading],
+    () => deriveNavigationDestinations({ actingWorkspace }),
+    [actingWorkspace],
   );
 
   // Single source of truth for mobile-menu visibility.

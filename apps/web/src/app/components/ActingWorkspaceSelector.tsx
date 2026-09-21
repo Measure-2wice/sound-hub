@@ -48,7 +48,7 @@ interface ActingWorkspaceSelectorProps {
 export function ActingWorkspaceSelector({ variant }: ActingWorkspaceSelectorProps) {
   const { user } = useSession();
   const { actingWorkspace, actingWorkspaceId } = useActingWorkspace();
-  const setActingWorkspaceId = useSetActingWorkspace();
+  const { setPendingTarget } = useSetActingWorkspace();
   const router = useRouter();
   const [open, setOpen] = useState(false);
   const containerRef = useRef<HTMLDivElement>(null);
@@ -114,16 +114,11 @@ export function ActingWorkspaceSelector({ variant }: ActingWorkspaceSelectorProp
   const handleSelect = (targetId: string) => {
     setOpen(false);
     if (targetId === actingWorkspaceId) return;
-    if (actingWorkspace) {
-      setActingWorkspaceId(targetId);
-      router.push(
-        `/workspace/switch?target=${encodeURIComponent(targetId)}&return=${encodeURIComponent("/dashboard")}`,
-      );
-    } else {
-      // No current acting Workspace — set and stay on dashboard.
-      setActingWorkspaceId(targetId);
-      router.push("/dashboard");
-    }
+    // Set the candidate in-memory only. The localStorage write
+    // happens AFTER `commitPendingTarget` resolves successfully on
+    // the switch page; Cancel never touches committed state.
+    setPendingTarget(targetId);
+    router.push(`/workspace/switch?target=${encodeURIComponent(targetId)}`);
   };
 
   const currentName = actingWorkspace?.name ?? "Choose a Workspace";
