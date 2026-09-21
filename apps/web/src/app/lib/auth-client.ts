@@ -24,9 +24,11 @@ import type {
   Bg1SessionInfoV1,
   Bg1VerifyTokenRequestV1,
   Bg1VerifyTokenResponseV1,
+  IntentRequestV1,
+  IntentResponseV1,
 } from "@soundhub/types";
 
-export type { Bg1VerifyTokenResponseV1 };
+export type { Bg1VerifyTokenResponseV1, IntentResponseV1 };
 
 /**
  * M2 (#82): server-derived recovery state. The convergence service
@@ -45,6 +47,8 @@ import {
   bg1MagicLinkResponseV1Schema,
   bg1SessionInfoV1Schema,
   bg1VerifyTokenResponseV1Schema,
+  intentRequestV1Schema,
+  intentResponseV1Schema,
 } from "@soundhub/types";
 
 export interface AuthClientError {
@@ -175,4 +179,38 @@ export async function selectActingWorkspace(input: { actingWorkspaceId: string }
   if (!response.ok) {
     throw ensureError(null, await parseErrorResponse(response));
   }
+}
+
+/**
+ * M2 (#83): submit the user's intent choice (`Hire talent`,
+ * `Offer services`, `Both`) to the server. The server validates
+ * the request body, revalidates current membership on the acting
+ * Workspace, and provisions the requested capability set. The
+ * server's response carries the updated public user payload and
+ * the validated `returnTo` (or `null`).
+ *
+ * The browser never reads raw query parameters to recover a return
+ * destination — the response's `returnTo` is the only authoritative
+ * value, validated by the existing internal-return validation rules.
+ */
+export async function submitIntent(input: {
+  workspaceId: string;
+  intent: IntentRequestV1;
+}): Promise<IntentResponseV1> {
+  // The route layer validates the body against `intentRequestV1Schema`
+  // before the service runs; the client re-validates so a stale UI
+  // cannot produce a request that the server would reject. The
+  // schema is the executable contract on both sides.
+  const validated = intentRequestV1Schema.parse(input.intent);
+  const response = await fetch(`/api/workspaces/${encodeURIComponent(input.workspaceId)}/intent`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    credentials: "include",
+    body: JSON.stringify(validated),
+  });
+  if (!response.ok) {
+    throw ensureError(null, await parseErrorResponse(response));
+  }
+  const raw: unknown = await response.json();
+  return intentResponseV1Schema.parse(raw);
 }

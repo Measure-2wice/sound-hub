@@ -27,6 +27,7 @@ import type {
   AuthRepository,
   PersonalWorkspaceState,
   PublicUserView,
+  SellerParticipationAcceptanceRecord,
   SessionRecord,
   UserIdentityMapping,
   WorkspaceMembershipView,
@@ -76,6 +77,16 @@ interface InternalUser {
   identitySubject: string;
 }
 
+interface InternalSellerAcceptance {
+  readonly id: string;
+  readonly workspaceId: string;
+  readonly termsVersion: string;
+  readonly termsContentHash: string;
+  readonly acceptedByUserId: string;
+  readonly grantedByUserId: string;
+  readonly acceptedAt: Date;
+}
+
 export class InMemoryAuthRepository implements AuthRepository {
   private readonly usersByIdentity = new Map<string, UserIdentityMapping>();
   private readonly usersById = new Map<string, InternalUser>();
@@ -83,6 +94,13 @@ export class InMemoryAuthRepository implements AuthRepository {
   private readonly membershipsByUserWorkspace = new Map<string, InternalMembership>();
   private readonly membershipsById = new Map<string, InternalMembership>();
   private readonly sessions = new Map<string, SessionRecord>();
+  // M2 (#83): Seller participation acceptance rows keyed by
+  // `${workspaceId}::${termsVersion}` — mirrors the database
+  // `UNIQUE (workspace_id, terms_version)` index. A second
+  // insertion with the same key is a no-op (returns the existing
+  // record). Idempotency lives in this map's key uniqueness; the
+  // application does not rely on find-then-insert pre-checks.
+  private readonly sellerAcceptances = new Map<string, InternalSellerAcceptance>();
   private readonly nowFn: () => number;
 
   constructor(seeds: readonly InMemoryUserSeed[] = [], now: () => number = () => Date.now()) {
@@ -403,6 +421,64 @@ export class InMemoryAuthRepository implements AuthRepository {
     return Promise.resolve(this.workspacesById.get(workspaceId)?.slug ?? null);
   }
 
+  // ---------- M2 #83: Intent selection primitives ----------
+
+  /**
+   * Idempotent capability upsert. The in-memory adapter mirrors
+   * the database's `(workspaceId, capability)` uniqueness via the
+   * `includes` check before insertion — equivalent to the
+   * Prisma `upsert` wrapper.
+   */
+  async upsertCapability(input: {
+    readonly workspaceId: string;
+    readonly capability: MarketplaceCapabilityV1;
+  }): Promise<void> {
+    await Promise.resolve();
+    const workspace = this.workspacesById.get(input.workspaceId);
+    if (!workspace) {
+      throw new Error(
+        `InMemoryAuthRepository.upsertCapability: unknown workspaceId=${input.workspaceId}`,
+      );
+    }
+    if (!workspace.capabilities.includes(input.capability)) {
+      workspace.capabilities.push(input.capability);
+      workspace.capabilities.sort();
+    }
+  }
+
+  /**
+   * Idempotent Seller participation acceptance record. The
+   * in-memory map's key uniqueness (`${workspaceId}::${termsVersion}`)
+   * is the concurrency authority, mirroring the database
+   * `UNIQUE (workspace_id, terms_version)` index. A second
+   * insertion with the same key returns the existing record;
+   * no find-then-insert pre-check is needed.
+   */
+  async recordSellerParticipationAcceptance(input: {
+    readonly workspaceId: string;
+    readonly termsVersion: string;
+    readonly termsContentHash: string;
+    readonly acceptedByUserId: string;
+    readonly grantedByUserId: string;
+  }): Promise<SellerParticipationAcceptanceRecord> {
+    const key = `${input.workspaceId}::${input.termsVersion}`;
+    const existing = this.sellerAcceptances.get(key);
+    if (existing) {
+      return Promise.resolve(toAcceptanceRecord(existing));
+    }
+    const row: InternalSellerAcceptance = {
+      id: randomUUID(),
+      workspaceId: input.workspaceId,
+      termsVersion: input.termsVersion,
+      termsContentHash: input.termsContentHash,
+      acceptedByUserId: input.acceptedByUserId,
+      grantedByUserId: input.grantedByUserId,
+      acceptedAt: new Date(this.nowFn()),
+    };
+    this.sellerAcceptances.set(key, row);
+    return Promise.resolve(toAcceptanceRecord(row));
+  }
+
   private toMembershipView(
     membership: InternalMembership,
     workspace: InternalWorkspace,
@@ -418,4 +494,16 @@ export class InMemoryAuthRepository implements AuthRepository {
       joinedAt: membership.createdAt,
     };
   }
+}
+
+function toAcceptanceRecord(row: InternalSellerAcceptance): SellerParticipationAcceptanceRecord {
+  return {
+    id: row.id,
+    workspaceId: row.workspaceId,
+    termsVersion: row.termsVersion,
+    termsContentHash: row.termsContentHash,
+    acceptedByUserId: row.acceptedByUserId,
+    grantedByUserId: row.grantedByUserId,
+    acceptedAt: row.acceptedAt,
+  };
 }

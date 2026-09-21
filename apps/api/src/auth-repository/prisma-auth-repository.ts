@@ -32,6 +32,7 @@ import type {
   AuthRepository,
   PersonalWorkspaceState,
   PublicUserView,
+  SellerParticipationAcceptanceRecord,
   SessionRecord,
   UserIdentityMapping,
   WorkspaceMembershipView,
@@ -456,6 +457,140 @@ export class PrismaAuthRepository implements AuthRepository {
     });
     return row?.slug ?? null;
   }
+
+  // ---------- M2 #83: Intent selection primitives ----------
+
+  /**
+   * Idempotent capability upsert. The existing
+   * `WorkspaceCapability` table already enforces
+   * `(workspaceId, capability)` uniqueness via the
+   * `workspace_capabilities_workspace_id_capability_key` index;
+   * a concurrent insert of the same tuple is rejected by the
+   * database. The upsert wrapper preserves idempotency without
+   * relying on a find-then-insert pre-check.
+   *
+   * Caller invariant: the Workspace exists. The IntentService
+   * revalidates current Owner membership before calling this
+   * primitive (see `WorkspaceAuthorizationService`).
+   */
+  async upsertCapability(input: {
+    readonly workspaceId: string;
+    readonly capability: MarketplaceCapabilityV1;
+  }): Promise<void> {
+    await this.prisma.workspaceCapability.upsert({
+      where: {
+        workspaceId_capability: {
+          workspaceId: input.workspaceId,
+          capability: input.capability,
+        },
+      },
+      create: {
+        workspaceId: input.workspaceId,
+        capability: input.capability,
+      },
+      update: {},
+    });
+  }
+
+  /**
+   * Record a Seller participation acceptance row idempotently.
+   * The natural unique index
+   * `seller_participation_acceptances_workspace_version_unique_idx`
+   * is the concurrency authority.
+   *
+   * `INSERT ... ON CONFLICT (workspace_id, terms_version) DO NOTHING
+   * RETURNING *` is the atomic serialization point: a concurrent
+   * second submission against the same (workspaceId, termsVersion)
+   * absorbs the conflict and the application reads the existing row
+   * back via a follow-up `findUnique`. The service treats that as
+   * success — same row, same evidence, no duplicate.
+   *
+   * The application never calls this with `Buyer` capability. The
+   * table name itself is the DB-level restriction.
+   */
+  async recordSellerParticipationAcceptance(input: {
+    readonly workspaceId: string;
+    readonly termsVersion: string;
+    readonly termsContentHash: string;
+    readonly acceptedByUserId: string;
+    readonly grantedByUserId: string;
+  }): Promise<SellerParticipationAcceptanceRecord> {
+    const inserted = await this.prisma.$queryRaw<
+      Array<{
+        id: string;
+        workspaceId: string;
+        termsVersion: string;
+        termsContentHash: string;
+        acceptedByUserId: string;
+        grantedByUserId: string;
+        acceptedAt: Date;
+      }>
+    >`
+      INSERT INTO "seller_participation_acceptances"
+        ("id", "workspace_id", "terms_version", "terms_content_hash",
+         "accepted_by_user_id", "granted_by_user_id", "accepted_at")
+      VALUES (
+        gen_random_uuid()::text,
+        ${input.workspaceId}::text,
+        ${input.termsVersion}::text,
+        ${input.termsContentHash}::text,
+        ${input.acceptedByUserId}::text,
+        ${input.grantedByUserId}::text,
+        CURRENT_TIMESTAMP
+      )
+      ON CONFLICT ("workspace_id", "terms_version") DO NOTHING
+      RETURNING
+        "id",
+        "workspace_id"      AS "workspaceId",
+        "terms_version"     AS "termsVersion",
+        "terms_content_hash" AS "termsContentHash",
+        "accepted_by_user_id" AS "acceptedByUserId",
+        "granted_by_user_id"  AS "grantedByUserId",
+        "accepted_at"       AS "acceptedAt"
+    `;
+    if (inserted.length === 1) {
+      const row = inserted[0]!;
+      return {
+        id: row.id,
+        workspaceId: row.workspaceId,
+        termsVersion: row.termsVersion,
+        termsContentHash: row.termsContentHash,
+        acceptedByUserId: row.acceptedByUserId,
+        grantedByUserId: row.grantedByUserId,
+        acceptedAt: row.acceptedAt,
+      };
+    }
+    // Lost the ON CONFLICT race: another concurrent submission
+    // already inserted the row. Read it back and return the same
+    // evidence — the unique constraint guarantees exactly one row
+    // exists for this (workspaceId, termsVersion) tuple.
+    const existing = await this.prisma.sellerParticipationAcceptance.findUnique({
+      where: {
+        workspaceId_termsVersion: {
+          workspaceId: input.workspaceId,
+          termsVersion: input.termsVersion,
+        },
+      },
+    });
+    if (!existing) {
+      // Should be unreachable: the unique conflict guaranteed a
+      // row exists. Throw closed so a malformed DB state cannot
+      // silently no-op.
+      throw new Error(
+        `recordSellerParticipationAcceptance: ON CONFLICT path returned no row for ` +
+          `workspaceId=${input.workspaceId} termsVersion=${input.termsVersion}`,
+      );
+    }
+    return {
+      id: existing.id,
+      workspaceId: existing.workspaceId,
+      termsVersion: existing.termsVersion,
+      termsContentHash: existing.termsContentHash,
+      acceptedByUserId: existing.acceptedByUserId,
+      grantedByUserId: existing.grantedByUserId,
+      acceptedAt: existing.acceptedAt,
+    };
+  }
 }
 
 function assertBg1Provider(provider: string): asserts provider is Bg1IdentityProviderV1 {
@@ -475,6 +610,7 @@ function isBg1Provider(provider: string): provider is Bg1IdentityProviderV1 {
 // self-contained without forcing callers to know the path layout.
 export type {
   PublicUserView,
+  SellerParticipationAcceptanceRecord,
   SessionRecord,
   UserIdentityMapping,
   WorkspaceMembershipView,

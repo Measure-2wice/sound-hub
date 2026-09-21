@@ -253,6 +253,24 @@ function mapStatus(code: ApiErrorCodeV1): number {
       return 403;
     case "PERSONAL_WORKSPACE_CONVERGENCE_CONFLICT":
       return 409;
+    // M2 (#83): Intent selection status mapping. 400 for malformed
+    // requests, 403 for authorization rejections collapsed by the
+    // safe envelope, 503 for the single explicit product/legal
+    // blocker (Seller participation terms not yet registered).
+    case "INTENT_INVALID":
+      return 400;
+    case "INTENT_FORBIDDEN":
+      return 403;
+    case "INTENT_LEGAL_BLOCKED":
+      // 503 Service Unavailable. Seller participation terms are
+      // not yet registered. This is the single explicit
+      // product/legal blocker on the M2 #83 slice: `Offer
+      // services` and `Both` cannot provision Seller capability
+      // until product/legal supplies and registers the versioned
+      // customer-readable Seller participation text. The safe
+      // envelope carries the neutral retryable message; the
+      // browser surfaces an operable retry control.
+      return 503;
   }
 }
 

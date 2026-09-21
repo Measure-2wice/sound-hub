@@ -10,6 +10,7 @@ import { createAuthRouter } from "./routes/auth.js";
 import { createAudioSamplesRouter } from "./routes/audio-samples.js";
 import { createOfferingCatalogRouter } from "./routes/offering-catalog.js";
 import { createMatchmakerRouter } from "./routes/matchmaker.js";
+import { createIntentRouter } from "./routes/intent.js";
 import { PrismaOfferingCatalogRepository } from "./repositories/prisma-offering-catalog.repository.js";
 import { createProjectRequestRouter } from "./routes/project-requests.js";
 import { createDealTermsRouter } from "./routes/deal-terms.js";
@@ -22,6 +23,7 @@ import { TalentSearchService } from "./services/talent-search.service.js";
 import { AuthenticationService } from "./services/authentication.service.js";
 import { WorkspaceAuthorizationService } from "./services/workspace-authorization.service.js";
 import { PersonalWorkspaceConvergenceService } from "./services/personal-workspace-convergence.service.js";
+import { IntentService } from "./services/intent.service.js";
 import { AudioSampleService } from "./services/audio-sample.service.js";
 import { MatchmakerService } from "./services/matchmaker.service.js";
 import { ProjectRequestService } from "./project-request/project-request.service.js";
@@ -163,6 +165,13 @@ export interface AppOptions {
    * (or the service with a stub repository).
    */
   readonly personalWorkspaceConvergenceService?: PersonalWorkspaceConvergenceService;
+  /**
+   * Override for the Intent selection service (ticket #83). When
+   * supplied, the composition root does NOT construct the service
+   * from the auth repository and authorization service; the
+   * override is served directly. Tests inject a stub service.
+   */
+  readonly intentService?: IntentService;
 }
 
 export interface BuiltApp {
@@ -186,6 +195,12 @@ export interface BuiltApp {
    * the composition root and injected into `AuthenticationService`.
    */
   readonly personalWorkspaceConvergenceService: PersonalWorkspaceConvergenceService;
+  /**
+   * M2 (#83): Intent selection service. Composed at the composition
+   * root from the auth repository and authorization service; injected
+   * into `createIntentRouter`.
+   */
+  readonly intentService: IntentService;
 }
 
 export function buildApp(options: AppOptions = {}): BuiltApp {
@@ -234,6 +249,16 @@ export function buildApp(options: AppOptions = {}): BuiltApp {
     });
   const workspaceAuthorizationService =
     options.workspaceAuthorizationService ?? new WorkspaceAuthorizationService({ authRepository });
+
+  // M2 (#83): Intent selection service. Wired from the auth
+  // repository and authorization service. Tests can inject a stub
+  // via `options.intentService` to bypass real repository work.
+  const intentService =
+    options.intentService ??
+    new IntentService({
+      authRepository,
+      workspaceAuthorizationService,
+    });
 
   // BG3 Matchmaker: build the AI adapter bundle (managed stub OR
   // deterministic fallback) and the project-brief repository, then
@@ -412,6 +437,20 @@ export function buildApp(options: AppOptions = {}): BuiltApp {
       dealListService,
     }),
   );
+  // M2 (#83): Intent selection route. Mounted at `/api/workspaces`
+  // so the URL path `/:workspaceId/intent` reads the acting
+  // Workspace id directly. The route revalidates current
+  // membership via `WorkspaceAuthorizationService.requireActingMembership`
+  // (membership-not-Owner-only per ticket #82).
+  app.use(
+    "/api/workspaces",
+    createIntentRouter({
+      authenticationService,
+      intentService,
+      personalWorkspaceConvergenceService,
+      allowedReturnOrigin: process.env.FRONTEND_URL ?? "http://localhost:3000",
+    }),
+  );
   app.use(
     "/api/deals",
     createDealTermsRouter({
@@ -471,6 +510,7 @@ export function buildApp(options: AppOptions = {}): BuiltApp {
     dealTermsService,
     dealListService,
     personalWorkspaceConvergenceService,
+    intentService,
   };
 }
 

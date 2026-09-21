@@ -244,4 +244,63 @@ export interface AuthRepository {
    * winner's slug. Returns null when the Workspace is unknown.
    */
   findWorkspaceSlugById(workspaceId: string): Promise<string | null>;
+
+  // ---------- M2 #83: Intent selection primitives ----------
+
+  /**
+   * Idempotent capability upsert. The existing
+   * `WorkspaceCapability` table already enforces
+   * `(workspaceId, capability)` uniqueness; this primitive wraps
+   * the same constraint in a single repository call so the
+   * `IntentService` can compose `Both` atomically.
+   *
+   * The unique constraint is the concurrency authority: a
+   * concurrent insert of the same `(workspaceId, capability)`
+   * tuple is rejected by the database. The service does not rely
+   * on a find-then-insert pre-check for race correctness.
+   */
+  upsertCapability(input: {
+    readonly workspaceId: string;
+    readonly capability: MarketplaceCapabilityV1;
+  }): Promise<void>;
+
+  /**
+   * Record a Seller participation acceptance row idempotently.
+   * Uses `INSERT ... ON CONFLICT DO NOTHING RETURNING *` so two
+   * concurrent `Offer services` (or two concurrent `Both`)
+   * submissions against the same (workspaceId, termsVersion)
+   * cannot create a duplicate row. The natural unique index
+   * `seller_participation_acceptances_workspace_version_unique_idx`
+   * is the concurrency authority. Returns the persisted row so
+   * the service can read back the existing evidence on a lost
+   * race.
+   *
+   * The application never calls this with `Buyer` capability —
+   * the table name itself is the DB-level restriction; Buyer
+   * capability creation does not write an acceptance row at any
+   * layer.
+   */
+  recordSellerParticipationAcceptance(input: {
+    readonly workspaceId: string;
+    readonly termsVersion: string;
+    readonly termsContentHash: string;
+    readonly acceptedByUserId: string;
+    readonly grantedByUserId: string;
+  }): Promise<SellerParticipationAcceptanceRecord>;
+}
+
+/**
+ * The persisted shape of a Seller participation acceptance row.
+ * Exposed as a stable view so the IntentService can read back
+ * the row recorded by `recordSellerParticipationAcceptance`
+ * without depending on Prisma model types in its public surface.
+ */
+export interface SellerParticipationAcceptanceRecord {
+  readonly id: string;
+  readonly workspaceId: string;
+  readonly termsVersion: string;
+  readonly termsContentHash: string;
+  readonly acceptedByUserId: string;
+  readonly grantedByUserId: string;
+  readonly acceptedAt: Date;
 }

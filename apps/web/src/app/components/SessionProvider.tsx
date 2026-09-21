@@ -29,6 +29,15 @@
 // token response (including the server-derived `setupState` and the
 // validated `returnTo`) so callers can navigate appropriately
 // without an additional round-trip.
+//
+// M2 (#83): the acting-Workspace id is a CLIENT convenience only.
+// The `actingWorkspaceId` exposed here is derived from localStorage
+// (via `remembered-acting-workspace.ts`) and falls back to the
+// user's Personal Workspace. The server does NOT persist this
+// value; every consequential command names its acting Workspace
+// explicitly and the server revalidates current membership on
+// every request via the existing #82 `requireActingMembership`
+// route (which accepts any Owner/Admin/Member role).
 
 import {
   createContext,
@@ -45,6 +54,10 @@ import type {
   Bg1VerifyTokenResponseV1,
 } from "@soundhub/types";
 import { fetchSessionInfo, signOut as signOutRequest, verifyToken } from "../lib/auth-client";
+import {
+  clearRememberedActingWorkspaceId,
+  readRememberedActingWorkspaceId,
+} from "../lib/remembered-acting-workspace";
 
 export interface SessionContextValue {
   readonly user: Bg1PublicUserV1 | null;
@@ -64,6 +77,110 @@ export interface SessionContextValue {
 }
 
 const SessionContext = createContext<SessionContextValue | null>(null);
+
+/**
+ * Resolve the current acting-Workspace id from the user's
+ * accessible workspaces plus a remembered localStorage value.
+ * Falls back to the user's Personal Workspace when the remembered
+ * value is not accessible or no remembered value exists. Returns
+ * `null` when no Workspace is accessible.
+ */
+function resolveActingWorkspaceId(
+  user: Bg1PublicUserV1 | null,
+  remembered: string | null,
+): string | null {
+  if (!user) return null;
+  if (user.workspaces.length === 0) return null;
+  // The remembered value is convenience only — revalidate against
+  // the user's current accessible workspaces.
+  if (remembered) {
+    const match = user.workspaces.find((w) => w.workspaceId === remembered);
+    if (match) return match.workspaceId;
+  }
+  // Default to the Personal Workspace. The Personal Workspace is
+  // the production-shaped first Workspace; Organization
+  // memberships never become the default.
+  const personal = user.workspaces.find((w) => w.workspaceType === "Personal");
+  return personal ? personal.workspaceId : user.workspaces[0]!.workspaceId;
+}
+
+export interface ActingWorkspaceContextValue {
+  readonly actingWorkspaceId: string | null;
+  readonly actingWorkspace: Bg1PublicUserV1["workspaces"][number] | null;
+}
+
+const ActingWorkspaceContext = createContext<ActingWorkspaceContextValue>({
+  actingWorkspaceId: null,
+  actingWorkspace: null,
+});
+
+export function ActingWorkspaceProvider({ children }: { readonly children: ReactNode }) {
+  const { user } = useSession();
+  const [remembered, setRemembered] = useState<string | null>(null);
+
+  // Read localStorage on mount. Server-rendered HTML cannot
+  // access localStorage; the value is `null` on the first render
+  // and re-derives on the client.
+  useEffect(() => {
+    setRemembered(readRememberedActingWorkspaceId());
+  }, []);
+
+  const actingWorkspaceId = useMemo(
+    () => resolveActingWorkspaceId(user, remembered),
+    [user, remembered],
+  );
+
+  const actingWorkspace = useMemo(() => {
+    if (!user || !actingWorkspaceId) return null;
+    return user.workspaces.find((w) => w.workspaceId === actingWorkspaceId) ?? null;
+  }, [user, actingWorkspaceId]);
+
+  // Expose a way for the selector to update the remembered value
+  // and trigger re-derivation.
+  const setActingWorkspaceId = useCallback((workspaceId: string | null) => {
+    if (workspaceId === null) {
+      clearRememberedActingWorkspaceId();
+    } else {
+      // Use the dynamic import via window.localStorage to avoid
+      // the SSR-safe path.
+      try {
+        if (typeof window !== "undefined") {
+          window.localStorage.setItem("soundhub.actingWorkspaceId", workspaceId);
+        }
+      } catch {
+        // Best-effort.
+      }
+    }
+    setRemembered(workspaceId);
+  }, []);
+
+  const value = useMemo<ActingWorkspaceContextValue>(
+    () => ({ actingWorkspaceId, actingWorkspace }),
+    [actingWorkspaceId, actingWorkspace],
+  );
+
+  return (
+    <ActingWorkspaceContext.Provider value={value}>
+      <ActingWorkspaceUpdateContext.Provider value={setActingWorkspaceId}>
+        {children}
+      </ActingWorkspaceUpdateContext.Provider>
+    </ActingWorkspaceContext.Provider>
+  );
+}
+
+const ActingWorkspaceUpdateContext = createContext<(id: string | null) => void>(() => {
+  // Default no-op; the provider overrides it. Used by the
+  // selector to write the remembered value without exposing
+  // localStorage to the rest of the tree.
+});
+
+export function useActingWorkspace(): ActingWorkspaceContextValue {
+  return useContext(ActingWorkspaceContext);
+}
+
+export function useSetActingWorkspace(): (id: string | null) => void {
+  return useContext(ActingWorkspaceUpdateContext);
+}
 
 export function SessionProvider({ children }: { readonly children: ReactNode }) {
   const [user, setUser] = useState<Bg1PublicUserV1 | null>(null);
@@ -117,6 +234,7 @@ export function SessionProvider({ children }: { readonly children: ReactNode }) 
 
   const signOutAndRefresh = useCallback(async (): Promise<void> => {
     await signOutRequest();
+    clearRememberedActingWorkspaceId();
     // After sign-out the server no longer recognises the session
     // cookie, so `/api/auth/me` returns null. Re-pull to clear every
     // consumer consistently.
@@ -128,7 +246,11 @@ export function SessionProvider({ children }: { readonly children: ReactNode }) 
     [user, loading, refresh, verifyAndRefresh, signOutAndRefresh],
   );
 
-  return <SessionContext.Provider value={value}>{children}</SessionContext.Provider>;
+  return (
+    <SessionContext.Provider value={value}>
+      <ActingWorkspaceProvider>{children}</ActingWorkspaceProvider>
+    </SessionContext.Provider>
+  );
 }
 
 export function useSession(): SessionContextValue {

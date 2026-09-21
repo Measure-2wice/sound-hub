@@ -534,6 +534,19 @@ export const apiErrorCodeV1Schema = z.enum([
   // compare-and-set + retry budget. Defensive code; the safe envelope
   // covers it if it occurs.
   "PERSONAL_WORKSPACE_CONVERGENCE_CONFLICT",
+  // M2 (#83): Intent selection surface.
+  // 400 — the intent request body failed runtime validation.
+  "INTENT_INVALID",
+  // 403 — the acting human is not a current member of the target
+  // Personal Workspace, the Workspace is not eligible, or some
+  // other authorization rejection collapsed by the safe envelope.
+  "INTENT_FORBIDDEN",
+  // 503 — Seller participation terms are not yet registered. This
+  // is the single explicit product/legal blocker on the M2 #83
+  // slice: `Offer services` and `Both` cannot provision Seller
+  // capability until product/legal supplies and registers the
+  // versioned customer-readable Seller participation text.
+  "INTENT_LEGAL_BLOCKED",
 ]);
 export type ApiErrorCodeV1 = z.infer<typeof apiErrorCodeV1Schema>;
 
@@ -898,6 +911,94 @@ export type Sha256HexFn = (input: string) => string;
 export function deriveDeterministicSubject(email: string, sha256Hex: Sha256HexFn): string {
   return sha256Hex(`deterministic|${email.trim().toLowerCase()}`);
 }
+
+// ===========================================================================
+// M2 (#83) shared runtime contracts.
+//
+// Intent selection is the Personal-Workspace-scoped command that lets
+// a freshly-converged human choose `Hire talent`, `Offer services`, or
+// `Both`. The command is capability-creating only; it never grants
+// `DealApprover` and never publishes seller content. The acting
+// Workspace id is required so the route can revalidate current Owner
+// membership (any Owner/Admin/Member role passes
+// `requireActingMembership` — the route is not Owner-only per ticket
+// #82). Buyer capability is provisioned without any attestation;
+// Seller capability requires the versioned Seller participation
+// acceptance evidence recorded below.
+//
+// The `returnTo` field on the request is validated by the route via
+// the existing internal-return validation rules
+// (`apps/api/src/lib/return-context.ts`). Invalid values are silently
+// dropped; the route proceeds with `returnTo: null`. The successful
+// response echoes only the validated `returnTo`. The intent contract
+// does not carry `setupState` — recovery is already surfaced via the
+// existing `bg1PublicUserV1Schema.setupState` field on the user
+// payload and the dashboard renders it.
+// ===========================================================================
+
+// ---------- Closed intent values ----------
+
+export const intentKindV1Values = ["Hire", "Offer", "Both"] as const;
+export type IntentKindV1 = (typeof intentKindV1Values)[number];
+
+// ---------- Seller participation acceptance evidence ----------
+
+// Versioned Seller participation terms reference. The route resolves
+// the registered text via `apps/api/src/lib/seller-participation-terms.ts`
+// and computes the matching content hash. The hash is the durable
+// evidence the accepted text cannot change retroactively.
+export const sellerParticipationAcceptanceV1Schema = z
+  .object({
+    termsVersion: z.string().min(1).max(64),
+    termsContentHash: z
+      .string()
+      .regex(/^[a-f0-9]{64}$/, "termsContentHash must be a 64-char hex SHA-256 digest"),
+  })
+  .strict();
+export type SellerParticipationAcceptanceV1 = z.infer<typeof sellerParticipationAcceptanceV1Schema>;
+
+// ---------- Intent request ----------
+
+// The intent request body. `intent` selects the capability set;
+// `sellerAcceptance` is required when `intent` is `Offer` or `Both`
+// (enforced by the route's `.superRefine` — schema-level and runtime
+// rejection). `returnTo` is optional; the route revalidates it via the
+// existing internal-return validation rules. The route also resolves
+// the registered `sellerParticipationAcceptanceV1Schema` content
+// hash; the request does not echo a free-form document.
+export const intentRequestV1Schema = z
+  .object({
+    intent: z.enum(intentKindV1Values),
+    sellerAcceptance: sellerParticipationAcceptanceV1Schema.optional(),
+    returnTo: z.string().min(1).max(256).optional(),
+  })
+  .strict()
+  .superRefine((value, ctx) => {
+    if ((value.intent === "Offer" || value.intent === "Both") && !value.sellerAcceptance) {
+      ctx.addIssue({
+        code: z.ZodIssueCode.custom,
+        message: "sellerAcceptance is required when intent is Offer or Both.",
+        path: ["sellerAcceptance"],
+      });
+    }
+  });
+export type IntentRequestV1 = z.infer<typeof intentRequestV1Schema>;
+
+// ---------- Intent response ----------
+
+// The successful intent response. Carries the updated public user
+// payload and the validated `returnTo` (or `null` when none was
+// supplied / validation dropped it). The contract does NOT carry
+// `setupState` — recovery is already surfaced via the user payload's
+// existing `setupState` field; intent is capability-only.
+export const intentResponseV1Schema = z
+  .object({
+    ok: z.literal(true),
+    user: bg1PublicUserV1Schema,
+    returnTo: z.string().min(1).max(256).nullable(),
+  })
+  .strict();
+export type IntentResponseV1 = z.infer<typeof intentResponseV1Schema>;
 
 // ===========================================================================
 // Matchmaker shared runtime contracts (introduced by ticket #60

@@ -1,133 +1,67 @@
 "use client";
 
-// Dashboard page.
+// Dashboard page (M2 #83).
 //
-// Background: the authenticated human lands on the dashboard after a
-// successful magic-link verification. M2 (#82) makes the dashboard
-// server-driven: it reads `user.setupState` (a server-derived
-// classification of the Personal Workspace convergence state) and
-// renders either the Personal Workspace surface or the recovery
-// surface. The browser NEVER infers recovery from the workspaces
-// array — only the server can classify the recovery state, and the
-// public DTO exposes it as the opaque `setupState: "converged" |
-// "recovery"` field.
+// Background: the M2 dashboard is a Workspace-scoped readiness and
+// activity home. It derives useful next actions from durable records
+// (capabilities + persisted seller resources) rather than a mutable
+// onboarding-step flag or a permanent exhaustive checklist. Buyer
+// and Seller readiness remain independent; a dual-capability
+// Workspace shows both without a persona switch. Missing contextual
+// readiness does not globally block unrelated features.
 //
-// The BG1 engineering harness controls ("Verify acting Workspace",
-// "Send consequential command") are removed entirely from the
-// customer UX per the M2 UX addendum. The Personal Workspace
-// dashboard shows the workspace identity and the readiness / next
-// action placeholder (real readiness actions land in later M2
-// tickets).
+// Authorization rules:
 //
-// M2 (#82) visual-QA remediation: the customer-facing arrival copy
-// no longer exposes implementation / domain terminology. The
-// Identity provider label, the Workspace slug, and the type/status
-// /capabilities line are removed from the customer DOM. The opaque
-// CUID-slug invariant is already pinned at the API/repository layer
-// (`apps/api/src/auth-repository/prisma-auth-repository.test.ts:334`)
-// so the browser no longer needs to assert it.
+//   - The dashboard renders only after `useSession()` resolves. It
+//     reads `user.setupState` (already server-derived per #82) to
+//     decide between the Personal Workspace surface and the
+//     recovery surface. Recovery is rendered from the server's
+//     classification — the browser never infers recovery from the
+//     workspaces array.
+//   - Missing or empty capabilities are routed to
+//     `/workspace/intent` via a one-shot `router.replace` (NOT
+//     `push`, so the back button does not return to the
+//     loop).
 //
-// The contradictory-Personal-Workspace recovery surface uses the
-// `Card` `recovery` variant — warm parchment surface with a
-// restrained gold border and an inline info glyph so the recovery
-// cue is never color alone (per the M2 UX addendum). Structural
-// actions (sign-out) stay aubergine.
-//
-// Sign-out transport failures map to a bounded customer-safe
-// message ("We couldn't confirm sign-out. Please try again.") on a
-// `role="alert"` Alert (variant=failure, no gold). The sign-out
-// button stays operable (not disabled by the error state) and
-// focus is restored to it when the error renders.
-//
-// All surfaces preserve logical keyboard order, visible focus,
-// ≥16px body text, ≥44×44px mobile hit areas, no autoplay, no
-// decorative parallax. The recovery surface uses the application
-// sans for operational copy and exposes only operable sign-out /
-// recovery actions.
+// M2 visual-QA: the dashboard uses the warm parchment canvas,
+// ink/muted typography, and aubergine for management actions.
+// Coral is reserved for marketplace-progression actions
+// (none currently appear on the dashboard itself — they live
+// on `/talent`, `Send project request`, and `Publish profile`).
+// Sea-glass appears on the readiness badges for availability
+// surfaces (none currently surface; the readiness rows below
+// are placeholders for #84–#89).
 
-import { useEffect, useRef, useState, type FormEvent } from "react";
+import { useEffect } from "react";
 import Link from "next/link";
 import { useRouter } from "next/navigation";
 import { useSession } from "../components/SessionProvider";
-import type { Bg1PublicWorkspaceV1 } from "@soundhub/types";
 import { Card } from "../components/ui/Card";
 import { Alert } from "../components/ui/Alert";
 
-// Calm inline info glyph paired with the recovery title so the
-// gold-accent recovery cue is never color alone. The glyph is a
-// circle with an "i" dot — calm, NOT a warning triangle.
-function RecoveryGlyph() {
-  return (
-    <svg
-      aria-hidden="true"
-      viewBox="0 0 20 20"
-      className="inline-block w-4 h-4 align-[-2px] mr-2"
-      fill="none"
-      stroke="currentColor"
-      strokeWidth="1.5"
-    >
-      <circle cx="10" cy="10" r="8" />
-      <circle cx="10" cy="6.5" r="0.8" fill="currentColor" stroke="none" />
-      <path d="M10 9v5" strokeLinecap="round" />
-    </svg>
-  );
-}
-
 export default function DashboardPage() {
-  const { user, loading, signOutAndRefresh } = useSession();
+  const { user, loading } = useSession();
   const router = useRouter();
-  const [signingOut, setSigningOut] = useState(false);
-  const [signOutError, setSignOutError] = useState<string | null>(null);
-  const signOutButtonRef = useRef<HTMLButtonElement>(null);
 
-  const handleSignOut = async (e: FormEvent) => {
-    e.preventDefault();
-    setSigningOut(true);
-    setSignOutError(null);
-    try {
-      await signOutAndRefresh();
-      router.push("/");
-    } catch {
-      // Bounded copy — never expose the raw transport message
-      // (e.g. "Failed to fetch") and never claim the session
-      // definitely remains active.
-      setSignOutError("We couldn't confirm sign-out. Please try again.");
-    } finally {
-      setSigningOut(false);
-    }
-  };
-
-  // Restore focus to the sign-out button when the failure surfaces
-  // so the retry stays operable and the user's focus target is
-  // sensible. role="alert" alone does not guarantee focus movement.
+  // Route capability-less users to the intent page on mount.
+  // This is a one-shot redirect, not a render gate.
   useEffect(() => {
-    if (signOutError !== null && signOutButtonRef.current !== null) {
-      signOutButtonRef.current.focus();
+    if (loading) return;
+    if (!user) return;
+    if (user.setupState === "recovery") return;
+    const hasAnyCapability = user.workspaces.some(
+      (w) => w.capabilities.includes("Buyer") || w.capabilities.includes("Seller"),
+    );
+    if (!hasAnyCapability) {
+      void router.replace("/workspace/intent");
     }
-  }, [signOutError]);
+  }, [user, loading, router]);
 
   if (loading) {
-    // M2 (#82) visual-QA: the dashboard loading branch renders
-    // EXACTLY ONE bounded warm status surface using the existing
-    // Alert primitive (role="status", variant="status") — never an
-    // unbounded floating paragraph. The primitive's title + body
-    // are both rendered with text-base (16px) so the customer-safe
-    // operational copy meets the addendum's ≥16px floor; the
-    // parchment surface + warm neutral border (border-borderWarm)
-    // is rendered with no gold recovery accent, no coral, and no
-    // internal DTO / debug vocabulary. The surface stays inside
-    // the existing #82 scoped `min-h-screen bg-canvas` wrapper so
-    // the warm canvas treatment is owned by this page and never
-    // leaks into the global body color.
     return (
       <div className="min-h-screen bg-canvas">
         <div className="max-w-2xl mx-auto px-6 py-12" data-testid="dashboard-loading">
-          <Alert
-            role="status"
-            variant="status"
-            testId="dashboard-loading-status"
-            title="Loading your workspace…"
-          >
+          <Alert role="status" variant="status" title="Loading your workspace…">
             Just a moment.
           </Alert>
         </div>
@@ -144,8 +78,8 @@ export default function DashboardPage() {
               <p className="text-base text-muted">
                 You are not signed in.{" "}
                 <Link
-                  href={"/login"}
-                  className="text-aubergine hover:text-aubergine-hover font-medium"
+                  href="/login"
+                  className="text-aubergine hover:text-aubergine-hover font-medium focus:outline-none focus-visible:outline focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-aubergine rounded"
                   data-testid="dashboard-sign-in-link"
                 >
                   Sign in
@@ -159,114 +93,107 @@ export default function DashboardPage() {
     );
   }
 
-  // M2 (#82): the recovery decision is server-derived. The browser
-  // reads ONLY `user.setupState` — it never infers recovery from the
-  // workspaces array. This prevents a future Workspace type or
-  // capability flag from silently changing the rendered surface.
   if (user.setupState === "recovery") {
+    return <RecoverySurface user={user} />;
+  }
+
+  // Personal Workspace is the canonical Personal surface.
+  const personal = user.workspaces.find((w) => w.workspaceType === "Personal") ?? null;
+
+  if (!personal) {
     return (
-      <RecoverySurface
-        user={user}
-        onSignOut={handleSignOut}
-        signingOut={signingOut}
-        signOutError={signOutError}
-        signOutButtonRef={signOutButtonRef}
-      />
+      <div className="min-h-screen bg-canvas">
+        <div className="max-w-2xl mx-auto px-6 py-12" data-testid="dashboard-no-personal">
+          <Card variant="parchment">
+            <Card.Header>
+              <Card.Title>No Personal Workspace</Card.Title>
+            </Card.Header>
+            <Card.Content>
+              <p className="text-base text-muted">
+                Your Personal Workspace is being prepared. Refresh in a moment.
+              </p>
+            </Card.Content>
+          </Card>
+        </div>
+      </div>
     );
   }
 
   return (
-    <PersonalWorkspaceSurface
-      user={user}
-      onSignOut={handleSignOut}
-      signingOut={signingOut}
-      signOutError={signOutError}
-      signOutButtonRef={signOutButtonRef}
-    />
-  );
-}
-
-function PersonalWorkspaceSurface({
-  user,
-  onSignOut,
-  signingOut,
-  signOutError,
-  signOutButtonRef,
-}: {
-  user: NonNullable<ReturnType<typeof useSession>["user"]>;
-  onSignOut: (e: FormEvent) => Promise<void>;
-  signingOut: boolean;
-  signOutError: string | null;
-  signOutButtonRef: React.RefObject<HTMLButtonElement>;
-}) {
-  // The Personal Workspace is the new Personal Workspace created on
-  // first auth (or the existing one for a returning user). The
-  // browser renders the Personal Workspace card only — the BG1
-  // engineering acting-Workspace selector is removed.
-  const personalWorkspace = user.workspaces.find(
-    (workspace) => workspace.workspaceType === "Personal",
-  );
-
-  return (
     <div className="min-h-screen bg-canvas">
-      <div className="max-w-2xl mx-auto px-6 py-12 space-y-6" data-testid="dashboard">
-        <Card variant="parchment">
-          <Card.Header>
-            <Card.Title data-testid="dashboard-user-email">
-              Signed in as {user.email ?? "anonymous"}
-            </Card.Title>
-          </Card.Header>
-          <Card.Content>
-            <button
-              ref={signOutButtonRef}
-              type="button"
-              onClick={(e) => {
-                void onSignOut(e);
-              }}
-              disabled={signingOut}
-              // M2 UX addendum assigns recovery and management actions
-              // (including the dashboard sign-out control) to the
-              // aubergine semantic family (`docs/specs/milestone-2-reconciled-ux.md:269-274`).
-              // The base visual reference is around `#3B1E3E`. Hover,
-              // keyboard focus, and disabled variants follow the
-              // addendum's "foreground, hover, focus, disabled" rule
-              // for each functional family.
-              className="inline-flex items-center justify-center min-h-[44px] min-w-[44px] py-3 px-4 text-base font-medium text-aubergine hover:text-aubergine-hover disabled:opacity-50 focus:outline-none focus-visible:outline focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-aubergine focus:ring-2 focus:ring-aubergine rounded"
-              data-testid="dashboard-sign-out"
-            >
-              {signingOut ? "Signing out…" : "Sign out"}
-            </button>
-            {signOutError && (
-              <div className="mt-2">
-                <Alert
-                  role="alert"
-                  variant="failure"
-                  testId="dashboard-sign-out-error"
-                  title="Could not sign out"
-                >
-                  {signOutError}
-                </Alert>
-              </div>
-            )}
-          </Card.Content>
-        </Card>
+      <div className="max-w-3xl mx-auto px-6 py-8 space-y-6" data-testid="dashboard">
+        <header className="mb-2">
+          <h1 className="text-2xl font-serif text-ink mb-1" data-testid="dashboard-workspace-name">
+            {personal.name}
+          </h1>
+          <p className="text-base text-muted" data-testid="dashboard-subtitle">
+            Your marketplace home.
+          </p>
+        </header>
 
-        <Card variant="parchment" data-testid="dashboard-personal-workspace">
+        <div className="grid gap-4 sm:grid-cols-2" data-testid="dashboard-readiness">
+          {personal.capabilities.includes("Buyer") && <BuyerReadinessRow />}
+          {personal.capabilities.includes("Seller") && <SellerReadinessRow />}
+          {!personal.capabilities.includes("Buyer") &&
+            !personal.capabilities.includes("Seller") && (
+              <Card variant="parchment" data-testid="dashboard-no-capabilities">
+                <Card.Header>
+                  <Card.Title>Choose how you want to use SoundHub</Card.Title>
+                </Card.Header>
+                <Card.Content>
+                  <p className="text-base text-muted mb-3">
+                    You haven&apos;t picked an intent yet. Hire talent, offer services, or both.
+                  </p>
+                  <Link
+                    href="/workspace/intent"
+                    className="inline-flex items-center justify-center min-h-[44px] min-w-[44px] py-3 px-4 text-base font-medium text-aubergine hover:text-aubergine-hover border border-aubergine rounded focus:outline-none focus-visible:outline focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-aubergine"
+                    data-testid="dashboard-choose-intent"
+                  >
+                    Choose intent
+                  </Link>
+                </Card.Content>
+              </Card>
+            )}
+        </div>
+
+        <Card variant="parchment" data-testid="dashboard-quick-actions">
           <Card.Header>
-            <Card.Title>My Workspace</Card.Title>
+            <Card.Title>Quick actions</Card.Title>
           </Card.Header>
           <Card.Content>
-            {personalWorkspace ? (
-              <PersonalWorkspaceCard workspace={personalWorkspace} />
-            ) : (
-              <p className="text-base text-muted">Your Personal Workspace is being prepared.</p>
-            )}
-            <p
-              className="mt-3 text-base text-muted"
-              data-testid="dashboard-personal-workspace-next-action"
-            >
-              When you&apos;re ready, you can choose what you want to do here.
-            </p>
+            <ul className="space-y-2 text-base">
+              {personal.capabilities.includes("Buyer") && (
+                <li>
+                  <Link
+                    href="/talent"
+                    className="text-aubergine hover:text-aubergine-hover font-medium focus:outline-none focus-visible:outline focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-aubergine rounded"
+                    data-testid="dashboard-find-talent"
+                  >
+                    Find talent
+                  </Link>
+                </li>
+              )}
+              {personal.capabilities.includes("Seller") && (
+                <li>
+                  <Link
+                    href="/dashboard/audio"
+                    className="text-aubergine hover:text-aubergine-hover font-medium focus:outline-none focus-visible:outline focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-aubergine rounded"
+                    data-testid="dashboard-manage-services"
+                  >
+                    Manage your services
+                  </Link>
+                </li>
+              )}
+              <li>
+                <Link
+                  href="/deals"
+                  className="text-aubergine hover:text-aubergine-hover font-medium focus:outline-none focus-visible:outline focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-aubergine rounded"
+                  data-testid="dashboard-view-deals"
+                >
+                  View your deals
+                </Link>
+              </li>
+            </ul>
           </Card.Content>
         </Card>
       </div>
@@ -274,60 +201,61 @@ function PersonalWorkspaceSurface({
   );
 }
 
-function PersonalWorkspaceCard({ workspace }: { workspace: Bg1PublicWorkspaceV1 }) {
-  // M2 (#82) visual-QA: the opaque Workspace slug and the
-  // type/status/capabilities line are removed from the customer-
-  // visible DOM. The literal heading remains so the e2e contract
-  // ("My Workspace rendered inside dashboard-personal-workspace-card
-  // at computed fontSize ≥ 16px") holds.
+function BuyerReadinessRow() {
   return (
-    <div data-testid="dashboard-personal-workspace-card">
-      <p className="text-base font-medium text-ink">{workspace.name}</p>
-    </div>
+    <Card variant="parchment" data-testid="dashboard-buyer-readiness">
+      <Card.Header>
+        <Card.Title>Hiring</Card.Title>
+      </Card.Header>
+      <Card.Content>
+        <p className="text-base text-muted">
+          You can find Caribbean talent, send project requests, and approve work.
+        </p>
+        <Link
+          href="/talent"
+          className="mt-3 inline-flex items-center justify-center min-h-[44px] min-w-[44px] py-2 px-4 text-base font-medium text-white bg-coral hover:bg-coral-hover rounded focus:outline-none focus-visible:outline focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-coral"
+          data-testid="dashboard-buyer-find-talent"
+        >
+          Find talent
+        </Link>
+      </Card.Content>
+    </Card>
+  );
+}
+
+function SellerReadinessRow() {
+  return (
+    <Card variant="parchment" data-testid="dashboard-seller-readiness">
+      <Card.Header>
+        <Card.Title>Offering services</Card.Title>
+      </Card.Header>
+      <Card.Content>
+        <p className="text-base text-muted">
+          Set up your Professional Profile and activate your first ServiceOffering to be
+          discoverable on Talent.
+        </p>
+        <p className="mt-2 text-sm text-muted" data-testid="dashboard-seller-hint">
+          Profile and ServiceOffering setup lands in #84 and #85.
+        </p>
+      </Card.Content>
+    </Card>
   );
 }
 
 function RecoverySurface({
   user,
-  onSignOut,
-  signingOut,
-  signOutError,
-  signOutButtonRef,
 }: {
-  user: NonNullable<ReturnType<typeof useSession>["user"]>;
-  onSignOut: (e: FormEvent) => Promise<void>;
-  signingOut: boolean;
-  signOutError: string | null;
-  signOutButtonRef: React.RefObject<HTMLButtonElement>;
+  readonly user: NonNullable<ReturnType<typeof useSession>["user"]>;
 }) {
-  // The recovery surface is rendered ONLY when
-  // `user.setupState === "recovery"`. Per the M2 UX addendum:
-  //   - Show signed-in / recovery context (email only — no
-  //     provider-key disclosure).
-  //   - Calm explanation that SoundHub did not guess, merge, or
-  //     select.
-  //   - Operable sign-out button.
-  //   - NO fabricated acting-Workspace selector.
-  //   - NO support-process or security guarantee claims.
-  //   - Surface truthful customer-facing Organization identity
-  //     (name only — no slug, no raw capabilities, no internal
-  //     role vocabulary) for any current Organization memberships
-  //     so the customer knows those relationships remain.
-  //   - Restrained gold attention cue on the recovery Card
-  //     chrome (border + inline info glyph), paired with the
-  //     accompanying recovery text — never color alone, never
-  //     danger/alarm.
-  const organizationMemberships = user.workspaces.filter(
-    (workspace) => workspace.workspaceType === "Organization",
-  );
-
+  const { signOutAndRefresh } = useSession();
+  const router = useRouter();
+  const organizationMemberships = user.workspaces.filter((w) => w.workspaceType === "Organization");
   return (
     <div className="min-h-screen bg-canvas">
       <div className="max-w-2xl mx-auto px-6 py-12 space-y-6" data-testid="dashboard-recovery">
         <Card variant="recovery">
           <Card.Header>
             <Card.Title data-testid="dashboard-recovery-title">
-              <RecoveryGlyph />
               Workspace setup needs your attention
             </Card.Title>
           </Card.Header>
@@ -345,33 +273,18 @@ function RecoverySurface({
               memberships have not been changed.
             </p>
             <button
-              ref={signOutButtonRef}
               type="button"
-              onClick={(e) => {
-                void onSignOut(e);
+              onClick={() => {
+                void (async () => {
+                  await signOutAndRefresh();
+                  router.replace("/");
+                })();
               }}
-              disabled={signingOut}
-              // Same aubergine treatment as the Personal Workspace
-              // dashboard sign-out — see comment there. Recovery
-              // actions are explicitly listed in the M2 UX addendum's
-              // aubergine semantic family (`docs/specs/milestone-2-reconciled-ux.md:271`).
-              className="mt-3 inline-flex items-center justify-center min-h-[44px] min-w-[44px] py-3 px-4 text-base font-medium text-aubergine hover:text-aubergine-hover disabled:opacity-50 focus:outline-none focus-visible:outline focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-aubergine focus:ring-2 focus:ring-aubergine rounded"
+              className="mt-3 inline-flex items-center justify-center min-h-[44px] min-w-[44px] py-3 px-4 text-base font-medium text-aubergine hover:text-aubergine-hover border border-aubergine rounded focus:outline-none focus-visible:outline focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-aubergine"
               data-testid="dashboard-recovery-sign-out"
             >
-              {signingOut ? "Signing out…" : "Sign out"}
+              Sign out
             </button>
-            {signOutError && (
-              <div className="mt-2">
-                <Alert
-                  role="alert"
-                  variant="failure"
-                  testId="dashboard-recovery-sign-out-error"
-                  title="Could not sign out"
-                >
-                  {signOutError}
-                </Alert>
-              </div>
-            )}
           </Card.Content>
         </Card>
         {organizationMemberships.length > 0 && (
