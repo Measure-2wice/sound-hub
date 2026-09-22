@@ -303,4 +303,110 @@ describe("Intent route (in-memory)", () => {
     assert.equal(response.status, 400);
     assert.equal(response.body.error.code, "INTENT_INVALID");
   });
+
+  // Conflicting intent retry at the route boundary: a second
+  // `Offer` retry after a successful `Hire` would silently merge
+  // into Buyer+Seller=Both. The route must reject with
+  // INTENT_FORBIDDEN and zero unintended capability writes. The
+  // dedicated "add the other capability" command (later
+  // boundary) is the explicit path.
+  test("Conflicting intent retry (Offer after Hire) returns INTENT_FORBIDDEN; zero unintended writes", async () => {
+    const cookie = await signIn();
+    const hire = await request(app)
+      .post(`/api/workspaces/${WS_ID}/intent`)
+      .send({ intent: "Hire" })
+      .set("Content-Type", "application/json")
+      .set("Cookie", cookie);
+    assert.equal(hire.status, 200);
+    assert.deepEqual(hire.body.user.workspaces[0].capabilities, ["Buyer"]);
+
+    const offer = await request(app)
+      .post(`/api/workspaces/${WS_ID}/intent`)
+      .send({ intent: "Offer" })
+      .set("Content-Type", "application/json")
+      .set("Cookie", cookie);
+    assert.equal(offer.status, 403);
+    assert.equal(offer.body.error.code, "INTENT_FORBIDDEN");
+
+    const view = await authRepo.getPublicUser(USER_ID);
+    const personal = view!.workspaces.find((w) => w.workspaceId === WS_ID);
+    assert.deepEqual(personal?.capabilities, ["Buyer"], "no silent merge into Both");
+  });
+
+  // Canonical Personal Workspace enforcement at the route
+  // boundary: a non-canonical accessible Personal Workspace (the
+  // user can access TWO Personal Workspaces, and the convergence
+  // pointer picks the canonical one) must not receive capability
+  // writes when the path id targets the non-canonical
+  // alternative.
+  test("Canonical Personal Workspace enforcement: non-canonical Personal Workspace id returns INTENT_FORBIDDEN; zero mutation", async () => {
+    const NON_CANONICAL_PERSONAL = "ws-intent-route-personal-2";
+    authRepo = new InMemoryAuthRepository([
+      {
+        userAccountId: USER_ID,
+        email: EMAIL,
+        identityProvider: "deterministic",
+        identitySubject: SUBJECT,
+        memberships: [
+          {
+            workspaceId: WS_ID,
+            slug: "intent-route-personal",
+            name: "Intent Route Personal",
+            workspaceType: "Personal",
+            workspaceStatus: "Active",
+            role: "Owner",
+            capabilities: [],
+          },
+          {
+            workspaceId: NON_CANONICAL_PERSONAL,
+            slug: "intent-route-personal-2",
+            name: "Intent Route Personal 2 (non-canonical)",
+            workspaceType: "Personal",
+            workspaceStatus: "Active",
+            role: "Owner",
+            capabilities: [],
+          },
+        ],
+      },
+    ]);
+    personalWorkspaceConvergenceService = new PersonalWorkspaceConvergenceService({
+      authRepository: authRepo,
+    });
+    authenticationService = new AuthenticationService({
+      identityAdapter: adapter,
+      authRepository: authRepo,
+      personalWorkspaceConvergenceService,
+    });
+    workspaceAuthorizationService = new WorkspaceAuthorizationService({
+      authRepository: authRepo,
+    });
+    intentService = new IntentService({
+      authRepository: authRepo,
+      workspaceAuthorizationService,
+    });
+    app = buildApp({
+      authenticationService,
+      workspaceAuthorizationService,
+      authRepository: authRepo,
+      identityAdapter: adapter,
+      intentService,
+      personalWorkspaceConvergenceService,
+      prismaClient: stubPrisma,
+    }).app;
+
+    const cookie = await signIn();
+    const response = await request(app)
+      .post(`/api/workspaces/${NON_CANONICAL_PERSONAL}/intent`)
+      .send({ intent: "Hire" })
+      .set("Content-Type", "application/json")
+      .set("Cookie", cookie);
+    assert.equal(response.status, 403);
+    assert.equal(response.body.error.code, "INTENT_FORBIDDEN");
+
+    const view = await authRepo.getPublicUser(USER_ID);
+    const canonical = view!.workspaces.find((w) => w.workspaceId === WS_ID);
+    const nonCanonical = view!.workspaces.find((w) => w.workspaceId === NON_CANONICAL_PERSONAL);
+    assert.deepEqual(canonical?.capabilities, []);
+    assert.deepEqual(nonCanonical?.capabilities, []);
+  });
 });

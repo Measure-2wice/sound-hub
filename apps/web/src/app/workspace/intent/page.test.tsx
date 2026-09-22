@@ -1,9 +1,9 @@
-// Codex CHANGES_REQUESTED P1-005: focused contract coverage for the
-// M2 #83 intent page. The repo's existing test pattern uses source-
-// level contract assertions (readFileSync + regex) rather than a
-// React DOM testing library; this test file pins the BEHAVIORAL
-// contract — verbatim UI rendering, capability-only intent CTA,
-// server-resolved safe navigation — by reading the page source.
+// Focused contract coverage for the M2 #83 intent page. The repo's
+// existing test pattern uses source-level contract assertions
+// (readFileSync + regex) rather than a React DOM testing library;
+// this test file pins the BEHAVIORAL contract — verbatim UI
+// rendering, capability-only intent CTA, server-resolved safe
+// navigation — by reading the page source.
 //
 // Cross-tab / browser behaviour (arrow keys, focus management,
 // network wiring) is covered end-to-end by the Playwright spec
@@ -44,11 +44,22 @@ describe("IntentPage — M2 #83 capability-only contract (#83 re-revision)", () 
     );
   });
 
-  test("Intent page submits only the intent value (no sellerAcceptance payload)", () => {
+  test("Intent page submits only `intent` (with optional `returnTo` for the validated-return flow; no sellerAcceptance payload)", () => {
     const source = readFile("workspace/intent/page.tsx");
+    // The body MAY carry `returnTo` when the URL supplies a
+    // validated `?return=`. The schema is `.strict()`; the page
+    // never constructs `null` / junk / `sellerAcceptance`.
     assert.ok(
-      /const intentBody:\s*IntentRequestV1\s*=\s*\{\s*intent\s*\}/.test(source),
-      "page MUST submit an IntentRequestV1 carrying only `intent`",
+      /const intentBody:\s*IntentRequestV1\s*=/.test(source),
+      "page MUST submit an IntentRequestV1 typed payload",
+    );
+    assert.ok(
+      /\{\s*intent,\s*returnTo:\s*validatedReturnTo\s*\}/.test(source),
+      "page MUST submit `{ intent, returnTo: validatedReturnTo }` when return is validated",
+    );
+    assert.ok(
+      /\{\s*intent\s*\}/.test(source),
+      "page MUST submit `{ intent }` when no return is validated",
     );
     // Check the CODE (strip JSDoc/comment lines) for sellerAcceptance;
     // the file documents the #83 re-revision decision in comments, but
@@ -61,6 +72,28 @@ describe("IntentPage — M2 #83 capability-only contract (#83 re-revision)", () 
     assert.ok(
       !/sellerAcceptance/.test(codeOnly),
       "intent page MUST NOT construct a sellerAcceptance payload",
+    );
+  });
+
+  test("Intent page reads + validates `?return=` from the URL", () => {
+    const source = readFile("workspace/intent/page.tsx");
+    assert.ok(/useSearchParams\(\)/.test(source), "page reads the query string");
+    assert.ok(/validatedReturnTo/.test(source), "page derives `validatedReturnTo` from the URL");
+    assert.ok(
+      /isLocallyValidReturnPath/.test(source),
+      "page uses the local same-origin path validator",
+    );
+  });
+
+  test("Switch link threads `?return=` through (cross-Workspace continuation)", () => {
+    const source = readFile("workspace/intent/page.tsx");
+    assert.ok(
+      /\/workspace\/switch\?target=/.test(source),
+      "switch link includes the `target` parameter",
+    );
+    assert.ok(
+      /validatedReturnTo\s*\?\s*`&return=/.test(source),
+      "switch link carries the validated `?return=` forward",
     );
   });
 
@@ -175,14 +208,39 @@ describe("Switch interstitial — commit / cancel behaviour (§4 / P1-005)", () 
       "page only promotes ACTIVE Workspaces",
     );
   });
+
+  // Validated return threading. The switch interstitial reads
+  // `?return=` from the URL and threads it through both the
+  // commit (Switch and continue) and the cancel paths so the
+  // customer's pending destination is reachable even when the
+  // explicit-switch step is the only thing they bypassed.
+  test("Switch page reads + validates `?return=` and threads it through commit + cancel", () => {
+    const source = readFile("workspace/switch/page.tsx");
+    assert.ok(/queryReturnTo/.test(source), "switch page derives `queryReturnTo` from the URL");
+    assert.ok(
+      /isLocallyValidReturnPath/.test(source),
+      "switch page uses the local same-origin path validator",
+    );
+    assert.ok(
+      /queryReturnTo\s*\?\?\s*"\/dashboard"/.test(source),
+      "switch page defaults to /dashboard when no `?return=` is supplied",
+    );
+  });
 });
 
 describe("Dashboard — capability-truthful copy (§4 / P1-005 / P1-004)", () => {
-  test('Dashboard renders "View your deals" only when Buyer capability is present', () => {
+  // Deals is a Deal-party destination, not a Buyer-only one.
+  // Sellers are also Deal parties; the action is available when
+  // EITHER capability is present.
+  test('Dashboard renders "View your deals" when Buyer OR Seller capability is present', () => {
     const source = readFile("dashboard/page.tsx");
+    // The "View your deals" link MUST be inside an `||` guard that
+    // matches either capability.
     assert.ok(
-      /actingWorkspace\.capabilities\.includes\("Buyer"\)[\s\S]*?\/\s*deals/.test(source),
-      "View your deals MUST only render for Buyer-acting Workspaces",
+      /capabilities\.includes\("Buyer"\)\s*\|\|\s*actingWorkspace\.capabilities\.includes\("Seller"\)/.test(
+        source,
+      ),
+      "View your deals MUST render for Buyer OR Seller acting Workspaces",
     );
   });
 
@@ -197,6 +255,28 @@ describe("Dashboard — capability-truthful copy (§4 / P1-005 / P1-004)", () =>
         source,
       ),
       "dashboard Seller copy MUST remain capability-aware and customer-safe",
+    );
+  });
+
+  // The previous "Profile and service setup unlocks after your
+  // first deal" copy reversed the documented M2 journey. The
+  // new copy must reflect the forward progression (publish
+  // profile + activate service → receive requests). Strip
+  // comment lines so the test only asserts on rendered copy.
+  test("Dashboard Seller-readiness copy reflects forward journey (no reversed first-deal wording)", () => {
+    const source = readFile("dashboard/page.tsx");
+    const codeOnly = source
+      .split("\n")
+      .filter((line) => !line.trim().startsWith("//") && !line.trim().startsWith("*"))
+      .filter((line) => !line.trim().startsWith("/*") && !line.trim().startsWith("*/"))
+      .join("\n");
+    assert.ok(
+      !/unlocks after your first deal/i.test(codeOnly),
+      "dashboard MUST NOT contain the reversed 'unlocks after your first deal' copy",
+    );
+    assert.ok(
+      /Publish your professional profile|Publish|private drafts/i.test(codeOnly),
+      "dashboard Seller readiness copy MUST reflect the forward journey",
     );
   });
 
@@ -219,6 +299,16 @@ describe("Shell — capability-truthful destinations (§4 / P1-005 / P1-004)", (
     assert.ok(
       !/user\.workspaces\[0\]/.test(source),
       "Shell MUST NOT pick the first workspace from user.workspaces array",
+    );
+  });
+
+  // The Shell exposes the Deals destination for Buyer OR
+  // Seller capability. Sellers are also Deal parties.
+  test("Shell exposes Deals destination for Buyer OR Seller capability", () => {
+    const source = readFile("components/Shell.tsx");
+    assert.ok(
+      /capabilities\.includes\("Buyer"\)\s*\|\|\s*capabilities\.includes\("Seller"\)/.test(source),
+      "Shell MUST expose Deals when Buyer OR Seller capability is present",
     );
   });
 });

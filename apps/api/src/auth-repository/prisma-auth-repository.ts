@@ -36,6 +36,7 @@ import type {
   UserIdentityMapping,
   WorkspaceMembershipView,
 } from "./auth-repository.js";
+import { IntentConflictError } from "./auth-repository.js";
 
 const BG1_PROVIDER_KEYS: ReadonlySet<Bg1IdentityProviderV1> = new Set([
   "managed-magic-link",
@@ -459,34 +460,6 @@ export class PrismaAuthRepository implements AuthRepository {
 
   // ---------- M2 #83: Intent selection primitives ----------
 
-  // ---------------------------------------------------------------------
-  // The standalone capability primitive is a PRIVATE implementation
-  // helper (named with the `_` prefix convention). The
-  // PrismaAuthRepository class exposes it so the in-class
-  // `provisionIntentAtomically` transaction helper can use it,
-  // but it is NOT part of the `AuthRepository` interface.
-  // Production consumers cannot bypass the atomic invariant.
-  // ---------------------------------------------------------------------
-
-  async _upsertCapability(input: {
-    readonly workspaceId: string;
-    readonly capability: MarketplaceCapabilityV1;
-  }): Promise<void> {
-    await this.prisma.workspaceCapability.upsert({
-      where: {
-        workspaceId_capability: {
-          workspaceId: input.workspaceId,
-          capability: input.capability,
-        },
-      },
-      create: {
-        workspaceId: input.workspaceId,
-        capability: input.capability,
-      },
-      update: {},
-    });
-  }
-
   /**
    * M2 #83: atomic intent provisioning. ONE Prisma `$transaction`
    * covers every capability write. Either all writes commit, or
@@ -495,13 +468,30 @@ export class PrismaAuthRepository implements AuthRepository {
    * this primitive is the single source of atomicity.
    *
    * The transaction callback may throw (e.g., a real FK violation
-   * against the Workspace). In that case Prisma's $transaction
-   * rolls back the transaction and re-throws the error.
+   * against the Workspace, OR a conflicting-intent-retry signal
+   * — see below). In both cases Prisma's `$transaction` rolls
+   * back the transaction and re-throws.
    *
    * #83 re-revision: intent does NOT collect a generic Seller
    * participation/terms acceptance at capability-provisioning time.
    * Context-specific confirmations are owned by their later
    * boundaries.
+   *
+   * Conflict semantics. The transaction reads the workspace's
+   * EXISTING capability set BEFORE any write and rejects
+   * requests that would silently merge or widen into a
+   * different set than the customer originally requested:
+   *
+   *   - Identical retry (existing === requested) → commit
+   *     (the in-transaction upserts absorb duplicates).
+   *   - Conflicting retry (any other shape — disjoint,
+   *     proper-extension, or narrowing) → throw
+   *     `IntentConflictError`; the transaction rolls back to
+   *     zero rows.
+   *
+   * The dedicated "add the other capability" command (a later
+   * boundary) is the explicit path to a wider capability set;
+   * the initial intent command must remain explicit.
    */
   async provisionIntentAtomically(input: {
     readonly workspaceId: string;
@@ -509,6 +499,27 @@ export class PrismaAuthRepository implements AuthRepository {
     readonly capabilities: readonly MarketplaceCapabilityV1[];
   }): Promise<void> {
     await this.prisma.$transaction(async (tx) => {
+      // Pre-write conflict check. Read the existing capability set
+      // inside the same transaction (so the read is consistent with
+      // the subsequent writes) and reject requests that would
+      // silently merge or widen into a different set than was
+      // originally requested.
+      const existingRows = await tx.workspaceCapability.findMany({
+        where: { workspaceId: input.workspaceId },
+        select: { capability: true },
+      });
+      const existing: readonly MarketplaceCapabilityV1[] = existingRows
+        .map((r) => r.capability)
+        .sort();
+      const requested: readonly MarketplaceCapabilityV1[] = [...input.capabilities].sort();
+      if (hasConflictingCapability(existing, requested)) {
+        throw new IntentConflictError(
+          "Conflicting intent retry: existing capability set cannot be silently merged.",
+          existing,
+          requested,
+        );
+      }
+
       // Capability upsert via raw `INSERT ... ON CONFLICT DO NOTHING`.
       // The Prisma-generated `tx.workspaceCapability.upsert` form
       // produces a unique-constraint violation under concurrent
@@ -526,6 +537,43 @@ export class PrismaAuthRepository implements AuthRepository {
       }
     });
   }
+}
+
+/**
+ * Detect a conflicting intent retry. The intent command only
+ * accepts IDENTICAL retries; everything else is rejected.
+ *
+ *   - First submission (existing empty) → accept.
+ *   - Identical retry (existing === requested) → accept; the
+ *     in-transaction upserts absorb duplicates.
+ *   - Any other shape → REJECT. The M2 #83 specification
+ *     ("Changing intent is not a capability removal mechanism")
+ *     forbids narrowing the capability set, and the dedicated
+ *     "add the other capability" command (a later boundary) is
+ *     the only explicit path to a wider set.
+ *
+ * Concrete examples of the rejected shapes:
+ *
+ *   - Disjoint retry: `Hire` after `Offer` would silently merge
+ *     into `Both` — `Offer` is committed, the new `Hire` row
+ *     would land as `Buyer`, and the Workspace would have
+ *     `Buyer + Seller` even though the customer's intent was
+ *     one or the other.
+ *   - Proper-extension retry: `Both` after `Hire` would silently
+ *     add `Seller` beyond the user's original intent.
+ *   - Narrowing retry: `Hire` after `Both` would silently remove
+ *     `Seller` from the capability set.
+ */
+function hasConflictingCapability(
+  existing: readonly MarketplaceCapabilityV1[],
+  requested: readonly MarketplaceCapabilityV1[],
+): boolean {
+  if (existing.length === 0) return false;
+  if (existing.length !== requested.length) return true;
+  for (const capability of existing) {
+    if (!requested.includes(capability)) return true;
+  }
+  return false;
 }
 
 function assertBg1Provider(provider: string): asserts provider is Bg1IdentityProviderV1 {

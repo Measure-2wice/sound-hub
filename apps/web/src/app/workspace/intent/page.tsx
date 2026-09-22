@@ -12,7 +12,7 @@
 // activates, Tab moves to Submit). No custom keyboard handlers,
 // no custom aria-pressed buttons, no Escape-to-clear.
 //
-// Authorization rules (Codex CHANGES_REQUESTED remediation §4 / P1-001):
+// Authorization rules:
 //
 //   - The page reads `useActingWorkspace()` and ONLY accepts the
 //     request when the COMMITTED acting Workspace is the user's
@@ -36,9 +36,15 @@
 //     confirmations are owned by their later boundaries
 //     (SellerProfile publication, media use, ServiceOffering
 //     activation, Deal approval authority / approval).
-//   - `returnTo`: optional. The route revalidates it via
-//     `safeReturnTo`; the browser consumes only the
-//     server-resolved value.
+//   - `returnTo`: optional. The browser reads `?return=<path>`
+//     from the URL, pre-filters it to a same-origin path shape,
+//     and submits it on the intent body. The route revalidates
+//     it via `isValidReturnPath` and resolves a server-
+//     authorized `safeReturnTo` against the FRESH post-provision
+//     user payload; the browser consumes only
+//     `safeReturnTo`. A malformed or external value is silently
+//     dropped to `null` and the destination falls back to
+//     `/dashboard`.
 //
 // Errors:
 //   - INTENT_INVALID: malformed submission.
@@ -46,19 +52,45 @@
 //     Workspace, including the recovery-state refusal and the
 //     Personal-Workspace boundary.
 
-import { useMemo, useState, type FormEvent } from "react";
-import { useRouter } from "next/navigation";
+import { Suspense, useMemo, useState, type FormEvent } from "react";
+import { useRouter, useSearchParams } from "next/navigation";
 import { useActingWorkspace, useSession } from "../../components/SessionProvider";
 import { Card } from "../../components/ui/Card";
 import { Alert } from "../../components/ui/Alert";
 import { submitIntent } from "../../lib/auth-client";
 import { navigateAfterIntent } from "../../lib/navigate-after-intent";
 import type { IntentKindV1, IntentRequestV1 } from "@soundhub/types";
+import { isLocallyValidReturnPath } from "../../lib/return-path-shape";
 
 export default function IntentPage() {
+  // `useSearchParams` requires a Suspense boundary at static-export
+  // time. The intent page is client-rendered and dynamic; the inner
+  // component reads `useSearchParams` so the route's static
+  // generation can resolve.
+  return (
+    <Suspense fallback={<IntentLoading />}>
+      <IntentPageInner />
+    </Suspense>
+  );
+}
+
+function IntentLoading() {
+  return (
+    <div className="min-h-screen bg-canvas">
+      <div className="max-w-2xl mx-auto px-6 py-12" data-testid="intent-loading">
+        <Alert role="status" variant="status" title="Loading…">
+          Just a moment.
+        </Alert>
+      </div>
+    </div>
+  );
+}
+
+function IntentPageInner() {
   const { user, loading, refresh } = useSession();
   const { actingWorkspace } = useActingWorkspace();
   const router = useRouter();
+  const searchParams = useSearchParams();
   const [intent, setIntent] = useState<IntentKindV1 | null>(null);
   const [submitting, setSubmitting] = useState(false);
   const [error, setError] = useState<string | null>(null);
@@ -67,6 +99,19 @@ export default function IntentPage() {
     if (!user) return null;
     return user.workspaces.find((w) => w.workspaceType === "Personal") ?? null;
   }, [user]);
+
+  // Read the validated `?return=` query parameter (same-origin
+  // path shape only). The server is the authoritative validator
+  // (`isValidReturnPath`); this client helper pre-filters obvious
+  // junk so the user does not submit a value that would be
+  // silently dropped server-side. A
+  // non-same-origin, malformed, or `/api/` value is treated as
+  // absent (the route will fall back to `/dashboard`).
+  const validatedReturnTo = useMemo(() => {
+    const raw = searchParams.get("return");
+    if (!raw) return null;
+    return isLocallyValidReturnPath(raw) ? raw : null;
+  }, [searchParams]);
 
   // Read the COMMITTED acting Workspace (P1-001). The intent page
   // is Personal-Workspace-only; if the actor is not Personal,
@@ -164,7 +209,9 @@ export default function IntentPage() {
                 individual.
               </p>
               <a
-                href={`/workspace/switch?target=${encodeURIComponent(personalWorkspace.workspaceId)}`}
+                href={`/workspace/switch?target=${encodeURIComponent(personalWorkspace.workspaceId)}${
+                  validatedReturnTo ? `&return=${encodeURIComponent(validatedReturnTo)}` : ""
+                }`}
                 className="inline-flex items-center justify-center min-h-[44px] min-w-[44px] py-3 px-6 text-base font-medium text-white bg-aubergine hover:bg-aubergine-hover rounded focus:outline-none focus-visible:outline focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-aubergine"
                 data-testid="intent-switch-to-personal"
               >
@@ -186,7 +233,12 @@ export default function IntentPage() {
     setSubmitting(true);
     setError(null);
 
-    const intentBody: IntentRequestV1 = { intent };
+    // Carry the validated `?return=` forward. The schema requires
+    // the field to be present-or-omitted
+    // (`.strict()` rejects `null`); we submit it only when validated
+    // to avoid sending junk that the server would silently drop.
+    const intentBody: IntentRequestV1 =
+      validatedReturnTo !== null ? { intent, returnTo: validatedReturnTo } : { intent };
 
     void (async () => {
       try {

@@ -273,10 +273,43 @@ export interface AuthRepository {
    * Context-specific confirmations are owned by their later
    * boundaries (SellerProfile publication, media use, ServiceOffering
    * activation, Deal approval authority / approval).
+   *
+   * Conflict semantics. The transaction reads the workspace's
+   * EXISTING capability set BEFORE any write and rejects requests
+   * that would silently merge or widen into a different set than
+   * the customer originally requested. Identical retries commit
+   * normally (the in-transaction upserts absorb duplicates);
+   * conflicting retries throw `IntentConflictError` and roll
+   * back to zero rows. The dedicated "add the other capability"
+   * command (a later boundary) is the explicit path to a wider
+   * capability set.
    */
   provisionIntentAtomically(input: {
     readonly workspaceId: string;
     readonly userAccountId: string;
     readonly capabilities: readonly MarketplaceCapabilityV1[];
   }): Promise<void>;
+}
+
+/**
+ * Conflicting intent retry signal. Thrown by the atomic
+ * capability primitive when the existing capability set would
+ * silently merge or widen into a wider set than the requested
+ * one. The transaction has been rolled back; no rows were
+ * written.
+ *
+ * Surfaced as `INTENT_FORBIDDEN` to the customer. The dedicated
+ * "add the other capability" command (a later boundary) is the
+ * path to a wider capability set; the initial intent command
+ * must remain explicit.
+ */
+export class IntentConflictError extends Error {
+  constructor(
+    message: string,
+    public readonly existing: readonly MarketplaceCapabilityV1[],
+    public readonly requested: readonly MarketplaceCapabilityV1[],
+  ) {
+    super(message);
+    this.name = "IntentConflictError";
+  }
 }

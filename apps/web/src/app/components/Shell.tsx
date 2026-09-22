@@ -62,7 +62,11 @@ function deriveNavigationDestinations({
   // on the next render.
   if (!actingWorkspace) return out;
   const capabilities: readonly MarketplaceCapabilityV1[] = actingWorkspace.capabilities;
-  if (capabilities.includes("Buyer")) {
+  // Deals is a Deal-party destination, not a Buyer-only one.
+  // Sellers are also Deal parties — the Deal-list route
+  // authorizes Sellers on the Workspace's Deals exactly like
+  // Buyers. Expose the destination for EITHER capability.
+  if (capabilities.includes("Buyer") || capabilities.includes("Seller")) {
     out.push({ href: "/deals", label: "Deals", testId: "nav-deals-link" });
   }
   if (capabilities.includes("Seller")) {

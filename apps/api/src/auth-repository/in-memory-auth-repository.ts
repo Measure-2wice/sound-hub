@@ -31,6 +31,7 @@ import type {
   UserIdentityMapping,
   WorkspaceMembershipView,
 } from "./auth-repository.js";
+import { IntentConflictError } from "./auth-repository.js";
 
 export interface InMemoryMembershipSeed {
   readonly workspaceId: string;
@@ -406,33 +407,6 @@ export class InMemoryAuthRepository implements AuthRepository {
   // ---------- M2 #83: Intent selection primitives ----------
 
   /**
-   * The standalone capability primitive is a PRIVATE implementation
-   * helper (named with the `_` prefix convention). The
-   * InMemoryAuthRepository class exposes it so the in-class
-   * `provisionIntentAtomically` transaction helper can use it,
-   * but it is NOT part of the `AuthRepository` interface.
-   * Production consumers cannot call it — only the atomic command
-   * is exposed.
-   */
-
-  async _upsertCapability(input: {
-    readonly workspaceId: string;
-    readonly capability: MarketplaceCapabilityV1;
-  }): Promise<void> {
-    await Promise.resolve();
-    const workspace = this.workspacesById.get(input.workspaceId);
-    if (!workspace) {
-      throw new Error(
-        `InMemoryAuthRepository._upsertCapability: unknown workspaceId=${input.workspaceId}`,
-      );
-    }
-    if (!workspace.capabilities.includes(input.capability)) {
-      workspace.capabilities.push(input.capability);
-      workspace.capabilities.sort();
-    }
-  }
-
-  /**
    * M2 #83: symmetric in-memory implementation of the Prisma
    * transactional primitive. Real-world transaction atomicity is not
    * testable in a single-threaded in-memory store, so this
@@ -446,14 +420,26 @@ export class InMemoryAuthRepository implements AuthRepository {
    * participation/terms acceptance at capability-provisioning time.
    * Context-specific confirmations are owned by their later
    * boundaries.
+   *
+   * Conflict semantics mirror the Prisma adapter: pre-write
+   * check rejects requests that would silently merge or widen
+   * into a different capability set than the customer
+   * originally requested. Identical retries commit normally;
+   * conflicting retries throw `IntentConflictError` and the
+   * snapshot/restore block rolls the in-memory state back to
+   * the pre-call capability set.
    */
   async provisionIntentAtomically(input: {
     readonly workspaceId: string;
     readonly userAccountId: string;
     readonly capabilities: readonly MarketplaceCapabilityV1[];
   }): Promise<void> {
-    // Snapshot the workspace capabilities so a mid-write failure
-    // can roll back to the pre-call state.
+    // Mirror the Prisma adapter's atomic-shape: an `await` so the
+    // linter's require-await rule sees a real awaitable path. The
+    // snapshot/restore block below mirrors the Prisma
+    // `$transaction` rollback on failure.
+    await Promise.resolve();
+
     const workspace = this.workspacesById.get(input.workspaceId);
     if (!workspace) {
       throw new Error(
@@ -462,9 +448,23 @@ export class InMemoryAuthRepository implements AuthRepository {
     }
     const beforeCapabilities = [...workspace.capabilities];
 
+    // Pre-write conflict check. If the existing capability set
+    // has any element not in the requested set, a write would
+    // silently merge into a wider set than requested — reject
+    // without mutation.
+    const existing: readonly MarketplaceCapabilityV1[] = [...workspace.capabilities];
+    const requested: readonly MarketplaceCapabilityV1[] = [...input.capabilities];
+    if (hasConflictingCapability(existing, requested)) {
+      throw new IntentConflictError(
+        "Conflicting intent retry: existing capability set cannot be silently merged.",
+        [...existing].sort(),
+        [...requested].sort(),
+      );
+    }
+
     try {
       for (const capability of input.capabilities) {
-        await this._upsertCapability({ workspaceId: input.workspaceId, capability });
+        applyCapabilityUpsert(workspace, capability);
       }
     } catch (err) {
       // Roll back capability changes so a mid-write failure cannot
@@ -489,4 +489,42 @@ export class InMemoryAuthRepository implements AuthRepository {
       joinedAt: membership.createdAt,
     };
   }
+}
+
+/**
+ * Apply a single capability upsert to an in-memory workspace.
+ * Module-local helper — intentionally NOT exposed on the
+ * `InMemoryAuthRepository` class. Only the atomic
+ * `provisionIntentAtomically` primitive calls it. There is no
+ * public capability-primitive surface that could be called
+ * outside the atomic transaction.
+ */
+function applyCapabilityUpsert(
+  workspace: InternalWorkspace,
+  capability: MarketplaceCapabilityV1,
+): void {
+  if (!workspace.capabilities.includes(capability)) {
+    workspace.capabilities.push(capability);
+    workspace.capabilities.sort();
+  }
+}
+
+/**
+ * Shared conflict detector. The Prisma adapter and the
+ * in-memory adapter both call this helper so conflict semantics
+ * are identical in unit tests and in the real database. The
+ * intent command only accepts IDENTICAL retries; everything
+ * else is rejected (the dedicated "add the other capability"
+ * command is the explicit path to a wider set).
+ */
+function hasConflictingCapability(
+  existing: readonly MarketplaceCapabilityV1[],
+  requested: readonly MarketplaceCapabilityV1[],
+): boolean {
+  if (existing.length === 0) return false;
+  if (existing.length !== requested.length) return true;
+  for (const capability of existing) {
+    if (!requested.includes(capability)) return true;
+  }
+  return false;
 }

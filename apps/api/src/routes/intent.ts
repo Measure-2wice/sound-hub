@@ -173,21 +173,21 @@ async function handleIntent(req: Request, res: Response, deps: IntentRouteDeps):
       : null
     : null;
 
-  // Derive setupState via the existing convergence classification.
-  // Intent is capability-only; recovery is rendered by the
-  // dashboard from the user payload's existing `setupState`
-  // field. The route never re-classifies recovery as part of
-  // intent.
+  // Derive the full Personal Workspace convergence classification.
+  // The intent service uses the canonical Workspace id (when
+  // present) to require exact equality with the path workspaceId
+  // before any mutation. The route never re-classifies recovery
+  // — it passes the kind through so the service can apply the
+  // canonical-id check.
   const kind = await deps.personalWorkspaceConvergenceService.resolveConvergence({
     userAccountId: resolved.userAccountId,
   });
-  const setupState: "converged" | "recovery" = kind.kind === "converged" ? "converged" : "recovery";
 
   try {
     const result = await deps.intentService.submitIntent({
       userAccountId: resolved.userAccountId,
       workspaceId,
-      setupState,
+      convergence: kind,
       intent: parsed,
     });
 

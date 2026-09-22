@@ -10,7 +10,7 @@
 // Workspace shows both without a persona switch. Missing contextual
 // readiness does not globally block unrelated features.
 //
-// Authorization rules (Codex CHANGES_REQUESTED remediation §4-C3/X2):
+// Authorization rules:
 //
 //   - The dashboard derives from the COMMITTED
 //     `actingWorkspace` (via `useActingWorkspace()`); the same
@@ -208,7 +208,11 @@ function PersonalActingDashboard() {
                 </Link>
               </li>
             )}
-            {actingWorkspace.capabilities.includes("Buyer") && (
+            {/* Deals is a Deal-party destination, not a Buyer-only
+                one. Sellers are also Deal parties. The action is
+                available when EITHER capability is present. */}
+            {(actingWorkspace.capabilities.includes("Buyer") ||
+              actingWorkspace.capabilities.includes("Seller")) && (
               <li>
                 <Link
                   href="/deals"
@@ -307,6 +311,12 @@ function BuyerReadinessRow() {
 }
 
 function SellerReadinessRow() {
+  // The previous "Profile and service setup unlocks after your
+  // first deal" copy reversed the documented M2 journey:
+  // published profile + active services are the prerequisites
+  // for receiving ProjectRequests,
+  // not the consequence of a first Deal. Replace with the
+  // forward journey.
   return (
     <Card variant="parchment" data-testid="dashboard-seller-readiness">
       <Card.Header>
@@ -314,11 +324,11 @@ function SellerReadinessRow() {
       </Card.Header>
       <Card.Content>
         <p className="text-base text-muted">
-          Once your services are set up, you&apos;ll appear in search results and buyers can send
-          you project requests.
+          Publish your professional profile and activate at least one service to appear in search
+          results and receive project requests.
         </p>
         <p className="mt-2 text-sm text-muted" data-testid="dashboard-seller-hint">
-          Profile and service setup unlocks after your first deal.
+          You can save private drafts as you go — publication is a separate explicit step.
         </p>
       </Card.Content>
     </Card>
