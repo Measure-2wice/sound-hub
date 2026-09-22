@@ -165,32 +165,49 @@ function PersonalActingDashboard() {
   // Workspace does not see a fabricated feed. The fetched rows
   // are kept local — they are summary inputs, not authoritative
   // state — so a subsequent navigation can re-read fresh.
+  //
+  // P2-002: requests and deals carry INDEPENDENT load/error
+  // state. A failure from one list does NOT discard the other
+  // list's successful response, and a failure is NOT presented
+  // as a truthful empty state. The dashboard surfaces a small
+  // recoverable error card when grounded activity could not be
+  // loaded so a quiet Workspace cannot be confused with a
+  // broken API.
   const [requests, setRequests] = useState<readonly ProjectRequestPublicV1[] | null>(null);
+  const [requestsLoadError, setRequestsLoadError] = useState<boolean>(false);
   const [deals, setDeals] = useState<readonly DealListItemPublicV1[] | null>(null);
+  const [dealsLoadError, setDealsLoadError] = useState<boolean>(false);
   useEffect(() => {
     if (!hasAnyCapability) {
       setRequests(null);
+      setRequestsLoadError(false);
       setDeals(null);
+      setDealsLoadError(false);
       return;
     }
     let cancelled = false;
     void (async () => {
-      try {
-        const [reqResult, dealResult] = await Promise.all([
-          listProjectRequests({ actingWorkspaceId: actingWorkspace.workspaceId }),
-          listDeals(actingWorkspace.workspaceId),
-        ]);
-        if (cancelled) return;
-        setRequests(reqResult.projectRequests);
-        setDeals(dealResult.deals);
-      } catch {
-        // Session-stale errors hand control back to the
-        // SessionProvider, which re-renders the signed-out
-        // state. Showing an error here too would be
-        // redundant; a quiet re-render is enough.
-        if (cancelled) return;
+      const [reqResult, dealResult] = await Promise.allSettled([
+        listProjectRequests({ actingWorkspaceId: actingWorkspace.workspaceId }),
+        listDeals(actingWorkspace.workspaceId),
+      ]);
+      if (cancelled) return;
+      if (reqResult.status === "fulfilled") {
+        setRequests(reqResult.value.projectRequests);
+        setRequestsLoadError(false);
+      } else {
+        // Independent failure state: do NOT clobber an existing
+        // successful requests snapshot, but on a fresh load set
+        // the error flag so the recoverable error card can render.
         setRequests([]);
+        setRequestsLoadError(true);
+      }
+      if (dealResult.status === "fulfilled") {
+        setDeals(dealResult.value.deals);
+        setDealsLoadError(false);
+      } else {
         setDeals([]);
+        setDealsLoadError(true);
       }
     })();
     return () => {
@@ -212,19 +229,42 @@ function PersonalActingDashboard() {
         ).length;
   const negotiatingDeals =
     deals === null ? 0 : deals.filter((d) => d.status === "Negotiating").length;
-  // Approval-readiness: a Negotiating Deal awaiting Buyer approval
-  // is the documented context that makes the optional permission
-  // setup relevant. The dashboard surfaces this at low prominence
-  // — a single-line hint without a link, since permission-to-approve
-  // setup is owned by a later milestone and the dashboard must not
-  // fabricate navigation to a not-yet-shipped surface.
+  // P1-002: approval-readiness is derived per the acting
+  // Workspace's actual Deal party. Buyer-side readiness fires
+  // when ANY Negotiating Deal the actor owns on the Buyer side
+  // is awaiting Buyer approval (`AwaitingBuyerApproval` —
+  // seller already approved — or `AwaitingBothApprovals`). The
+  // Seller-side mirror fires when the actor's Seller-side Deals
+  // are awaiting Seller approval (`AwaitingSellerApproval` or
+  // `AwaitingBothApprovals`). A Seller-only Workspace with a
+  // Negotiating Deal in `AwaitingSellerApproval` MUST see the
+  // readiness hint, since Deal approval authority is party-
+  // and capability-neutral; the hint text is party-appropriate
+  // (no Buyer-specific copy leaking to a Seller-only actor).
+  //
+  // The hint is low prominence (a single muted paragraph) and
+  // does NOT link to a not-yet-shipped destination — setup is
+  // owned by a later milestone and the dashboard must not
+  // fabricate navigation.
+  const dealsLoaded = deals !== null;
   const buyerNeedsApproval =
     hasBuyer &&
-    deals !== null &&
+    dealsLoaded &&
     deals.some(
       (d) =>
         d.status === "Negotiating" &&
+        d.actingSide === "Buyer" &&
         (d.approvalState === "AwaitingBuyerApproval" ||
+          d.approvalState === "AwaitingBothApprovals"),
+    );
+  const sellerNeedsApproval =
+    hasSeller &&
+    dealsLoaded &&
+    deals.some(
+      (d) =>
+        d.status === "Negotiating" &&
+        d.actingSide === "Seller" &&
+        (d.approvalState === "AwaitingSellerApproval" ||
           d.approvalState === "AwaitingBothApprovals"),
     );
   const showActivity =
@@ -232,6 +272,7 @@ function PersonalActingDashboard() {
     requests !== null &&
     deals !== null &&
     (buyerPendingRequests > 0 || sellerPendingRequests > 0 || negotiatingDeals > 0);
+  const showLoadError = hasAnyCapability && (requestsLoadError || dealsLoadError);
 
   return (
     <>
@@ -364,9 +405,35 @@ function PersonalActingDashboard() {
         </Card>
       ) : null}
 
+      {showLoadError ? (
+        // P2-002: a small recoverable error card surfaces when
+        // grounded activity could not be loaded. The card
+        // MUST NOT render activity counts from a failure and
+        // MUST NOT be silent (a quiet re-render is insufficient
+        // because a Workspace with no records would look
+        // identical to a Workspace where the API failed).
+        <Card variant="parchment" data-testid="dashboard-activity-error">
+          <Card.Header>
+            <Card.Title>Couldn&apos;t load your activity</Card.Title>
+          </Card.Header>
+          <Card.Content>
+            <p className="text-base text-muted">
+              SoundHub couldn&apos;t load your current activity. Refresh the page to try again.
+            </p>
+          </Card.Content>
+        </Card>
+      ) : null}
+
       {buyerNeedsApproval ? (
-        <p className="text-sm text-muted" data-testid="dashboard-approval-readiness">
+        <p className="text-sm text-muted" data-testid="dashboard-approval-readiness-buyer">
           A Negotiating Deal needs your buyer approval. You can set up permission to approve terms
+          when you open the Deal.
+        </p>
+      ) : null}
+
+      {sellerNeedsApproval ? (
+        <p className="text-sm text-muted" data-testid="dashboard-approval-readiness-seller">
+          A Negotiating Deal needs your seller approval. You can set up permission to approve terms
           when you open the Deal.
         </p>
       ) : null}

@@ -127,8 +127,35 @@ describe("resolvePostCommandReturnDestination", () => {
     assert.deepEqual(result, { route: "/deals", path: "/deals" });
   });
 
-  test("/deals + actor without Buyer capability falls back", () => {
-    const user = buildUser({ personal: true }); // no Buyer
+  // P1-001: `/deals` is gated by Buyer OR Seller. Deals are a
+  // party destination for BOTH buyer and seller Workspaces, so a
+  // Seller-only Workspace returning from Offer intent or a
+  // Seller-Workspace switch must be able to resume the valid
+  // `/deals` continuation under the fresh post-command actor.
+  test("/deals + Seller-only actor is kept (P1-001: Deals are a party destination)", () => {
+    const user = buildUser({ personal: true, seller: true });
+    const result = resolvePostCommandReturnDestination({
+      returnTo: "/deals",
+      freshUser: user,
+      actingWorkspaceId: "ws-personal",
+      allowedOrigin: ALLOWED_ORIGIN,
+    });
+    assert.deepEqual(result, { route: "/deals", path: "/deals" });
+  });
+
+  test("/deals + dual-capability actor is kept (P1-001)", () => {
+    const user = buildUser({ personal: true, buyer: true, seller: true });
+    const result = resolvePostCommandReturnDestination({
+      returnTo: "/deals",
+      freshUser: user,
+      actingWorkspaceId: "ws-personal",
+      allowedOrigin: ALLOWED_ORIGIN,
+    });
+    assert.deepEqual(result, { route: "/deals", path: "/deals" });
+  });
+
+  test("/deals + actor with neither Buyer nor Seller falls back (P1-001)", () => {
+    const user = buildUser({ personal: true }); // no capabilities
     assert.throws(
       () =>
         resolvePostCommandReturnDestination({

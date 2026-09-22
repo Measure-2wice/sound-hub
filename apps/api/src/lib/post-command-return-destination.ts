@@ -23,15 +23,24 @@
 //   4. Workspace-scoped revalidation: if `workspaceId` appears as
 //      a path segment or query parameter, it must match a current,
 //      Active member Workspace of the fresh user.
-//   5. Capability-gated revalidation: `/deals` requires Buyer;
-//      `/seller-requests` and `/dashboard/audio` require Seller.
-//      `/talent` is open.
+//   5. Capability-gated revalidation: the route lookup is bounded
+//      to `POST_COMMAND_ROUTES_V1`. Routes are gated by a SET of
+//      capabilities; the actor satisfies the gate when they hold
+//      AT LEAST ONE listed capability. `/deals` is gated by Buyer
+//      OR Seller (Deal parties are both Buyer and Seller sides;
+//      the destination is reachable from either side). `/talent`
+//      is open.
 //   6. Replay protection: `/api/*` and unknown destinations cannot
 //      replay protected actions; the bounded set covers every
 //      legitimate #83 destination, so anything else is invalid.
 //   7. Fallback: any failure drops to `/dashboard`.
 
-import type { Bg1PublicUserV1, MarketplaceCapabilityV1 } from "@soundhub/types";
+import {
+  type Bg1PublicUserV1,
+  type MarketplaceCapabilityV1,
+  type PostCommandRouteV1,
+  postCommandRouteValuesV1,
+} from "@soundhub/types";
 import { isValidReturnPath } from "./return-context.js";
 
 /**
@@ -39,35 +48,38 @@ import { isValidReturnPath } from "./return-context.js";
  * deliberately closed: the #83 slice ships a small, named list of
  * internal routes, and unknown routes fall back to `/dashboard`.
  * No pattern matching, no heuristics.
+ *
+ * Re-exported here for downstream consumers (and tests) that want
+ * the server-side name. The canonical list lives in
+ * `@soundhub/types` so the typed client narrowing helper on the
+ * Workspace-switch interstitial stays consistent with the server's
+ * closed enum.
  */
-export type PostCommandRouteV1 =
-  | "/dashboard"
-  | "/workspace/intent"
-  | "/workspace/switch"
-  | "/talent"
-  | "/deals"
-  | "/seller-requests"
-  | "/dashboard/audio";
+export type { PostCommandRouteV1 };
 
-export const POST_COMMAND_ROUTES_V1: ReadonlySet<PostCommandRouteV1> = new Set([
-  "/dashboard",
-  "/workspace/intent",
-  "/workspace/switch",
-  "/talent",
-  "/deals",
-  "/seller-requests",
-  "/dashboard/audio",
-]);
+export const POST_COMMAND_ROUTES_V1: ReadonlySet<PostCommandRouteV1> = new Set(
+  postCommandRouteValuesV1,
+);
 
 /**
- * Routes that require a specific capability on the FRESH acting
- * Workspace. The route lookup is bounded — only routes in
- * `POST_COMMAND_ROUTES_V1` are recognized.
+ * Routes that require the FRESH acting Workspace to hold AT
+ * LEAST ONE of the listed capabilities. The route lookup is
+ * bounded — only routes in `POST_COMMAND_ROUTES_V1` are
+ * recognized. A route without a gate entry is open to any actor.
+ *
+ * `/deals` is gated by `Buyer OR Seller`: Deals are a party
+ * destination for BOTH buyer and seller Workspaces, so a
+ * Seller-only Workspace returning from Offer intent or a
+ * Seller-Workspace switch must be able to resume the valid
+ * `/deals` continuation under the fresh post-command actor.
  */
-const CAPABILITY_GATES: ReadonlyMap<PostCommandRouteV1, MarketplaceCapabilityV1> = new Map([
-  ["/deals", "Buyer"],
-  ["/seller-requests", "Seller"],
-  ["/dashboard/audio", "Seller"],
+const CAPABILITY_GATES: ReadonlyMap<
+  PostCommandRouteV1,
+  ReadonlySet<MarketplaceCapabilityV1>
+> = new Map([
+  ["/deals", new Set<MarketplaceCapabilityV1>(["Buyer", "Seller"])],
+  ["/seller-requests", new Set<MarketplaceCapabilityV1>(["Seller"])],
+  ["/dashboard/audio", new Set<MarketplaceCapabilityV1>(["Seller"])],
 ]);
 
 export interface ResolveReturnInput {
@@ -219,8 +231,8 @@ export function resolvePostCommandReturnDestination(
   }
 
   // Step 5: capability-gated revalidation.
-  const required = CAPABILITY_GATES.get(route);
-  if (required !== undefined) {
+  const requiredCapabilities = CAPABILITY_GATES.get(route);
+  if (requiredCapabilities !== undefined) {
     const actor = resolveActorWorkspace(input.freshUser, input.actingWorkspaceId);
     if (!actor) {
       throw new SafeReturnToFallback(
@@ -228,9 +240,16 @@ export function resolvePostCommandReturnDestination(
         "missing-capability",
       );
     }
-    if (!actor.capabilities.includes(required)) {
+    // The gate is satisfied when the actor holds AT LEAST ONE of the
+    // listed capabilities. A Seller-only Workspace returning to
+    // `/deals` and a Buyer-only Workspace returning to `/deals` both
+    // pass — Deals are a Deal-party destination, not a
+    // Buyer-exclusive one.
+    const satisfied = actor.capabilities.some((cap) => requiredCapabilities.has(cap));
+    if (!satisfied) {
+      const requiredList = [...requiredCapabilities].join(" | ");
       throw new SafeReturnToFallback(
-        `Acting Workspace lacks required capability (${required}) for ${route}.`,
+        `Acting Workspace lacks required capability (${requiredList}) for ${route}.`,
         "missing-capability",
       );
     }

@@ -31,6 +31,7 @@
 import { Suspense, useEffect, useMemo, useRef, useState } from "react";
 import { useRouter, useSearchParams } from "next/navigation";
 import type { Route } from "next";
+import { postCommandRouteValuesV1 } from "@soundhub/types";
 import { Card } from "../../components/ui/Card";
 import { Alert } from "../../components/ui/Alert";
 import {
@@ -318,22 +319,14 @@ function WorkspaceSwitchPageInner() {
 
 /**
  * The bounded #83 destination routes the server returns from
- * `resolvePostCommandReturnDestination`. This list mirrors the
- * closed set so the local narrowing stays consistent with the
- * server-side enforcement. The list is intentionally explicit —
- * any new route the resolver grows MUST also be added here so
- * the typed `Route<string>` cast does not silently admit
- * out-of-band values.
+ * `resolvePostCommandReturnDestination`. The closed enum is
+ * declared ONCE in `@soundhub/types` (`postCommandRouteValuesV1`)
+ * and consumed by both the server-side authority boundary and
+ * this typed client narrowing helper — adding a route in the
+ * resolver extends the same shared list, so a server-returnable
+ * value can never be silently rejected here.
  */
-const BOUNDED_SWITCH_ROUTES = [
-  "/dashboard",
-  "/workspace/intent",
-  "/workspace/switch",
-  "/talent",
-  "/deals",
-  "/seller-requests",
-  "/dashboard/audio",
-] as const;
+const BOUNDED_SWITCH_ROUTES: readonly string[] = postCommandRouteValuesV1;
 
 /**
  * Narrow a server-resolved `safeReturnTo` value into the typed
@@ -347,7 +340,7 @@ function toTypedSwitchRoute(safeReturnTo: string | null): Route<string> {
   const fallback = "/dashboard" as Route<string>;
   if (safeReturnTo === null) return fallback;
   const pathOnly = safeReturnTo.split("?")[0] ?? "";
-  if ((BOUNDED_SWITCH_ROUTES as readonly string[]).includes(pathOnly)) {
+  if (BOUNDED_SWITCH_ROUTES.includes(pathOnly)) {
     return safeReturnTo as Route<string>;
   }
   return fallback;

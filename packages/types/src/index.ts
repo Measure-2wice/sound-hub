@@ -962,6 +962,32 @@ export function deriveDeterministicSubject(email: string, sha256Hex: Sha256HexFn
 export const intentKindV1Values = ["Hire", "Offer", "Both"] as const;
 export type IntentKindV1 = (typeof intentKindV1Values)[number];
 
+// ---------- Bounded post-command return routes (M2 #83) ----------
+//
+// The closed set of internal return routes the post-command destination
+// resolver may emit. This list is the SHARED definition consumed by both
+// the server-side authority boundary
+// (`apps/api/src/lib/post-command-return-destination.ts`) AND the typed
+// client narrowing helper on the Workspace-switch interstitial
+// (`apps/web/src/app/workspace/switch/page.tsx`). Adding a route in the
+// resolver MUST extend this list in lock-step so a server-returnable
+// value can never be silently rejected by the client narrowing helper.
+//
+// The set is intentionally closed (#83 review §5): unknown routes fall
+// back to `/dashboard` rather than being pattern-matched. The resolver
+// does not build a general route-manifest authorization engine; the
+// list of authorized destinations is the closed enum declared here.
+export const postCommandRouteValuesV1 = [
+  "/dashboard",
+  "/workspace/intent",
+  "/workspace/switch",
+  "/talent",
+  "/deals",
+  "/seller-requests",
+  "/dashboard/audio",
+] as const;
+export type PostCommandRouteV1 = (typeof postCommandRouteValuesV1)[number];
+
 // ---------- Intent request ----------
 
 // The intent request body.

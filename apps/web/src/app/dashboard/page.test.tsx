@@ -260,33 +260,31 @@ describe("dashboard grounded activity + approval readiness (M2 #83 P1-002)", () 
     );
   });
 
-  test("Personal dashboard renders low-prominence approval-readiness only when a Negotiating Deal awaits Buyer approval", () => {
-    // P1-002: permission-to-approve readiness is low-prominence
-    // (a single muted paragraph) and contextual — it must
-    // appear ONLY when a Negotiating Deal requires Buyer
-    // approval. The surface must NOT link to a not-yet-shipped
-    // destination (no `href=` in the readiness line).
+  // P1-002: approval-readiness is derived per the acting
+  // Workspace's actual Deal party. The dashboard MUST surface
+  // party-appropriate readiness for both Buyer-only and
+  // Seller-only actors; a Seller-only Workspace with a Deal in
+  // `AwaitingSellerApproval` MUST see the Seller-side hint.
+  test("Personal dashboard derives Buyer-side approval-readiness from a Negotiating Deal the actor owns on the Buyer side", () => {
     assert.match(
       DASHBOARD_PAGE_SOURCE,
-      /data-testid="dashboard-approval-readiness"/,
-      "dashboard renders a stable testid on the approval-readiness surface",
+      /data-testid="dashboard-approval-readiness-buyer"/,
+      "dashboard renders a stable testid on the Buyer-side approval-readiness surface",
     );
     assert.match(
       DASHBOARD_PAGE_SOURCE,
-      /AwaitingBuyerApproval|AwaitingBothApprovals/,
-      "approval-readiness trigger MUST reference the closed-enum approval states",
+      /buyerNeedsApproval\s*=[\s\S]*?actingSide\s*===\s*["']Buyer["']/,
+      "Buyer-side readiness MUST be conditioned on the deal's actingSide === 'Buyer'",
     );
     const readinessBlock = DASHBOARD_PAGE_SOURCE.match(
-      /\{buyerNeedsApproval\s*\?\s*\(\s*<p\b[\s\S]*?data-testid="dashboard-approval-readiness"[\s\S]*?<\/p>/,
+      /\{buyerNeedsApproval\s*\?\s*\(\s*<p\b[\s\S]*?data-testid="dashboard-approval-readiness-buyer"[\s\S]*?<\/p>/,
     );
-    assert.ok(readinessBlock, "expected an approval-readiness surface");
+    assert.ok(readinessBlock, "expected a Buyer-side approval-readiness surface");
     assert.equal(
       /<Link\s|<a\s/i.test(readinessBlock[0]),
       false,
       "approval-readiness surface MUST NOT link to a not-yet-shipped destination",
     );
-    // The line must be muted (`text-muted`) so it stays low
-    // prominence against the readiness / activity cards above.
     assert.match(
       readinessBlock[0],
       /text-muted/,
@@ -294,7 +292,47 @@ describe("dashboard grounded activity + approval readiness (M2 #83 P1-002)", () 
     );
   });
 
-  test("Personal dashboard derives counts from existing rows without inventing persistence (no DealApprover / sellerAcceptance)", () => {
+  test("Personal dashboard derives Seller-side approval-readiness from a Negotiating Deal the actor owns on the Seller side (P1-002)", () => {
+    // P1-002: a Seller-only Workspace with a Negotiating Deal
+    // in `AwaitingSellerApproval` MUST see party-appropriate
+    // readiness copy. The hint MUST be party-specific — Seller
+    // copy cannot leak "buyer approval" wording to a Seller-only
+    // actor, and a Seller-only Workspace with NO Seller-side
+    // readiness MUST NOT see the Buyer-side hint.
+    assert.match(
+      DASHBOARD_PAGE_SOURCE,
+      /data-testid="dashboard-approval-readiness-seller"/,
+      "dashboard renders a stable testid on the Seller-side approval-readiness surface",
+    );
+    assert.match(
+      DASHBOARD_PAGE_SOURCE,
+      /sellerNeedsApproval\s*=[\s\S]*?actingSide\s*===\s*["']Seller["']/,
+      "Seller-side readiness MUST be conditioned on the deal's actingSide === 'Seller'",
+    );
+    assert.match(
+      DASHBOARD_PAGE_SOURCE,
+      /AwaitingSellerApproval/,
+      "Seller-side readiness MUST reference the closed AwaitingSellerApproval state",
+    );
+    const sellerReadinessBlock = DASHBOARD_PAGE_SOURCE.match(
+      /\{sellerNeedsApproval\s*\?\s*\(\s*<p\b[\s\S]*?data-testid="dashboard-approval-readiness-seller"[\s\S]*?<\/p>/,
+    );
+    assert.ok(sellerReadinessBlock, "expected a Seller-side approval-readiness surface");
+    // The Seller-side hint copy MUST NOT mention "buyer approval" —
+    // party-appropriate copy is mandatory per P1-002.
+    assert.equal(
+      /buyer approval/i.test(sellerReadinessBlock[0]),
+      false,
+      "Seller-side readiness copy MUST NOT mention 'buyer approval'",
+    );
+    assert.match(
+      sellerReadinessBlock[0],
+      /seller approval/i,
+      "Seller-side readiness copy MUST mention 'seller approval'",
+    );
+  });
+
+  test("Personal dashboard renders approval-readiness surfaces without inventing persistence (no DealApprover / sellerAcceptance)", () => {
     // P1-002 must NOT introduce new persistence or capability
     // fields. The dashboard reads existing repository records
     // and surfaces grounded counts only.
@@ -311,6 +349,95 @@ describe("dashboard grounded activity + approval readiness (M2 #83 P1-002)", () 
       /sellerAcceptance/.test(codeOnly),
       false,
       "dashboard MUST NOT collect a generic Seller participation acceptance",
+    );
+  });
+});
+
+describe("dashboard grounded activity error surface (M2 #83 P2-002)", () => {
+  // P2-002: a failure from either list request cannot be
+  // presented as a truthful empty Workspace. The dashboard
+  // carries independent load/error state per collection and
+  // surfaces a small recoverable error card so an API failure
+  // is distinguishable from a genuinely empty Workspace.
+
+  test("dashboard uses Promise.allSettled (not Promise.all) so a single failure does not discard the other list", () => {
+    assert.match(
+      DASHBOARD_PAGE_SOURCE,
+      /Promise\.allSettled\(/,
+      "dashboard MUST use Promise.allSettled to preserve independent load state",
+    );
+    assert.equal(
+      /Promise\.all\(\s*\[\s*listProjectRequests\([^)]+\)\s*,\s*listDeals\(/m.test(
+        DASHBOARD_PAGE_SOURCE,
+      ),
+      false,
+      "dashboard MUST NOT use Promise.all around the two list calls (it would discard one on the other's failure)",
+    );
+  });
+
+  test("dashboard carries independent error state per collection (requestsLoadError + dealsLoadError)", () => {
+    assert.match(
+      DASHBOARD_PAGE_SOURCE,
+      /requestsLoadError/,
+      "dashboard MUST carry independent requestsLoadError state",
+    );
+    assert.match(
+      DASHBOARD_PAGE_SOURCE,
+      /dealsLoadError/,
+      "dashboard MUST carry independent dealsLoadError state",
+    );
+    assert.match(
+      DASHBOARD_PAGE_SOURCE,
+      /setRequestsLoadError\(\s*true\s*\)/,
+      "dashboard MUST set requestsLoadError on a requests list failure",
+    );
+    assert.match(
+      DASHBOARD_PAGE_SOURCE,
+      /setDealsLoadError\(\s*true\s*\)/,
+      "dashboard MUST set dealsLoadError on a deals list failure",
+    );
+  });
+
+  test("dashboard surfaces a small recoverable error card when grounded activity cannot be loaded", () => {
+    assert.match(
+      DASHBOARD_PAGE_SOURCE,
+      /data-testid="dashboard-activity-error"/,
+      "dashboard MUST render a stable testid on the recoverable error card",
+    );
+    // The error card copy MUST mention "Couldn't load" or
+    // equivalent so the customer can distinguish a broken API
+    // from a genuinely empty Workspace.
+    assert.match(
+      DASHBOARD_PAGE_SOURCE,
+      /Couldn(?:&apos;|['’])t load your activity/,
+      "dashboard error card MUST surface a 'couldn't load' message",
+    );
+    assert.match(
+      DASHBOARD_PAGE_SOURCE,
+      /Refresh the page/,
+      "dashboard error card MUST surface a recoverable retry hint",
+    );
+  });
+
+  test("dashboard preserves a successful response when the other list fails (P2-002 partial-failure)", () => {
+    // P2-002: a partial-failure scenario must NOT discard the
+    // successful list's response. The source MUST guard each
+    // `setState` call independently of the other branch, so a
+    // successful requests/deals payload survives a failure of
+    // the other list.
+    //
+    // The implementation uses `Promise.allSettled` and branches
+    // on each result's `status`, so a failure in one branch
+    // cannot block the other branch's `setState` call. The
+    // surrounding `if (reqResult.status === "fulfilled")` /
+    // `if (dealResult.status === "fulfilled")` branches are
+    // structurally independent in the source.
+    const fulfilledBranches = DASHBOARD_PAGE_SOURCE.match(/status\s*===\s*["']fulfilled["']/g);
+    assert.ok(fulfilledBranches, "expected Promise.allSettled fulfilled branches");
+    assert.equal(
+      fulfilledBranches.length,
+      2,
+      "dashboard MUST have one fulfilled branch per collection (independent load state)",
     );
   });
 });

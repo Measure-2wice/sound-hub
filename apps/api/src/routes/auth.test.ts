@@ -538,6 +538,21 @@ describe("BG1 auth routes (in-memory, deterministic adapter)", () => {
     assert.equal(response.body.safeReturnTo, "/deals");
   });
 
+  // P1-001: Deals are a party destination for both Buyer and
+  // Seller Workspaces. A Seller-only actor returning to `/deals`
+  // must resume the valid continuation; the resolver MUST NOT
+  // silently drop the request to the dashboard fallback.
+  test("P1-001: POST /api/auth/acting-workspace with capability-gated `/deals` keeps the destination (Seller-only actor)", async () => {
+    const cookie = await signIn(app, adapter, "seller-route@example.com");
+    const response = await request(app)
+      .post("/api/auth/acting-workspace")
+      .send({ actingWorkspaceId: SELLER_WORKSPACE_ID, returnTo: "/deals" })
+      .set("Cookie", cookie)
+      .set("Content-Type", "application/json");
+    assert.equal(response.status, 200);
+    assert.equal(response.body.safeReturnTo, "/deals");
+  });
+
   test("P1-001: POST /api/auth/acting-workspace with capability-gated `/seller-requests` falls back to null (Buyer-only actor)", async () => {
     const cookie = await signIn(app, adapter, "buyer-route@example.com");
     const response = await request(app)
