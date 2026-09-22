@@ -77,10 +77,12 @@ export default function IntentPage() {
 function IntentLoading() {
   return (
     <div className="min-h-screen bg-canvas">
-      <div className="max-w-2xl mx-auto px-6 py-12" data-testid="intent-loading">
-        <Alert role="status" variant="status" title="Loading…">
-          Just a moment.
-        </Alert>
+      <div className="max-w-[1440px] mx-auto px-6 lg:px-12 py-12">
+        <div className="max-w-2xl mx-auto" data-testid="intent-loading">
+          <Alert role="status" variant="status" title="Loading…">
+            Just a moment.
+          </Alert>
+        </div>
       </div>
     </div>
   );
@@ -127,10 +129,12 @@ function IntentPageInner() {
   if (loading) {
     return (
       <div className="min-h-screen bg-canvas">
-        <div className="max-w-2xl mx-auto px-6 py-12" data-testid="intent-loading">
-          <Alert role="status" variant="status" title="Loading…">
-            Just a moment.
-          </Alert>
+        <div className="max-w-[1440px] mx-auto px-6 lg:px-12 py-12">
+          <div className="max-w-2xl mx-auto" data-testid="intent-loading">
+            <Alert role="status" variant="status" title="Loading…">
+              Just a moment.
+            </Alert>
+          </div>
         </div>
       </div>
     );
@@ -148,18 +152,21 @@ function IntentPageInner() {
   if (user.setupState === "recovery") {
     return (
       <div className="min-h-screen bg-canvas">
-        <div className="max-w-2xl mx-auto px-6 py-12" data-testid="intent-recovery">
-          <Card variant="recovery">
-            <Card.Header>
-              <Card.Title>Workspace setup needs your attention</Card.Title>
-            </Card.Header>
-            <Card.Content>
-              <p className="text-base text-muted">
-                SoundHub did not guess, merge, or automatically select a Personal Workspace for this
-                account. Intent selection is unavailable while Workspace ownership is in recovery.
-              </p>
-            </Card.Content>
-          </Card>
+        <div className="max-w-[1440px] mx-auto px-6 lg:px-12 py-12">
+          <div className="max-w-2xl mx-auto" data-testid="intent-recovery">
+            <Card variant="recovery">
+              <Card.Header>
+                <Card.Title>Workspace setup needs your attention</Card.Title>
+              </Card.Header>
+              <Card.Content>
+                <p className="text-base text-muted">
+                  SoundHub did not guess, merge, or automatically select a Personal Workspace for
+                  this account. Intent selection is unavailable while Workspace ownership is in
+                  recovery.
+                </p>
+              </Card.Content>
+            </Card>
+          </div>
         </div>
       </div>
     );
@@ -172,18 +179,20 @@ function IntentPageInner() {
   if (!personalWorkspace) {
     return (
       <div className="min-h-screen bg-canvas">
-        <div className="max-w-2xl mx-auto px-6 py-12" data-testid="intent-no-personal">
-          <Card variant="parchment">
-            <Card.Header>
-              <Card.Title>No Personal Workspace</Card.Title>
-            </Card.Header>
-            <Card.Content>
-              <p className="text-base text-muted">
-                Intent selection is available on your Personal Workspace. SoundHub could not find
-                one for this account.
-              </p>
-            </Card.Content>
-          </Card>
+        <div className="max-w-[1440px] mx-auto px-6 lg:px-12 py-12">
+          <div className="max-w-2xl mx-auto" data-testid="intent-no-personal">
+            <Card variant="parchment">
+              <Card.Header>
+                <Card.Title>No Personal Workspace</Card.Title>
+              </Card.Header>
+              <Card.Content>
+                <p className="text-base text-muted">
+                  Intent selection is available on your Personal Workspace. SoundHub could not find
+                  one for this account.
+                </p>
+              </Card.Content>
+            </Card>
+          </div>
         </div>
       </div>
     );
@@ -198,31 +207,33 @@ function IntentPageInner() {
   if (!personalActor) {
     return (
       <div className="min-h-screen bg-canvas">
-        <div className="max-w-2xl mx-auto px-6 py-12" data-testid="intent-not-personal-actor">
-          <Card variant="parchment">
-            <Card.Header>
-              <Card.Title>Switch to your Personal Workspace</Card.Title>
-            </Card.Header>
-            <Card.Content>
-              <p className="text-base text-muted mb-4">
-                Intent selection is Personal-only. You are currently acting as{" "}
-                <span className="font-medium text-ink" data-testid="intent-current-actor-name">
-                  {actingWorkspace?.name ?? "another Workspace"}
-                </span>
-                . Switch to your Personal Workspace to choose how you want to use SoundHub as an
-                individual.
-              </p>
-              <a
-                href={`/workspace/switch?target=${encodeURIComponent(personalWorkspace.workspaceId)}${
-                  validatedReturnTo ? `&return=${encodeURIComponent(validatedReturnTo)}` : ""
-                }`}
-                className="inline-flex items-center justify-center min-h-[44px] min-w-[44px] py-3 px-6 text-base font-medium text-white bg-aubergine hover:bg-aubergine-hover rounded focus:outline-none focus-visible:outline focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-aubergine"
-                data-testid="intent-switch-to-personal"
-              >
-                Switch to your Personal Workspace
-              </a>
-            </Card.Content>
-          </Card>
+        <div className="max-w-[1440px] mx-auto px-6 lg:px-12 py-12">
+          <div className="max-w-2xl mx-auto" data-testid="intent-not-personal-actor">
+            <Card variant="parchment">
+              <Card.Header>
+                <Card.Title>Switch to your Personal Workspace</Card.Title>
+              </Card.Header>
+              <Card.Content>
+                <p className="text-base text-muted mb-4">
+                  Intent selection is Personal-only. You are currently acting as{" "}
+                  <span className="font-medium text-ink" data-testid="intent-current-actor-name">
+                    {actingWorkspace?.name ?? "another Workspace"}
+                  </span>
+                  . Switch to your Personal Workspace to choose how you want to use SoundHub as an
+                  individual.
+                </p>
+                <a
+                  href={`/workspace/switch?target=${encodeURIComponent(personalWorkspace.workspaceId)}${
+                    validatedReturnTo ? `&return=${encodeURIComponent(validatedReturnTo)}` : ""
+                  }`}
+                  className="inline-flex items-center justify-center min-h-[44px] min-w-[44px] py-3 px-6 text-base font-medium text-white bg-aubergine hover:bg-aubergine-hover rounded focus:outline-none focus-visible:outline focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-aubergine"
+                  data-testid="intent-switch-to-personal"
+                >
+                  Switch to your Personal Workspace
+                </a>
+              </Card.Content>
+            </Card>
+          </div>
         </div>
       </div>
     );
@@ -317,126 +328,128 @@ function IntentPageInner() {
 
   return (
     <div className="min-h-screen bg-canvas">
-      <div className="max-w-2xl mx-auto px-6 py-12" data-testid="intent-page">
-        {hasBoth ? (
-          <>
-            <h1 className="text-3xl font-serif text-ink mb-3" data-testid="intent-heading">
-              You have both capabilities
-            </h1>
-            <p className="text-base text-muted mb-8" data-testid="intent-summary">
-              Your Personal Workspace is set up for hiring and offering services. Return to the
-              dashboard to continue.
-            </p>
-            <a
-              href="/dashboard"
-              className="inline-flex items-center justify-center min-h-[44px] min-w-[44px] py-3 px-6 text-base font-medium text-white bg-aubergine hover:bg-aubergine-hover rounded focus:outline-none focus-visible:outline focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-aubergine"
-              data-testid="intent-back-to-dashboard"
-            >
-              Return to dashboard
-            </a>
-          </>
-        ) : (
-          <>
-            <h1 className="text-3xl font-serif text-ink mb-3" data-testid="intent-heading">
-              {isBuyer
-                ? "Add Offer services too?"
-                : isSeller
-                  ? "Add Hire talent too?"
-                  : "How do you want to use SoundHub?"}
-            </h1>
-            <p className="text-base text-muted mb-8" data-testid="intent-summary">
-              {isBuyer
-                ? "You currently have Buyer capability. You can add Seller capability any time."
-                : isSeller
-                  ? "You currently have Seller capability. You can add Buyer capability any time."
-                  : "Choose how you want to use SoundHub. You can add the other capability later from the dashboard."}
-            </p>
+      <div className="max-w-[1440px] mx-auto px-6 lg:px-12 py-12">
+        <div className="max-w-2xl mx-auto" data-testid="intent-page">
+          {hasBoth ? (
+            <>
+              <h1 className="text-3xl font-serif text-ink mb-3" data-testid="intent-heading">
+                You have both capabilities
+              </h1>
+              <p className="text-base text-muted mb-8" data-testid="intent-summary">
+                Your Personal Workspace is set up for hiring and offering services. Return to the
+                dashboard to continue.
+              </p>
+              <a
+                href="/dashboard"
+                className="inline-flex items-center justify-center min-h-[44px] min-w-[44px] py-3 px-6 text-base font-medium text-white bg-aubergine hover:bg-aubergine-hover rounded focus:outline-none focus-visible:outline focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-aubergine"
+                data-testid="intent-back-to-dashboard"
+              >
+                Return to dashboard
+              </a>
+            </>
+          ) : (
+            <>
+              <h1 className="text-3xl font-serif text-ink mb-3" data-testid="intent-heading">
+                {isBuyer
+                  ? "Add Offer services too?"
+                  : isSeller
+                    ? "Add Hire talent too?"
+                    : "How do you want to use SoundHub?"}
+              </h1>
+              <p className="text-base text-muted mb-8" data-testid="intent-summary">
+                {isBuyer
+                  ? "You currently have Buyer capability. You can add Seller capability any time."
+                  : isSeller
+                    ? "You currently have Seller capability. You can add Buyer capability any time."
+                    : "Choose how you want to use SoundHub. You can add the other capability later from the dashboard."}
+              </p>
 
-            <form onSubmit={handleSubmit} className="space-y-4" data-testid="intent-form">
-              <fieldset disabled={submitting} className="space-y-3" data-testid="intent-fieldset">
-                <legend className="sr-only">Marketplace intent</legend>
-                {currentCapabilities.length === 0 ? (
-                  <>
-                    <IntentChoice
-                      value="Hire"
-                      title="Hire talent"
-                      description="Find Caribbean producers, songwriters, and performers. Send project requests and approve work."
-                      selected={intent === "Hire"}
-                      disabled={submitting}
-                      onSelect={setIntent}
-                      testId="intent-choice-hire"
-                    />
+              <form onSubmit={handleSubmit} className="space-y-4" data-testid="intent-form">
+                <fieldset disabled={submitting} className="space-y-3" data-testid="intent-fieldset">
+                  <legend className="sr-only">Marketplace intent</legend>
+                  {currentCapabilities.length === 0 ? (
+                    <>
+                      <IntentChoice
+                        value="Hire"
+                        title="Hire talent"
+                        description="Find Caribbean producers, songwriters, and performers. Send project requests and approve work."
+                        selected={intent === "Hire"}
+                        disabled={submitting}
+                        onSelect={setIntent}
+                        testId="intent-choice-hire"
+                      />
+                      <IntentChoice
+                        value="Offer"
+                        title="Offer services"
+                        description="Publish a profile and one or more services. Receive project requests from buyers."
+                        selected={intent === "Offer"}
+                        disabled={submitting}
+                        onSelect={setIntent}
+                        testId="intent-choice-offer"
+                      />
+                      <IntentChoice
+                        value="Both"
+                        title="Both"
+                        description="Hire talent and offer services from the same Personal Workspace."
+                        selected={intent === "Both"}
+                        disabled={submitting}
+                        onSelect={setIntent}
+                        testId="intent-choice-both"
+                      />
+                    </>
+                  ) : isBuyer ? (
                     <IntentChoice
                       value="Offer"
-                      title="Offer services"
+                      title="Add Offer services too"
                       description="Publish a profile and one or more services. Receive project requests from buyers."
                       selected={intent === "Offer"}
                       disabled={submitting}
                       onSelect={setIntent}
                       testId="intent-choice-offer"
                     />
+                  ) : (
                     <IntentChoice
-                      value="Both"
-                      title="Both"
-                      description="Hire talent and offer services from the same Personal Workspace."
-                      selected={intent === "Both"}
+                      value="Hire"
+                      title="Add Hire talent too"
+                      description="Find Caribbean producers, songwriters, and performers. Send project requests and approve work."
+                      selected={intent === "Hire"}
                       disabled={submitting}
                       onSelect={setIntent}
-                      testId="intent-choice-both"
+                      testId="intent-choice-hire"
                     />
-                  </>
-                ) : isBuyer ? (
-                  <IntentChoice
-                    value="Offer"
-                    title="Add Offer services too"
-                    description="Publish a profile and one or more services. Receive project requests from buyers."
-                    selected={intent === "Offer"}
-                    disabled={submitting}
-                    onSelect={setIntent}
-                    testId="intent-choice-offer"
-                  />
-                ) : (
-                  <IntentChoice
-                    value="Hire"
-                    title="Add Hire talent too"
-                    description="Find Caribbean producers, songwriters, and performers. Send project requests and approve work."
-                    selected={intent === "Hire"}
-                    disabled={submitting}
-                    onSelect={setIntent}
-                    testId="intent-choice-hire"
-                  />
-                )}
-              </fieldset>
+                  )}
+                </fieldset>
 
-              <button
-                type="submit"
-                disabled={submitDisabled}
-                className="w-full sm:w-auto inline-flex items-center justify-center min-h-[44px] min-w-[44px] py-3 px-6 text-base font-medium text-white bg-coral hover:bg-coral-hover rounded disabled:opacity-50 transition-colors focus:outline-none focus-visible:outline focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-coral"
-                data-testid="intent-submit"
-              >
-                {submitting ? "Submitting…" : "Continue"}
-              </button>
-            </form>
-          </>
-        )}
+                <button
+                  type="submit"
+                  disabled={submitDisabled}
+                  className="w-full sm:w-auto inline-flex items-center justify-center min-h-[44px] min-w-[44px] py-3 px-6 text-base font-medium text-white bg-coral hover:bg-coral-hover rounded disabled:opacity-50 transition-colors focus:outline-none focus-visible:outline focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-coral"
+                  data-testid="intent-submit"
+                >
+                  {submitting ? "Submitting…" : "Continue"}
+                </button>
+              </form>
+            </>
+          )}
 
-        {error && (
-          <div className="mt-6" data-testid="intent-error">
-            <Alert role="alert" variant="failure" title="Could not submit your choice">
-              {error}
-            </Alert>
-            {lastCode === "INTENT_CONFLICT" ? (
-              <button
-                type="button"
-                onClick={handleReload}
-                className="mt-3 inline-flex items-center justify-center min-h-[44px] min-w-[44px] py-2 px-4 text-sm font-medium text-aubergine hover:text-aubergine-hover border border-aubergine rounded focus:outline-none focus-visible:outline focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-aubergine"
-                data-testid="intent-reload"
-              >
-                Reload
-              </button>
-            ) : null}
-          </div>
-        )}
+          {error && (
+            <div className="mt-6" data-testid="intent-error">
+              <Alert role="alert" variant="failure" title="Could not submit your choice">
+                {error}
+              </Alert>
+              {lastCode === "INTENT_CONFLICT" ? (
+                <button
+                  type="button"
+                  onClick={handleReload}
+                  className="mt-3 inline-flex items-center justify-center min-h-[44px] min-w-[44px] py-2 px-4 text-sm font-medium text-aubergine hover:text-aubergine-hover border border-aubergine rounded focus:outline-none focus-visible:outline focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-aubergine"
+                  data-testid="intent-reload"
+                >
+                  Reload
+                </button>
+              ) : null}
+            </div>
+          )}
+        </div>
       </div>
     </div>
   );

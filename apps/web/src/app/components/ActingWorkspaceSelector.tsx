@@ -107,7 +107,7 @@ export function ActingWorkspaceSelector({ variant }: ActingWorkspaceSelectorProp
     if (variant === "desktop") {
       return (
         <span
-          className="text-sm font-medium text-ink truncate max-w-[16rem]"
+          className="text-sm font-medium text-ink truncate max-w-[12rem]"
           data-testid="acting-workspace-label"
           title={only.name}
         >
@@ -117,7 +117,7 @@ export function ActingWorkspaceSelector({ variant }: ActingWorkspaceSelectorProp
     }
     return (
       <span
-        className="text-sm font-medium text-ink truncate max-w-[10rem]"
+        className="text-sm font-medium text-ink truncate max-w-[8rem]"
         data-testid="acting-workspace-compact-label"
         title={only.name}
       >
@@ -144,7 +144,7 @@ export function ActingWorkspaceSelector({ variant }: ActingWorkspaceSelectorProp
 
   if (variant === "desktop") {
     return (
-      <div ref={containerRef} className="relative">
+      <div ref={containerRef} className="relative min-w-0">
         <button
           ref={buttonRef}
           type="button"
@@ -153,7 +153,7 @@ export function ActingWorkspaceSelector({ variant }: ActingWorkspaceSelectorProp
           aria-expanded={open}
           aria-controls={dropdownId}
           aria-label={`Acting Workspace: ${currentName}. Select to switch.`}
-          className="inline-flex items-center gap-2 min-h-[44px] px-3 py-2 text-sm font-medium text-ink bg-surface hover:bg-surface/80 border border-borderWarm rounded focus:outline-none focus-visible:outline focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-aubergine truncate max-w-[16rem]"
+          className="inline-flex items-center gap-2 min-h-[44px] px-3 py-2 text-sm font-medium text-ink bg-surface hover:bg-surface/80 border border-borderWarm rounded focus:outline-none focus-visible:outline focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-aubergine max-w-[12rem]"
           data-testid="acting-workspace-selector"
         >
           <span className="truncate" data-testid="acting-workspace-selector-name">
@@ -211,7 +211,7 @@ export function ActingWorkspaceSelector({ variant }: ActingWorkspaceSelectorProp
 
   // mobile-compact variant.
   return (
-    <div ref={containerRef} className="relative">
+    <div ref={containerRef} className="relative min-w-0">
       <button
         ref={buttonRef}
         type="button"
@@ -220,7 +220,7 @@ export function ActingWorkspaceSelector({ variant }: ActingWorkspaceSelectorProp
         aria-expanded={open}
         aria-controls={dropdownId}
         aria-label={`Acting Workspace: ${currentName}. Select to switch.`}
-        className="inline-flex items-center gap-1 min-h-[44px] min-w-[44px] px-2 py-1 text-sm font-medium text-ink bg-transparent hover:bg-surface border border-borderWarm rounded focus:outline-none focus-visible:outline focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-aubergine truncate max-w-[10rem]"
+        className="inline-flex items-center gap-1 min-h-[44px] min-w-[44px] px-2 py-1 text-sm font-medium text-ink bg-transparent hover:bg-surface border border-borderWarm rounded focus:outline-none focus-visible:outline focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-aubergine max-w-[8rem]"
         data-testid="acting-workspace-compact-selector"
       >
         <span className="truncate" data-testid="acting-workspace-compact-name">

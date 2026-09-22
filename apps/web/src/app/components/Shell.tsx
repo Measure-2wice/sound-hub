@@ -40,6 +40,7 @@ import type { Bg1PublicUserV1, MarketplaceCapabilityV1 } from "@soundhub/types";
 import { useActingWorkspace } from "./SessionProvider";
 import { SessionStatus } from "./SessionStatus";
 import { ActingWorkspaceSelector } from "./ActingWorkspaceSelector";
+import { SoundHubLogo } from "./SoundHubLogo";
 
 type NavigationDestination = {
   readonly href: Route;
@@ -100,24 +101,24 @@ export function Shell() {
     <header className="bg-canvas border-b border-borderWarm" data-testid="top-shell">
       <div className="max-w-7xl mx-auto px-4 sm:px-6 lg:px-8">
         <div className="flex justify-between items-center min-h-16 h-auto py-2 gap-4">
-          <div className="flex items-center gap-3 min-w-0">
+          <div className="flex items-center gap-3 min-w-0 shrink-0">
             <Link
               href="/"
-              className="text-xl sm:text-2xl font-bold text-ink truncate"
+              className="inline-flex items-center text-ink truncate"
               data-testid="shell-brand"
             >
-              <span aria-hidden="true">🎧</span> SoundHub
+              <SoundHubLogo size="md" />
             </Link>
           </div>
           <div
-            className="hidden md:flex items-center gap-4 min-w-0"
+            className="hidden lg:flex items-center gap-4 min-w-0 flex-1 justify-end"
             data-testid="shell-desktop-row"
           >
             {destinations.map((destination) => (
               <Link
                 key={destination.href}
                 href={destination.href}
-                className="text-sm font-medium text-muted hover:text-ink focus-visible:text-ink focus-visible:outline focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-aubergine rounded transition-colors"
+                className="text-sm font-medium text-muted hover:text-ink focus-visible:text-ink focus-visible:outline focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-aubergine rounded transition-colors whitespace-nowrap"
                 data-testid={destination.testId}
               >
                 {destination.label}
@@ -126,7 +127,10 @@ export function Shell() {
             <ActingWorkspaceSelector variant="desktop" />
             <SessionStatus />
           </div>
-          <div className="flex items-center gap-3 md:hidden min-w-0" data-testid="shell-mobile-bar">
+          <div
+            className="flex items-center gap-3 lg:hidden min-w-0 ml-auto"
+            data-testid="shell-mobile-bar"
+          >
             <ActingWorkspaceSelector variant="mobile-compact" />
             <SessionStatus />
             {hasMobileDestination && <MobileMenuToggle open={open} onToggle={onToggle} />}
@@ -184,7 +188,11 @@ function MobileMenuPanel({
   useEffect(() => {
     if (typeof window === "undefined") return undefined;
     const onResize = () => {
-      if (window.innerWidth >= 768) onClose();
+      // Match the `lg` breakpoint the desktop row uses (see Shell.tsx
+      // `shell-desktop-row hidden lg:flex`). At >= 1024px the desktop
+      // nav is visible; auto-close the mobile panel so it doesn't
+      // linger above the desktop destinations.
+      if (window.innerWidth >= 1024) onClose();
     };
     window.addEventListener("resize", onResize);
     return () => window.removeEventListener("resize", onResize);
@@ -193,7 +201,7 @@ function MobileMenuPanel({
   return (
     <div
       id="shell-mobile-panel"
-      className={`${open ? "block" : "hidden"} md:hidden border-t border-borderWarm py-2`}
+      className={`${open ? "block" : "hidden"} lg:hidden border-t border-borderWarm py-2`}
       data-testid="shell-mobile-panel"
       data-open={open ? "true" : "false"}
     >

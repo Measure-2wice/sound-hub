@@ -127,17 +127,22 @@ export default function DashboardPage() {
 
   return (
     <div className="min-h-screen bg-canvas">
-      <div className="max-w-3xl mx-auto px-6 py-8 space-y-6" data-testid="dashboard">
-        <header className="mb-2">
-          <h1 className="text-2xl font-serif text-ink mb-1" data-testid="dashboard-workspace-name">
-            {actingWorkspace.name}
-          </h1>
-          <p className="text-base text-muted" data-testid="dashboard-subtitle">
-            {actingWorkspace.workspaceType === "Personal"
-              ? "Your marketplace home."
-              : "Your organization home."}
-          </p>
-        </header>
+      <div className="max-w-[1440px] mx-auto px-6 lg:px-12 py-8 space-y-6" data-testid="dashboard">
+        <Card variant="parchment" data-testid="dashboard-personal-workspace-card">
+          <Card.Header>
+            <h1
+              className="text-3xl font-serif text-ink mb-1"
+              data-testid="dashboard-workspace-name"
+            >
+              {actingWorkspace.name}
+            </h1>
+            <p className="text-base text-muted" data-testid="dashboard-subtitle">
+              {actingWorkspace.workspaceType === "Personal"
+                ? "Your marketplace home."
+                : "Your organization home."}
+            </p>
+          </Card.Header>
+        </Card>
 
         {actingWorkspace.workspaceType === "Organization" ? (
           <OrganizationActingDashboard actingWorkspaceId={actingWorkspaceId} />

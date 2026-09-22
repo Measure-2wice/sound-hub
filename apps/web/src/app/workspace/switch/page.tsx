@@ -56,10 +56,12 @@ export default function WorkspaceSwitchPage() {
 function WorkspaceSwitchLoading() {
   return (
     <div className="min-h-screen bg-canvas">
-      <div className="max-w-2xl mx-auto px-6 py-12" data-testid="switch-loading">
-        <Alert role="status" variant="status" title="Loading…">
-          Just a moment.
-        </Alert>
+      <div className="max-w-[1440px] mx-auto px-6 lg:px-12 py-12">
+        <div className="max-w-2xl mx-auto" data-testid="switch-loading">
+          <Alert role="status" variant="status" title="Loading…">
+            Just a moment.
+          </Alert>
+        </div>
       </div>
     </div>
   );
@@ -133,25 +135,27 @@ function WorkspaceSwitchPageInner() {
   if (!user) {
     return (
       <div className="min-h-screen bg-canvas">
-        <div className="max-w-2xl mx-auto px-6 py-12" data-testid="switch-unavailable">
-          <Card variant="parchment">
-            <Card.Header>
-              <Card.Title>Workspace switch unavailable</Card.Title>
-            </Card.Header>
-            <Card.Content>
-              <p className="text-base text-muted mb-4">
-                You are not signed in. Return to the dashboard.
-              </p>
-              <button
-                type="button"
-                onClick={() => router.replace("/dashboard")}
-                className="inline-flex items-center justify-center min-h-[44px] min-w-[44px] py-3 px-6 text-base font-medium text-aubergine hover:text-aubergine-hover border border-aubergine rounded focus:outline-none focus-visible:outline focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-aubergine"
-                data-testid="switch-back-to-dashboard"
-              >
-                Return to dashboard
-              </button>
-            </Card.Content>
-          </Card>
+        <div className="max-w-[1440px] mx-auto px-6 lg:px-12 py-12">
+          <div className="max-w-2xl mx-auto" data-testid="switch-unavailable">
+            <Card variant="parchment">
+              <Card.Header>
+                <Card.Title>Workspace switch unavailable</Card.Title>
+              </Card.Header>
+              <Card.Content>
+                <p className="text-base text-muted mb-4">
+                  You are not signed in. Return to the dashboard.
+                </p>
+                <button
+                  type="button"
+                  onClick={() => router.replace("/dashboard")}
+                  className="inline-flex items-center justify-center min-h-[44px] min-w-[44px] py-3 px-6 text-base font-medium text-aubergine hover:text-aubergine-hover border border-aubergine rounded focus:outline-none focus-visible:outline focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-aubergine"
+                  data-testid="switch-back-to-dashboard"
+                >
+                  Return to dashboard
+                </button>
+              </Card.Content>
+            </Card>
+          </div>
         </div>
       </div>
     );
@@ -160,29 +164,31 @@ function WorkspaceSwitchPageInner() {
   if (!actingWorkspace || !target) {
     return (
       <div className="min-h-screen bg-canvas">
-        <div className="max-w-2xl mx-auto px-6 py-12" data-testid="switch-unavailable">
-          <Card variant="parchment">
-            <Card.Header>
-              <Card.Title>Workspace switch unavailable</Card.Title>
-            </Card.Header>
-            <Card.Content>
-              <p className="text-base text-muted mb-4">
-                SoundHub could not safely switch to the requested Workspace. The target may not be
-                accessible, or your remembered Workspace no longer exists.
-              </p>
-              <button
-                type="button"
-                onClick={() => {
-                  cancelPendingTarget();
-                  router.replace("/dashboard");
-                }}
-                className="inline-flex items-center justify-center min-h-[44px] min-w-[44px] py-3 px-6 text-base font-medium text-aubergine hover:text-aubergine-hover border border-aubergine rounded focus:outline-none focus-visible:outline focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-aubergine"
-                data-testid="switch-back-to-dashboard"
-              >
-                Return to dashboard
-              </button>
-            </Card.Content>
-          </Card>
+        <div className="max-w-[1440px] mx-auto px-6 lg:px-12 py-12">
+          <div className="max-w-2xl mx-auto" data-testid="switch-unavailable">
+            <Card variant="parchment">
+              <Card.Header>
+                <Card.Title>Workspace switch unavailable</Card.Title>
+              </Card.Header>
+              <Card.Content>
+                <p className="text-base text-muted mb-4">
+                  SoundHub could not safely switch to the requested Workspace. The target may not be
+                  accessible, or your remembered Workspace no longer exists.
+                </p>
+                <button
+                  type="button"
+                  onClick={() => {
+                    cancelPendingTarget();
+                    router.replace("/dashboard");
+                  }}
+                  className="inline-flex items-center justify-center min-h-[44px] min-w-[44px] py-3 px-6 text-base font-medium text-aubergine hover:text-aubergine-hover border border-aubergine rounded focus:outline-none focus-visible:outline focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-aubergine"
+                  data-testid="switch-back-to-dashboard"
+                >
+                  Return to dashboard
+                </button>
+              </Card.Content>
+            </Card>
+          </div>
         </div>
       </div>
     );
@@ -237,81 +243,83 @@ function WorkspaceSwitchPageInner() {
 
   return (
     <div className="min-h-screen bg-canvas">
-      <div className="max-w-2xl mx-auto px-6 py-12" data-testid="workspace-switch-page">
-        <h1 className="text-3xl font-serif text-ink mb-3" data-testid="workspace-switch-heading">
-          Switch acting Workspace?
-        </h1>
-        <p className="text-base text-muted mb-8" data-testid="workspace-switch-summary">
-          You&apos;re about to switch which Workspace you&apos;re acting as. SoundHub will
-          revalidate your access. Any Workspace-scoped input you&apos;ve started will stay with the
-          Workspace it was started on.
-        </p>
+      <div className="max-w-[1440px] mx-auto px-6 lg:px-12 py-12">
+        <div className="max-w-2xl mx-auto" data-testid="workspace-switch-page">
+          <h1 className="text-3xl font-serif text-ink mb-3" data-testid="workspace-switch-heading">
+            Switch acting Workspace?
+          </h1>
+          <p className="text-base text-muted mb-8" data-testid="workspace-switch-summary">
+            You&apos;re about to switch which Workspace you&apos;re acting as. SoundHub will
+            revalidate your access. Any Workspace-scoped input you&apos;ve started will stay with
+            the Workspace it was started on.
+          </p>
 
-        <Card variant="parchment" className="mb-6">
-          <Card.Content>
-            <dl className="space-y-3 text-base" data-testid="workspace-switch-current">
-              <div>
-                <dt className="inline font-medium text-muted">Currently acting as: </dt>
-                <dd className="inline text-ink" data-testid="workspace-switch-current-name">
-                  {actingWorkspace.name}
-                </dd>
-              </div>
-            </dl>
-          </Card.Content>
-        </Card>
-
-        <Card variant="parchment" className="mb-6">
-          <Card.Content>
-            <dl className="space-y-3 text-base" data-testid="workspace-switch-target">
-              <div>
-                <dt className="inline font-medium text-muted">Switch to: </dt>
-                <dd className="inline text-ink" data-testid="workspace-switch-target-name">
-                  {target.name}
-                </dd>
-              </div>
-              <div>
-                <dt className="inline font-medium text-muted">Type: </dt>
-                <dd className="inline text-ink">{target.workspaceType}</dd>
-              </div>
-              {target.capabilities.length > 0 && (
+          <Card variant="parchment" className="mb-6">
+            <Card.Content>
+              <dl className="space-y-3 text-base" data-testid="workspace-switch-current">
                 <div>
-                  <dt className="inline font-medium text-muted">Capabilities: </dt>
-                  <dd className="inline text-ink">{target.capabilities.join(", ")}</dd>
+                  <dt className="inline font-medium text-muted">Currently acting as: </dt>
+                  <dd className="inline text-ink" data-testid="workspace-switch-current-name">
+                    {actingWorkspace.name}
+                  </dd>
                 </div>
-              )}
-            </dl>
-          </Card.Content>
-        </Card>
+              </dl>
+            </Card.Content>
+          </Card>
 
-        <div className="flex flex-col sm:flex-row gap-3">
-          <button
-            ref={switchButtonRef}
-            type="button"
-            onClick={handleSwitch}
-            disabled={submitting}
-            className="inline-flex items-center justify-center min-h-[44px] min-w-[44px] py-3 px-6 text-base font-medium text-white bg-aubergine hover:bg-aubergine-hover rounded disabled:opacity-50 transition-colors focus:outline-none focus-visible:outline focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-aubergine"
-            data-testid="workspace-switch-continue"
-          >
-            {submitting ? "Switching…" : "Switch and continue"}
-          </button>
-          <button
-            type="button"
-            onClick={handleCancel}
-            disabled={submitting}
-            className="inline-flex items-center justify-center min-h-[44px] min-w-[44px] py-3 px-6 text-base font-medium text-aubergine hover:text-aubergine-hover focus:outline-none focus-visible:outline focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-aubergine rounded"
-            data-testid="workspace-switch-cancel"
-          >
-            Cancel
-          </button>
-        </div>
+          <Card variant="parchment" className="mb-6">
+            <Card.Content>
+              <dl className="space-y-3 text-base" data-testid="workspace-switch-target">
+                <div>
+                  <dt className="inline font-medium text-muted">Switch to: </dt>
+                  <dd className="inline text-ink" data-testid="workspace-switch-target-name">
+                    {target.name}
+                  </dd>
+                </div>
+                <div>
+                  <dt className="inline font-medium text-muted">Type: </dt>
+                  <dd className="inline text-ink">{target.workspaceType}</dd>
+                </div>
+                {target.capabilities.length > 0 && (
+                  <div>
+                    <dt className="inline font-medium text-muted">Capabilities: </dt>
+                    <dd className="inline text-ink">{target.capabilities.join(", ")}</dd>
+                  </div>
+                )}
+              </dl>
+            </Card.Content>
+          </Card>
 
-        {error && (
-          <div className="mt-6" data-testid="workspace-switch-error">
-            <Alert role="alert" variant="failure" title="Could not switch Workspace">
-              {error}
-            </Alert>
+          <div className="flex flex-col sm:flex-row gap-3">
+            <button
+              ref={switchButtonRef}
+              type="button"
+              onClick={handleSwitch}
+              disabled={submitting}
+              className="inline-flex items-center justify-center min-h-[44px] min-w-[44px] py-3 px-6 text-base font-medium text-white bg-aubergine hover:bg-aubergine-hover rounded disabled:opacity-50 transition-colors focus:outline-none focus-visible:outline focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-aubergine"
+              data-testid="workspace-switch-continue"
+            >
+              {submitting ? "Switching…" : "Switch and continue"}
+            </button>
+            <button
+              type="button"
+              onClick={handleCancel}
+              disabled={submitting}
+              className="inline-flex items-center justify-center min-h-[44px] min-w-[44px] py-3 px-6 text-base font-medium text-aubergine hover:text-aubergine-hover focus:outline-none focus-visible:outline focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-aubergine rounded"
+              data-testid="workspace-switch-cancel"
+            >
+              Cancel
+            </button>
           </div>
-        )}
+
+          {error && (
+            <div className="mt-6" data-testid="workspace-switch-error">
+              <Alert role="alert" variant="failure" title="Could not switch Workspace">
+                {error}
+              </Alert>
+            </div>
+          )}
+        </div>
       </div>
     </div>
   );
