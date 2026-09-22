@@ -28,6 +28,11 @@ const DASHBOARD_PAGE_SOURCE = readFileSync(
   `${new URL(".", import.meta.url).pathname}page.tsx`,
   "utf8",
 );
+const ACTIVITY_SECTION_SOURCE = readFileSync(
+  `${new URL(".", import.meta.url).pathname}activity-section.tsx`,
+  "utf8",
+);
+const DASHBOARD_SOURCES = `${DASHBOARD_PAGE_SOURCE}\n${ACTIVITY_SECTION_SOURCE}`;
 
 describe("dashboard recovery surface (M2 #82)", () => {
   test("recovery surface renders Organization memberships by name", () => {
@@ -214,6 +219,12 @@ describe("dashboard grounded activity + approval readiness (M2 #83 P1-002)", () 
   // APIs only — no new persistence.
 
   test("Personal dashboard renders compact 'Your activity' summary grounded in listProjectRequests + listDeals", () => {
+    // `listProjectRequests`/`listDeals` live in `page.tsx` (the
+    // load effect); the derived counts (`buyerPendingRequests`,
+    // `sellerPendingRequests`, `negotiatingDeals`) and the
+    // `dashboard-activity` testid live in `activity-section.tsx`
+    // (the extracted section). The dashboard's contract is the
+    // composition of both files.
     assert.match(
       DASHBOARD_PAGE_SOURCE,
       /listProjectRequests\(/,
@@ -221,32 +232,34 @@ describe("dashboard grounded activity + approval readiness (M2 #83 P1-002)", () 
     );
     assert.match(DASHBOARD_PAGE_SOURCE, /listDeals\(/, "dashboard reads Deal records");
     assert.match(
-      DASHBOARD_PAGE_SOURCE,
+      ACTIVITY_SECTION_SOURCE,
       /buyerWorkspaceId.*Pending|Pending.*buyerWorkspaceId/,
-      "dashboard derives a Buyer-pending count from ProjectRequest rows",
+      "activity section derives a Buyer-pending count from ProjectRequest rows",
     );
     assert.match(
-      DASHBOARD_PAGE_SOURCE,
+      ACTIVITY_SECTION_SOURCE,
       /sellerWorkspaceId.*Pending|Pending.*sellerWorkspaceId/,
-      "dashboard derives a Seller-pending count from ProjectRequest rows",
+      "activity section derives a Seller-pending count from ProjectRequest rows",
     );
     assert.match(
-      DASHBOARD_PAGE_SOURCE,
+      ACTIVITY_SECTION_SOURCE,
       /Negotiating/,
-      "dashboard derives a Negotiating-Deals count from Deal rows",
+      "activity section derives a Negotiating-Deals count from Deal rows",
     );
     assert.match(
-      DASHBOARD_PAGE_SOURCE,
+      ACTIVITY_SECTION_SOURCE,
       /data-testid="dashboard-activity"/,
-      "dashboard renders a stable testid on the activity card",
+      "activity section renders a stable testid on the activity card",
     );
   });
 
   test("Personal dashboard activity card is omitted entirely on empty / unloaded state (no fabricated feed)", () => {
     // The activity card is rendered conditionally on
     // (records loaded AND at least one count > 0). An empty
-    // Workspace must NOT see a fabricated feed.
-    const showActivityMatch = DASHBOARD_PAGE_SOURCE.match(/showActivity\s*=\s*[\s\S]*?;/);
+    // Workspace must NOT see a fabricated feed. The guard
+    // lives in `activity-section.tsx` after the #83
+    // P1-001 refactor.
+    const showActivityMatch = ACTIVITY_SECTION_SOURCE.match(/showActivity\s*=\s*[\s\S]*?;/);
     assert.ok(showActivityMatch, "expected a showActivity guard");
     assert.match(
       showActivityMatch[0],
@@ -254,7 +267,7 @@ describe("dashboard grounded activity + approval readiness (M2 #83 P1-002)", () 
       "activity card MUST be conditional on at least one non-zero grounded count",
     );
     assert.match(
-      DASHBOARD_PAGE_SOURCE,
+      ACTIVITY_SECTION_SOURCE,
       /showActivity\s*\?\s*\([\s\S]*?dashboard-activity[\s\S]*?\)\s*:\s*null/,
       "activity card MUST render or be omitted, never an empty fallback",
     );
@@ -267,16 +280,16 @@ describe("dashboard grounded activity + approval readiness (M2 #83 P1-002)", () 
   // `AwaitingSellerApproval` MUST see the Seller-side hint.
   test("Personal dashboard derives Buyer-side approval-readiness from a Negotiating Deal the actor owns on the Buyer side", () => {
     assert.match(
-      DASHBOARD_PAGE_SOURCE,
+      ACTIVITY_SECTION_SOURCE,
       /data-testid="dashboard-approval-readiness-buyer"/,
-      "dashboard renders a stable testid on the Buyer-side approval-readiness surface",
+      "activity section MUST render a stable testid on the Buyer-side approval-readiness surface",
     );
     assert.match(
-      DASHBOARD_PAGE_SOURCE,
+      ACTIVITY_SECTION_SOURCE,
       /buyerNeedsApproval\s*=[\s\S]*?actingSide\s*===\s*["']Buyer["']/,
       "Buyer-side readiness MUST be conditioned on the deal's actingSide === 'Buyer'",
     );
-    const readinessBlock = DASHBOARD_PAGE_SOURCE.match(
+    const readinessBlock = ACTIVITY_SECTION_SOURCE.match(
       /\{buyerNeedsApproval\s*\?\s*\(\s*<p\b[\s\S]*?data-testid="dashboard-approval-readiness-buyer"[\s\S]*?<\/p>/,
     );
     assert.ok(readinessBlock, "expected a Buyer-side approval-readiness surface");
@@ -300,21 +313,21 @@ describe("dashboard grounded activity + approval readiness (M2 #83 P1-002)", () 
     // actor, and a Seller-only Workspace with NO Seller-side
     // readiness MUST NOT see the Buyer-side hint.
     assert.match(
-      DASHBOARD_PAGE_SOURCE,
+      ACTIVITY_SECTION_SOURCE,
       /data-testid="dashboard-approval-readiness-seller"/,
-      "dashboard renders a stable testid on the Seller-side approval-readiness surface",
+      "activity section MUST render a stable testid on the Seller-side approval-readiness surface",
     );
     assert.match(
-      DASHBOARD_PAGE_SOURCE,
+      ACTIVITY_SECTION_SOURCE,
       /sellerNeedsApproval\s*=[\s\S]*?actingSide\s*===\s*["']Seller["']/,
       "Seller-side readiness MUST be conditioned on the deal's actingSide === 'Seller'",
     );
     assert.match(
-      DASHBOARD_PAGE_SOURCE,
+      ACTIVITY_SECTION_SOURCE,
       /AwaitingSellerApproval/,
       "Seller-side readiness MUST reference the closed AwaitingSellerApproval state",
     );
-    const sellerReadinessBlock = DASHBOARD_PAGE_SOURCE.match(
+    const sellerReadinessBlock = ACTIVITY_SECTION_SOURCE.match(
       /\{sellerNeedsApproval\s*\?\s*\(\s*<p\b[\s\S]*?data-testid="dashboard-approval-readiness-seller"[\s\S]*?<\/p>/,
     );
     assert.ok(sellerReadinessBlock, "expected a Seller-side approval-readiness surface");
@@ -400,7 +413,7 @@ describe("dashboard grounded activity error surface (M2 #83 P2-002)", () => {
 
   test("dashboard surfaces a small recoverable error card when grounded activity cannot be loaded", () => {
     assert.match(
-      DASHBOARD_PAGE_SOURCE,
+      DASHBOARD_SOURCES,
       /data-testid="dashboard-activity-error"/,
       "dashboard MUST render a stable testid on the recoverable error card",
     );
@@ -408,12 +421,12 @@ describe("dashboard grounded activity error surface (M2 #83 P2-002)", () => {
     // equivalent so the customer can distinguish a broken API
     // from a genuinely empty Workspace.
     assert.match(
-      DASHBOARD_PAGE_SOURCE,
+      DASHBOARD_SOURCES,
       /Couldn(?:&apos;|['’])t load your activity/,
       "dashboard error card MUST surface a 'couldn't load' message",
     );
     assert.match(
-      DASHBOARD_PAGE_SOURCE,
+      DASHBOARD_SOURCES,
       /Refresh the page/,
       "dashboard error card MUST surface a recoverable retry hint",
     );
@@ -438,6 +451,60 @@ describe("dashboard grounded activity error surface (M2 #83 P2-002)", () => {
       fulfilledBranches.length,
       2,
       "dashboard MUST have one fulfilled branch per collection (independent load state)",
+    );
+  });
+});
+
+describe("dashboard cross-Workspace stale state (M2 #83 P1-001)", () => {
+  // P1-001: switching the acting Workspace MUST NOT cause the
+  // previously-loaded Workspace's grounded activity to render
+  // against the new actor. The dashboard binds loaded state to
+  // the Workspace that produced it and renders nothing for an
+  // actor whose fetch has not yet resolved.
+  //
+  // The behavior is exercised at the React boundary by
+  // `apps/web/src/app/dashboard/activity-section.test.tsx`
+  // (rendering tests). These source-pattern tests pin the
+  // gate logic so a regression that removes the
+  // `loadedForWorkspaceId` tracking fails here before reaching
+  // the behavior layer.
+
+  test("dashboard tracks loadedForWorkspaceId alongside the loaded activity state", () => {
+    assert.match(
+      DASHBOARD_SOURCES,
+      /loadedForWorkspaceId/,
+      "dashboard MUST carry loadedForWorkspaceId state to bind loaded activity to the actor that produced it",
+    );
+    assert.match(
+      DASHBOARD_SOURCES,
+      /setLoadedForWorkspaceId\(/,
+      "dashboard MUST update loadedForWorkspaceId when the fetch settles",
+    );
+  });
+
+  test("dashboard clears loadedForWorkspaceId on actor change so stale state cannot render", () => {
+    // The effect body MUST clear `loadedForWorkspaceId` (and
+    // its companion state) at the start of each fetch, so the
+    // FIRST render after an actor switch sees the cleared
+    // state and the rendered section returns `null`.
+    const clearBlock = DASHBOARD_SOURCES.match(/setLoadedForWorkspaceId\(\s*null\s*\)/);
+    assert.ok(
+      clearBlock,
+      "dashboard MUST clear loadedForWorkspaceId on each fetch start to prevent stale rendering",
+    );
+  });
+
+  test("dashboard renders the activity section through a P1-001 cross-Workspace gate (loadedForWorkspaceId === actingWorkspace.workspaceId)", () => {
+    // The behavior test file (`activity-section.test.tsx`) is
+    // the canonical guarantee of the cross-Workspace gate at
+    // the rendered-DOM level. This source-pattern assertion
+    // pins the gate's presence in the dashboard's source so a
+    // refactor cannot silently re-introduce cross-Workspace
+    // stale state.
+    assert.match(
+      ACTIVITY_SECTION_SOURCE,
+      /loadedForWorkspaceId\s*!==\s*actingWorkspace\.workspaceId/,
+      "activity section MUST gate grounded activity on loadedForWorkspaceId === actingWorkspace.workspaceId",
     );
   });
 });

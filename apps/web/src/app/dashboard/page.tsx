@@ -42,6 +42,7 @@ import { Alert } from "../components/ui/Alert";
 import { listDeals } from "../lib/deal-list-client";
 import { listProjectRequests } from "../lib/project-requests-client";
 import type { DealListItemPublicV1, ProjectRequestPublicV1 } from "@soundhub/types";
+import { DashboardActivitySection } from "./activity-section";
 
 export default function DashboardPage() {
   const { user, loading } = useSession();
@@ -166,6 +167,18 @@ function PersonalActingDashboard() {
   // are kept local — they are summary inputs, not authoritative
   // state — so a subsequent navigation can re-read fresh.
   //
+  // P1-001: the loaded activity state is BOUND to the
+  // `loadedForWorkspaceId` that produced it. When the actor
+  // switches Workspaces, the dashboard MUST NOT render the
+  // previous Workspace's counts, approval hints, or load errors
+  // against the newly selected Workspace. Until the new fetch
+  // settles, `loadedForWorkspaceId` is `null` (cleared at the
+  // start of the effect) and `DashboardActivitySection` renders
+  // NOTHING for the in-flight Workspace — no stale counts, no
+  // stale approval readiness, no stale error card. Once the
+  // fetch settles for the new actor, the section renders only
+  // the new actor's data.
+  //
   // P2-002: requests and deals carry INDEPENDENT load/error
   // state. A failure from one list does NOT discard the other
   // list's successful response, and a failure is NOT presented
@@ -173,18 +186,30 @@ function PersonalActingDashboard() {
   // recoverable error card when grounded activity could not be
   // loaded so a quiet Workspace cannot be confused with a
   // broken API.
+  const [loadedForWorkspaceId, setLoadedForWorkspaceId] = useState<string | null>(null);
   const [requests, setRequests] = useState<readonly ProjectRequestPublicV1[] | null>(null);
   const [requestsLoadError, setRequestsLoadError] = useState<boolean>(false);
   const [deals, setDeals] = useState<readonly DealListItemPublicV1[] | null>(null);
   const [dealsLoadError, setDealsLoadError] = useState<boolean>(false);
   useEffect(() => {
     if (!hasAnyCapability) {
+      setLoadedForWorkspaceId(null);
       setRequests(null);
       setRequestsLoadError(false);
       setDeals(null);
       setDealsLoadError(false);
       return;
     }
+    // Clear stale state synchronously so the FIRST render after
+    // an actor switch does not display the previous Workspace's
+    // grounded activity. The cleanup flag in the return below
+    // only prevents an in-flight fetch from committing late; it
+    // cannot prevent already-committed state from rendering.
+    setLoadedForWorkspaceId(null);
+    setRequests(null);
+    setRequestsLoadError(false);
+    setDeals(null);
+    setDealsLoadError(false);
     let cancelled = false;
     void (async () => {
       const [reqResult, dealResult] = await Promise.allSettled([
@@ -196,9 +221,6 @@ function PersonalActingDashboard() {
         setRequests(reqResult.value.projectRequests);
         setRequestsLoadError(false);
       } else {
-        // Independent failure state: do NOT clobber an existing
-        // successful requests snapshot, but on a fresh load set
-        // the error flag so the recoverable error card can render.
         setRequests([]);
         setRequestsLoadError(true);
       }
@@ -209,70 +231,14 @@ function PersonalActingDashboard() {
         setDeals([]);
         setDealsLoadError(true);
       }
+      // Bind the loaded snapshot to the Workspace that produced
+      // it. Until this resolves, no derived value renders.
+      setLoadedForWorkspaceId(actingWorkspace.workspaceId);
     })();
     return () => {
       cancelled = true;
     };
   }, [actingWorkspace.workspaceId, hasAnyCapability]);
-
-  const buyerPendingRequests =
-    requests === null
-      ? 0
-      : requests.filter(
-          (r) => r.status === "Pending" && r.buyerWorkspaceId === actingWorkspace.workspaceId,
-        ).length;
-  const sellerPendingRequests =
-    requests === null
-      ? 0
-      : requests.filter(
-          (r) => r.status === "Pending" && r.sellerWorkspaceId === actingWorkspace.workspaceId,
-        ).length;
-  const negotiatingDeals =
-    deals === null ? 0 : deals.filter((d) => d.status === "Negotiating").length;
-  // P1-002: approval-readiness is derived per the acting
-  // Workspace's actual Deal party. Buyer-side readiness fires
-  // when ANY Negotiating Deal the actor owns on the Buyer side
-  // is awaiting Buyer approval (`AwaitingBuyerApproval` —
-  // seller already approved — or `AwaitingBothApprovals`). The
-  // Seller-side mirror fires when the actor's Seller-side Deals
-  // are awaiting Seller approval (`AwaitingSellerApproval` or
-  // `AwaitingBothApprovals`). A Seller-only Workspace with a
-  // Negotiating Deal in `AwaitingSellerApproval` MUST see the
-  // readiness hint, since Deal approval authority is party-
-  // and capability-neutral; the hint text is party-appropriate
-  // (no Buyer-specific copy leaking to a Seller-only actor).
-  //
-  // The hint is low prominence (a single muted paragraph) and
-  // does NOT link to a not-yet-shipped destination — setup is
-  // owned by a later milestone and the dashboard must not
-  // fabricate navigation.
-  const dealsLoaded = deals !== null;
-  const buyerNeedsApproval =
-    hasBuyer &&
-    dealsLoaded &&
-    deals.some(
-      (d) =>
-        d.status === "Negotiating" &&
-        d.actingSide === "Buyer" &&
-        (d.approvalState === "AwaitingBuyerApproval" ||
-          d.approvalState === "AwaitingBothApprovals"),
-    );
-  const sellerNeedsApproval =
-    hasSeller &&
-    dealsLoaded &&
-    deals.some(
-      (d) =>
-        d.status === "Negotiating" &&
-        d.actingSide === "Seller" &&
-        (d.approvalState === "AwaitingSellerApproval" ||
-          d.approvalState === "AwaitingBothApprovals"),
-    );
-  const showActivity =
-    hasAnyCapability &&
-    requests !== null &&
-    deals !== null &&
-    (buyerPendingRequests > 0 || sellerPendingRequests > 0 || negotiatingDeals > 0);
-  const showLoadError = hasAnyCapability && (requestsLoadError || dealsLoadError);
 
   return (
     <>
@@ -351,92 +317,16 @@ function PersonalActingDashboard() {
         </Card.Content>
       </Card>
 
-      {showActivity ? (
-        <Card variant="parchment" data-testid="dashboard-activity">
-          <Card.Header>
-            <Card.Title>Your activity</Card.Title>
-          </Card.Header>
-          <Card.Content>
-            <ul className="space-y-2 text-base">
-              {hasBuyer && buyerPendingRequests > 0 && (
-                <li className="flex items-baseline justify-between gap-3">
-                  <span className="text-muted">Pending requests you sent</span>
-                  <span
-                    className="font-medium text-ink"
-                    data-testid="dashboard-activity-buyer-pending"
-                  >
-                    {buyerPendingRequests}
-                  </span>
-                </li>
-              )}
-              {hasSeller && sellerPendingRequests > 0 && (
-                <li className="flex items-baseline justify-between gap-3">
-                  <Link
-                    href="/seller-requests"
-                    className="text-aubergine hover:text-aubergine-hover font-medium focus:outline-none focus-visible:outline focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-aubergine rounded"
-                    data-testid="dashboard-activity-seller-pending-link"
-                  >
-                    Requests awaiting your response
-                  </Link>
-                  <span
-                    className="font-medium text-ink"
-                    data-testid="dashboard-activity-seller-pending"
-                  >
-                    {sellerPendingRequests}
-                  </span>
-                </li>
-              )}
-              {negotiatingDeals > 0 && (
-                <li className="flex items-baseline justify-between gap-3">
-                  <Link
-                    href="/deals"
-                    className="text-aubergine hover:text-aubergine-hover font-medium focus:outline-none focus-visible:outline focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-aubergine rounded"
-                    data-testid="dashboard-activity-deals-link"
-                  >
-                    Deals negotiating
-                  </Link>
-                  <span className="font-medium text-ink" data-testid="dashboard-activity-deals">
-                    {negotiatingDeals}
-                  </span>
-                </li>
-              )}
-            </ul>
-          </Card.Content>
-        </Card>
-      ) : null}
-
-      {showLoadError ? (
-        // P2-002: a small recoverable error card surfaces when
-        // grounded activity could not be loaded. The card
-        // MUST NOT render activity counts from a failure and
-        // MUST NOT be silent (a quiet re-render is insufficient
-        // because a Workspace with no records would look
-        // identical to a Workspace where the API failed).
-        <Card variant="parchment" data-testid="dashboard-activity-error">
-          <Card.Header>
-            <Card.Title>Couldn&apos;t load your activity</Card.Title>
-          </Card.Header>
-          <Card.Content>
-            <p className="text-base text-muted">
-              SoundHub couldn&apos;t load your current activity. Refresh the page to try again.
-            </p>
-          </Card.Content>
-        </Card>
-      ) : null}
-
-      {buyerNeedsApproval ? (
-        <p className="text-sm text-muted" data-testid="dashboard-approval-readiness-buyer">
-          A Negotiating Deal needs your buyer approval. You can set up permission to approve terms
-          when you open the Deal.
-        </p>
-      ) : null}
-
-      {sellerNeedsApproval ? (
-        <p className="text-sm text-muted" data-testid="dashboard-approval-readiness-seller">
-          A Negotiating Deal needs your seller approval. You can set up permission to approve terms
-          when you open the Deal.
-        </p>
-      ) : null}
+      <DashboardActivitySection
+        requests={requests}
+        deals={deals}
+        requestsLoadError={requestsLoadError}
+        dealsLoadError={dealsLoadError}
+        hasBuyer={hasBuyer}
+        hasSeller={hasSeller}
+        actingWorkspace={actingWorkspace}
+        loadedForWorkspaceId={loadedForWorkspaceId}
+      />
     </>
   );
 }
