@@ -52,7 +52,7 @@
 //     Workspace, including the recovery-state refusal and the
 //     Personal-Workspace boundary.
 
-import { Suspense, useMemo, useState, type FormEvent } from "react";
+import { Suspense, useEffect, useMemo, useState, type FormEvent } from "react";
 import { useRouter, useSearchParams } from "next/navigation";
 import { useActingWorkspace, useSession } from "../../components/SessionProvider";
 import { Card } from "../../components/ui/Card";
@@ -126,7 +126,24 @@ function IntentPageInner() {
   const personalActor =
     actingWorkspace && actingWorkspace.workspaceType === "Personal" ? actingWorkspace : null;
 
-  if (loading) {
+  // Redirect signed-out visitors to /login. The redirect lives in
+  // a useEffect callback (NOT in the render body) so the browser
+  // never receives a navigation call during render — calling
+  // `router.replace` directly during render triggers
+  // "Cannot update Router while rendering IntentPageInner" (Codex
+  // React correctness finding). While the session is still
+  // resolving OR the user is null but the redirect has not yet
+  // resolved, the render keeps returning the loading surface; the
+  // effect runs after commit, navigates once, and the new
+  // destination mounts under the new route.
+  useEffect(() => {
+    if (loading) return;
+    if (!user) {
+      void router.replace("/login?return=/workspace/intent");
+    }
+  }, [loading, user, router]);
+
+  if (loading || !user) {
     return (
       <div className="min-h-screen bg-canvas">
         <div className="max-w-[1440px] mx-auto px-6 lg:px-12 py-12">
@@ -138,11 +155,6 @@ function IntentPageInner() {
         </div>
       </div>
     );
-  }
-
-  if (!user) {
-    void router.replace("/login?return=/workspace/intent");
-    return null;
   }
 
   // Recovery state: render only. Intent self-service is

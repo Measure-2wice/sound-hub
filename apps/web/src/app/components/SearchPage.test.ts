@@ -37,7 +37,8 @@ import assert from "node:assert/strict";
 import { describe, test } from "node:test";
 import { renderToStaticMarkup } from "react-dom/server";
 import type { TalentSearchResultV1 } from "@soundhub/types";
-import { EmptySearchGuidance, ResultCard } from "./SearchPage";
+import { ResultCard } from "./ResultCard";
+import { EmptySearchGuidance } from "./SearchPage";
 import { EMPTY_SEARCH_GUIDANCE_MESSAGE } from "../lib/talent-search-request-builder";
 
 // Stable sample so the assertions read as a single behavioral contract

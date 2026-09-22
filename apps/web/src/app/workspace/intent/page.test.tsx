@@ -170,6 +170,109 @@ describe("IntentPage — M2 #83 capability-only contract (#83 re-revision)", () 
       "page MUST navigate via the navigateAfterIntent seam with the response",
     );
   });
+
+  // Codex React correctness finding: visiting /workspace/intent
+  // without a valid session must not trigger navigation during
+  // render. The previous implementation called
+  // `router.replace("/login?return=/workspace/intent")` directly
+  // inside an `if (!user)` branch in the render body, which
+  // throws "Cannot update Router while rendering IntentPageInner"
+  // when React's reconciler schedules the navigation against the
+  // live render. The fix moves the redirect into a `useEffect`
+  // callback so it executes after commit, and keeps the loading
+  // surface mounted for both the still-loading and the signed-
+  // out branches (the redirect fires from the effect, not from
+  // render).
+  test("Signed-out redirect lives inside useEffect — NEVER in the render body", () => {
+    const source = readFile("workspace/intent/page.tsx");
+
+    // The redirect target MUST be reachable from a useEffect
+    // callback body. Extract every useEffect body (anchored on
+    // the `useEffect(` opener and the matching `[deps]` close)
+    // and assert at least one of them issues the /login
+    // redirect.
+    const effectBodies: string[] = [];
+    const effectRegex =
+      /useEffect\(\s*(?:\(\s*\)\s*=>\s*\{|\(\s*\(\s*\)\s*=>\s*\{|\(\s*\(\)\s*=>\s*\{)[\s\S]*?\}\s*,\s*\[[^\]]+\]\s*\)/g;
+    let effectMatch: RegExpExecArray | null;
+    while ((effectMatch = effectRegex.exec(source)) !== null) {
+      effectBodies.push(effectMatch[0]);
+    }
+    assert.ok(
+      effectBodies.length >= 1,
+      "page MUST define at least one useEffect callback so the redirect can run after commit",
+    );
+    const effectIssuesRedirect = effectBodies.some((body) =>
+      /router\.replace\([\s\S]*?\/login\?return=\/workspace\/intent/.test(body),
+    );
+    assert.ok(
+      effectIssuesRedirect,
+      "the signed-out redirect (router.replace('/login?return=/workspace/intent')) MUST live inside a useEffect callback so it never fires during render",
+    );
+
+    // Now strip every useEffect body from the source and assert
+    // the remaining render code does NOT issue the redirect.
+    // A regression that puts the redirect back in the render
+    // body would leave a `router.replace("/login?return=...`)`
+    // call in the residue and fail here.
+    let renderResidue = source;
+    for (const body of effectBodies) {
+      renderResidue = renderResidue.replace(body, "/* useEffect body elided */");
+    }
+    assert.equal(
+      /router\.replace\(\s*["'`]\/login\?return=\/workspace\/intent/.test(renderResidue),
+      false,
+      "render body MUST NOT call router.replace('/login?return=/workspace/intent') — the redirect is owned by useEffect so it fires after commit, never during render",
+    );
+  });
+
+  test("Render guard keeps the loading surface mounted for both loading=true and user=null", () => {
+    // While the session is still resolving OR the user is null
+    // (signed out), the page renders the loading surface — the
+    // useEffect fires after commit and navigates. The render
+    // guard MUST therefore cover `loading || !user`, not just
+    // `loading`, so a signed-out visitor sees the loading
+    // surface (data-testid="intent-loading") for the brief
+    // window before the useEffect commits the redirect.
+    const source = readFile("workspace/intent/page.tsx");
+    assert.ok(
+      /if\s*\(\s*loading\s*\|\|\s*!user\s*\)/.test(source),
+      "the render guard MUST cover both `loading` and `!user` so the loading surface stays mounted for signed-out visitors until the useEffect redirect commits",
+    );
+    // And the loading surface MUST render `data-testid="intent-loading"`
+    // inside that branch — the Playwright walkToIntentPage
+    // helper and the existing render contract both depend on it.
+    const guardMatch = source.match(
+      /if\s*\(\s*loading\s*\|\|\s*!user\s*\)\s*\{[\s\S]*?\}\s*(?=(if|return)\s*\()/,
+    );
+    if (guardMatch) {
+      assert.ok(
+        /data-testid="intent-loading"/.test(guardMatch[0]),
+        'the loading||!user branch MUST render the intent-loading surface (data-testid="intent-loading")',
+      );
+    }
+  });
+
+  test("Intent page reads `loading` from useSession so the redirect fires only after the session settles", () => {
+    // The useEffect MUST guard on `loading` so the redirect
+    // never fires for a transient null user mid-fetch. This
+    // mirrors the dashboard's pattern
+    // (`apps/web/src/app/dashboard/page.tsx`) where the
+    // capability redirect checks `loading` first.
+    const source = readFile("workspace/intent/page.tsx");
+    const useSessionMatch = source.match(/useSession\(\)/);
+    assert.ok(useSessionMatch, "page MUST consume useSession()");
+    assert.ok(
+      /\{\s*user\s*,\s*loading\s*,\s*refresh\s*\}/.test(source),
+      "page MUST destructure `loading` from useSession so the redirect effect can guard on it",
+    );
+    assert.ok(
+      /useEffect\([\s\S]*?if\s*\(\s*loading\s*\)\s*return[\s\S]*?\}\s*,\s*\[\s*loading\s*,\s*user\s*,\s*router\s*\]/.test(
+        source,
+      ),
+      "the redirect useEffect MUST guard on `loading`, depend on [loading, user, router], and short-circuit while the session is still resolving",
+    );
+  });
 });
 
 describe("navigateAfterIntent — server-resolved safeReturnTo seam (§5 / P1-005)", () => {

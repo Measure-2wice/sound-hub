@@ -165,8 +165,9 @@ const MIXED_ACTIVE_PROBES: readonly MixedActiveProbe[] = [
 async function submitSearch(page: Page, query: string) {
   // Navigate home for each probe so any prior rendered state is
   // discarded deterministically. Each probe starts from a known
-  // empty-state page.
-  await page.goto("/");
+  // empty-state page. The public discovery route moved from `/` to
+  // `/talent` in M2 #83.
+  await page.goto("/talent");
   await expect(page.getByRole("heading", { name: "Find Caribbean talent" })).toBeVisible();
   await page.getByTestId("search-input").fill(query);
   await page.getByTestId("search-submit").click();
