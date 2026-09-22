@@ -186,11 +186,36 @@ export function resolvePostCommandReturnDestination(
   // Step 4: Workspace-scoped revalidation. If the original (or
   // stripped) path carried a `workspaceId` that is not in the
   // fresh user's accessible Workspaces, drop.
-  if (mentionsWorkspaceId(input.returnTo, input.freshUser) === "stale") {
-    throw new SafeReturnToFallback(
-      "returnTo names a workspaceId that is not a current member of the fresh user.",
-      "stale-workspace",
-    );
+  //
+  // Codex CHANGES_REQUESTED P1-003 (cross-Workspace destination):
+  // when returnTo names a `workspaceId` that IS a current member
+  // of the fresh user but is NOT the post-command acting Workspace,
+  // the destination must be reachable from the new actor — the
+  // bounded resolver returns `/workspace/switch?target=<id>` so
+  // the customer lands on a confirmation interstitial, NOT on a
+  // resource owned by a Workspace they are no longer acting as.
+  // This binds the navigation context to the command's resolved
+  // Workspace; cross-Workspace destinations cannot replay or
+  // leak.
+  const workspaceIdParam = extractWorkspaceIdParam(input.returnTo);
+  if (workspaceIdParam !== null) {
+    const accessible = input.freshUser.workspaces.some((w) => w.workspaceId === workspaceIdParam);
+    if (!accessible) {
+      throw new SafeReturnToFallback(
+        "returnTo names a workspaceId that is not a current member of the fresh user.",
+        "stale-workspace",
+      );
+    }
+    if (input.actingWorkspaceId !== null && input.actingWorkspaceId !== workspaceIdParam) {
+      // Cross-Workspace: route through the switch interstitial.
+      // Browser consumes this as the next destination; the
+      // interstitial renders the explicit confirmation before
+      // the actor's persistent state changes.
+      return {
+        route: "/dashboard",
+        path: `/workspace/switch?target=${encodeURIComponent(workspaceIdParam)}`,
+      };
+    }
   }
 
   // Step 5: capability-gated revalidation.
@@ -254,19 +279,18 @@ function stripQueryAndWorkspaceSegments(rawPath: string): string {
   return `/${prefix}`;
 }
 
-function mentionsWorkspaceId(
-  rawPath: string,
-  freshUser: Bg1PublicUserV1,
-): "ok" | "stale" | "absent" {
-  // The bounded set does not include any route that takes a
-  // workspaceId. If the URL carries `workspace=` or `workspaceId=`
-  // AND the value is not in the fresh user, drop.
-  const match = rawPath.match(/[?&](workspaceId|workspace)=([^&]+)/);
-  if (!match) return "absent";
-  const value = decodeWorkspaceIdParam(match[2] ?? "");
-  if (!value) return "absent";
-  const accessible = freshUser.workspaces.some((w) => w.workspaceId === value);
-  return accessible ? "ok" : "stale";
+/**
+ * Extract the `workspaceId` / `workspace` query parameter from a raw
+ * path. Returns `null` when absent. Used by the post-command
+ * destination resolver to detect cross-Workspace destinations
+ * (P1-003): if returnTo names a workspaceId that is current but
+ * different from the command actor, the resolver routes the
+ * destination through `/workspace/switch?target=<id>`.
+ */
+function extractWorkspaceIdParam(rawPath: string): string | null {
+  const match = rawPath.match(/[?&](?:workspaceId|workspace)=([^&]+)/);
+  if (!match) return null;
+  return decodeWorkspaceIdParam(match[1] ?? "");
 }
 
 function decodeWorkspaceIdParam(raw: string): string | null {

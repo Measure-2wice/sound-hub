@@ -1,21 +1,17 @@
 // Concurrency correctness for intent acceptance persistence (M2 #83).
 //
-// Disposable Postgres. Two concurrent `recordSellerParticipationAcceptance`
-// calls against the same `(workspaceId, termsVersion)` must produce
-// exactly ONE row in `seller_participation_acceptances`. The
-// application relies on the natural unique index as the concurrency
-// authority — there is no application-level pre-check, no find-then-
-// insert race window.
+// Disposable Postgres. Concurrent WHOLE-COMMAND
+// `provisionIntentAtomically` calls against the same Workspace
+// must converge on exactly one Buyer + one Seller + one
+// acceptance row. The natural unique indexes are the
+// concurrency authority — there is no application-level pre-check,
+// no find-then-insert race window.
 //
-// The repository primitive uses
-// `INSERT ... ON CONFLICT (workspace_id, terms_version) DO NOTHING
-// RETURNING *`; when the ON CONFLICT path fires, the primitive reads
-// back the existing row by `(workspaceId, termsVersion)` and returns
-// it. Both submissions return the same `id`.
-//
-// This test pins the database-level invariant: regardless of how
-// many concurrent submissions arrive, exactly one acceptance row
-// exists per `(workspaceId, termsVersion)` tuple.
+// Per Codex CHANGES_REQUESTED P2-001: the standalone
+// `recordSellerParticipationAcceptance` and `upsertCapability`
+// primitives are no longer on the public AuthRepository contract.
+// Idempotency and atomicity are tested through the public
+// atomic command — the production entry point.
 
 /* eslint-disable @typescript-eslint/no-floating-promises */
 
@@ -29,7 +25,7 @@ import { PrismaAuthRepository } from "./prisma-auth-repository.js";
 const TEST_DATABASE_URL =
   process.env.TEST_DATABASE_URL ?? "postgresql://soundhub:password@localhost:5433/soundhub_m1_test";
 
-describe("PrismaAuthRepository intent concurrency", () => {
+describe("PrismaAuthRepository intent concurrency (atomic command)", () => {
   let prisma: PrismaClient;
   let repo: PrismaAuthRepository;
 
@@ -38,7 +34,7 @@ describe("PrismaAuthRepository intent concurrency", () => {
     repo = new PrismaAuthRepository(prisma);
   });
 
-  test("two concurrent recordSellerParticipationAcceptance calls produce exactly one row", async () => {
+  test("Concurrent whole-command converges on exactly one Buyer + Seller + acceptance row", async () => {
     const ts = Date.now();
     const user = await prisma.userAccount.create({
       data: { email: `intent-conc-${ts}@example.test` },
@@ -56,41 +52,45 @@ describe("PrismaAuthRepository intent concurrency", () => {
     const termsContentHash = "a".repeat(64);
     const input = {
       workspaceId: workspace.id,
-      termsVersion,
-      termsContentHash,
-      acceptedByUserId: user.id,
-      grantedByUserId: user.id,
+      userAccountId: user.id,
+      capabilities: ["Buyer", "Seller"] as const,
+      acceptance: {
+        termsVersion,
+        termsContentHash,
+        grantedByUserId: user.id,
+      },
     };
+    const N = 5;
 
-    // Two concurrent submissions.
-    const [r1, r2] = await Promise.all([
-      repo.recordSellerParticipationAcceptance(input),
-      repo.recordSellerParticipationAcceptance(input),
-    ]);
+    // N concurrent whole-command callers. Each one composes
+    // capability upserts + acceptance insert inside ONE Prisma
+    // transaction. The natural unique indexes absorb duplicate
+    // capability inserts and duplicate acceptance inserts
+    // idempotently; the final state is exactly one Buyer, one
+    // Seller, one acceptance row.
+    await Promise.all(Array.from({ length: N }, () => repo.provisionIntentAtomically(input)));
 
-    // Both return the same `id` (the database's existing row OR
-    // the freshly inserted row — either way, exactly one row).
-    assert.equal(r1.id, r2.id);
-    assert.equal(r1.workspaceId, workspace.id);
-    assert.equal(r1.termsVersion, termsVersion);
-    assert.equal(r1.termsContentHash, termsContentHash);
+    const caps = await prisma.workspaceCapability.findMany({
+      where: { workspaceId: workspace.id },
+    });
+    assert.equal(caps.length, 2, "exactly one Buyer + one Seller capability row");
 
-    // Database-level invariant: exactly one row exists.
-    const rows = await prisma.sellerParticipationAcceptance.findMany({
+    const acceptances = await prisma.sellerParticipationAcceptance.findMany({
       where: { workspaceId: workspace.id, termsVersion },
     });
-    assert.equal(rows.length, 1);
+    assert.equal(acceptances.length, 1, "exactly one acceptance row");
 
     // Cleanup.
     await prisma.sellerParticipationAcceptance.deleteMany({
       where: { workspaceId: workspace.id },
     });
+    await prisma.workspaceCapability.deleteMany({ where: { workspaceId: workspace.id } });
     await prisma.workspaceMembership.deleteMany({ where: { workspaceId: workspace.id } });
     await prisma.workspace.delete({ where: { id: workspace.id } });
     await prisma.userAccount.delete({ where: { id: user.id } });
   });
 
-  test("upsertCapability against the same (workspaceId, capability) is idempotent", async () => {
+  test("Atomic command: idempotent Hire row (concurrent Buyer upserts)", async () => {
     const ts = Date.now();
     const user = await prisma.userAccount.create({
       data: { email: `intent-upsert-${ts}@example.test` },
@@ -105,8 +105,17 @@ describe("PrismaAuthRepository intent concurrency", () => {
       },
     });
 
-    await repo.upsertCapability({ workspaceId: workspace.id, capability: "Buyer" });
-    await repo.upsertCapability({ workspaceId: workspace.id, capability: "Buyer" });
+    const N = 5;
+    await Promise.all(
+      Array.from({ length: N }, () =>
+        repo.provisionIntentAtomically({
+          workspaceId: workspace.id,
+          userAccountId: user.id,
+          capabilities: ["Buyer"],
+          acceptance: null,
+        }),
+      ),
+    );
 
     const rows = await prisma.workspaceCapability.findMany({
       where: { workspaceId: workspace.id, capability: "Buyer" },

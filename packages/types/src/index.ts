@@ -1013,6 +1013,30 @@ export const intentResponseV1Schema = z
   .strict();
 export type IntentResponseV1 = z.infer<typeof intentResponseV1Schema>;
 
+// ---------- Read registered Seller participation terms ----------
+//
+// The intent page reads the currently registered Seller
+// participation terms document so the customer can view the
+// exact text they will accept. When the registration seam is
+// null (production has not yet registered), the response carries
+// `registered: false` and `version / contentHash / content` are
+// `null`. The page renders the legal-blocked copy in that case.
+export const sellerParticipationTermsReadResponseV1Schema = z
+  .object({
+    ok: z.literal(true),
+    registered: z.boolean(),
+    version: z.string().min(1).max(64).nullable(),
+    contentHash: z
+      .string()
+      .regex(/^[a-f0-9]{64}$/, "contentHash must be a 64-char hex SHA-256 digest")
+      .nullable(),
+    content: z.string().min(1).nullable(),
+  })
+  .strict();
+export type SellerParticipationTermsReadResponseV1 = z.infer<
+  typeof sellerParticipationTermsReadResponseV1Schema
+>;
+
 // ===========================================================================
 // Matchmaker shared runtime contracts (introduced by ticket #60
 // / BG3 of the Buildathon Golden Slice).

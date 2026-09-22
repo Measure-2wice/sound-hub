@@ -246,47 +246,15 @@ export interface AuthRepository {
   findWorkspaceSlugById(workspaceId: string): Promise<string | null>;
 
   // ---------- M2 #83: Intent selection primitives ----------
-
-  /**
-   * Idempotent capability upsert. The existing
-   * `WorkspaceCapability` table already enforces
-   * `(workspaceId, capability)` uniqueness; this primitive wraps
-   * the same constraint in a single repository call so the
-   * `IntentService` can compose `Both` atomically.
-   *
-   * The unique constraint is the concurrency authority: a
-   * concurrent insert of the same `(workspaceId, capability)`
-   * tuple is rejected by the database. The service does not rely
-   * on a find-then-insert pre-check for race correctness.
-   */
-  upsertCapability(input: {
-    readonly workspaceId: string;
-    readonly capability: MarketplaceCapabilityV1;
-  }): Promise<void>;
-
-  /**
-   * Record a Seller participation acceptance row idempotently.
-   * Uses `INSERT ... ON CONFLICT DO NOTHING RETURNING *` so two
-   * concurrent `Offer services` (or two concurrent `Both`)
-   * submissions against the same (workspaceId, termsVersion)
-   * cannot create a duplicate row. The natural unique index
-   * `seller_participation_acceptances_workspace_version_unique_idx`
-   * is the concurrency authority. Returns the persisted row so
-   * the service can read back the existing evidence on a lost
-   * race.
-   *
-   * The application never calls this with `Buyer` capability —
-   * the table name itself is the DB-level restriction; Buyer
-   * capability creation does not write an acceptance row at any
-   * layer.
-   */
-  recordSellerParticipationAcceptance(input: {
-    readonly workspaceId: string;
-    readonly termsVersion: string;
-    readonly termsContentHash: string;
-    readonly acceptedByUserId: string;
-    readonly grantedByUserId: string;
-  }): Promise<SellerParticipationAcceptanceRecord>;
+  //
+  // Codex CHANGES_REQUESTED P2-001: the standalone
+  // `upsertCapability` and `recordSellerParticipationAcceptance`
+  // primitives were removed from the public AuthRepository contract.
+  // They remain as PRIVATE implementation helpers in each
+  // adapter — the public surface exposes ONLY
+  // `provisionIntentAtomically`, which composes them inside a
+  // single transaction. Production consumers cannot bypass the
+  // atomic invariant.
 
   /**
    * M2 #83 remediation (Codex CHANGES_REQUESTED P0): atomic intent
@@ -332,4 +300,19 @@ export interface SellerParticipationAcceptanceRecord {
   readonly acceptedByUserId: string;
   readonly grantedByUserId: string;
   readonly acceptedAt: Date;
+}
+
+/**
+ * Codex CHANGES_REQUESTED P0-003: raised by every AuthRepository
+ * implementation when a Seller participation acceptance retry
+ * supplies a `termsContentHash` different from the existing row's
+ * content hash. The acceptance evidence is immutable; a different
+ * hash against the same `(workspaceId, termsVersion)` is a
+ * conflict. Caller MUST fail closed.
+ */
+export class SellerParticipationAcceptanceConflictError extends Error {
+  constructor(message: string) {
+    super(message);
+    this.name = "SellerParticipationAcceptanceConflictError";
+  }
 }

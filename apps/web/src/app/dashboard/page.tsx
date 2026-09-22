@@ -208,15 +208,17 @@ function PersonalActingDashboard() {
                 </Link>
               </li>
             )}
-            <li>
-              <Link
-                href="/deals"
-                className="text-aubergine hover:text-aubergine-hover font-medium focus:outline-none focus-visible:outline focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-aubergine rounded"
-                data-testid="dashboard-view-deals"
-              >
-                View your deals
-              </Link>
-            </li>
+            {actingWorkspace.capabilities.includes("Buyer") && (
+              <li>
+                <Link
+                  href="/deals"
+                  className="text-aubergine hover:text-aubergine-hover font-medium focus:outline-none focus-visible:outline focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-aubergine rounded"
+                  data-testid="dashboard-view-deals"
+                >
+                  View your deals
+                </Link>
+              </li>
+            )}
           </ul>
         </Card.Content>
       </Card>
@@ -312,11 +314,11 @@ function SellerReadinessRow() {
       </Card.Header>
       <Card.Content>
         <p className="text-base text-muted">
-          Set up your Professional Profile and activate your first ServiceOffering to be
-          discoverable on Talent.
+          Once your services are set up, you&apos;ll appear in search results and buyers can send
+          you project requests.
         </p>
         <p className="mt-2 text-sm text-muted" data-testid="dashboard-seller-hint">
-          Profile and ServiceOffering setup lands in #84 and #85.
+          Profile and service setup unlocks after your first deal.
         </p>
       </Card.Content>
     </Card>

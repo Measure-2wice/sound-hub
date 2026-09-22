@@ -134,6 +134,24 @@ export class IntentService {
   constructor(private readonly deps: IntentServiceDeps) {}
 
   async submitIntent(input: SubmitIntentInput): Promise<SubmitIntentResult> {
+    // Step 0: recovery-state failure-closed guard. When the
+    // convergence service classifies the user as `recovery`, no
+    // Personal Workspace can be authoritative. The intent service
+    // refuses ANY mutation — capability provisioning, acceptance
+    // recording — without an authoritative canonical Personal
+    // Workspace. Ambiguous or contradictory Personal Workspace
+    // authority must remain in recovery and must never be guessed.
+    //
+    // This is a fail-closed guard that runs BEFORE every other
+    // validation; even an accessible Personal Workspace path id is
+    // not authoritative when convergence is in recovery.
+    if (input.setupState === "recovery") {
+      throw new IntentServiceError(
+        "Personal Workspace is in recovery; intent self-service is unavailable.",
+        "INTENT_FORBIDDEN",
+      );
+    }
+
     // Step 1: revalidate current membership on the target Personal
     // Workspace. A valid Organization membership is rejected here
     // (`INTENT_NOT_PERSONAL` translated to `INTENT_FORBIDDEN`),

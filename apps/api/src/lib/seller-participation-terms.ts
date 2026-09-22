@@ -77,6 +77,31 @@ export interface SellerParticipationTerms {
   readonly content: string;
 }
 
+/**
+ * Marker error raised when a Seller participation terms registration
+ * is attempted for a `version` that has already been registered.
+ * The registration seam is IMMUTABLE: a given `version` is registered
+ * ONCE; a second `registerSellerParticipationTerms` call with the
+ * same version fails closed. Tests use `__resetSellerParticipationTermsForTests`
+ * to clear the seam between cases.
+ *
+ * Immutability prevents the silent-evidence-drift bug the Codex
+ * review flagged: if a same-version replacement were permitted, a
+ * retry could validate a NEW content hash against the registered
+ * surface while a stale acceptance row from the previous content
+ * remained in the database. Immutability guarantees that the
+ * registered version and content are stable for the lifetime of
+ * the registration; a different content requires a different
+ * `version` so the natural `(workspaceId, termsVersion)` unique
+ * constraint still anchors the audit trail.
+ */
+export class SellerParticipationTermsImmutableError extends Error {
+  constructor(message: string) {
+    super(message);
+    this.name = "SellerParticipationTermsImmutableError";
+  }
+}
+
 let registered: SellerParticipationTerms | null = null;
 
 /**
@@ -95,13 +120,17 @@ export function getCurrentSellerParticipationTerms(): SellerParticipationTerms |
  * application accepts the registration as the source of truth for
  * subsequent acceptance requests.
  *
+ * IMMUTABILITY: a given `version` is registered ONCE. A second
+ * registration call with an existing `version` throws
+ * `SellerParticipationTermsImmutableError` — including the case
+ * where the new content hashes to the same digest as the previous
+ * registration (the version's hash is also locked). A content
+ * change requires a new `version` so the database-level
+ * `(workspaceId, termsVersion)` unique index still anchors the
+ * audit trail per-version.
+ *
  * The hash is computed server-side from the content so the caller
- * cannot accidentally supply a mismatched hash. A registration
- * with the same version as an existing one REPLACES the in-memory
- * record — production registration tooling should treat that as a
- * versioning mistake and reject it; the in-memory seam is
- * deliberately simple so a future server-side registration
- * workflow can layer policy on top.
+ * cannot accidentally supply a mismatched hash.
  */
 export function registerSellerParticipationTerms(input: {
   readonly version: string;
@@ -112,6 +141,12 @@ export function registerSellerParticipationTerms(input: {
   }
   if (typeof input.content !== "string" || input.content.length === 0) {
     throw new Error("registerSellerParticipationTerms: content is required");
+  }
+  if (registered !== null && registered.version === input.version) {
+    throw new SellerParticipationTermsImmutableError(
+      `Seller participation terms version ${input.version} is already registered; ` +
+        `same-version re-registration is not permitted. Use a new version for new content.`,
+    );
   }
   const contentHash = createHash("sha256").update(input.content, "utf8").digest("hex");
   registered = {

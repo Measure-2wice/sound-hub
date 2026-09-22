@@ -26,6 +26,7 @@ import type {
   Bg1VerifyTokenResponseV1,
   IntentRequestV1,
   IntentResponseV1,
+  SellerParticipationTermsReadResponseV1,
 } from "@soundhub/types";
 
 export type { Bg1VerifyTokenResponseV1, IntentResponseV1 };
@@ -49,6 +50,7 @@ import {
   bg1VerifyTokenResponseV1Schema,
   intentRequestV1Schema,
   intentResponseV1Schema,
+  sellerParticipationTermsReadResponseV1Schema,
 } from "@soundhub/types";
 
 export interface AuthClientError {
@@ -213,4 +215,27 @@ export async function submitIntent(input: {
   }
   const raw: unknown = await response.json();
   return intentResponseV1Schema.parse(raw);
+}
+
+/**
+ * Codex CHANGES_REQUESTED P0-001: read the currently registered
+ * Seller participation terms document. The intent page renders
+ * the registered text verbatim so the customer can read what
+ * they accept before submitting. When the registration is null
+ * the response carries `registered: false` and `content: null`,
+ * and the page renders the legal-blocked copy.
+ *
+ * Authentication required (session cookie).
+ */
+export async function fetchSellerParticipationTerms(): Promise<SellerParticipationTermsReadResponseV1> {
+  const response = await fetch("/api/seller-participation-terms", {
+    method: "GET",
+    credentials: "include",
+    headers: { Accept: "application/json" },
+  });
+  if (!response.ok) {
+    throw ensureError(null, await parseErrorResponse(response));
+  }
+  const raw: unknown = await response.json();
+  return sellerParticipationTermsReadResponseV1Schema.parse(raw);
 }

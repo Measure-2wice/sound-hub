@@ -31,6 +31,7 @@ import { beforeEach, describe, test } from "node:test";
 import {
   __resetSellerParticipationTermsForTests,
   registerSellerParticipationTerms,
+  SellerParticipationTermsImmutableError,
 } from "../lib/seller-participation-terms.js";
 import { InMemoryAuthRepository } from "../auth-repository/in-memory-auth-repository.js";
 import { IntentService, IntentServiceError } from "./intent.service.js";
@@ -311,14 +312,119 @@ describe("IntentService", () => {
     );
   });
 
-  test("Returned user payload preserves setupState verbatim from the input", async () => {
+  test("Recovery state refuses intent provisioning; no mutation (Hire)", async () => {
+    // Codex CHANGES_REQUESTED P0-002: when convergence is in
+    // recovery, intent MUST refuse — even with an accessible
+    // Personal Workspace path id — because the canonical
+    // Personal Workspace is not authoritative.
+    const { service, authRepo } = buildService();
+    await assert.rejects(
+      () =>
+        service.submitIntent({
+          userAccountId: USER_ID,
+          workspaceId: WS_ID,
+          setupState: "recovery",
+          intent: { intent: "Hire" },
+        }),
+      (err: unknown) => {
+        assert.ok(err instanceof IntentServiceError);
+        assert.equal(err.code, "INTENT_FORBIDDEN");
+        return true;
+      },
+    );
+    const view = await authRepo.getPublicUser(USER_ID);
+    assert.deepEqual(view!.workspaces.find((w) => w.workspaceId === WS_ID)?.capabilities, []);
+  });
+
+  test("Recovery state refuses intent provisioning; no mutation (Offer)", async () => {
+    __resetSellerParticipationTermsForTests();
+    const { service } = buildService();
+    registerSellerParticipationTerms(SAMPLE_TERMS);
+    await assert.rejects(
+      () =>
+        service.submitIntent({
+          userAccountId: USER_ID,
+          workspaceId: WS_ID,
+          setupState: "recovery",
+          intent: {
+            intent: "Offer",
+            sellerAcceptance: {
+              termsVersion: SAMPLE_TERMS.version,
+              termsContentHash: "0".repeat(64),
+            },
+          },
+        }),
+      (err: unknown) => {
+        assert.ok(err instanceof IntentServiceError);
+        assert.equal(err.code, "INTENT_FORBIDDEN");
+        return true;
+      },
+    );
+  });
+
+  test("Recovery state fires BEFORE the legal-blocked Seller-terms check", async () => {
+    // Even with terms unregistered (which would normally trigger
+    // INTENT_LEGAL_BLOCKED), recovery-state refusal takes
+    // precedence — the recovery state means there is no
+    // authoritative Personal Workspace to provision against,
+    // regardless of the legal copy state.
+    __resetSellerParticipationTermsForTests();
+    const { service } = buildService();
+    await assert.rejects(
+      () =>
+        service.submitIntent({
+          userAccountId: USER_ID,
+          workspaceId: WS_ID,
+          setupState: "recovery",
+          intent: {
+            intent: "Offer",
+            sellerAcceptance: {
+              termsVersion: "1.0.0",
+              termsContentHash: "0".repeat(64),
+            },
+          },
+        }),
+      (err: unknown) => {
+        assert.ok(err instanceof IntentServiceError);
+        assert.equal(err.code, "INTENT_FORBIDDEN");
+        return true;
+      },
+    );
+  });
+
+  test("Converged intent payload still preserves setupState on the success path", async () => {
     const { service } = buildService();
     const result = await service.submitIntent({
       userAccountId: USER_ID,
       workspaceId: WS_ID,
-      setupState: "recovery",
+      setupState: "converged",
       intent: { intent: "Hire" },
     });
-    assert.equal(result.user.setupState, "recovery");
+    assert.equal(result.user.setupState, "converged");
+  });
+
+  test("Same-version Seller terms re-registration is rejected (P0-003 immutability)", () => {
+    // Codex CHANGES_REQUESTED P0-003: the registration seam is
+    // IMMUTABLE. A second register with the same version throws
+    // even if the content hashes to the same digest — the version's
+    // hash is also locked.
+    __resetSellerParticipationTermsForTests();
+    registerSellerParticipationTerms(SAMPLE_TERMS);
+    assert.throws(
+      () =>
+        registerSellerParticipationTerms({
+          version: SAMPLE_TERMS.version,
+          content: SAMPLE_TERMS.content,
+        }),
+      (err: unknown) => err instanceof SellerParticipationTermsImmutableError,
+    );
+    assert.throws(
+      () =>
+        registerSellerParticipationTerms({
+          version: SAMPLE_TERMS.version,
+          content: SAMPLE_TERMS.content + " (revised)",
+        }),
+      (err: unknown) => err instanceof SellerParticipationTermsImmutableError,
+    );
   });
 });

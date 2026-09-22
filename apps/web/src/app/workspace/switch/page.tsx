@@ -66,11 +66,28 @@ function WorkspaceSwitchPageInner() {
   const router = useRouter();
   const searchParams = useSearchParams();
   const { user } = useSession();
-  const { actingWorkspace, pendingTarget } = useActingWorkspace();
-  const { commitPendingTarget, cancelPendingTarget } = useSetActingWorkspace();
+  const { actingWorkspace, pendingTarget, pendingTargetId } = useActingWorkspace();
+  const { commitPendingTarget, cancelPendingTarget, setPendingTarget } = useSetActingWorkspace();
 
-  // Query-string target is a recovery hint; context wins in the
-  // live case (the selector already set pendingTarget via the
+  // Query-string target is a recovery hint for deep-link / hard-reload
+  // cases (P1-002). When context is empty AND the URL carries a
+  // `target=` query parameter, validate the candidate against the
+  // user's accessible Workspaces and promote it to the in-memory
+  // pending state. Once pendingTarget is set, the page's "Switch
+  // and continue" commit operation must explicitly switch — no
+  // silent no-op path.
+  useEffect(() => {
+    if (pendingTargetId !== null) return;
+    if (!user) return;
+    const queryTargetId = searchParams.get("target");
+    if (!queryTargetId) return;
+    const candidate = user.workspaces.find(
+      (w) => w.workspaceId === queryTargetId && w.workspaceStatus === "Active",
+    );
+    if (!candidate) return;
+    setPendingTarget(candidate.workspaceId);
+  }, [pendingTargetId, user, searchParams, setPendingTarget]);
+
   // provider before navigating here).
   const queryTargetId = searchParams.get("target");
 

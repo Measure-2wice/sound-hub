@@ -31,11 +31,13 @@ function buildUser(input: {
   readonly org?: boolean;
   readonly buyer?: boolean;
   readonly seller?: boolean;
+  readonly personalId?: string;
+  readonly orgId?: string;
 }): Bg1PublicUserV1 {
   const workspaces: Bg1PublicUserV1["workspaces"] = [];
   if (input.personal) {
     workspaces.push({
-      workspaceId: "ws-personal",
+      workspaceId: input.personalId ?? "ws-personal",
       slug: "personal",
       name: "Personal",
       workspaceType: "Personal",
@@ -48,7 +50,7 @@ function buildUser(input: {
   }
   if (input.org) {
     workspaces.push({
-      workspaceId: "ws-org",
+      workspaceId: input.orgId ?? "ws-org",
       slug: "org",
       name: "Org",
       workspaceType: "Organization",
@@ -226,6 +228,44 @@ describe("resolvePostCommandReturnDestination", () => {
         }),
       (err: unknown) => err instanceof SafeReturnToFallback && err.reason === "unknown-route",
     );
+  });
+
+  test("Cross-Workspace destination (returnTo names a different accessible workspaceId) routes through the switch interstitial (P1-003)", () => {
+    const user = buildUser({ personal: true, buyer: true, personalId: "ws-personal" });
+    user.workspaces.push({
+      workspaceId: "ws-org-other",
+      slug: "org-other",
+      name: "Other Org",
+      workspaceType: "Organization",
+      workspaceStatus: "Active",
+      capabilities: ["Buyer"],
+      role: "Owner",
+      joinedAt: "2025-01-01T00:00:00.000Z",
+    } as never);
+    const result = resolvePostCommandReturnDestination({
+      returnTo: "/deals?workspaceId=ws-org-other",
+      freshUser: user,
+      actingWorkspaceId: "ws-personal",
+      allowedOrigin: ALLOWED_ORIGIN,
+    });
+    // The accessible-but-different workspaceId is routed through
+    // the switch interstitial instead of leaking a
+    // cross-Workspace destination.
+    assert.deepEqual(result, {
+      route: "/dashboard",
+      path: "/workspace/switch?target=ws-org-other",
+    });
+  });
+
+  test("Same-Workspace destination (returnTo names the acting workspaceId) is kept", () => {
+    const user = buildUser({ personal: true, buyer: true });
+    const result = resolvePostCommandReturnDestination({
+      returnTo: "/deals?workspaceId=ws-personal",
+      freshUser: user,
+      actingWorkspaceId: "ws-personal",
+      allowedOrigin: ALLOWED_ORIGIN,
+    });
+    assert.deepEqual(result, { route: "/deals", path: "/deals" });
   });
 
   test("malformed cross-origin path falls back (shape)", () => {

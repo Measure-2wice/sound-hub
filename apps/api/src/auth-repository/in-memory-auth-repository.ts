@@ -32,6 +32,7 @@ import type {
   UserIdentityMapping,
   WorkspaceMembershipView,
 } from "./auth-repository.js";
+import { SellerParticipationAcceptanceConflictError } from "./auth-repository.js";
 
 export interface InMemoryMembershipSeed {
   readonly workspaceId: string;
@@ -424,12 +425,16 @@ export class InMemoryAuthRepository implements AuthRepository {
   // ---------- M2 #83: Intent selection primitives ----------
 
   /**
-   * Idempotent capability upsert. The in-memory adapter mirrors
-   * the database's `(workspaceId, capability)` uniqueness via the
-   * `includes` check before insertion — equivalent to the
-   * Prisma `upsert` wrapper.
+   * Codex CHANGES_REQUESTED P2-001: the standalone primitives are
+   * PRIVATE implementation helpers (named with the `_` prefix
+   * convention). The InMemoryAuthRepository class still exposes
+   * them as class methods so the in-class `provisionIntentAtomically`
+   * transaction helper can use them, but they are NOT part of the
+   * `AuthRepository` interface. Production consumers cannot call
+   * them — only the atomic command is exposed.
    */
-  async upsertCapability(input: {
+
+  async _upsertCapability(input: {
     readonly workspaceId: string;
     readonly capability: MarketplaceCapabilityV1;
   }): Promise<void> {
@@ -437,7 +442,7 @@ export class InMemoryAuthRepository implements AuthRepository {
     const workspace = this.workspacesById.get(input.workspaceId);
     if (!workspace) {
       throw new Error(
-        `InMemoryAuthRepository.upsertCapability: unknown workspaceId=${input.workspaceId}`,
+        `InMemoryAuthRepository._upsertCapability: unknown workspaceId=${input.workspaceId}`,
       );
     }
     if (!workspace.capabilities.includes(input.capability)) {
@@ -446,15 +451,7 @@ export class InMemoryAuthRepository implements AuthRepository {
     }
   }
 
-  /**
-   * Idempotent Seller participation acceptance record. The
-   * in-memory map's key uniqueness (`${workspaceId}::${termsVersion}`)
-   * is the concurrency authority, mirroring the database
-   * `UNIQUE (workspace_id, terms_version)` index. A second
-   * insertion with the same key returns the existing record;
-   * no find-then-insert pre-check is needed.
-   */
-  async recordSellerParticipationAcceptance(input: {
+  async _recordSellerParticipationAcceptance(input: {
     readonly workspaceId: string;
     readonly termsVersion: string;
     readonly termsContentHash: string;
@@ -464,6 +461,17 @@ export class InMemoryAuthRepository implements AuthRepository {
     const key = `${input.workspaceId}::${input.termsVersion}`;
     const existing = this.sellerAcceptances.get(key);
     if (existing) {
+      // Codex CHANGES_REQUESTED P0-003: a retry with a different
+      // content hash is a conflict — the existing acceptance row's
+      // evidence is immutable. Caller must supply the SAME hash
+      // that was originally registered OR fail closed.
+      if (existing.termsContentHash !== input.termsContentHash) {
+        throw new SellerParticipationAcceptanceConflictError(
+          `InMemoryAuthRepository._recordSellerParticipationAcceptance: termsContentHash ` +
+            `conflict for workspaceId=${input.workspaceId} termsVersion=${input.termsVersion}; ` +
+            `the existing acceptance row carries a different content hash.`,
+        );
+      }
       return Promise.resolve(toAcceptanceRecord(existing));
     }
     const row: InternalSellerAcceptance = {
@@ -515,15 +523,26 @@ export class InMemoryAuthRepository implements AuthRepository {
       ? (this.sellerAcceptances.get(acceptanceKey) ?? null)
       : null;
 
+    // Codex CHANGES_REQUESTED P0-003: in-transaction hash-conflict
+    // check that mirrors the Prisma adapter. A conflicting retry
+    // throws BEFORE any write — the transaction (or in-memory
+    // rollback path below) preserves the previous row.
+    if (input.acceptance && beforeAcceptance) {
+      if (beforeAcceptance.termsContentHash !== input.acceptance.termsContentHash) {
+        throw new SellerParticipationAcceptanceConflictError(
+          `InMemoryAuthRepository.provisionIntentAtomically: termsContentHash conflict for ` +
+            `workspaceId=${input.workspaceId} termsVersion=${input.acceptance.termsVersion}; ` +
+            `the existing acceptance row carries a different content hash.`,
+        );
+      }
+    }
+
     try {
       for (const capability of input.capabilities) {
-        await this.upsertCapability({ workspaceId: input.workspaceId, capability });
+        await this._upsertCapability({ workspaceId: input.workspaceId, capability });
       }
       if (input.acceptance) {
-        // Simulate the in-transaction upsert by writing through
-        // `recordSellerParticipationAcceptance`. The natural unique
-        // key already absorbs the duplicate.
-        await this.recordSellerParticipationAcceptance({
+        await this._recordSellerParticipationAcceptance({
           workspaceId: input.workspaceId,
           termsVersion: input.acceptance.termsVersion,
           termsContentHash: input.acceptance.termsContentHash,
