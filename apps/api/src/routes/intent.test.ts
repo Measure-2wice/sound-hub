@@ -296,6 +296,65 @@ describe("Intent route (in-memory)", () => {
     assert.equal(response.body.error.code, "INTENT_INVALID");
   });
 
+  // P2-001: `expectedCapabilities` is a SET, not an array. The
+  // closed domain contains only Buyer and Seller so the maximum
+  // unique size is two, and duplicates must be rejected at the
+  // schema boundary so the comparison against the persisted set
+  // never produces a false conflict.
+  test("P2-001: duplicate expectedCapabilities ([Buyer, Buyer]) returns INTENT_INVALID", async () => {
+    const cookie = await signIn();
+    const response = await request(app)
+      .post(`/api/workspaces/${WS_ID}/intent`)
+      .send({ intent: "Hire", expectedCapabilities: ["Buyer", "Buyer"] })
+      .set("Content-Type", "application/json")
+      .set("Cookie", cookie);
+    assert.equal(response.status, 400);
+    assert.equal(response.body.error.code, "INTENT_INVALID");
+  });
+
+  test("P2-001: more than two expectedCapabilities returns INTENT_INVALID", async () => {
+    const cookie = await signIn();
+    const response = await request(app)
+      .post(`/api/workspaces/${WS_ID}/intent`)
+      .send({
+        intent: "Both",
+        // The closed domain has only Buyer and Seller; anything
+        // beyond the two members is rejected at the schema
+        // boundary so a junk value cannot reach the
+        // transaction-bound comparison.
+        expectedCapabilities: ["Buyer", "Seller", "Buyer"],
+      })
+      .set("Content-Type", "application/json")
+      .set("Cookie", cookie);
+    assert.equal(response.status, 400);
+    assert.equal(response.body.error.code, "INTENT_INVALID");
+  });
+
+  test("P2-001: each valid capability set is accepted (canonical order-independent)", async () => {
+    // The schema must accept `[]`, each singleton, and the
+    // pair in either order — all are valid capability sets.
+    const cookie = await signIn();
+    const variants: ReadonlyArray<readonly string[]> = [
+      [],
+      ["Buyer"],
+      ["Seller"],
+      ["Buyer", "Seller"],
+      ["Seller", "Buyer"],
+    ];
+    for (const expected of variants) {
+      const response = await request(app)
+        .post(`/api/workspaces/${WS_ID}/intent`)
+        .send({ intent: "Both", expectedCapabilities: expected })
+        .set("Content-Type", "application/json")
+        .set("Cookie", cookie);
+      assert.notEqual(
+        response.status,
+        400,
+        `expected capability set ${JSON.stringify(expected)} to pass schema validation`,
+      );
+    }
+  });
+
   test("Validated returnTo is echoed in the response; malformed values are silently dropped to null", async () => {
     const cookie = await signIn();
     const okResponse = await request(app)

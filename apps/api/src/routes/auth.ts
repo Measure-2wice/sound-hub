@@ -83,6 +83,10 @@ import {
   resolveAllowedOrigin,
   setReturnContextCookie,
 } from "../lib/return-context.js";
+import {
+  SafeReturnToFallback,
+  resolvePostCommandReturnDestination,
+} from "../lib/post-command-return-destination.js";
 import { toPublicUser } from "../dto/public-mappers.js";
 
 export interface AuthRouteDeps {
@@ -388,8 +392,8 @@ async function handleActingWorkspace(
   res.setHeader("x-request-id", requestId);
 
   const sessionId = readSessionCookie(req);
-  const view = await deps.authenticationService.resolveSession(sessionId);
-  if (!view) {
+  const resolved = await deps.authenticationService.resolveSessionWithSetupState(sessionId);
+  if (!resolved) {
     writeSafeError(
       res,
       buildSafeError(
@@ -401,6 +405,7 @@ async function handleActingWorkspace(
     );
     return;
   }
+  const view = resolved;
 
   const rawBody = await readJsonBodyOrRespond(req, res, requestId);
   if (rawBody === undefined) return;
@@ -426,14 +431,37 @@ async function handleActingWorkspace(
 
   try {
     const membership = await deps.workspaceAuthorizationService.requireActingMembership({
-      userAccountId: view.userAccountId,
+      userAccountId: view.user.userAccountId,
       workspaceId: parsed.actingWorkspaceId,
     });
-    // The acting-workspace route does NOT carry a `returnTo` in
-    // the request body — the switch page's "Cancel" exits in-page
-    // to `/dashboard` and "Switch and continue" uses the route
-    // result to refresh state. `safeReturnTo` is therefore `null`;
-    // the bounded resolver is exercised by the intent route path.
+    // Resolve `safeReturnTo` against the FRESH post-commit user
+    // payload (via the bounded #83 post-command destination
+    // resolver). The browser consumes ONLY this value; the raw
+    // `?return=` query parameter is never honored client-side
+    // after a successful commit, so a cross-Workspace destination
+    // cannot reach the browser before the Workspace the customer
+    // just committed to is the actor. A `null` request value, or
+    // a value that fails the bounded revalidation, leaves
+    // `safeReturnTo` at `null` and the browser falls back to
+    // `/dashboard`.
+    const publicUser = toPublicUser(view.user, view.setupState);
+    let safeReturnTo: string | null = null;
+    try {
+      const resolvedDestination = resolvePostCommandReturnDestination({
+        returnTo: parsed.returnTo ?? null,
+        freshUser: publicUser,
+        actingWorkspaceId: membership.workspace.workspaceId,
+        allowedOrigin:
+          deps.allowedReturnOrigin ?? process.env.FRONTEND_URL ?? "http://localhost:3000",
+      });
+      safeReturnTo = resolvedDestination?.path ?? null;
+    } catch (err) {
+      if (err instanceof SafeReturnToFallback) {
+        safeReturnTo = null;
+      } else {
+        throw err;
+      }
+    }
     const body = bg1ActingWorkspaceResponseV1Schema.parse({
       ok: true,
       actingWorkspace: membership.workspace,
@@ -441,7 +469,7 @@ async function handleActingWorkspace(
         role: membership.role,
         joinedAt: membership.joinedAt.toISOString(),
       },
-      safeReturnTo: null,
+      safeReturnTo,
     });
     res.status(200).json(body);
   } catch (err) {

@@ -205,3 +205,112 @@ describe("dashboard loading surface (M2 #82)", () => {
     );
   });
 });
+
+describe("dashboard grounded activity + approval readiness (M2 #83 P1-002)", () => {
+  // P1-002: the #83 Personal Workspace home must show grounded
+  // Requests/Deals summaries where records exist and keep
+  // optional permission-to-approve readiness discoverable at low
+  // prominence. The dashboard derives from existing repository
+  // APIs only — no new persistence.
+
+  test("Personal dashboard renders compact 'Your activity' summary grounded in listProjectRequests + listDeals", () => {
+    assert.match(
+      DASHBOARD_PAGE_SOURCE,
+      /listProjectRequests\(/,
+      "dashboard reads ProjectRequest records",
+    );
+    assert.match(DASHBOARD_PAGE_SOURCE, /listDeals\(/, "dashboard reads Deal records");
+    assert.match(
+      DASHBOARD_PAGE_SOURCE,
+      /buyerWorkspaceId.*Pending|Pending.*buyerWorkspaceId/,
+      "dashboard derives a Buyer-pending count from ProjectRequest rows",
+    );
+    assert.match(
+      DASHBOARD_PAGE_SOURCE,
+      /sellerWorkspaceId.*Pending|Pending.*sellerWorkspaceId/,
+      "dashboard derives a Seller-pending count from ProjectRequest rows",
+    );
+    assert.match(
+      DASHBOARD_PAGE_SOURCE,
+      /Negotiating/,
+      "dashboard derives a Negotiating-Deals count from Deal rows",
+    );
+    assert.match(
+      DASHBOARD_PAGE_SOURCE,
+      /data-testid="dashboard-activity"/,
+      "dashboard renders a stable testid on the activity card",
+    );
+  });
+
+  test("Personal dashboard activity card is omitted entirely on empty / unloaded state (no fabricated feed)", () => {
+    // The activity card is rendered conditionally on
+    // (records loaded AND at least one count > 0). An empty
+    // Workspace must NOT see a fabricated feed.
+    const showActivityMatch = DASHBOARD_PAGE_SOURCE.match(/showActivity\s*=\s*[\s\S]*?;/);
+    assert.ok(showActivityMatch, "expected a showActivity guard");
+    assert.match(
+      showActivityMatch[0],
+      /buyerPendingRequests\s*>\s*0\s*\|\|\s*sellerPendingRequests\s*>\s*0\s*\|\|\s*negotiatingDeals\s*>\s*0/,
+      "activity card MUST be conditional on at least one non-zero grounded count",
+    );
+    assert.match(
+      DASHBOARD_PAGE_SOURCE,
+      /showActivity\s*\?\s*\([\s\S]*?dashboard-activity[\s\S]*?\)\s*:\s*null/,
+      "activity card MUST render or be omitted, never an empty fallback",
+    );
+  });
+
+  test("Personal dashboard renders low-prominence approval-readiness only when a Negotiating Deal awaits Buyer approval", () => {
+    // P1-002: permission-to-approve readiness is low-prominence
+    // (a single muted paragraph) and contextual — it must
+    // appear ONLY when a Negotiating Deal requires Buyer
+    // approval. The surface must NOT link to a not-yet-shipped
+    // destination (no `href=` in the readiness line).
+    assert.match(
+      DASHBOARD_PAGE_SOURCE,
+      /data-testid="dashboard-approval-readiness"/,
+      "dashboard renders a stable testid on the approval-readiness surface",
+    );
+    assert.match(
+      DASHBOARD_PAGE_SOURCE,
+      /AwaitingBuyerApproval|AwaitingBothApprovals/,
+      "approval-readiness trigger MUST reference the closed-enum approval states",
+    );
+    const readinessBlock = DASHBOARD_PAGE_SOURCE.match(
+      /\{buyerNeedsApproval\s*\?\s*\(\s*<p\b[\s\S]*?data-testid="dashboard-approval-readiness"[\s\S]*?<\/p>/,
+    );
+    assert.ok(readinessBlock, "expected an approval-readiness surface");
+    assert.equal(
+      /<Link\s|<a\s/i.test(readinessBlock[0]),
+      false,
+      "approval-readiness surface MUST NOT link to a not-yet-shipped destination",
+    );
+    // The line must be muted (`text-muted`) so it stays low
+    // prominence against the readiness / activity cards above.
+    assert.match(
+      readinessBlock[0],
+      /text-muted/,
+      "approval-readiness surface MUST render in muted typography to remain low prominence",
+    );
+  });
+
+  test("Personal dashboard derives counts from existing rows without inventing persistence (no DealApprover / sellerAcceptance)", () => {
+    // P1-002 must NOT introduce new persistence or capability
+    // fields. The dashboard reads existing repository records
+    // and surfaces grounded counts only.
+    const codeOnly = DASHBOARD_PAGE_SOURCE.split("\n")
+      .filter((line) => !line.trim().startsWith("//") && !line.trim().startsWith("*"))
+      .filter((line) => !line.trim().startsWith("/*") && !line.trim().startsWith("*/"))
+      .join("\n");
+    assert.equal(
+      /DealApprover|approvalPermission|permissionToApprove/.test(codeOnly),
+      false,
+      "dashboard MUST NOT introduce new approval-permission persistence",
+    );
+    assert.equal(
+      /sellerAcceptance/.test(codeOnly),
+      false,
+      "dashboard MUST NOT collect a generic Seller participation acceptance",
+    );
+  });
+});

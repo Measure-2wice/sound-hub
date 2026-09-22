@@ -33,12 +33,15 @@
 //   - Recovery is rendered for `user.setupState === "recovery"`
 //     and is independent of the acting Workspace.
 
-import { useEffect } from "react";
+import { useEffect, useState } from "react";
 import Link from "next/link";
 import { useRouter } from "next/navigation";
 import { useActingWorkspace, useSession } from "../components/SessionProvider";
 import { Card } from "../components/ui/Card";
 import { Alert } from "../components/ui/Alert";
+import { listDeals } from "../lib/deal-list-client";
+import { listProjectRequests } from "../lib/project-requests-client";
+import type { DealListItemPublicV1, ProjectRequestPublicV1 } from "@soundhub/types";
 
 export default function DashboardPage() {
   const { user, loading } = useSession();
@@ -153,6 +156,82 @@ function PersonalActingDashboard() {
   const hasAnyCapability =
     actingWorkspace.capabilities.includes("Buyer") ||
     actingWorkspace.capabilities.includes("Seller");
+  const hasBuyer = actingWorkspace.capabilities.includes("Buyer");
+  const hasSeller = actingWorkspace.capabilities.includes("Seller");
+
+  // Grounded activity derived from existing repository APIs.
+  // The dashboard renders counts only when records exist; the
+  // section is omitted entirely on empty state so a quiet
+  // Workspace does not see a fabricated feed. The fetched rows
+  // are kept local — they are summary inputs, not authoritative
+  // state — so a subsequent navigation can re-read fresh.
+  const [requests, setRequests] = useState<readonly ProjectRequestPublicV1[] | null>(null);
+  const [deals, setDeals] = useState<readonly DealListItemPublicV1[] | null>(null);
+  useEffect(() => {
+    if (!hasAnyCapability) {
+      setRequests(null);
+      setDeals(null);
+      return;
+    }
+    let cancelled = false;
+    void (async () => {
+      try {
+        const [reqResult, dealResult] = await Promise.all([
+          listProjectRequests({ actingWorkspaceId: actingWorkspace.workspaceId }),
+          listDeals(actingWorkspace.workspaceId),
+        ]);
+        if (cancelled) return;
+        setRequests(reqResult.projectRequests);
+        setDeals(dealResult.deals);
+      } catch {
+        // Session-stale errors hand control back to the
+        // SessionProvider, which re-renders the signed-out
+        // state. Showing an error here too would be
+        // redundant; a quiet re-render is enough.
+        if (cancelled) return;
+        setRequests([]);
+        setDeals([]);
+      }
+    })();
+    return () => {
+      cancelled = true;
+    };
+  }, [actingWorkspace.workspaceId, hasAnyCapability]);
+
+  const buyerPendingRequests =
+    requests === null
+      ? 0
+      : requests.filter(
+          (r) => r.status === "Pending" && r.buyerWorkspaceId === actingWorkspace.workspaceId,
+        ).length;
+  const sellerPendingRequests =
+    requests === null
+      ? 0
+      : requests.filter(
+          (r) => r.status === "Pending" && r.sellerWorkspaceId === actingWorkspace.workspaceId,
+        ).length;
+  const negotiatingDeals =
+    deals === null ? 0 : deals.filter((d) => d.status === "Negotiating").length;
+  // Approval-readiness: a Negotiating Deal awaiting Buyer approval
+  // is the documented context that makes the optional permission
+  // setup relevant. The dashboard surfaces this at low prominence
+  // — a single-line hint without a link, since permission-to-approve
+  // setup is owned by a later milestone and the dashboard must not
+  // fabricate navigation to a not-yet-shipped surface.
+  const buyerNeedsApproval =
+    hasBuyer &&
+    deals !== null &&
+    deals.some(
+      (d) =>
+        d.status === "Negotiating" &&
+        (d.approvalState === "AwaitingBuyerApproval" ||
+          d.approvalState === "AwaitingBothApprovals"),
+    );
+  const showActivity =
+    hasAnyCapability &&
+    requests !== null &&
+    deals !== null &&
+    (buyerPendingRequests > 0 || sellerPendingRequests > 0 || negotiatingDeals > 0);
 
   return (
     <>
@@ -230,6 +309,67 @@ function PersonalActingDashboard() {
           </ul>
         </Card.Content>
       </Card>
+
+      {showActivity ? (
+        <Card variant="parchment" data-testid="dashboard-activity">
+          <Card.Header>
+            <Card.Title>Your activity</Card.Title>
+          </Card.Header>
+          <Card.Content>
+            <ul className="space-y-2 text-base">
+              {hasBuyer && buyerPendingRequests > 0 && (
+                <li className="flex items-baseline justify-between gap-3">
+                  <span className="text-muted">Pending requests you sent</span>
+                  <span
+                    className="font-medium text-ink"
+                    data-testid="dashboard-activity-buyer-pending"
+                  >
+                    {buyerPendingRequests}
+                  </span>
+                </li>
+              )}
+              {hasSeller && sellerPendingRequests > 0 && (
+                <li className="flex items-baseline justify-between gap-3">
+                  <Link
+                    href="/seller-requests"
+                    className="text-aubergine hover:text-aubergine-hover font-medium focus:outline-none focus-visible:outline focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-aubergine rounded"
+                    data-testid="dashboard-activity-seller-pending-link"
+                  >
+                    Requests awaiting your response
+                  </Link>
+                  <span
+                    className="font-medium text-ink"
+                    data-testid="dashboard-activity-seller-pending"
+                  >
+                    {sellerPendingRequests}
+                  </span>
+                </li>
+              )}
+              {negotiatingDeals > 0 && (
+                <li className="flex items-baseline justify-between gap-3">
+                  <Link
+                    href="/deals"
+                    className="text-aubergine hover:text-aubergine-hover font-medium focus:outline-none focus-visible:outline focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-aubergine rounded"
+                    data-testid="dashboard-activity-deals-link"
+                  >
+                    Deals negotiating
+                  </Link>
+                  <span className="font-medium text-ink" data-testid="dashboard-activity-deals">
+                    {negotiatingDeals}
+                  </span>
+                </li>
+              )}
+            </ul>
+          </Card.Content>
+        </Card>
+      ) : null}
+
+      {buyerNeedsApproval ? (
+        <p className="text-sm text-muted" data-testid="dashboard-approval-readiness">
+          A Negotiating Deal needs your buyer approval. You can set up permission to approve terms
+          when you open the Deal.
+        </p>
+      ) : null}
     </>
   );
 }

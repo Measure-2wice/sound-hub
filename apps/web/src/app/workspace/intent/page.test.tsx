@@ -223,7 +223,13 @@ describe("ActingWorkspaceSelector — #83 context model (§4 / P1-005)", () => {
 describe("Switch interstitial — commit / cancel behaviour (§4 / P1-005)", () => {
   test("Switch page calls commitPendingTarget on Switch and continue", () => {
     const source = readFile("workspace/switch/page.tsx");
-    assert.ok(/commitPendingTarget\(\)/.test(source));
+    // The continue handler forwards the validated `?return=`
+    // (queryReturnTo) into commitPendingTarget so the server can
+    // re-resolve it under the post-commit actor.
+    assert.ok(
+      /commitPendingTarget\(queryReturnTo\)/.test(source),
+      "Switch and continue MUST forward queryReturnTo into commitPendingTarget",
+    );
   });
 
   test("Switch page calls cancelPendingTarget on Cancel (commit state untouched)", () => {

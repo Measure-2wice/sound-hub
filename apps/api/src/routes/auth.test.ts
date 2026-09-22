@@ -483,6 +483,9 @@ describe("BG1 auth routes (in-memory, deterministic adapter)", () => {
     assert.equal(response.body.ok, true);
     assert.equal(response.body.actingWorkspace.workspaceId, BUYER_WORKSPACE_ID);
     assert.equal(response.body.membership.role, "Owner");
+    // P1-001: no `returnTo` carried → `safeReturnTo` is `null`
+    // and the browser falls back to `/dashboard`.
+    assert.equal(response.body.safeReturnTo, null);
   });
 
   test("POST /api/auth/acting-workspace rejects a non-member with NOT_A_MEMBER (GS 4 / GS 5)", async () => {
@@ -503,6 +506,94 @@ describe("BG1 auth routes (in-memory, deterministic adapter)", () => {
       .set("Content-Type", "application/json");
     assert.equal(response.status, 401);
     assert.equal(response.body.error.code, "SESSION_INVALID");
+  });
+
+  // ---------- P1-001 — `returnTo` continuation through /api/auth/acting-workspace ----------
+  //
+  // The switch interstitial forwards the validated `?return=`
+  // query into the acting-workspace request body; the route
+  // revalidates it against the FRESH post-commit user via
+  // `resolvePostCommandReturnDestination` and emits the bounded
+  // `safeReturnTo`. The browser consumes ONLY this value.
+
+  test("P1-001: POST /api/auth/acting-workspace with `returnTo: '/talent'` resolves safeReturnTo to '/talent' under Buyer-capable actor", async () => {
+    const cookie = await signIn(app, adapter, "buyer-route@example.com");
+    const response = await request(app)
+      .post("/api/auth/acting-workspace")
+      .send({ actingWorkspaceId: BUYER_WORKSPACE_ID, returnTo: "/talent" })
+      .set("Cookie", cookie)
+      .set("Content-Type", "application/json");
+    assert.equal(response.status, 200);
+    assert.equal(response.body.safeReturnTo, "/talent");
+  });
+
+  test("P1-001: POST /api/auth/acting-workspace with capability-gated `/deals` keeps the destination (Buyer actor)", async () => {
+    const cookie = await signIn(app, adapter, "buyer-route@example.com");
+    const response = await request(app)
+      .post("/api/auth/acting-workspace")
+      .send({ actingWorkspaceId: BUYER_WORKSPACE_ID, returnTo: "/deals" })
+      .set("Cookie", cookie)
+      .set("Content-Type", "application/json");
+    assert.equal(response.status, 200);
+    assert.equal(response.body.safeReturnTo, "/deals");
+  });
+
+  test("P1-001: POST /api/auth/acting-workspace with capability-gated `/seller-requests` falls back to null (Buyer-only actor)", async () => {
+    const cookie = await signIn(app, adapter, "buyer-route@example.com");
+    const response = await request(app)
+      .post("/api/auth/acting-workspace")
+      .send({ actingWorkspaceId: BUYER_WORKSPACE_ID, returnTo: "/seller-requests" })
+      .set("Cookie", cookie)
+      .set("Content-Type", "application/json");
+    assert.equal(response.status, 200);
+    // The route must NOT admit a destination the post-commit actor
+    // cannot reach; the browser falls back to `/dashboard`.
+    assert.equal(response.body.safeReturnTo, null);
+  });
+
+  test("P1-001: POST /api/auth/acting-workspace with malformed `returnTo` (external origin) returns safeReturnTo: null", async () => {
+    const cookie = await signIn(app, adapter, "buyer-route@example.com");
+    const response = await request(app)
+      .post("/api/auth/acting-workspace")
+      .send({ actingWorkspaceId: BUYER_WORKSPACE_ID, returnTo: "https://evil.example/x" })
+      .set("Cookie", cookie)
+      .set("Content-Type", "application/json");
+    assert.equal(response.status, 200);
+    assert.equal(response.body.safeReturnTo, null);
+  });
+
+  test("P1-001: POST /api/auth/acting-workspace with action-endpoint `returnTo` returns safeReturnTo: null", async () => {
+    const cookie = await signIn(app, adapter, "buyer-route@example.com");
+    const response = await request(app)
+      .post("/api/auth/acting-workspace")
+      .send({ actingWorkspaceId: BUYER_WORKSPACE_ID, returnTo: "/api/auth/sign-out" })
+      .set("Cookie", cookie)
+      .set("Content-Type", "application/json");
+    assert.equal(response.status, 200);
+    assert.equal(response.body.safeReturnTo, null);
+  });
+
+  test("P1-001: POST /api/auth/acting-workspace with unknown-route `returnTo` returns safeReturnTo: null", async () => {
+    const cookie = await signIn(app, adapter, "buyer-route@example.com");
+    const response = await request(app)
+      .post("/api/auth/acting-workspace")
+      .send({ actingWorkspaceId: BUYER_WORKSPACE_ID, returnTo: "/this/is/not/bounded" })
+      .set("Cookie", cookie)
+      .set("Content-Type", "application/json");
+    assert.equal(response.status, 200);
+    assert.equal(response.body.safeReturnTo, null);
+  });
+
+  test("P1-001: POST /api/auth/acting-workspace rejects oversized `returnTo` with INVALID_AUTH_REQUEST", async () => {
+    const cookie = await signIn(app, adapter, "buyer-route@example.com");
+    const oversizedReturnTo = "/" + "x".repeat(300);
+    const response = await request(app)
+      .post("/api/auth/acting-workspace")
+      .send({ actingWorkspaceId: BUYER_WORKSPACE_ID, returnTo: oversizedReturnTo })
+      .set("Cookie", cookie)
+      .set("Content-Type", "application/json");
+    assert.equal(response.status, 400);
+    assert.equal(response.body.error.code, "INVALID_AUTH_REQUEST");
   });
 
   test("POST /api/auth/sign-out revokes the session and clears the cookie", async () => {
@@ -1041,6 +1132,116 @@ describe("BG1 /api/auth/me is strictly read-only (Tenki PR #91, in-memory)", () 
     assert.equal(afterB.ownerPersonalMemberships.length, 1);
     assert.equal(afterA.coOwnedPersonalWorkspaceIds.has(CO_OWNED_WORKSPACE_ID), true);
     assert.equal(afterB.coOwnedPersonalWorkspaceIds.has(CO_OWNED_WORKSPACE_ID), true);
+  });
+});
+
+// ---------- P1-001 — cross-Workspace `returnTo` resolves through /workspace/switch ----------
+//
+// The bounded post-command destination resolver routes
+// cross-Workspace destinations through `/workspace/switch?target=<id>`
+// so a customer landing on a destination owned by a Workspace
+// they are no longer acting as must first pass the explicit
+// switch interstitial.
+describe("BG1 auth routes — cross-Workspace returnTo (P1-001)", () => {
+  const CROSS_USER_ID = "user-cross-ws";
+  const PERSONAL_ID = "ws-cross-personal";
+  const ORG_ID = "ws-cross-org";
+  const adapter = new DeterministicIdentityAdapter({ allowDevVerificationUrl: true });
+  const crossSubject = deterministicSubjectFor("cross-ws@example.com");
+  const authRepo = new InMemoryAuthRepository([
+    {
+      userAccountId: CROSS_USER_ID,
+      email: "cross-ws@example.com",
+      identityProvider: "deterministic",
+      identitySubject: crossSubject,
+      memberships: [
+        {
+          workspaceId: PERSONAL_ID,
+          slug: "cross-personal",
+          name: "Cross Personal",
+          workspaceType: "Personal",
+          workspaceStatus: "Active",
+          role: "Owner",
+          capabilities: ["Buyer"],
+        },
+        {
+          workspaceId: ORG_ID,
+          slug: "cross-org",
+          name: "Cross Org",
+          workspaceType: "Organization",
+          workspaceStatus: "Active",
+          role: "Member",
+          capabilities: ["Buyer"],
+        },
+      ],
+    },
+  ]);
+  const authenticationService = new AuthenticationService({
+    identityAdapter: adapter,
+    authRepository: authRepo,
+    personalWorkspaceConvergenceService: new PersonalWorkspaceConvergenceService({
+      authRepository: authRepo,
+    }),
+  });
+  const workspaceAuthorizationService = new WorkspaceAuthorizationService({
+    authRepository: authRepo,
+  });
+  const stubPrisma = new Proxy({} as never, {
+    get() {
+      throw new Error(
+        "Prisma client was invoked; the route tests must use the in-memory auth repository.",
+      );
+    },
+  });
+
+  let app: import("express").Application;
+  beforeEach(() => {
+    app = buildApp({
+      authenticationService,
+      workspaceAuthorizationService,
+      authRepository: authRepo,
+      identityAdapter: adapter,
+      prismaClient: stubPrisma,
+    }).app;
+  });
+
+  test("P1-001: switch from Personal→Org with returnTo '/talent?workspace=<other>' routes through /workspace/switch?target=<other>", async () => {
+    const cookie = await signIn(app, adapter, "cross-ws@example.com");
+    const response = await request(app)
+      .post("/api/auth/acting-workspace")
+      .send({
+        actingWorkspaceId: ORG_ID,
+        returnTo: `/talent?workspace=${PERSONAL_ID}`,
+      })
+      .set("Cookie", cookie)
+      .set("Content-Type", "application/json");
+    assert.equal(response.status, 200);
+    // The Workspace the customer just committed to (ORG_ID) is
+    // NOT the one named in `?workspace=<PERSONAL_ID>`; the
+    // resolver routes the destination through the switch
+    // interstitial so the explicit confirmation happens first.
+    assert.equal(
+      response.body.safeReturnTo,
+      `/workspace/switch?target=${encodeURIComponent(PERSONAL_ID)}`,
+    );
+  });
+
+  test("P1-001: switch from Personal→Org with same-Workspace `?workspace=` keeps the bounded destination", async () => {
+    const cookie = await signIn(app, adapter, "cross-ws@example.com");
+    const response = await request(app)
+      .post("/api/auth/acting-workspace")
+      .send({
+        actingWorkspaceId: ORG_ID,
+        returnTo: `/deals?workspace=${ORG_ID}`,
+      })
+      .set("Cookie", cookie)
+      .set("Content-Type", "application/json");
+    assert.equal(response.status, 200);
+    // Same-Workspace destinations are stripped of the workspaceId
+    // query (the bounded route is the only path the browser
+    // receives) and pass through the capability gate (Buyer present
+    // → `/deals` is reachable).
+    assert.equal(response.body.safeReturnTo, "/deals");
   });
 });
 

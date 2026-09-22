@@ -868,6 +868,15 @@ export type Bg1SignOutResponseV1 = z.infer<typeof bg1SignOutResponseV1Schema>;
 export const bg1ActingWorkspaceRequestV1Schema = z
   .object({
     actingWorkspaceId: z.string().min(1).max(128),
+    // M2 #83 continuation: the switch interstitial forwards the
+    // raw `?return=` query into the request body when present.
+    // The route revalidates and resolves it under the
+    // post-commit acting Workspace context via
+    // `resolvePostCommandReturnDestination`; the response only
+    // carries the bounded `safeReturnTo`. Invalid / missing
+    // values drop to `safeReturnTo: null` and the browser falls
+    // back to `/dashboard`.
+    returnTo: z.string().min(1).max(256).optional(),
   })
   .strict();
 export type Bg1ActingWorkspaceRequestV1 = z.infer<typeof bg1ActingWorkspaceRequestV1Schema>;
@@ -972,6 +981,12 @@ export type IntentKindV1 = (typeof intentKindV1Values)[number];
 // `expectedCapabilities` does NOT produce a conflict when the
 // chosen set is already present.
 //
+// `expectedCapabilities` is a SET, not an array: the closed
+// domain contains only Buyer and Seller so the maximum unique
+// size is two, and duplicate entries (`['Buyer', 'Buyer']`) must
+// be rejected so the comparison against the persisted set never
+// produces a false conflict.
+//
 // `returnTo` is optional; the route revalidates it via the
 // existing internal-return validation rules. No `sellerAcceptance`
 // field is carried: the M2 #83 slice does not collect a generic
@@ -980,7 +995,16 @@ export type IntentKindV1 = (typeof intentKindV1Values)[number];
 export const intentRequestV1Schema = z
   .object({
     intent: z.enum(intentKindV1Values),
-    expectedCapabilities: z.array(z.enum(marketplaceCapabilityValuesV1)).max(8),
+    expectedCapabilities: z
+      .array(z.enum(marketplaceCapabilityValuesV1))
+      .max(2, {
+        message:
+          "expectedCapabilities may contain at most the two closed-enum capabilities (Buyer, Seller).",
+      })
+      .refine(
+        (arr) => new Set(arr).size === arr.length,
+        "expectedCapabilities must contain unique entries (duplicate capabilities are not allowed).",
+      ),
     returnTo: z.string().min(1).max(256).optional(),
   })
   .strict();
@@ -1025,7 +1049,13 @@ export const intentConflictResponseV1Schema = z
       .object({
         code: z.literal("INTENT_CONFLICT"),
         message: z.string().min(1).max(500),
-        freshCapabilities: z.array(z.enum(marketplaceCapabilityValuesV1)).max(8),
+        // Server-emitted fresh persisted capability set. Mirrors
+        // the request-side cap: at most the two closed-enum
+        // values, unique only.
+        freshCapabilities: z
+          .array(z.enum(marketplaceCapabilityValuesV1))
+          .max(2)
+          .refine((arr) => new Set(arr).size === arr.length, "freshCapabilities must be unique"),
         requestId: z.string().min(1).max(128),
       })
       .strict(),

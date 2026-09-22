@@ -30,6 +30,7 @@
 
 import { Suspense, useEffect, useMemo, useRef, useState } from "react";
 import { useRouter, useSearchParams } from "next/navigation";
+import type { Route } from "next";
 import { Card } from "../../components/ui/Card";
 import { Alert } from "../../components/ui/Alert";
 import {
@@ -37,6 +38,7 @@ import {
   useSession,
   useSetActingWorkspace,
 } from "../../components/SessionProvider";
+import { isLocallyValidReturnPath } from "../../lib/return-path-shape";
 
 export default function WorkspaceSwitchPage() {
   // `useSearchParams` requires a Suspense boundary at static-export
@@ -90,6 +92,20 @@ function WorkspaceSwitchPageInner() {
 
   // provider before navigating here).
   const queryTargetId = searchParams.get("target");
+  // The cross-Workspace `?return=` query carries the destination
+  // the customer was heading to before the acting Workspace
+  // interstitial interrupted them. It is forwarded into the
+  // acting-workspace commit call so the SERVER can re-resolve it
+  // under the post-commit actor (see
+  // `resolvePostCommandReturnDestination`). The browser never
+  // honours the raw value directly; the server's `safeReturnTo`
+  // is the only path the switch page can navigate to. Cancel
+  // ignores it entirely.
+  const queryReturnTo = useMemo(() => {
+    const raw = searchParams.get("return");
+    if (raw === null) return null;
+    return isLocallyValidReturnPath(raw) ? raw : null;
+  }, [searchParams]);
 
   const target = useMemo(() => {
     if (pendingTarget) return pendingTarget;
@@ -186,8 +202,14 @@ function WorkspaceSwitchPageInner() {
         // successful commit, so a cross-Workspace destination
         // cannot reach the browser before the Workspace the
         // customer just committed to is the actor.
-        const safeReturnTo = await commitPendingTarget();
-        const destination = safeReturnTo ?? "/dashboard";
+        const safeReturnTo = await commitPendingTarget(queryReturnTo);
+        // `safeReturnTo` is server-resolved against the bounded
+        // #83 route set (`resolvePostCommandReturnDestination`).
+        // Narrow it into the typed `Route<string>` representation
+        // the Next.js router expects; out-of-set values fall back
+        // to `/dashboard` rather than reaching the browser with
+        // an untyped destination.
+        const destination = toTypedSwitchRoute(safeReturnTo);
         router.replace(destination);
       } catch {
         // Commit failed — leave both committed state AND
@@ -292,4 +314,41 @@ function WorkspaceSwitchPageInner() {
       </div>
     </div>
   );
+}
+
+/**
+ * The bounded #83 destination routes the server returns from
+ * `resolvePostCommandReturnDestination`. This list mirrors the
+ * closed set so the local narrowing stays consistent with the
+ * server-side enforcement. The list is intentionally explicit —
+ * any new route the resolver grows MUST also be added here so
+ * the typed `Route<string>` cast does not silently admit
+ * out-of-band values.
+ */
+const BOUNDED_SWITCH_ROUTES = [
+  "/dashboard",
+  "/workspace/intent",
+  "/workspace/switch",
+  "/talent",
+  "/deals",
+  "/seller-requests",
+  "/dashboard/audio",
+] as const;
+
+/**
+ * Narrow a server-resolved `safeReturnTo` value into the typed
+ * `Route<string>` representation the Next.js router expects.
+ * The server already constrains the value to the bounded #83 set;
+ * this helper exists so the typed cast is gated by an explicit
+ * local match — out-of-set values fall back to `/dashboard`
+ * rather than reaching the browser as an untyped string.
+ */
+function toTypedSwitchRoute(safeReturnTo: string | null): Route<string> {
+  const fallback = "/dashboard" as Route<string>;
+  if (safeReturnTo === null) return fallback;
+  const pathOnly = safeReturnTo.split("?")[0] ?? "";
+  if ((BOUNDED_SWITCH_ROUTES as readonly string[]).includes(pathOnly)) {
+    return safeReturnTo as Route<string>;
+  }
+  return fallback;
 }

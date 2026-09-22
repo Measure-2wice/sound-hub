@@ -181,12 +181,28 @@ export async function signOut(): Promise<void> {
 
 export async function selectActingWorkspace(input: {
   actingWorkspaceId: string;
+  /**
+   * Optional raw cross-Workspace continuation captured by the
+   * switch interstitial. Forwarded verbatim into the request
+   * body; the server revalidates and resolves it under the
+   * post-commit acting Workspace context
+   * (`resolvePostCommandReturnDestination`). `null` / omitted
+   * leaves the server's `safeReturnTo` at `null` and the
+   * browser falls back to `/dashboard`.
+   */
+  returnTo?: string | null;
 }): Promise<{ readonly safeReturnTo: string | null }> {
+  const body: { actingWorkspaceId: string; returnTo?: string } = {
+    actingWorkspaceId: input.actingWorkspaceId,
+  };
+  if (input.returnTo !== null && input.returnTo !== undefined) {
+    body.returnTo = input.returnTo;
+  }
   const response = await fetch("/api/auth/acting-workspace", {
     method: "POST",
     headers: { "Content-Type": "application/json" },
     credentials: "include",
-    body: JSON.stringify(input),
+    body: JSON.stringify(body),
   });
   if (!response.ok) {
     throw ensureError(null, await parseErrorResponse(response));
@@ -197,11 +213,11 @@ export async function selectActingWorkspace(input: {
   // post-commit acting Workspace. The browser consumes ONLY
   // this value; the raw `?return=` query parameter is never
   // honored client-side after a successful commit.
-  const body = raw as { safeReturnTo?: unknown };
+  const responseBody = raw as { safeReturnTo?: unknown };
   return {
     safeReturnTo:
-      typeof body.safeReturnTo === "string" && body.safeReturnTo.length > 0
-        ? body.safeReturnTo
+      typeof responseBody.safeReturnTo === "string" && responseBody.safeReturnTo.length > 0
+        ? responseBody.safeReturnTo
         : null,
   };
 }
