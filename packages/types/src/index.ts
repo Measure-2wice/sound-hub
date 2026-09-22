@@ -541,12 +541,6 @@ export const apiErrorCodeV1Schema = z.enum([
   // Personal Workspace, the Workspace is not eligible, or some
   // other authorization rejection collapsed by the safe envelope.
   "INTENT_FORBIDDEN",
-  // 503 — Seller participation terms are not yet registered. This
-  // is the single explicit product/legal blocker on the M2 #83
-  // slice: `Offer services` and `Both` cannot provision Seller
-  // capability until product/legal supplies and registers the
-  // versioned customer-readable Seller participation text.
-  "INTENT_LEGAL_BLOCKED",
 ]);
 export type ApiErrorCodeV1 = z.infer<typeof apiErrorCodeV1Schema>;
 
@@ -930,9 +924,11 @@ export function deriveDeterministicSubject(email: string, sha256Hex: Sha256HexFn
 // Workspace id is required so the route can revalidate current Owner
 // membership (any Owner/Admin/Member role passes
 // `requireActingMembership` — the route is not Owner-only per ticket
-// #82). Buyer capability is provisioned without any attestation;
-// Seller capability requires the versioned Seller participation
-// acceptance evidence recorded below.
+// #82). Neither Buyer nor Seller capability collects a generic
+// participation/terms acceptance at capability-provisioning time —
+// context-specific confirmations are owned by their later boundaries
+// (SellerProfile publication, media use, ServiceOffering activation,
+// Deal approval authority / approval).
 //
 // The `returnTo` field on the request is validated by the route via
 // the existing internal-return validation rules
@@ -949,47 +945,19 @@ export function deriveDeterministicSubject(email: string, sha256Hex: Sha256HexFn
 export const intentKindV1Values = ["Hire", "Offer", "Both"] as const;
 export type IntentKindV1 = (typeof intentKindV1Values)[number];
 
-// ---------- Seller participation acceptance evidence ----------
-
-// Versioned Seller participation terms reference. The route resolves
-// the registered text via `apps/api/src/lib/seller-participation-terms.ts`
-// and computes the matching content hash. The hash is the durable
-// evidence the accepted text cannot change retroactively.
-export const sellerParticipationAcceptanceV1Schema = z
-  .object({
-    termsVersion: z.string().min(1).max(64),
-    termsContentHash: z
-      .string()
-      .regex(/^[a-f0-9]{64}$/, "termsContentHash must be a 64-char hex SHA-256 digest"),
-  })
-  .strict();
-export type SellerParticipationAcceptanceV1 = z.infer<typeof sellerParticipationAcceptanceV1Schema>;
-
 // ---------- Intent request ----------
 
 // The intent request body. `intent` selects the capability set;
-// `sellerAcceptance` is required when `intent` is `Offer` or `Both`
-// (enforced by the route's `.superRefine` — schema-level and runtime
-// rejection). `returnTo` is optional; the route revalidates it via the
-// existing internal-return validation rules. The route also resolves
-// the registered `sellerParticipationAcceptanceV1Schema` content
-// hash; the request does not echo a free-form document.
+// `returnTo` is optional; the route revalidates it via the existing
+// internal-return validation rules. No `sellerAcceptance` field is
+// carried: the M2 #83 slice does not collect a generic Seller
+// participation/terms acceptance at capability-provisioning time.
 export const intentRequestV1Schema = z
   .object({
     intent: z.enum(intentKindV1Values),
-    sellerAcceptance: sellerParticipationAcceptanceV1Schema.optional(),
     returnTo: z.string().min(1).max(256).optional(),
   })
-  .strict()
-  .superRefine((value, ctx) => {
-    if ((value.intent === "Offer" || value.intent === "Both") && !value.sellerAcceptance) {
-      ctx.addIssue({
-        code: z.ZodIssueCode.custom,
-        message: "sellerAcceptance is required when intent is Offer or Both.",
-        path: ["sellerAcceptance"],
-      });
-    }
-  });
+  .strict();
 export type IntentRequestV1 = z.infer<typeof intentRequestV1Schema>;
 
 // ---------- Intent response ----------
@@ -1012,30 +980,6 @@ export const intentResponseV1Schema = z
   })
   .strict();
 export type IntentResponseV1 = z.infer<typeof intentResponseV1Schema>;
-
-// ---------- Read registered Seller participation terms ----------
-//
-// The intent page reads the currently registered Seller
-// participation terms document so the customer can view the
-// exact text they will accept. When the registration seam is
-// null (production has not yet registered), the response carries
-// `registered: false` and `version / contentHash / content` are
-// `null`. The page renders the legal-blocked copy in that case.
-export const sellerParticipationTermsReadResponseV1Schema = z
-  .object({
-    ok: z.literal(true),
-    registered: z.boolean(),
-    version: z.string().min(1).max(64).nullable(),
-    contentHash: z
-      .string()
-      .regex(/^[a-f0-9]{64}$/, "contentHash must be a 64-char hex SHA-256 digest")
-      .nullable(),
-    content: z.string().min(1).nullable(),
-  })
-  .strict();
-export type SellerParticipationTermsReadResponseV1 = z.infer<
-  typeof sellerParticipationTermsReadResponseV1Schema
->;
 
 // ===========================================================================
 // Matchmaker shared runtime contracts (introduced by ticket #60

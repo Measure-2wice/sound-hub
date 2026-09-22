@@ -30,41 +30,30 @@
 // Server contract (already validated by `intentRequestV1Schema`):
 //
 //   - `intent`: "Hire" | "Offer" | "Both".
-//   - `sellerAcceptance`: required when intent is "Offer" or
-//     "Both". The page fetches `/api/seller-participation-terms`
-//     on mount; when the registration seam is null the page
-//     renders the neutral retryable copy and disables the
-//     Submit button. When non-null, the page renders the
-//     verbatim registered text AND an explicit acceptance
-//     checkbox the customer must tick before Submit enables.
+//   - No `sellerAcceptance` field is carried on the intent surface.
+//     #83 does NOT collect a generic Seller participation/terms
+//     acceptance at capability-provisioning time — context-specific
+//     confirmations are owned by their later boundaries
+//     (SellerProfile publication, media use, ServiceOffering
+//     activation, Deal approval authority / approval).
 //   - `returnTo`: optional. The route revalidates it via
 //     `safeReturnTo`; the browser consumes only the
 //     server-resolved value.
 //
 // Errors:
-//   - INTENT_LEGAL_BLOCKED: the registered Seller participation
-//     terms are not yet registered (the explicit product/legal
-//     blocker). The page surfaces the neutral retryable copy.
 //   - INTENT_INVALID: malformed submission.
 //   - INTENT_FORBIDDEN: not a current member of the target
 //     Workspace, including the recovery-state refusal and the
 //     Personal-Workspace boundary.
 
-import { useEffect, useMemo, useState, type FormEvent } from "react";
+import { useMemo, useState, type FormEvent } from "react";
 import { useRouter } from "next/navigation";
 import { useActingWorkspace, useSession } from "../../components/SessionProvider";
 import { Card } from "../../components/ui/Card";
 import { Alert } from "../../components/ui/Alert";
-import { fetchSellerParticipationTerms, submitIntent } from "../../lib/auth-client";
+import { submitIntent } from "../../lib/auth-client";
 import { navigateAfterIntent } from "../../lib/navigate-after-intent";
-import type {
-  IntentKindV1,
-  IntentRequestV1,
-  SellerParticipationAcceptanceV1,
-  SellerParticipationTermsReadResponseV1,
-} from "@soundhub/types";
-
-const LEGAL_BLOCKED_COPY = "Seller setup is temporarily unavailable. Please try again later.";
+import type { IntentKindV1, IntentRequestV1 } from "@soundhub/types";
 
 export default function IntentPage() {
   const { user, loading, refresh } = useSession();
@@ -73,35 +62,6 @@ export default function IntentPage() {
   const [intent, setIntent] = useState<IntentKindV1 | null>(null);
   const [submitting, setSubmitting] = useState(false);
   const [error, setError] = useState<string | null>(null);
-  const [terms, setTerms] = useState<SellerParticipationTermsReadResponseV1 | null>(null);
-  const [termsLoaded, setTermsLoaded] = useState(false);
-  const [termsError, setTermsError] = useState<string | null>(null);
-  const [termsAccepted, setTermsAccepted] = useState(false);
-
-  // Fetch the registered Seller participation terms on mount.
-  // The customer must read AND accept the registered text
-  // before Submit enables for Offer/Both. When the registration
-  // seam is null, the page renders the legal-blocked copy and
-  // disables the Submit button.
-  useEffect(() => {
-    if (!user || user.setupState === "recovery") return;
-    let cancelled = false;
-    void (async () => {
-      try {
-        const result = await fetchSellerParticipationTerms();
-        if (cancelled) return;
-        setTerms(result);
-        setTermsLoaded(true);
-      } catch {
-        if (cancelled) return;
-        setTermsError("Could not load Seller participation terms.");
-        setTermsLoaded(true);
-      }
-    })();
-    return () => {
-      cancelled = true;
-    };
-  }, [user]);
 
   const personalWorkspace = useMemo(() => {
     if (!user) return null;
@@ -218,34 +178,15 @@ export default function IntentPage() {
   }
 
   const personalWorkspaceId = personalActor.workspaceId;
-
-  // `Offer` and `Both` paths require Seller participation terms
-  // to be registered AND the customer to have explicitly accepted
-  // them. Without either condition, Submit is disabled.
-  const sellerAcceptanceRequired = intent === "Offer" || intent === "Both";
-  const sellerBlocked =
-    sellerAcceptanceRequired && (!termsLoaded || !terms?.registered || !termsAccepted);
-  const submitDisabled = intent === null || submitting || sellerBlocked;
+  const submitDisabled = intent === null || submitting;
 
   const handleSubmit = (e: FormEvent) => {
     e.preventDefault();
     if (intent === null || submitting || !personalWorkspaceId) return;
-    if (sellerAcceptanceRequired && (!terms || !terms.registered || !termsAccepted)) return;
     setSubmitting(true);
     setError(null);
 
-    const intentBody: IntentRequestV1 =
-      intent === "Hire"
-        ? { intent }
-        : terms && terms.registered && terms.version && terms.contentHash
-          ? {
-              intent,
-              sellerAcceptance: {
-                termsVersion: terms.version,
-                termsContentHash: terms.contentHash,
-              } satisfies SellerParticipationAcceptanceV1,
-            }
-          : { intent };
+    const intentBody: IntentRequestV1 = { intent };
 
     void (async () => {
       try {
@@ -257,9 +198,7 @@ export default function IntentPage() {
         navigateAfterIntent({ router, response });
       } catch (err) {
         const apiErr = err as { status?: number; code?: string; message?: string };
-        if (apiErr.code === "INTENT_LEGAL_BLOCKED") {
-          setError(LEGAL_BLOCKED_COPY);
-        } else if (apiErr.code === "INTENT_INVALID") {
+        if (apiErr.code === "INTENT_INVALID") {
           setError("Please choose how you want to use SoundHub.");
         } else if (apiErr.code === "INTENT_FORBIDDEN" || apiErr.status === 403) {
           setError("You are not a current member of this Workspace.");
@@ -316,78 +255,6 @@ export default function IntentPage() {
               testId="intent-choice-both"
             />
           </fieldset>
-
-          {sellerAcceptanceRequired && (
-            <div
-              className="mt-4 border border-borderWarm rounded-lg p-4 bg-surface"
-              data-testid="intent-seller-terms-block"
-            >
-              <h2 className="text-lg font-medium text-ink mb-2" data-testid="intent-terms-heading">
-                Seller participation terms
-              </h2>
-              {!termsLoaded && (
-                <p
-                  className="text-base text-muted"
-                  data-testid="intent-terms-loading"
-                  role="status"
-                >
-                  Loading the current terms…
-                </p>
-              )}
-              {termsLoaded && termsError !== null && (
-                <Alert
-                  role="alert"
-                  variant="failure"
-                  title="Could not load terms"
-                  data-testid="intent-terms-error"
-                >
-                  {termsError}
-                </Alert>
-              )}
-              {termsLoaded && termsError === null && !terms?.registered && (
-                <Alert
-                  role="status"
-                  variant="status"
-                  title="Seller setup is unavailable"
-                  data-testid="intent-terms-unavailable"
-                >
-                  {LEGAL_BLOCKED_COPY}
-                </Alert>
-              )}
-              {termsLoaded && termsError === null && terms?.registered && (
-                <>
-                  <pre
-                    className="text-sm text-ink whitespace-pre-wrap max-h-80 overflow-auto p-3 bg-canvas border border-borderWarm rounded"
-                    data-testid="intent-terms-content"
-                    data-terms-version={terms.version ?? undefined}
-                    data-terms-content-hash={terms.contentHash ?? undefined}
-                  >
-                    {terms.content}
-                  </pre>
-                  <p className="mt-2 text-xs text-muted" data-testid="intent-terms-meta">
-                    Version <span data-testid="intent-terms-version">{terms.version}</span> ·
-                    SHA-256 <code data-testid="intent-terms-contenthash">{terms.contentHash}</code>
-                  </p>
-                  <label
-                    className="mt-3 flex items-start gap-2"
-                    data-testid="intent-terms-accept-label"
-                  >
-                    <input
-                      type="checkbox"
-                      checked={termsAccepted}
-                      onChange={(e) => setTermsAccepted(e.currentTarget.checked)}
-                      disabled={submitting}
-                      className="mt-1 h-4 w-4 accent-aubergine focus:outline-none focus-visible:outline focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-aubergine"
-                      data-testid="intent-terms-accept-input"
-                    />
-                    <span className="text-sm text-ink" data-testid="intent-terms-accept-text">
-                      I have read and accept the Seller participation terms above.
-                    </span>
-                  </label>
-                </>
-              )}
-            </div>
-          )}
 
           <button
             type="submit"

@@ -32,12 +32,10 @@ import type {
   AuthRepository,
   PersonalWorkspaceState,
   PublicUserView,
-  SellerParticipationAcceptanceRecord,
   SessionRecord,
   UserIdentityMapping,
   WorkspaceMembershipView,
 } from "./auth-repository.js";
-import { SellerParticipationAcceptanceConflictError } from "./auth-repository.js";
 
 const BG1_PROVIDER_KEYS: ReadonlySet<Bg1IdentityProviderV1> = new Set([
   "managed-magic-link",
@@ -462,11 +460,11 @@ export class PrismaAuthRepository implements AuthRepository {
   // ---------- M2 #83: Intent selection primitives ----------
 
   // ---------------------------------------------------------------------
-  // Codex CHANGES_REQUESTED P2-001: the standalone primitives are
-  // PRIVATE implementation helpers (`_` prefix convention). The
-  // PrismaAuthRepository class exposes them so the in-class
-  // `provisionIntentAtomically` transaction helper can use them,
-  // but they are NOT part of the `AuthRepository` interface.
+  // The standalone capability primitive is a PRIVATE implementation
+  // helper (named with the `_` prefix convention). The
+  // PrismaAuthRepository class exposes it so the in-class
+  // `provisionIntentAtomically` transaction helper can use it,
+  // but it is NOT part of the `AuthRepository` interface.
   // Production consumers cannot bypass the atomic invariant.
   // ---------------------------------------------------------------------
 
@@ -490,34 +488,25 @@ export class PrismaAuthRepository implements AuthRepository {
   }
 
   /**
-   * M2 #83 remediation: atomic intent provisioning. ONE Prisma
-   * `$transaction` covers every capability upsert and the acceptance
-   * insert. Either all writes commit, or the transaction rolls back
-   * to zero rows. The natural unique constraints provide idempotency;
+   * M2 #83: atomic intent provisioning. ONE Prisma `$transaction`
+   * covers every capability write. Either all writes commit, or
+   * the transaction rolls back to zero rows. The natural unique
+   * `(workspace_id, capability)` unique index provides idempotency;
    * this primitive is the single source of atomicity.
    *
-   * The transaction callback may throw (e.g., a real FK violation when
-   * `acceptance.grantedByUserId` references a deleted UserAccount).
-   * In that case Prisma's $transaction rolls back the transaction
-   * and re-throws the error. The Prisma atomicity test fails a real
-   * FK inside this transaction to prove the rollback — no wrapper is
-   * required.
+   * The transaction callback may throw (e.g., a real FK violation
+   * against the Workspace). In that case Prisma's $transaction
+   * rolls back the transaction and re-throws the error.
    *
-   * Concurrent whole-command callers converge on a single row via the
-   * in-transaction `tx.sellerParticipationAcceptance.upsert` against
-   * the natural unique index. Concurrent duplicate inserts inside
-   * one transaction are absorbed by the unique constraint; the loser
-   * observes the winner's row.
+   * #83 re-revision: intent does NOT collect a generic Seller
+   * participation/terms acceptance at capability-provisioning time.
+   * Context-specific confirmations are owned by their later
+   * boundaries.
    */
   async provisionIntentAtomically(input: {
     readonly workspaceId: string;
     readonly userAccountId: string;
     readonly capabilities: readonly MarketplaceCapabilityV1[];
-    readonly acceptance: {
-      readonly termsVersion: string;
-      readonly termsContentHash: string;
-      readonly grantedByUserId: string;
-    } | null;
   }): Promise<void> {
     await this.prisma.$transaction(async (tx) => {
       // Capability upsert via raw `INSERT ... ON CONFLICT DO NOTHING`.
@@ -527,59 +516,12 @@ export class PrismaAuthRepository implements AuthRepository {
       // implemented for the runtime's interactive-transaction
       // client. The raw SQL form unconditionally absorbs duplicate
       // inserts against the natural `(workspace_id, capability)`
-      // unique index and commits the same row — matching the
-      // acceptance row's already-working raw-SQL path.
+      // unique index and commits the same row.
       for (const capability of input.capabilities) {
         await tx.$executeRaw`
           INSERT INTO "workspace_capabilities" ("id", "workspaceId", "capability")
           VALUES (gen_random_uuid()::text, ${input.workspaceId}, ${capability}::"MarketplaceCapability")
           ON CONFLICT ("workspaceId", "capability") DO NOTHING
-        `;
-      }
-      if (input.acceptance) {
-        // Codex CHANGES_REQUESTED P0-003: detect a hash conflict
-        // on an EXISTING acceptance row before upserting. The
-        // in-transaction read is consistent (the same `tx` is
-        // used for the read and the write), so the unique
-        // `(workspaceId, termsVersion)` index does not allow a
-        // concurrent insert between the two calls.
-        const existingAcceptance = await tx.sellerParticipationAcceptance.findUnique({
-          where: {
-            workspaceId_termsVersion: {
-              workspaceId: input.workspaceId,
-              termsVersion: input.acceptance.termsVersion,
-            },
-          },
-        });
-        if (
-          existingAcceptance &&
-          existingAcceptance.termsContentHash !== input.acceptance.termsContentHash
-        ) {
-          throw new SellerParticipationAcceptanceConflictError(
-            `provisionIntentAtomically: termsContentHash conflict for ` +
-              `workspaceId=${input.workspaceId} termsVersion=${input.acceptance.termsVersion}; ` +
-              `the existing acceptance row carries a different content hash.`,
-          );
-        }
-        // Use raw SQL upsert for the acceptance row as well —
-        // consistent with the capability path above. The
-        // conflict-detection read above pins the existing row
-        // before the write; the upsert is then a no-op when the
-        // hashes match.
-        await tx.$executeRaw`
-          INSERT INTO "seller_participation_acceptances"
-            ("id", "workspace_id", "terms_version", "terms_content_hash",
-             "accepted_by_user_id", "granted_by_user_id", "accepted_at")
-          VALUES (
-            gen_random_uuid()::text,
-            ${input.workspaceId}::text,
-            ${input.acceptance.termsVersion}::text,
-            ${input.acceptance.termsContentHash}::text,
-            ${input.userAccountId}::text,
-            ${input.acceptance.grantedByUserId}::text,
-            CURRENT_TIMESTAMP
-          )
-          ON CONFLICT ("workspace_id", "terms_version") DO NOTHING
         `;
       }
     });
@@ -603,7 +545,6 @@ function isBg1Provider(provider: string): provider is Bg1IdentityProviderV1 {
 // self-contained without forcing callers to know the path layout.
 export type {
   PublicUserView,
-  SellerParticipationAcceptanceRecord,
   SessionRecord,
   UserIdentityMapping,
   WorkspaceMembershipView,

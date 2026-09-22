@@ -222,12 +222,6 @@ model UserAccount {
   // the funding call (recorded for audit; the Buyer capability +
   // WorkspaceMembership are the authorization sources).
   createdPaymentIntents      PaymentIntent[]     @relation("PaymentIntentCreatedBy")
-  // M2 (#83): Seller participation acceptances this human recorded.
-  // Capability creation is the grant path; this relation is audit
-  // attribution. Buyer capability creation does NOT write any
-  // acceptance row.
-  acceptedSellerParticipations SellerParticipationAcceptance[] @relation("SellerParticipationAcceptanceAcceptedBy")
-  grantedSellerParticipations  SellerParticipationAcceptance[] @relation("SellerParticipationAcceptanceGrantedBy")
 
   @@map("user_accounts")
 }
@@ -332,10 +326,6 @@ model Workspace {
   // Workspace. Always the buyer Workspace; the activation invariant
   // rejects seller-side intents at the service layer.
   paymentIntents        PaymentIntent[]
-  // M2 (#83): the versioned Seller participation acceptance evidence
-  // recorded when the human chose `Offer services` or `Both`. Buyer
-  // capability creation does NOT write an acceptance row.
-  sellerParticipationAcceptances SellerParticipationAcceptance[]
 
   @@map("workspaces")
 }
@@ -1173,67 +1163,4 @@ model PaymentIntent {
   @@index([termsVersionId])
   @@index([actingWorkspaceId])
   @@map("payment_intents")
-}
-
-// ===========================================================================
-// M2 (#83): Seller participation acceptance
-//
-// SellerParticipationAcceptance records the versioned evidence a human
-// accepted when they chose `Offer services` or `Both` for a Personal
-// Workspace. Buyer capability creation does NOT write any acceptance row
-// at any layer — the table name itself is the DB-level restriction.
-//
-// Every row carries:
-//   - the Workspace receiving Seller capability
-//   - the immutable Seller participation terms version and content hash
-//   - the explicit human actor who accepted the terms
-//   - the timestamp of acceptance
-//
-// The `UNIQUE (workspace_id, terms_version)` index is the concurrency
-// authority. Two concurrent `Offer services` (or two concurrent `Both`)
-// submissions against the same (workspaceId, termsVersion) cannot
-// create a duplicate row — the application uses
-// `INSERT ... ON CONFLICT DO NOTHING RETURNING *` and never relies on
-// find-then-insert pre-checks for race correctness.
-//
-// A different termsVersion starts a NEW acceptance row for the same
-// Workspace. The Personal Workspace may hold at most one Seller
-// capability row (existing `WorkspaceCapability` unique constraint); the
-// acceptance row carries the version under which that capability was
-// originally granted. Re-provisioning under a newer termsVersion
-// creates a new acceptance row alongside the existing Seller capability.
-// ===========================================================================
-model SellerParticipationAcceptance {
-  id                String   @id @default(cuid())            @map("id")
-  workspaceId       String                                  @map("workspace_id")
-  // Versioned Seller participation terms identifier. Distinct from
-  // TermsVersion (BG5) which governs Deal-level scope; this version
-  // identifies the participation / platform-level terms the human
-  // accepted to obtain Seller capability on this Personal Workspace.
-  termsVersion      String                                  @map("terms_version")
-  // SHA-256 of the immutable document content corresponding to
-  // termsVersion. The application never reads this as authorization;
-  // it is the durable evidence the accepted text cannot change
-  // retroactively.
-  termsContentHash  String                                  @map("terms_content_hash")
-  // Explicit human actor. Required.
-  acceptedByUserId  String                                  @map("accepted_by_user_id")
-  // The user who recorded the acceptance in this session. Equal to
-  // acceptedByUserId for the M2 self-service flow. Always populated.
-  // (Reserved for future operator-assisted grant paths.)
-  grantedByUserId   String                                  @map("granted_by_user_id")
-  acceptedAt        DateTime @default(now())                @map("accepted_at")
-
-  workspace   Workspace   @relation(fields: [workspaceId], references: [id], onDelete: Restrict)
-  acceptedBy  UserAccount @relation("SellerParticipationAcceptanceAcceptedBy", fields: [acceptedByUserId], references: [id], onDelete: Restrict)
-  grantedBy   UserAccount @relation("SellerParticipationAcceptanceGrantedBy", fields: [grantedByUserId], references: [id], onDelete: Restrict)
-
-  // Concurrency authority. A retried `Offer services` with the same
-  // termsVersion finds the existing row via ON CONFLICT DO NOTHING;
-  // the service treats that as success — same row, same evidence, no
-  // duplicate.
-  @@unique([workspaceId, termsVersion], map: "seller_participation_acceptances_workspace_version_unique_idx")
-  @@index([workspaceId], map: "seller_participation_acceptances_workspace_id_idx")
-  @@index([acceptedByUserId], map: "seller_participation_acceptances_accepted_by_user_id_idx")
-  @@map("seller_participation_acceptances")
 }

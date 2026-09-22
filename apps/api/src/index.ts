@@ -11,7 +11,6 @@ import { createAudioSamplesRouter } from "./routes/audio-samples.js";
 import { createOfferingCatalogRouter } from "./routes/offering-catalog.js";
 import { createMatchmakerRouter } from "./routes/matchmaker.js";
 import { createIntentRouter } from "./routes/intent.js";
-import { createSellerTermsRouter } from "./routes/seller-participation-terms.js";
 import { PrismaOfferingCatalogRepository } from "./repositories/prisma-offering-catalog.repository.js";
 import { createProjectRequestRouter } from "./routes/project-requests.js";
 import { createDealTermsRouter } from "./routes/deal-terms.js";
@@ -450,12 +449,6 @@ export function buildApp(options: AppOptions = {}): BuiltApp {
       intentService,
       personalWorkspaceConvergenceService,
       allowedReturnOrigin: process.env.FRONTEND_URL ?? "http://localhost:3000",
-    }),
-  );
-  app.use(
-    "/api/seller-participation-terms",
-    createSellerTermsRouter({
-      authenticationService,
     }),
   );
   app.use(

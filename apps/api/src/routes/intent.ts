@@ -22,10 +22,13 @@
 // Body contract:
 //
 //   - `intent`: `"Hire" | "Offer" | "Both"` (closed enum).
-//   - `sellerAcceptance`: required when `intent` is `Offer` or
-//     `Both` (schema-level `.superRefine`); rejected with
-//     `INTENT_INVALID` when missing or when the
-//     `termsContentHash` does not match the registered content.
+//   - No `sellerAcceptance` field is carried on the intent
+//     surface. #83 does NOT collect a generic Seller
+//     participation/terms acceptance at capability-provisioning
+//     time — context-specific confirmations remain owned by their
+//     later boundaries (SellerProfile publication, media use,
+//     ServiceOffering activation, Deal approval authority /
+//     approval).
 //   - `returnTo`: optional. The route revalidates it via the
 //     existing internal-return validation rules
 //     (`isValidReturnPath`); invalid values are silently dropped.
@@ -51,18 +54,6 @@
 //   - `INTENT_FORBIDDEN` (403): authorization rejection (collapsed
 //     by the safe envelope). Includes Personal-Workspace boundary
 //     (`INTENT_NOT_PERSONAL` translated to `INTENT_FORBIDDEN`).
-//   - `INTENT_LEGAL_BLOCKED` (503): Seller participation terms are
-//     not yet registered. The customer-facing message is
-//     "Seller setup is temporarily unavailable. Please try again
-//     later." — owned by the web layer.
-//
-// TODO(legal-blocker): Offer/Both acceptance requires the
-// registered Seller participation terms. #83 keeps the seam
-// (`apps/api/src/lib/seller-participation-terms.ts`). #83 cannot
-// mark Offer/Both production-complete until product/legal calls
-// `registerSellerParticipationTerms({ version, content })` from an
-// approved admin bootstrap. Until that call lands, Offer/Both
-// return `INTENT_LEGAL_BLOCKED`. Owner: Product + Legal.
 //
 // M2 (#83) abuse surface: rate-limiting is intentionally deferred
 // to a future ticket. The route does NOT introduce a limiter in
@@ -70,11 +61,7 @@
 
 import { Router, type Request, type Response } from "express";
 import { ZodError } from "zod";
-import {
-  intentRequestV1Schema,
-  intentResponseV1Schema,
-  type ApiErrorCodeV1,
-} from "@soundhub/types";
+import { intentRequestV1Schema, intentResponseV1Schema } from "@soundhub/types";
 import type { AuthenticationService } from "../services/authentication.service.js";
 import type { IntentService, IntentServiceError } from "../services/intent.service.js";
 import type { PersonalWorkspaceConvergenceService } from "../services/personal-workspace-convergence.service.js";
@@ -83,7 +70,6 @@ import {
   buildSafeError,
   generateRequestId,
   writeSafeError,
-  type SafeErrorResponse,
 } from "../lib/errors.js";
 import { SESSION_COOKIE } from "../lib/session-cookie.js";
 import { isValidReturnPath } from "../lib/return-context.js";
@@ -234,18 +220,8 @@ async function handleIntent(req: Request, res: Response, deps: IntentRouteDeps):
     res.status(200).json(body);
   } catch (err) {
     if (err instanceof Error && err.name === "IntentServiceError") {
-      const intentErr = err as IntentServiceError & { code: ApiErrorCodeV1 };
-      // INTENT_LEGAL_BLOCKED is the single explicit product/legal
-      // blocker on the M2 #83 slice. The customer-facing copy is
-      // the neutral retryable message — the service-level message
-      // describes internal state (terms not registered) and must
-      // never cross the public DTO. Translate here at the route
-      // boundary.
-      const message =
-        intentErr.code === "INTENT_LEGAL_BLOCKED"
-          ? "Seller setup is temporarily unavailable. Please try again later."
-          : intentErr.message;
-      writeIntentError(res, intentErr.code, message, requestId);
+      const intentErr = err as IntentServiceError;
+      writeSafeError(res, buildSafeError(intentErr.code, intentErr.message, undefined, requestId));
       return;
     }
     // Mirror the BG1 pattern: surface AUTH_FAILED for unexpected
@@ -261,21 +237,6 @@ async function handleIntent(req: Request, res: Response, deps: IntentRouteDeps):
       ),
     );
   }
-}
-
-function writeIntentError(
-  res: Response,
-  code: ApiErrorCodeV1,
-  message: string,
-  requestId: string,
-): void {
-  // INTENT_LEGAL_BLOCKED carries the customer-facing copy
-  // "Seller setup is temporarily unavailable. Please try again
-  // later." — the only approved message for that envelope. Other
-  // intent errors surface the service-level message verbatim; the
-  // safe envelope format is identical.
-  const safe: SafeErrorResponse = buildSafeError(code, message, undefined, requestId);
-  writeSafeError(res, safe);
 }
 
 // ---------- Body parser middleware ----------
@@ -362,4 +323,4 @@ function readSessionCookie(req: Request): string | undefined {
 }
 
 // ---------- Type-only re-exports ----------
-export type { ApiErrorCodeV1 };
+export type { IntentServiceError };

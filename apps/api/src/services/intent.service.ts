@@ -6,12 +6,9 @@
 // Seller capability. The intent service is the single owner of
 // that provision:
 //
-//   - `Hire`   → Buyer capability (no attestation).
-//   - `Offer`  → Seller capability + versioned Seller participation
-//                acceptance evidence.
-//   - `Both`   → Buyer capability + Seller capability + Seller
-//                participation acceptance evidence, all in ONE
-//                atomic transaction.
+//   - `Hire`   → Buyer capability only.
+//   - `Offer`  → Seller capability only.
+//   - `Both`   → Buyer + Seller atomically in ONE transaction.
 //
 // Authorization invariants:
 //
@@ -22,40 +19,34 @@
 //     `INTENT_NOT_PERSONAL`, translated to `INTENT_FORBIDDEN`).
 //   - Any current Owner/Admin/Member role on the Personal
 //     Workspace passes (the route is NOT Owner-only per ticket #82).
-//   - Buyer capability requires no attestation.
-//   - Seller capability requires the registered Seller
-//     participation terms (`getCurrentSellerParticipationTerms`).
+//   - Neither Buyer nor Seller capability requires a generic
+//     participation/terms acceptance at capability-provisioning
+//     time. Context-specific confirmations are owned by their
+//     later boundaries (SellerProfile publication, media use,
+//     ServiceOffering activation, Deal approval authority /
+//     approval).
 //   - `DealApprover` is NEVER created by this service.
-//
-// TODO(legal-blocker): Offer/Both acceptance requires the
-// registered Seller participation terms. #83 keeps the seam
-// (`apps/api/src/lib/seller-participation-terms.ts`). #83 cannot
-// mark Offer/Both production-complete until product/legal calls
-// `registerSellerParticipationTerms({ version, content })` from an
-// approved admin bootstrap. Until that call lands, Offer/Both
-// return `INTENT_LEGAL_BLOCKED`. Owner: Product + Legal.
 //
 // Atomicity invariants (Codex CHANGES_REQUESTED P0):
 //
 //   - `Hire`, `Offer`, and `Both` route through
-//     `AuthRepository.provisionIntentAtomically`, which wraps the
-//     capability upserts and the acceptance insert in a single
-//     Prisma `$transaction`. Either ALL writes commit, or the
-//     transaction rolls back to zero rows.
+//     `AuthRepository.provisionIntentAtomically`, which wraps
+//     the capability upserts in a single Prisma `$transaction`.
+//     Either ALL writes commit, or the transaction rolls back
+//     to zero rows.
 //   - The natural unique indexes provide idempotency. The
 //     transaction is the single source of atomicity; if a write
 //     inside the transaction throws (e.g., a real FK constraint
 //     violation), Prisma rolls back every write the transaction
-//     issued, including the capability upserts.
+//     issued.
 //   - The application does NOT rely on find-then-insert pre-checks
 //     for race correctness.
 //
 // `setupState` is read-only on this path. The route derives it
 // via `PersonalWorkspaceConvergenceService.resolveConvergence` and
 // passes the classification into `submitIntent`. The intent service
-// never re-classifies recovery — recovery is already surfaced via
-// the user payload's existing `setupState` field; the dashboard
-// renders it. The intent navigation contract does NOT carry
+// refuses ANY mutation when convergence classifies the user as
+// recovery. The intent navigation contract does NOT carry
 // `setupState` (see `apps/web/src/app/lib/navigate-after-intent.ts`).
 
 import type {
@@ -65,7 +56,6 @@ import type {
   IntentRequestV1,
   IntentResponseV1,
   MarketplaceCapabilityV1,
-  sellerParticipationAcceptanceV1Schema,
 } from "@soundhub/types";
 import { toPublicUser } from "../dto/public-mappers.js";
 import type { AuthRepository, PublicUserView } from "../auth-repository/auth-repository.js";
@@ -74,12 +64,11 @@ import {
   PersonalActingMembershipError,
   type WorkspaceAuthorizationService,
 } from "./workspace-authorization.service.js";
-import { getCurrentSellerParticipationTerms } from "../lib/seller-participation-terms.js";
 
 export class IntentServiceError extends Error {
   constructor(
     message: string,
-    public readonly code: "INTENT_INVALID" | "INTENT_FORBIDDEN" | "INTENT_LEGAL_BLOCKED",
+    public readonly code: "INTENT_INVALID" | "INTENT_FORBIDDEN",
   ) {
     super(message);
     this.name = "IntentServiceError";
@@ -137,10 +126,10 @@ export class IntentService {
     // Step 0: recovery-state failure-closed guard. When the
     // convergence service classifies the user as `recovery`, no
     // Personal Workspace can be authoritative. The intent service
-    // refuses ANY mutation — capability provisioning, acceptance
-    // recording — without an authoritative canonical Personal
-    // Workspace. Ambiguous or contradictory Personal Workspace
-    // authority must remain in recovery and must never be guessed.
+    // refuses ANY mutation — capability provisioning — without an
+    // authoritative canonical Personal Workspace. Ambiguous or
+    // contradictory Personal Workspace authority must remain in
+    // recovery and must never be guessed.
     //
     // This is a fail-closed guard that runs BEFORE every other
     // validation; even an accessible Personal Workspace path id is
@@ -168,76 +157,26 @@ export class IntentService {
       throw err;
     }
 
-    // Step 2: shape validation. The route already validated the
-    // request body via the shared `intentRequestV1Schema`; this
-    // service re-reads the parsed value for capability routing.
+    // Step 2: derive the canonical capability payload. The route
+    // already validated the request body via the shared
+    // `intentRequestV1Schema`; this service re-reads the parsed
+    // intent for capability routing. No Seller participation
+    // acceptance field is carried on the intent surface.
     const intent = input.intent.intent;
-    const sellerAcceptance = input.intent.sellerAcceptance;
     const requestedReturn = input.intent.returnTo ?? null;
 
-    if ((intent === "Offer" || intent === "Both") && !sellerAcceptance) {
-      // Defense in depth — the schema's `.superRefine` rejects
-      // this case at parse time, but a code path that bypasses
-      // schema validation must not silently proceed.
-      throw new IntentServiceError(
-        "sellerAcceptance is required when intent is Offer or Both.",
-        "INTENT_INVALID",
-      );
-    }
-
-    // Step 3: build the canonical capability + acceptance payload.
-    // For Seller/Both, verify the registered terms first. The
-    // service NEVER invents legal copy; the registered-terms seam
-    // is the single explicit product/legal blocker.
     const capabilities: readonly MarketplaceCapabilityV1[] =
       intent === "Hire" ? ["Buyer"] : intent === "Offer" ? ["Seller"] : ["Buyer", "Seller"];
 
-    let acceptance: {
-      readonly termsVersion: string;
-      readonly termsContentHash: string;
-      readonly grantedByUserId: string;
-    } | null = null;
-
-    if (intent === "Offer" || intent === "Both") {
-      const registered = getCurrentSellerParticipationTerms();
-      if (!registered) {
-        throw new IntentServiceError(
-          "Seller participation terms are not yet registered. Cannot provision Seller capability.",
-          "INTENT_LEGAL_BLOCKED",
-        );
-      }
-      if (sellerAcceptance) {
-        if (sellerAcceptance.termsVersion !== registered.version) {
-          throw new IntentServiceError(
-            `sellerAcceptance.termsVersion does not match the registered version (got ${sellerAcceptance.termsVersion}, expected ${registered.version}).`,
-            "INTENT_INVALID",
-          );
-        }
-        if (sellerAcceptance.termsContentHash !== registered.contentHash) {
-          throw new IntentServiceError(
-            "sellerAcceptance.termsContentHash does not match the registered content hash.",
-            "INTENT_INVALID",
-          );
-        }
-        acceptance = {
-          termsVersion: sellerAcceptance.termsVersion,
-          termsContentHash: sellerAcceptance.termsContentHash,
-          grantedByUserId: input.userAccountId,
-        };
-      }
-    }
-
-    // Step 4: single atomic repository call. Either every write
-    // commits, or the transaction rolls back to zero rows. A real
-    // FK violation inside the transaction (e.g., acceptance's
-    // grantedByUserId references a deleted UserAccount) triggers a
-    // Prisma P2003 — the atomicity test exercises this path to
-    // prove the rollback.
+    // Step 3: single atomic repository call. Either every capability
+    // write commits, or the transaction rolls back to zero rows. A
+    // real FK violation inside the transaction (e.g., an FK on
+    // `WorkspaceCapability`) triggers a Prisma error — the
+    // atomicity test exercises this path to prove the rollback.
     await this.deps.authRepository.provisionIntentAtomically({
       workspaceId: acting.workspace.workspaceId,
       userAccountId: input.userAccountId,
       capabilities,
-      acceptance,
     });
 
     return {
@@ -270,5 +209,3 @@ export type {
   MarketplaceCapabilityV1,
   PublicUserView,
 };
-
-export { sellerParticipationAcceptanceV1Schema };

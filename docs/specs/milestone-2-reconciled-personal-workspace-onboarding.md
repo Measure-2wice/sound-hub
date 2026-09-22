@@ -46,12 +46,11 @@ contains no email or provider identity. Naming is not part of intent selection a
 publication is not coupled to renaming the Workspace.
 
 SoundHub then asks the human to choose `Hire talent`, `Offer services`, or `Both`. An explicit,
-retry-safe intent command provisions the corresponding Personal Workspace capabilities. Buyer
-capability requires no buyer-specific attestation. Seller capability requires versioned Seller
-participation/terms acceptance. `Both` provisions Buyer and Seller atomically after collecting the
-Seller acceptance. The initial choice is not permanent: the Personal Workspace may later add the
-other capability through the same explicit self-service policy and requirements. Capability
-deactivation is deferred.
+retry-safe intent command provisions the corresponding Personal Workspace capabilities. The command
+requires no generic participation/terms acceptance at capability-provisioning time — neither Buyer
+nor Seller capability collects a versioned acceptance row for intent. The initial choice is not
+permanent: the Personal Workspace may later add the other capability through the same explicit
+self-service policy. Capability deactivation is deferred.
 
 `DealApprover` remains capability-neutral and separate. An authenticated human acting through
 their own Personal Workspace may accept a versioned approval-authority attestation to provision
@@ -125,8 +124,8 @@ The following behavior is existing baseline, not new Milestone 2 implementation 
 9. As a Personal Workspace participant, I want to add the other capability later, so that my first intent choice is not a permanent role restriction.
 10. As a buyer, I want Buyer capability without a buyer-specific attestation, so that ordinary marketplace participation remains lightweight.
 11. As a buyer, I want Matchmaker and ProjectRequest access without Deal approval authority, so that discovery does not imply power to bind a Workspace.
-12. As a prospective seller, I want Seller capability to require explicit versioned Seller participation acceptance, so that selling is deliberate.
-13. As a prospective seller, I want Seller capability activation separated from profile and service rights representations, so that I attest only when concrete content exists.
+12. As a prospective seller, I want Seller capability provisioned by the same explicit self-service intent command, with no generic participation/terms acceptance at capability-provisioning time, so that ordinary Seller onboarding stays lightweight.
+13. As a prospective seller, I want Seller capability activation separated from later publication/service rights representations, so that those confirmations are collected only when their concrete content exists.
 14. As a Personal Workspace participant, I want Deal approval authority to be optional readiness, so that it does not block ordinary Buyer or Seller activity.
 15. As a Personal Workspace participant, I want to explicitly accept approval authority, so that `DealApprover` is never inferred from membership, Owner status, or capability.
 16. As a buyer approver, I want just-in-time authority setup at terms approval, so that missing authorization has a recoverable product flow.
@@ -260,11 +259,18 @@ The following behavior is existing baseline, not new Milestone 2 implementation 
 ### Intent and capabilities
 
 - The intent choices are `Hire talent`, `Offer services`, and `Both`.
-- `Hire talent` explicitly provisions Buyer capability and requires no buyer-specific attestation.
-- `Offer services` collects current versioned Seller participation/terms acceptance and atomically
-  records that acceptance with Seller capability.
-- `Both` collects the Seller acceptance and atomically creates Buyer and Seller capabilities
-  together. It never creates `DealApprover`.
+- `Hire talent` explicitly provisions Buyer capability. The command requires no buyer-specific
+  attestation.
+- `Offer services` explicitly provisions Seller capability. The command collects no generic
+  Seller participation/terms acceptance at capability-provisioning time — context-specific
+  confirmations are owned by their later boundaries (SellerProfile publication confirmation,
+  media-use confirmation, ServiceOffering activation confirmation, Deal approval authority /
+  approval).
+- `Both` atomically creates Buyer and Seller capabilities together. It never creates
+  `DealApprover`.
+- The intent command carries no `sellerAcceptance` request field, no terms version/hash, and no
+  `INTENT_LEGAL_BLOCKED` envelope — the generic Seller participation acceptance boundary is not
+  invoked at capability-provisioning time.
 - A Personal Workspace may add the other capability later through a dedicated self-service command
   satisfying the same requirements as initial selection. Changing intent is not a capability
   removal mechanism.
@@ -537,8 +543,9 @@ does not silently assert them:
   ```text
   seller completes deterministic production-shaped magic-link authentication
   → first-auth convergence creates UserAccount mapping + Personal Workspace + Owner membership only
-  → seller chooses Offer services and accepts versioned Seller participation terms
-  → Seller capability is provisioned
+  → seller chooses Offer services
+  → Seller capability is provisioned (no generic participation/terms acceptance at capability-
+    provisioning time)
   → seller creates and resumes a SellerProfile draft
   → seller satisfies profile fields and explicitly publishes with versioned confirmation
   → seller creates and resumes a ServiceOffering draft
@@ -572,8 +579,9 @@ does not silently assert them:
   Workspace convergence, concurrent callback/retry, response loss, existing valid Personal reuse,
   preservation of organization memberships, ambiguous/conflicting recovery, and prohibition on
   `ownerUserId` authorization.
-- Focused intent tests cover each choice, atomic `Both`, later capability addition, versioned Seller
-  acceptance, no buyer attestation, no automatic `DealApprover`, and retry convergence.
+- Focused intent tests cover each choice, atomic `Both`, later capability addition, no buyer
+  attestation, no generic Seller participation/terms acceptance at capability-provisioning time,
+  no automatic `DealApprover`, and retry convergence.
 - Focused `DealApprover` tests cover capability-neutral Personal self-service, immutable acceptance,
   dashboard and just-in-time entry, separate approval action, buyer/seller party scoping,
   counterparty rejection, retry, and membership loss.
@@ -683,10 +691,11 @@ The following later roadmap boundaries remain unchanged and are not pulled into 
   remains available for rationale and traceability.
 - The reconciled boundary intentionally promotes the working Golden Slice into an onboarding-backed
   user journey without claiming completion of untouched historical M2 or provisional M3–M7 scope.
-- Production legal/privacy review is still required for the exact Seller participation terms,
-  profile publication confirmation, service activation confirmation, media-use confirmation, and
-  approval-authority attestation. Implementation must version immutable approved text and must not
-  invent legal claims in code or UI copy.
+- Production legal/privacy review is still required for the profile publication confirmation,
+  service activation confirmation, media-use confirmation, and approval-authority attestation.
+  Implementation must version immutable approved text and must not invent legal claims in code or
+  UI copy. The generic Seller participation terms boundary is not invoked at capability-
+  provisioning time; later context-specific confirmations remain owned by their own boundaries.
 - `to-spec` establishes product and engineering behavior. Exact data models, API shapes,
   transaction ordering, idempotency mechanisms, migration SQL, rollout sequence, and ticket sizing
   require later repository verification and planning.

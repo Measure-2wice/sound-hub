@@ -92,7 +92,9 @@ test.describe("M2 #83: intent + Workspace switching (P1-005)", () => {
       await page.goto("/workspace/intent");
     }
     await page.getByTestId("intent-page").waitFor();
-    // Pick Hire (no legal copy required for Buyer-only).
+    // Pick Hire. #83 re-revision: no Seller participation terms
+    // surface is required for any intent path — the intent page
+    // submits the choice directly to the server.
     await page.getByTestId("intent-choice-hire-input").check();
     await page.getByTestId("intent-submit").click();
     // Returns to /dashboard via navigateAfterIntent.

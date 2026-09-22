@@ -41,7 +41,6 @@ import {
   createPrismaClient,
   readTestDatabaseUrl,
 } from "@soundhub/db";
-import type { PrismaClient } from "@soundhub/db";
 
 export interface MultiWorkspaceUserResult {
   readonly userAccountId: string;
@@ -67,9 +66,6 @@ export async function seedMultiWorkspaceUser(email: string): Promise<MultiWorksp
     // helper can be called repeatedly within the same test DB.
     const existing = await prisma.userAccount.findFirst({ where: { email } });
     if (existing) {
-      await prisma.sellerParticipationAcceptance.deleteMany({
-        where: { workspaceId: { in: await workspaceIdsOwnedBy(prisma, existing.id) } },
-      });
       await prisma.workspaceMembership.deleteMany({ where: { userId: existing.id } });
       await prisma.workspace.deleteMany({ where: { ownerUserId: existing.id } });
       await prisma.identityProvider.deleteMany({ where: { userAccountId: existing.id } });
@@ -121,14 +117,6 @@ export async function seedMultiWorkspaceUser(email: string): Promise<MultiWorksp
   } finally {
     await prisma.$disconnect();
   }
-}
-
-async function workspaceIdsOwnedBy(prisma: PrismaClient, userId: string): Promise<string[]> {
-  const rows = await prisma.workspace.findMany({
-    where: { ownerUserId: userId },
-    select: { id: true },
-  });
-  return rows.map((r) => r.id);
 }
 
 const isMainModule =

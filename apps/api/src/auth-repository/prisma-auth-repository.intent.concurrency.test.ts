@@ -1,17 +1,17 @@
-// Concurrency correctness for intent acceptance persistence (M2 #83).
+// Concurrency correctness for intent capability provisioning (M2 #83).
 //
 // Disposable Postgres. Concurrent WHOLE-COMMAND
 // `provisionIntentAtomically` calls against the same Workspace
-// must converge on exactly one Buyer + one Seller + one
-// acceptance row. The natural unique indexes are the
+// must converge on exactly one Buyer + one Seller capability row.
+// The natural unique `(workspace_id, capability)` index is the
 // concurrency authority — there is no application-level pre-check,
 // no find-then-insert race window.
 //
-// Per Codex CHANGES_REQUESTED P2-001: the standalone
-// `recordSellerParticipationAcceptance` and `upsertCapability`
-// primitives are no longer on the public AuthRepository contract.
-// Idempotency and atomicity are tested through the public
-// atomic command — the production entry point.
+// #83 re-revision: intent does NOT collect a generic Seller
+// participation/terms acceptance at capability-provisioning time;
+// this test no longer covers acceptance. Idempotency and atomicity
+// are tested through the public atomic command — the production
+// entry point.
 
 /* eslint-disable @typescript-eslint/no-floating-promises */
 
@@ -34,7 +34,7 @@ describe("PrismaAuthRepository intent concurrency (atomic command)", () => {
     repo = new PrismaAuthRepository(prisma);
   });
 
-  test("Concurrent whole-command converges on exactly one Buyer + Seller + acceptance row", async () => {
+  test("Concurrent whole-command converges on exactly one Buyer + Seller capability row", async () => {
     const ts = Date.now();
     const user = await prisma.userAccount.create({
       data: { email: `intent-conc-${ts}@example.test` },
@@ -48,26 +48,18 @@ describe("PrismaAuthRepository intent concurrency (atomic command)", () => {
         ownerUserId: user.id,
       },
     });
-    const termsVersion = `1.0.${ts}`;
-    const termsContentHash = "a".repeat(64);
     const input = {
       workspaceId: workspace.id,
       userAccountId: user.id,
       capabilities: ["Buyer", "Seller"] as const,
-      acceptance: {
-        termsVersion,
-        termsContentHash,
-        grantedByUserId: user.id,
-      },
     };
     const N = 5;
 
     // N concurrent whole-command callers. Each one composes
-    // capability upserts + acceptance insert inside ONE Prisma
-    // transaction. The natural unique indexes absorb duplicate
-    // capability inserts and duplicate acceptance inserts
-    // idempotently; the final state is exactly one Buyer, one
-    // Seller, one acceptance row.
+    // capability upserts inside ONE Prisma transaction. The natural
+    // unique `(workspace_id, capability)` index absorbs duplicate
+    // capability inserts idempotently; the final state is exactly
+    // one Buyer, one Seller capability row.
     await Promise.all(Array.from({ length: N }, () => repo.provisionIntentAtomically(input)));
 
     const caps = await prisma.workspaceCapability.findMany({
@@ -75,15 +67,7 @@ describe("PrismaAuthRepository intent concurrency (atomic command)", () => {
     });
     assert.equal(caps.length, 2, "exactly one Buyer + one Seller capability row");
 
-    const acceptances = await prisma.sellerParticipationAcceptance.findMany({
-      where: { workspaceId: workspace.id, termsVersion },
-    });
-    assert.equal(acceptances.length, 1, "exactly one acceptance row");
-
     // Cleanup.
-    await prisma.sellerParticipationAcceptance.deleteMany({
-      where: { workspaceId: workspace.id },
-    });
     await prisma.workspaceCapability.deleteMany({ where: { workspaceId: workspace.id } });
     await prisma.workspaceMembership.deleteMany({ where: { workspaceId: workspace.id } });
     await prisma.workspace.delete({ where: { id: workspace.id } });
@@ -112,7 +96,6 @@ describe("PrismaAuthRepository intent concurrency (atomic command)", () => {
           workspaceId: workspace.id,
           userAccountId: user.id,
           capabilities: ["Buyer"],
-          acceptance: null,
         }),
       ),
     );

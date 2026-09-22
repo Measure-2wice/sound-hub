@@ -247,72 +247,36 @@ export interface AuthRepository {
 
   // ---------- M2 #83: Intent selection primitives ----------
   //
-  // Codex CHANGES_REQUESTED P2-001: the standalone
-  // `upsertCapability` and `recordSellerParticipationAcceptance`
-  // primitives were removed from the public AuthRepository contract.
-  // They remain as PRIVATE implementation helpers in each
-  // adapter — the public surface exposes ONLY
-  // `provisionIntentAtomically`, which composes them inside a
-  // single transaction. Production consumers cannot bypass the
-  // atomic invariant.
+  // Per #83 implementation decision: the standalone
+  // `upsertCapability` primitive is a PRIVATE implementation helper
+  // in each adapter (named with the `_` prefix convention). The
+  // public AuthRepository surface exposes ONLY
+  // `provisionIntentAtomically`, which composes the capability
+  // writes inside a single transaction. Production consumers cannot
+  // bypass the atomic invariant.
 
   /**
-   * M2 #83 remediation (Codex CHANGES_REQUESTED P0): atomic intent
-   * provisioning. Single Prisma `$transaction` covering every
-   * capability upsert and the acceptance insert. Either ALL writes
-   * commit, or the transaction rolls back to zero rows.
+   * M2 #83: atomic intent provisioning. Single Prisma `$transaction`
+   * covering every capability write. Either ALL writes commit, or
+   * the transaction rolls back to zero rows.
    *
-   * `Hire`   — `{ capabilities: ["Buyer"],               acceptance: null }`
-   * `Offer`  — `{ capabilities: ["Seller"],              acceptance: { ... } }`
-   * `Both`   — `{ capabilities: ["Buyer", "Seller"],     acceptance: { ... } }`
+   * `Hire`   — `{ capabilities: ["Buyer"] }`
+   * `Offer`  — `{ capabilities: ["Seller"] }`
+   * `Both`   — `{ capabilities: ["Buyer", "Seller"] }`
    *
-   * The acceptance insert uses an in-transaction `upsert` against the
-   * natural `(workspaceId, termsVersion)` unique index so concurrent
-   * whole-command callers converge on the same single row.
-   *
-   * The natural unique constraints provide idempotency, NOT
-   * transaction atomicity. This primitive is the single source of
+   * The natural unique `(workspaceId, capability)` unique index
+   * provides idempotency. This primitive is the single source of
    * atomicity for intent provisioning.
+   *
+   * #83 re-revision note: intent does NOT collect a generic Seller
+   * participation/terms acceptance at capability-provisioning time.
+   * Context-specific confirmations are owned by their later
+   * boundaries (SellerProfile publication, media use, ServiceOffering
+   * activation, Deal approval authority / approval).
    */
   provisionIntentAtomically(input: {
     readonly workspaceId: string;
     readonly userAccountId: string;
     readonly capabilities: readonly MarketplaceCapabilityV1[];
-    readonly acceptance: {
-      readonly termsVersion: string;
-      readonly termsContentHash: string;
-      readonly grantedByUserId: string;
-    } | null;
   }): Promise<void>;
-}
-
-/**
- * The persisted shape of a Seller participation acceptance row.
- * Exposed as a stable view so the IntentService can read back
- * the row recorded by `recordSellerParticipationAcceptance`
- * without depending on Prisma model types in its public surface.
- */
-export interface SellerParticipationAcceptanceRecord {
-  readonly id: string;
-  readonly workspaceId: string;
-  readonly termsVersion: string;
-  readonly termsContentHash: string;
-  readonly acceptedByUserId: string;
-  readonly grantedByUserId: string;
-  readonly acceptedAt: Date;
-}
-
-/**
- * Codex CHANGES_REQUESTED P0-003: raised by every AuthRepository
- * implementation when a Seller participation acceptance retry
- * supplies a `termsContentHash` different from the existing row's
- * content hash. The acceptance evidence is immutable; a different
- * hash against the same `(workspaceId, termsVersion)` is a
- * conflict. Caller MUST fail closed.
- */
-export class SellerParticipationAcceptanceConflictError extends Error {
-  constructor(message: string) {
-    super(message);
-    this.name = "SellerParticipationAcceptanceConflictError";
-  }
 }

@@ -27,12 +27,10 @@ import type {
   AuthRepository,
   PersonalWorkspaceState,
   PublicUserView,
-  SellerParticipationAcceptanceRecord,
   SessionRecord,
   UserIdentityMapping,
   WorkspaceMembershipView,
 } from "./auth-repository.js";
-import { SellerParticipationAcceptanceConflictError } from "./auth-repository.js";
 
 export interface InMemoryMembershipSeed {
   readonly workspaceId: string;
@@ -78,16 +76,6 @@ interface InternalUser {
   identitySubject: string;
 }
 
-interface InternalSellerAcceptance {
-  readonly id: string;
-  readonly workspaceId: string;
-  readonly termsVersion: string;
-  readonly termsContentHash: string;
-  readonly acceptedByUserId: string;
-  readonly grantedByUserId: string;
-  readonly acceptedAt: Date;
-}
-
 export class InMemoryAuthRepository implements AuthRepository {
   private readonly usersByIdentity = new Map<string, UserIdentityMapping>();
   private readonly usersById = new Map<string, InternalUser>();
@@ -95,13 +83,6 @@ export class InMemoryAuthRepository implements AuthRepository {
   private readonly membershipsByUserWorkspace = new Map<string, InternalMembership>();
   private readonly membershipsById = new Map<string, InternalMembership>();
   private readonly sessions = new Map<string, SessionRecord>();
-  // M2 (#83): Seller participation acceptance rows keyed by
-  // `${workspaceId}::${termsVersion}` — mirrors the database
-  // `UNIQUE (workspace_id, terms_version)` index. A second
-  // insertion with the same key is a no-op (returns the existing
-  // record). Idempotency lives in this map's key uniqueness; the
-  // application does not rely on find-then-insert pre-checks.
-  private readonly sellerAcceptances = new Map<string, InternalSellerAcceptance>();
   private readonly nowFn: () => number;
 
   constructor(seeds: readonly InMemoryUserSeed[] = [], now: () => number = () => Date.now()) {
@@ -425,13 +406,13 @@ export class InMemoryAuthRepository implements AuthRepository {
   // ---------- M2 #83: Intent selection primitives ----------
 
   /**
-   * Codex CHANGES_REQUESTED P2-001: the standalone primitives are
-   * PRIVATE implementation helpers (named with the `_` prefix
-   * convention). The InMemoryAuthRepository class still exposes
-   * them as class methods so the in-class `provisionIntentAtomically`
-   * transaction helper can use them, but they are NOT part of the
-   * `AuthRepository` interface. Production consumers cannot call
-   * them — only the atomic command is exposed.
+   * The standalone capability primitive is a PRIVATE implementation
+   * helper (named with the `_` prefix convention). The
+   * InMemoryAuthRepository class exposes it so the in-class
+   * `provisionIntentAtomically` transaction helper can use it,
+   * but it is NOT part of the `AuthRepository` interface.
+   * Production consumers cannot call it — only the atomic command
+   * is exposed.
    */
 
   async _upsertCapability(input: {
@@ -451,61 +432,25 @@ export class InMemoryAuthRepository implements AuthRepository {
     }
   }
 
-  async _recordSellerParticipationAcceptance(input: {
-    readonly workspaceId: string;
-    readonly termsVersion: string;
-    readonly termsContentHash: string;
-    readonly acceptedByUserId: string;
-    readonly grantedByUserId: string;
-  }): Promise<SellerParticipationAcceptanceRecord> {
-    const key = `${input.workspaceId}::${input.termsVersion}`;
-    const existing = this.sellerAcceptances.get(key);
-    if (existing) {
-      // Codex CHANGES_REQUESTED P0-003: a retry with a different
-      // content hash is a conflict — the existing acceptance row's
-      // evidence is immutable. Caller must supply the SAME hash
-      // that was originally registered OR fail closed.
-      if (existing.termsContentHash !== input.termsContentHash) {
-        throw new SellerParticipationAcceptanceConflictError(
-          `InMemoryAuthRepository._recordSellerParticipationAcceptance: termsContentHash ` +
-            `conflict for workspaceId=${input.workspaceId} termsVersion=${input.termsVersion}; ` +
-            `the existing acceptance row carries a different content hash.`,
-        );
-      }
-      return Promise.resolve(toAcceptanceRecord(existing));
-    }
-    const row: InternalSellerAcceptance = {
-      id: randomUUID(),
-      workspaceId: input.workspaceId,
-      termsVersion: input.termsVersion,
-      termsContentHash: input.termsContentHash,
-      acceptedByUserId: input.acceptedByUserId,
-      grantedByUserId: input.grantedByUserId,
-      acceptedAt: new Date(this.nowFn()),
-    };
-    this.sellerAcceptances.set(key, row);
-    return Promise.resolve(toAcceptanceRecord(row));
-  }
-
   /**
-   * M2 #83 remediation: symmetric in-memory implementation of the
-   * Prisma transactional primitive. Real-world transaction atomicity
-   * is not testable in a single-threaded in-memory store, so this
+   * M2 #83: symmetric in-memory implementation of the Prisma
+   * transactional primitive. Real-world transaction atomicity is not
+   * testable in a single-threaded in-memory store, so this
    * implementation enforces atomicity by snapshotting the affected
-   * workspace + acceptance key before the writes and rolling back if
-   * any step throws. Tests that exercise real atomicity run against
+   * workspace capabilities before the writes and rolling back if any
+   * step throws. Tests that exercise real atomicity run against
    * `PrismaAuthRepository` (see the `prisma-auth-repository.intent.
    * atomicity.test.ts` file).
+   *
+   * #83 re-revision: intent does NOT collect a generic Seller
+   * participation/terms acceptance at capability-provisioning time.
+   * Context-specific confirmations are owned by their later
+   * boundaries.
    */
   async provisionIntentAtomically(input: {
     readonly workspaceId: string;
     readonly userAccountId: string;
     readonly capabilities: readonly MarketplaceCapabilityV1[];
-    readonly acceptance: {
-      readonly termsVersion: string;
-      readonly termsContentHash: string;
-      readonly grantedByUserId: string;
-    } | null;
   }): Promise<void> {
     // Snapshot the workspace capabilities so a mid-write failure
     // can roll back to the pre-call state.
@@ -516,52 +461,15 @@ export class InMemoryAuthRepository implements AuthRepository {
       );
     }
     const beforeCapabilities = [...workspace.capabilities];
-    const acceptanceKey = input.acceptance
-      ? `${input.workspaceId}::${input.acceptance.termsVersion}`
-      : null;
-    const beforeAcceptance = acceptanceKey
-      ? (this.sellerAcceptances.get(acceptanceKey) ?? null)
-      : null;
-
-    // Codex CHANGES_REQUESTED P0-003: in-transaction hash-conflict
-    // check that mirrors the Prisma adapter. A conflicting retry
-    // throws BEFORE any write — the transaction (or in-memory
-    // rollback path below) preserves the previous row.
-    if (input.acceptance && beforeAcceptance) {
-      if (beforeAcceptance.termsContentHash !== input.acceptance.termsContentHash) {
-        throw new SellerParticipationAcceptanceConflictError(
-          `InMemoryAuthRepository.provisionIntentAtomically: termsContentHash conflict for ` +
-            `workspaceId=${input.workspaceId} termsVersion=${input.acceptance.termsVersion}; ` +
-            `the existing acceptance row carries a different content hash.`,
-        );
-      }
-    }
 
     try {
       for (const capability of input.capabilities) {
         await this._upsertCapability({ workspaceId: input.workspaceId, capability });
       }
-      if (input.acceptance) {
-        await this._recordSellerParticipationAcceptance({
-          workspaceId: input.workspaceId,
-          termsVersion: input.acceptance.termsVersion,
-          termsContentHash: input.acceptance.termsContentHash,
-          acceptedByUserId: input.userAccountId,
-          grantedByUserId: input.acceptance.grantedByUserId,
-        });
-      }
     } catch (err) {
-      // Roll back capability changes; preserve the existing
-      // acceptance row (creating a new one would duplicate the
-      // natural unique key).
+      // Roll back capability changes so a mid-write failure cannot
+      // leave the Workspace with partial capability state.
       workspace.capabilities = beforeCapabilities;
-      if (acceptanceKey) {
-        if (beforeAcceptance) {
-          this.sellerAcceptances.set(acceptanceKey, beforeAcceptance);
-        } else {
-          this.sellerAcceptances.delete(acceptanceKey);
-        }
-      }
       throw err;
     }
   }
@@ -581,16 +489,4 @@ export class InMemoryAuthRepository implements AuthRepository {
       joinedAt: membership.createdAt,
     };
   }
-}
-
-function toAcceptanceRecord(row: InternalSellerAcceptance): SellerParticipationAcceptanceRecord {
-  return {
-    id: row.id,
-    workspaceId: row.workspaceId,
-    termsVersion: row.termsVersion,
-    termsContentHash: row.termsContentHash,
-    acceptedByUserId: row.acceptedByUserId,
-    grantedByUserId: row.grantedByUserId,
-    acceptedAt: row.acceptedAt,
-  };
 }
