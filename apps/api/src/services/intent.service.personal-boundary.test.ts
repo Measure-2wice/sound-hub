@@ -74,7 +74,7 @@ describe("IntentService Personal-Workspace boundary (inverse authorization)", ()
           userAccountId: USER_ID,
           workspaceId: WS_ORG,
           convergence: CONVERGED,
-          intent: { intent: "Hire" },
+          intent: { intent: "Hire", expectedCapabilities: [] },
         }),
       (err: unknown) => {
         assert.ok(err instanceof IntentServiceError);
@@ -97,7 +97,7 @@ describe("IntentService Personal-Workspace boundary (inverse authorization)", ()
           userAccountId: USER_ID,
           workspaceId: WS_ORG,
           convergence: CONVERGED,
-          intent: { intent: "Offer" },
+          intent: { intent: "Offer", expectedCapabilities: [] },
         }),
       (err: unknown) => {
         assert.ok(err instanceof IntentServiceError);
@@ -118,7 +118,7 @@ describe("IntentService Personal-Workspace boundary (inverse authorization)", ()
           userAccountId: USER_ID,
           workspaceId: WS_ORG,
           convergence: CONVERGED,
-          intent: { intent: "Both" },
+          intent: { intent: "Both", expectedCapabilities: [] },
         }),
       (err: unknown) => {
         assert.ok(err instanceof IntentServiceError);
@@ -137,7 +137,7 @@ describe("IntentService Personal-Workspace boundary (inverse authorization)", ()
       userAccountId: USER_ID,
       workspaceId: WS_PERSONAL,
       convergence: CONVERGED,
-      intent: { intent: "Hire" },
+      intent: { intent: "Hire", expectedCapabilities: [] },
     });
     assert.deepEqual(
       result.user.workspaces.find((w) => w.workspaceId === WS_PERSONAL)?.capabilities,
@@ -210,7 +210,7 @@ describe("IntentService Personal-Workspace boundary (inverse authorization)", ()
             workspaceId: WS_PERSONAL,
             membershipId: "m-personal-boundary-canonical",
           },
-          intent: { intent: "Hire" },
+          intent: { intent: "Hire", expectedCapabilities: [] },
         }),
       (err: unknown) => {
         assert.ok(err instanceof IntentServiceError);
@@ -238,7 +238,7 @@ describe("IntentService Personal-Workspace boundary (inverse authorization)", ()
             userAccountId: USER_ID,
             reason: "contradictory-personal-relationships",
           },
-          intent: { intent: "Both" },
+          intent: { intent: "Both", expectedCapabilities: [] },
         }),
       (err: unknown) => {
         assert.ok(err instanceof IntentServiceError);

@@ -541,6 +541,14 @@ export const apiErrorCodeV1Schema = z.enum([
   // Personal Workspace, the Workspace is not eligible, or some
   // other authorization rejection collapsed by the safe envelope.
   "INTENT_FORBIDDEN",
+  // 409 — the request's `expectedCapabilities` did not match the
+  // persisted capability set inside the locked transition. The
+  // transaction has been rolled back; the response carries the
+  // fresh capability set so the customer can re-submit with the
+  // up-to-date precondition. Distinct from INTENT_FORBIDDEN
+  // (authorization failure) so the UI can render an actionable
+  // recovery rather than a false "not a current member" message.
+  "INTENT_CONFLICT",
 ]);
 export type ApiErrorCodeV1 = z.infer<typeof apiErrorCodeV1Schema>;
 
@@ -947,14 +955,32 @@ export type IntentKindV1 = (typeof intentKindV1Values)[number];
 
 // ---------- Intent request ----------
 
-// The intent request body. `intent` selects the capability set;
-// `returnTo` is optional; the route revalidates it via the existing
-// internal-return validation rules. No `sellerAcceptance` field is
-// carried: the M2 #83 slice does not collect a generic Seller
-// participation/terms acceptance at capability-provisioning time.
+// The intent request body.
+//
+// `intent` selects the capability set to ADD. The command is
+// additive: `Hire` adds Buyer, `Offer` adds Seller, `Both` adds
+// Buyer + Seller. Removing or narrowing a capability is not
+// exposed by this command.
+//
+// `expectedCapabilities` is the capability set the human
+// observed when they clicked Submit. The route compares the
+// persisted set to this value inside the transaction's
+// Workspace-scoped lock and rejects mismatches with the
+// `INTENT_CONFLICT` envelope so the customer can recover with
+// the fresh state. Idempotency only requires the chosen set to
+// be fully covered by the persisted set; a stale
+// `expectedCapabilities` does NOT produce a conflict when the
+// chosen set is already present.
+//
+// `returnTo` is optional; the route revalidates it via the
+// existing internal-return validation rules. No `sellerAcceptance`
+// field is carried: the M2 #83 slice does not collect a generic
+// Seller participation/terms acceptance at capability-provisioning
+// time.
 export const intentRequestV1Schema = z
   .object({
     intent: z.enum(intentKindV1Values),
+    expectedCapabilities: z.array(z.enum(marketplaceCapabilityValuesV1)).max(8),
     returnTo: z.string().min(1).max(256).optional(),
   })
   .strict();
@@ -980,6 +1006,32 @@ export const intentResponseV1Schema = z
   })
   .strict();
 export type IntentResponseV1 = z.infer<typeof intentResponseV1Schema>;
+
+// ---------- Intent conflict response ----------
+//
+// Surface returned when the request's `expectedCapabilities`
+// does not match the persisted capability set inside the
+// locked transition. Carries the FRESH persisted capability set
+// so the customer can re-submit with the up-to-date
+// precondition. Distinct from the standard error envelope so
+// the UI can render an actionable recovery rather than the
+// false "not a current member" copy.
+//
+// The shape is only emitted by the intent route; the standard
+// safe error envelope covers every other rejection surface.
+export const intentConflictResponseV1Schema = z
+  .object({
+    error: z
+      .object({
+        code: z.literal("INTENT_CONFLICT"),
+        message: z.string().min(1).max(500),
+        freshCapabilities: z.array(z.enum(marketplaceCapabilityValuesV1)).max(8),
+        requestId: z.string().min(1).max(128),
+      })
+      .strict(),
+  })
+  .strict();
+export type IntentConflictResponseV1 = z.infer<typeof intentConflictResponseV1Schema>;
 
 // ===========================================================================
 // Matchmaker shared runtime contracts (introduced by ticket #60

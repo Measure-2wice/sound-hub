@@ -36,9 +36,10 @@
 //     `/workspace/switch` interstitial when the target is
 //     different from the current acting Workspace.
 
-import { useRouter } from "next/navigation";
-import { useEffect, useId, useRef, useState } from "react";
+import { useRouter, useSearchParams } from "next/navigation";
+import { useEffect, useId, useMemo, useRef, useState } from "react";
 import { useActingWorkspace, useSetActingWorkspace, useSession } from "./SessionProvider";
+import { isLocallyValidReturnPath } from "../lib/return-path-shape";
 
 interface ActingWorkspaceSelectorProps {
   /** Layout variant. `"desktop"` for inline nav, `"mobile-compact"` for the menu-external chrome. */
@@ -50,10 +51,24 @@ export function ActingWorkspaceSelector({ variant }: ActingWorkspaceSelectorProp
   const { actingWorkspace, actingWorkspaceId } = useActingWorkspace();
   const { setPendingTarget } = useSetActingWorkspace();
   const router = useRouter();
+  const searchParams = useSearchParams();
   const [open, setOpen] = useState(false);
   const containerRef = useRef<HTMLDivElement>(null);
   const buttonRef = useRef<HTMLButtonElement>(null);
   const dropdownId = useId();
+
+  // If the page that mounted the selector carried a validated
+  // `?return=` through (e.g., the dashboard "switch to your
+  // Personal Workspace" link from the Organization empty-state),
+  // thread it forward through the Workspace-switch interstitial.
+  // The switch page reads this URL parameter at commit time and
+  // passes it to the server, which re-resolves it under the
+  // POST-COMMIT acting Workspace context. Cancel ignores it.
+  const forwardReturnTo = useMemo(() => {
+    const raw = searchParams.get("return");
+    if (!raw) return null;
+    return isLocallyValidReturnPath(raw) ? raw : null;
+  }, [searchParams]);
 
   // Close the dropdown when the user clicks outside it.
   useEffect(() => {
@@ -118,7 +133,11 @@ export function ActingWorkspaceSelector({ variant }: ActingWorkspaceSelectorProp
     // happens AFTER `commitPendingTarget` resolves successfully on
     // the switch page; Cancel never touches committed state.
     setPendingTarget(targetId);
-    router.push(`/workspace/switch?target=${encodeURIComponent(targetId)}`);
+    const params = new URLSearchParams({ target: targetId });
+    if (forwardReturnTo !== null) {
+      params.set("return", forwardReturnTo);
+    }
+    router.push(`/workspace/switch?${params.toString()}`);
   };
 
   const currentName = actingWorkspace?.name ?? "Choose a Workspace";

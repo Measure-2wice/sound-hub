@@ -405,39 +405,73 @@ export class InMemoryAuthRepository implements AuthRepository {
   }
 
   // ---------- M2 #83: Intent selection primitives ----------
+  //
+  // Per-Workspace serialization queue. The Prisma adapter uses
+  // `pg_advisory_xact_lock` to serialize intent transitions per
+  // Workspace; the in-memory adapter mirrors that contract with
+  // a chained Promise queue keyed by `workspaceId`. Each new
+  // intent transition awaits the previous transition's tail
+  // before running, so two concurrent disjoint first
+  // submissions serialize and the second observes the first's
+  // committed state.
+  private readonly intentTransitionLocks = new Map<string, Promise<unknown>>();
 
   /**
    * M2 #83: symmetric in-memory implementation of the Prisma
-   * transactional primitive. Real-world transaction atomicity is not
-   * testable in a single-threaded in-memory store, so this
-   * implementation enforces atomicity by snapshotting the affected
-   * workspace capabilities before the writes and rolling back if any
-   * step throws. Tests that exercise real atomicity run against
-   * `PrismaAuthRepository` (see the `prisma-auth-repository.intent.
-   * atomicity.test.ts` file).
+   * expected-state intent primitive.
+   *
+   * Mirrors the Prisma adapter's contract:
+   *
+   *   - The command is additive only.
+   *   - A per-Workspace mutex queue serializes intent
+   *     transitions, equivalent to
+   *     `pg_advisory_xact_lock`.
+   *   - A snapshot/restore block enforces transaction-level
+   *     atomicity (a thrown step rolls capability writes back
+   *     to the pre-call state), equivalent to Prisma's
+   *     `$transaction` rollback.
    *
    * #83 re-revision: intent does NOT collect a generic Seller
-   * participation/terms acceptance at capability-provisioning time.
-   * Context-specific confirmations are owned by their later
-   * boundaries.
-   *
-   * Conflict semantics mirror the Prisma adapter: pre-write
-   * check rejects requests that would silently merge or widen
-   * into a different capability set than the customer
-   * originally requested. Identical retries commit normally;
-   * conflicting retries throw `IntentConflictError` and the
-   * snapshot/restore block rolls the in-memory state back to
-   * the pre-call capability set.
+   * participation/terms acceptance at capability-provisioning
+   * time. Context-specific confirmations are owned by their
+   * later boundaries.
    */
   async provisionIntentAtomically(input: {
     readonly workspaceId: string;
     readonly userAccountId: string;
     readonly capabilities: readonly MarketplaceCapabilityV1[];
+    readonly expectedCapabilities: readonly MarketplaceCapabilityV1[];
   }): Promise<void> {
-    // Mirror the Prisma adapter's atomic-shape: an `await` so the
-    // linter's require-await rule sees a real awaitable path. The
-    // snapshot/restore block below mirrors the Prisma
-    // `$transaction` rollback on failure.
+    // Per-Workspace serialization: chain this call onto the
+    // previous transition's tail so concurrent callers observe
+    // a strict FIFO order. The Prisma adapter achieves the
+    // same ordering via `pg_advisory_xact_lock` inside the
+    // transaction.
+    const previous = this.intentTransitionLocks.get(input.workspaceId) ?? Promise.resolve();
+    const run = previous
+      .catch(() => undefined) // never propagate a predecessor's failure into the next caller
+      .then(() => this.runProvisionIntentAtomically(input));
+    // Park the tail so the NEXT caller chains onto this one.
+    // Use a defensive `.catch` so a future caller that awaits
+    // `this.intentTransitionLocks.get(...)` directly does not
+    // see an unhandled rejection.
+    this.intentTransitionLocks.set(
+      input.workspaceId,
+      run.catch(() => undefined),
+    );
+    await run;
+  }
+
+  private async runProvisionIntentAtomically(input: {
+    readonly workspaceId: string;
+    readonly userAccountId: string;
+    readonly capabilities: readonly MarketplaceCapabilityV1[];
+    readonly expectedCapabilities: readonly MarketplaceCapabilityV1[];
+  }): Promise<void> {
+    // Mirror the Prisma adapter's atomic shape: an `await` so
+    // the linter's require-await rule sees a real awaitable
+    // path. The snapshot/restore block below mirrors the
+    // Prisma `$transaction` rollback on failure.
     await Promise.resolve();
 
     const workspace = this.workspacesById.get(input.workspaceId);
@@ -448,27 +482,35 @@ export class InMemoryAuthRepository implements AuthRepository {
     }
     const beforeCapabilities = [...workspace.capabilities];
 
-    // Pre-write conflict check. If the existing capability set
-    // has any element not in the requested set, a write would
-    // silently merge into a wider set than requested — reject
-    // without mutation.
     const existing: readonly MarketplaceCapabilityV1[] = [...workspace.capabilities];
-    const requested: readonly MarketplaceCapabilityV1[] = [...input.capabilities];
-    if (hasConflictingCapability(existing, requested)) {
+
+    const transition = deriveIntentTransition({
+      existing,
+      chosen: input.capabilities,
+      expected: input.expectedCapabilities,
+    });
+
+    if (transition.kind === "conflict") {
       throw new IntentConflictError(
-        "Conflicting intent retry: existing capability set cannot be silently merged.",
-        [...existing].sort(),
-        [...requested].sort(),
+        "Intent precondition mismatch: the persisted capability set does not match the state observed when this command was submitted.",
+        transition.existing,
+        transition.expected,
+        transition.existing,
       );
     }
 
+    if (transition.kind === "no-op") {
+      // Idempotent success — zero writes.
+      return;
+    }
+
     try {
-      for (const capability of input.capabilities) {
+      for (const capability of transition.addition) {
         applyCapabilityUpsert(workspace, capability);
       }
     } catch (err) {
-      // Roll back capability changes so a mid-write failure cannot
-      // leave the Workspace with partial capability state.
+      // Roll back capability changes so a mid-write failure
+      // cannot leave the Workspace with partial capability state.
       workspace.capabilities = beforeCapabilities;
       throw err;
     }
@@ -510,21 +552,71 @@ function applyCapabilityUpsert(
 }
 
 /**
- * Shared conflict detector. The Prisma adapter and the
- * in-memory adapter both call this helper so conflict semantics
- * are identical in unit tests and in the real database. The
- * intent command only accepts IDENTICAL retries; everything
- * else is rejected (the dedicated "add the other capability"
- * command is the explicit path to a wider set).
+ * Derive the additive transition for an intent command. Mirrors
+ * the Prisma adapter's module-local helper so transition
+ * semantics are identical in unit tests and the real database.
+ *
+ * Returns one of three shapes:
+ *
+ *   - `{ kind: "no-op" }` when the chosen set is already a
+ *     subset of the persisted set (idempotent success).
+ *   - `{ kind: "write", addition }` when persisted `existing`
+ *     matches `expected` and the command writes `chosen −
+ *     existing` rows.
+ *   - `{ kind: "conflict", existing, expected, fresh }` when
+ *     persisted `existing` differs from `expected`; the
+ *     transaction rolls back.
  */
-function hasConflictingCapability(
-  existing: readonly MarketplaceCapabilityV1[],
-  requested: readonly MarketplaceCapabilityV1[],
-): boolean {
-  if (existing.length === 0) return false;
-  if (existing.length !== requested.length) return true;
-  for (const capability of existing) {
-    if (!requested.includes(capability)) return true;
+type IntentTransition =
+  | { readonly kind: "no-op" }
+  | {
+      readonly kind: "write";
+      readonly addition: readonly MarketplaceCapabilityV1[];
+    }
+  | {
+      readonly kind: "conflict";
+      readonly existing: readonly MarketplaceCapabilityV1[];
+      readonly expected: readonly MarketplaceCapabilityV1[];
+    };
+
+function deriveIntentTransition(input: {
+  readonly existing: readonly MarketplaceCapabilityV1[];
+  readonly chosen: readonly MarketplaceCapabilityV1[];
+  readonly expected: readonly MarketplaceCapabilityV1[];
+}): IntentTransition {
+  const existing = [...input.existing].sort();
+  const chosen = [...input.chosen].sort();
+  const expected = [...input.expected].sort();
+
+  if (isSubset(chosen, existing)) {
+    return { kind: "no-op" };
   }
-  return false;
+
+  if (!arrayEqual(existing, expected)) {
+    return { kind: "conflict", existing, expected };
+  }
+
+  const addition = chosen.filter((capability) => !existing.includes(capability));
+  return { kind: "write", addition };
+}
+
+function isSubset(
+  candidate: readonly MarketplaceCapabilityV1[],
+  container: readonly MarketplaceCapabilityV1[],
+): boolean {
+  for (const value of candidate) {
+    if (!container.includes(value)) return false;
+  }
+  return true;
+}
+
+function arrayEqual(
+  a: readonly MarketplaceCapabilityV1[],
+  b: readonly MarketplaceCapabilityV1[],
+): boolean {
+  if (a.length !== b.length) return false;
+  for (let i = 0; i < a.length; i += 1) {
+    if (a[i] !== b[i]) return false;
+  }
+  return true;
 }

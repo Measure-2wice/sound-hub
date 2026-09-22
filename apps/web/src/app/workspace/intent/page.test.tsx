@@ -44,22 +44,23 @@ describe("IntentPage — M2 #83 capability-only contract (#83 re-revision)", () 
     );
   });
 
-  test("Intent page submits only `intent` (with optional `returnTo` for the validated-return flow; no sellerAcceptance payload)", () => {
+  test("Intent page submits `expectedCapabilities` from the current capability set, with optional `returnTo`", () => {
     const source = readFile("workspace/intent/page.tsx");
-    // The body MAY carry `returnTo` when the URL supplies a
-    // validated `?return=`. The schema is `.strict()`; the page
-    // never constructs `null` / junk / `sellerAcceptance`.
+    // The body MUST carry `expectedCapabilities` (the state the
+    // UI observed) so the server can detect a stale submission.
+    // The schema is `.strict()`; the page never constructs
+    // `null` / junk / `sellerAcceptance`.
+    assert.ok(
+      /expectedCapabilities:\s*\[\.\.\.currentCapabilities\]/.test(source),
+      "page MUST submit `expectedCapabilities` derived from the current capability set",
+    );
     assert.ok(
       /const intentBody:\s*IntentRequestV1\s*=/.test(source),
       "page MUST submit an IntentRequestV1 typed payload",
     );
     assert.ok(
-      /\{\s*intent,\s*returnTo:\s*validatedReturnTo\s*\}/.test(source),
-      "page MUST submit `{ intent, returnTo: validatedReturnTo }` when return is validated",
-    );
-    assert.ok(
-      /\{\s*intent\s*\}/.test(source),
-      "page MUST submit `{ intent }` when no return is validated",
+      /\.\.\.bodyBase/.test(source) || /\{ \.\.\.bodyBase/.test(source),
+      "page MUST spread bodyBase when carrying the validated return",
     );
     // Check the CODE (strip JSDoc/comment lines) for sellerAcceptance;
     // the file documents the #83 re-revision decision in comments, but
@@ -72,6 +73,41 @@ describe("IntentPage — M2 #83 capability-only contract (#83 re-revision)", () 
     assert.ok(
       !/sellerAcceptance/.test(codeOnly),
       "intent page MUST NOT construct a sellerAcceptance payload",
+    );
+  });
+
+  test("Intent page derives affordances from current Personal Workspace capabilities", () => {
+    const source = readFile("workspace/intent/page.tsx");
+    // The page reads `actingWorkspace.capabilities` and switches
+    // between the three affordance shapes (none / Buyer-only /
+    // Seller-only / Both). The Both branch renders a calm panel
+    // with no form; the Buyer/Seller branches render a single
+    // explicit "Add … too" affordance carrying the observed
+    // capability set as `expectedCapabilities`.
+    assert.ok(
+      /currentCapabilities\.length\s*===\s*0/.test(source),
+      "empty-capability branch renders the three-card initial form",
+    );
+    assert.ok(
+      /isBuyer\s*\?\s*\(/i.test(source) || /isBuyer\b/.test(source),
+      "Buyer-only branch renders the Offer add affordance",
+    );
+    assert.ok(
+      /hasBoth/.test(source),
+      "Both-capability branch renders the calm panel without a form",
+    );
+  });
+
+  test("Intent page surfaces INTENT_CONFLICT recovery (freshCapabilities + reload button)", () => {
+    const source = readFile("workspace/intent/page.tsx");
+    assert.ok(/INTENT_CONFLICT/.test(source), "page MUST handle the INTENT_CONFLICT error code");
+    assert.ok(
+      /freshCapabilities/.test(source),
+      "page MUST surface freshCapabilities from the INTENT_CONFLICT envelope",
+    );
+    assert.ok(
+      /data-testid="intent-reload"/.test(source),
+      "INTENT_CONFLICT surfaces a reload affordance",
     );
   });
 
@@ -178,8 +214,8 @@ describe("ActingWorkspaceSelector — #83 context model (§4 / P1-005)", () => {
       "handleSelect code MUST NOT write localStorage before explicit confirmation",
     );
     assert.ok(
-      /\/workspace\/switch\?target=/.test(handleBody),
-      "handleSelect MUST navigate to the switch interstitial",
+      /\/workspace\/switch\?/.test(handleBody) && /target:/.test(handleBody),
+      "handleSelect MUST navigate to the switch interstitial with the target query parameter",
     );
   });
 });
@@ -209,21 +245,33 @@ describe("Switch interstitial — commit / cancel behaviour (§4 / P1-005)", () 
     );
   });
 
-  // Validated return threading. The switch interstitial reads
-  // `?return=` from the URL and threads it through both the
-  // commit (Switch and continue) and the cancel paths so the
-  // customer's pending destination is reachable even when the
-  // explicit-switch step is the only thing they bypassed.
-  test("Switch page reads + validates `?return=` and threads it through commit + cancel", () => {
+  // Switch interstitial contract: the cross-Workspace `?return=`
+  // is read + validated at page entry so the Continue handler
+  // can hand it to the server for re-resolution under the
+  // POST-COMMIT acting Workspace context. Cancel never
+  // consumes the target Workspace's return continuation — it
+  // returns to the safe current-Workspace dashboard.
+  test("Switch page reads + validates `?return=`; Cancel returns to /dashboard (does not follow the cross-Workspace return)", () => {
     const source = readFile("workspace/switch/page.tsx");
     assert.ok(/queryReturnTo/.test(source), "switch page derives `queryReturnTo` from the URL");
     assert.ok(
       /isLocallyValidReturnPath/.test(source),
       "switch page uses the local same-origin path validator",
     );
+    // The Cancel handler must navigate to `/dashboard` and NOT
+    // follow `queryReturnTo` — Cancel performs no switch and
+    // never lands the customer on a destination owned by a
+    // Workspace they are no longer acting as.
+    const handleCancelMatch = source.match(/const handleCancel\s*=[\s\S]*?\n\s*\};/);
+    assert.ok(handleCancelMatch, "switch page exposes a handleCancel handler");
+    const cancelBody = handleCancelMatch ? handleCancelMatch[0] : "";
     assert.ok(
-      /queryReturnTo\s*\?\?\s*"\/dashboard"/.test(source),
-      "switch page defaults to /dashboard when no `?return=` is supplied",
+      /router\.replace\("\/dashboard"\)/.test(cancelBody),
+      "Cancel must navigate to /dashboard (not the cross-Workspace ?return=)",
+    );
+    assert.ok(
+      !/queryReturnTo/.test(cancelBody),
+      "Cancel handler MUST NOT consume the target Workspace's return continuation",
     );
   });
 });

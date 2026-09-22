@@ -157,8 +157,12 @@ function PersonalActingDashboard() {
   return (
     <>
       <div className="grid gap-4 sm:grid-cols-2" data-testid="dashboard-readiness">
-        {actingWorkspace.capabilities.includes("Buyer") && <BuyerReadinessRow />}
-        {actingWorkspace.capabilities.includes("Seller") && <SellerReadinessRow />}
+        {actingWorkspace.capabilities.includes("Buyer") && (
+          <BuyerReadinessRow hasSeller={actingWorkspace.capabilities.includes("Seller")} />
+        )}
+        {actingWorkspace.capabilities.includes("Seller") && (
+          <SellerReadinessRow hasBuyer={actingWorkspace.capabilities.includes("Buyer")} />
+        )}
         {!hasAnyCapability && (
           <Card variant="parchment" data-testid="dashboard-no-capabilities">
             <Card.Header>
@@ -245,8 +249,8 @@ function OrganizationActingDashboard({
   return (
     <>
       <div className="grid gap-4 sm:grid-cols-2" data-testid="dashboard-readiness">
-        {hasBuyer && <BuyerReadinessRow />}
-        {hasSeller && <SellerReadinessRow />}
+        {hasBuyer && <BuyerReadinessRow hasSeller={hasSeller} />}
+        {hasSeller && <SellerReadinessRow hasBuyer={hasBuyer} />}
         {!hasBuyer && !hasSeller && (
           <Card variant="parchment" data-testid="dashboard-org-no-capabilities">
             <Card.Header>
@@ -288,7 +292,7 @@ function OrganizationActingDashboard({
   );
 }
 
-function BuyerReadinessRow() {
+function BuyerReadinessRow({ hasSeller }: { readonly hasSeller: boolean }) {
   return (
     <Card variant="parchment" data-testid="dashboard-buyer-readiness">
       <Card.Header>
@@ -298,19 +302,30 @@ function BuyerReadinessRow() {
         <p className="text-base text-muted">
           You can find Caribbean talent, send project requests, and approve work.
         </p>
-        <Link
-          href="/talent"
-          className="mt-3 inline-flex items-center justify-center min-h-[44px] min-w-[44px] py-2 px-4 text-base font-medium text-white bg-coral hover:bg-coral-hover rounded focus:outline-none focus-visible:outline focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-coral"
-          data-testid="dashboard-buyer-find-talent"
-        >
-          Find talent
-        </Link>
+        <div className="mt-3 flex flex-col sm:flex-row gap-2">
+          <Link
+            href="/talent"
+            className="inline-flex items-center justify-center min-h-[44px] min-w-[44px] py-2 px-4 text-base font-medium text-white bg-coral hover:bg-coral-hover rounded focus:outline-none focus-visible:outline focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-coral"
+            data-testid="dashboard-buyer-find-talent"
+          >
+            Find talent
+          </Link>
+          {!hasSeller && (
+            <Link
+              href="/workspace/intent"
+              className="inline-flex items-center justify-center min-h-[44px] min-w-[44px] py-2 px-4 text-base font-medium text-aubergine hover:text-aubergine-hover border border-aubergine rounded focus:outline-none focus-visible:outline focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-aubergine"
+              data-testid="dashboard-add-offer"
+            >
+              Add Offer services too
+            </Link>
+          )}
+        </div>
       </Card.Content>
     </Card>
   );
 }
 
-function SellerReadinessRow() {
+function SellerReadinessRow({ hasBuyer }: { readonly hasBuyer: boolean }) {
   // The previous "Profile and service setup unlocks after your
   // first deal" copy reversed the documented M2 journey:
   // published profile + active services are the prerequisites
@@ -330,6 +345,15 @@ function SellerReadinessRow() {
         <p className="mt-2 text-sm text-muted" data-testid="dashboard-seller-hint">
           You can save private drafts as you go — publication is a separate explicit step.
         </p>
+        {!hasBuyer && (
+          <Link
+            href="/workspace/intent"
+            className="mt-3 inline-flex items-center justify-center min-h-[44px] min-w-[44px] py-2 px-4 text-base font-medium text-aubergine hover:text-aubergine-hover border border-aubergine rounded focus:outline-none focus-visible:outline focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-aubergine"
+            data-testid="dashboard-add-hire"
+          >
+            Add Hire talent too
+          </Link>
+        )}
       </Card.Content>
     </Card>
   );

@@ -461,49 +461,58 @@ export class PrismaAuthRepository implements AuthRepository {
   // ---------- M2 #83: Intent selection primitives ----------
 
   /**
-   * M2 #83: atomic intent provisioning. ONE Prisma `$transaction`
-   * covers every capability write. Either all writes commit, or
-   * the transaction rolls back to zero rows. The natural unique
-   * `(workspace_id, capability)` unique index provides idempotency;
-   * this primitive is the single source of atomicity.
+   * M2 #83: atomic, expected-state intent provisioning.
    *
-   * The transaction callback may throw (e.g., a real FK violation
-   * against the Workspace, OR a conflicting-intent-retry signal
-   * — see below). In both cases Prisma's `$transaction` rolls
-   * back the transaction and re-throws.
+   * Sequence inside one `$transaction`:
+   *
+   *   1. `pg_advisory_xact_lock(hashtext('intent:' ||
+   *      workspaceId))` — Workspace-scoped lock held for the
+   *      lifetime of the transaction. Concurrent disjoint first
+   *      submissions (e.g., simultaneous Hire and Offer on the
+   *      same empty Personal Workspace) serialize on this lock;
+   *      the loser's transaction then observes the winner's
+   *      committed row and conflicts — never silently unions.
+   *   2. Read the persisted capability rows for the Workspace.
+   *   3. Compute the additive transition via
+   *      `deriveIntentTransition`. If the chosen set is already
+   *      a subset of the persisted set, the transaction commits
+   *      with zero writes (idempotent success). Otherwise, the
+   *      persisted `existing` MUST equal the request's
+   *      `expectedCapabilities` (sorted); a mismatch throws
+   *      `IntentConflictError` and the transaction rolls back.
+   *   4. Insert the additive `addition` rows via
+   *      `INSERT ... ON CONFLICT DO NOTHING` — the natural
+   *      `(workspaceId, capability)` unique index absorbs
+   *      duplicate rows when an idempotent retry races a
+   *      concurrent commit.
+   *
+   * The natural unique index is the single source of row-level
+   * idempotency inside the lock. The lock is the single source of
+   * decision-level serialization.
    *
    * #83 re-revision: intent does NOT collect a generic Seller
-   * participation/terms acceptance at capability-provisioning time.
-   * Context-specific confirmations are owned by their later
-   * boundaries.
-   *
-   * Conflict semantics. The transaction reads the workspace's
-   * EXISTING capability set BEFORE any write and rejects
-   * requests that would silently merge or widen into a
-   * different set than the customer originally requested:
-   *
-   *   - Identical retry (existing === requested) → commit
-   *     (the in-transaction upserts absorb duplicates).
-   *   - Conflicting retry (any other shape — disjoint,
-   *     proper-extension, or narrowing) → throw
-   *     `IntentConflictError`; the transaction rolls back to
-   *     zero rows.
-   *
-   * The dedicated "add the other capability" command (a later
-   * boundary) is the explicit path to a wider capability set;
-   * the initial intent command must remain explicit.
+   * participation/terms acceptance at capability-provisioning
+   * time. Context-specific confirmations are owned by their
+   * later boundaries.
    */
   async provisionIntentAtomically(input: {
     readonly workspaceId: string;
     readonly userAccountId: string;
     readonly capabilities: readonly MarketplaceCapabilityV1[];
+    readonly expectedCapabilities: readonly MarketplaceCapabilityV1[];
   }): Promise<void> {
     await this.prisma.$transaction(async (tx) => {
-      // Pre-write conflict check. Read the existing capability set
-      // inside the same transaction (so the read is consistent with
-      // the subsequent writes) and reject requests that would
-      // silently merge or widen into a different set than was
-      // originally requested.
+      // Step 1: Workspace-scoped advisory lock. Released
+      // automatically on COMMIT / ROLLBACK by PostgreSQL. The
+      // hash key is namespaced ('intent:') so the lock space
+      // does not collide with other features that may adopt
+      // advisory locks in later milestones.
+      await tx.$executeRaw`
+        SELECT pg_advisory_xact_lock(hashtext(${"intent:" + input.workspaceId}::text))
+      `;
+
+      // Step 2: read persisted capabilities inside the same
+      // transaction (consistent with subsequent writes).
       const existingRows = await tx.workspaceCapability.findMany({
         where: { workspaceId: input.workspaceId },
         select: { capability: true },
@@ -511,24 +520,38 @@ export class PrismaAuthRepository implements AuthRepository {
       const existing: readonly MarketplaceCapabilityV1[] = existingRows
         .map((r) => r.capability)
         .sort();
-      const requested: readonly MarketplaceCapabilityV1[] = [...input.capabilities].sort();
-      if (hasConflictingCapability(existing, requested)) {
+
+      // Step 3: derive the additive transition. Returns either
+      // a no-op, a write plan, or a conflict signal.
+      const transition = deriveIntentTransition({
+        existing,
+        chosen: input.capabilities,
+        expected: input.expectedCapabilities,
+      });
+
+      if (transition.kind === "conflict") {
         throw new IntentConflictError(
-          "Conflicting intent retry: existing capability set cannot be silently merged.",
-          existing,
-          requested,
+          "Intent precondition mismatch: the persisted capability set does not match the state observed when this command was submitted.",
+          transition.existing,
+          transition.expected,
+          transition.existing,
         );
       }
 
-      // Capability upsert via raw `INSERT ... ON CONFLICT DO NOTHING`.
-      // The Prisma-generated `tx.workspaceCapability.upsert` form
-      // produces a unique-constraint violation under concurrent
-      // identical inserts, because the ON CONFLICT path is not
-      // implemented for the runtime's interactive-transaction
-      // client. The raw SQL form unconditionally absorbs duplicate
-      // inserts against the natural `(workspace_id, capability)`
-      // unique index and commits the same row.
-      for (const capability of input.capabilities) {
+      if (transition.kind === "no-op") {
+        // Idempotent success — zero writes. The command is a
+        // no-op when the chosen set is already fully covered
+        // by the persisted set.
+        return;
+      }
+
+      // Step 4: write the additive rows. The natural unique
+      // index absorbs duplicates when an idempotent retry
+      // races a concurrent commit; the in-transaction advisory
+      // lock guarantees the read-then-write decision is
+      // consistent, but row-level idempotency is the database's
+      // responsibility.
+      for (const capability of transition.addition) {
         await tx.$executeRaw`
           INSERT INTO "workspace_capabilities" ("id", "workspaceId", "capability")
           VALUES (gen_random_uuid()::text, ${input.workspaceId}, ${capability}::"MarketplaceCapability")
@@ -540,40 +563,100 @@ export class PrismaAuthRepository implements AuthRepository {
 }
 
 /**
- * Detect a conflicting intent retry. The intent command only
- * accepts IDENTICAL retries; everything else is rejected.
+ * Derive the additive transition for an intent command under
+ * the Workspace-scoped lock.
  *
- *   - First submission (existing empty) → accept.
- *   - Identical retry (existing === requested) → accept; the
- *     in-transaction upserts absorb duplicates.
- *   - Any other shape → REJECT. The M2 #83 specification
- *     ("Changing intent is not a capability removal mechanism")
- *     forbids narrowing the capability set, and the dedicated
- *     "add the other capability" command (a later boundary) is
- *     the only explicit path to a wider set.
+ * The command is additive only: it adds the chosen capability
+ * set to whatever is already present. A later-add
+ * (`[Buyer] + Offer → Both`) is the same primitive as initial
+ * selection (`[] + Both → Both`).
  *
- * Concrete examples of the rejected shapes:
+ * Returns one of three shapes:
  *
- *   - Disjoint retry: `Hire` after `Offer` would silently merge
- *     into `Both` — `Offer` is committed, the new `Hire` row
- *     would land as `Buyer`, and the Workspace would have
- *     `Buyer + Seller` even though the customer's intent was
- *     one or the other.
- *   - Proper-extension retry: `Both` after `Hire` would silently
- *     add `Seller` beyond the user's original intent.
- *   - Narrowing retry: `Hire` after `Both` would silently remove
- *     `Seller` from the capability set.
+ *   - `{ kind: "no-op" }` when the chosen set is already a
+ *     subset of the persisted set. Idempotent success —
+ *     zero writes, the transaction commits cleanly.
+ *
+ *   - `{ kind: "write", addition }` when the persisted
+ *     `existing` exactly matches the request's
+ *     `expectedCapabilities` (sorted). `addition` is the
+ *     set-difference `chosen − existing`, the rows the
+ *     command will insert.
+ *
+ *   - `{ kind: "conflict", existing, expected, fresh }` when
+ *     the persisted `existing` differs from
+ *     `expectedCapabilities`. The transaction MUST roll back;
+ *     `fresh` is the post-write state the command WOULD have
+ *     produced (i.e., `existing ∪ chosen`) so the UI can
+ *     surface both the persisted reality and the requested
+ *     addition.
+ *
+ * Idempotency invariant: a stale `expectedCapabilities`
+ * produces idempotent success (not a conflict) when the chosen
+ * set is already fully covered. The conflict signal ONLY fires
+ * when the customer would otherwise silently miss a write.
  */
-function hasConflictingCapability(
-  existing: readonly MarketplaceCapabilityV1[],
-  requested: readonly MarketplaceCapabilityV1[],
-): boolean {
-  if (existing.length === 0) return false;
-  if (existing.length !== requested.length) return true;
-  for (const capability of existing) {
-    if (!requested.includes(capability)) return true;
+type IntentTransition =
+  | { readonly kind: "no-op" }
+  | {
+      readonly kind: "write";
+      readonly addition: readonly MarketplaceCapabilityV1[];
+    }
+  | {
+      readonly kind: "conflict";
+      readonly existing: readonly MarketplaceCapabilityV1[];
+      readonly expected: readonly MarketplaceCapabilityV1[];
+    };
+
+function deriveIntentTransition(input: {
+  readonly existing: readonly MarketplaceCapabilityV1[];
+  readonly chosen: readonly MarketplaceCapabilityV1[];
+  readonly expected: readonly MarketplaceCapabilityV1[];
+}): IntentTransition {
+  const existing = [...input.existing].sort();
+  const chosen = [...input.chosen].sort();
+  const expected = [...input.expected].sort();
+
+  // Set membership: every chosen element must already be in
+  // existing for a no-op. Sorted-array equality is sufficient
+  // because MarketplaceCapabilityV1 is a closed enum with two
+  // members; we walk both arrays in lockstep.
+  if (isSubset(chosen, existing)) {
+    return { kind: "no-op" };
   }
-  return false;
+
+  // Precondition: the customer observed `expected` when they
+  // submitted. If the persisted set no longer matches, the
+  // transition is unsafe — surface the conflict so the
+  // customer can re-submit with the up-to-date precondition.
+  if (!arrayEqual(existing, expected)) {
+    return { kind: "conflict", existing, expected };
+  }
+
+  // Write plan: insert the additive delta (chosen − existing).
+  const addition = chosen.filter((capability) => !existing.includes(capability));
+  return { kind: "write", addition };
+}
+
+function isSubset(
+  candidate: readonly MarketplaceCapabilityV1[],
+  container: readonly MarketplaceCapabilityV1[],
+): boolean {
+  for (const value of candidate) {
+    if (!container.includes(value)) return false;
+  }
+  return true;
+}
+
+function arrayEqual(
+  a: readonly MarketplaceCapabilityV1[],
+  b: readonly MarketplaceCapabilityV1[],
+): boolean {
+  if (a.length !== b.length) return false;
+  for (let i = 0; i < a.length; i += 1) {
+    if (a[i] !== b[i]) return false;
+  }
+  return true;
 }
 
 function assertBg1Provider(provider: string): asserts provider is Bg1IdentityProviderV1 {

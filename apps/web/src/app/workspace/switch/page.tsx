@@ -30,7 +30,6 @@
 
 import { Suspense, useEffect, useMemo, useRef, useState } from "react";
 import { useRouter, useSearchParams } from "next/navigation";
-import type { Route } from "next";
 import { Card } from "../../components/ui/Card";
 import { Alert } from "../../components/ui/Alert";
 import {
@@ -38,7 +37,6 @@ import {
   useSession,
   useSetActingWorkspace,
 } from "../../components/SessionProvider";
-import { isLocallyValidReturnPath } from "../../lib/return-path-shape";
 
 export default function WorkspaceSwitchPage() {
   // `useSearchParams` requires a Suspense boundary at static-export
@@ -92,20 +90,6 @@ function WorkspaceSwitchPageInner() {
 
   // provider before navigating here).
   const queryTargetId = searchParams.get("target");
-
-  // Thread `?return=` through the interstitial. The intent
-  // page (and any other onboarding surface) carries the
-  // validated destination as a query parameter; the switch page
-  // must surface it after the explicit commit (or after cancel,
-  // when the user bailed out). The server is the authoritative
-  // validator — this client helper pre-filters obvious junk so
-  // the user does not round-trip a value that would obviously
-  // be rejected.
-  const queryReturnTo = useMemo(() => {
-    const raw = searchParams.get("return");
-    if (!raw) return null;
-    return isLocallyValidReturnPath(raw) ? raw : null;
-  }, [searchParams]);
 
   const target = useMemo(() => {
     if (pendingTarget) return pendingTarget;
@@ -194,14 +178,17 @@ function WorkspaceSwitchPageInner() {
 
     void (async () => {
       try {
-        await commitPendingTarget();
-        // Commit succeeded — committed + localStorage are updated
-        // and pendingTarget is cleared by the provider. Navigate
-        // to the validated `?return=` destination when one was
-        // supplied, otherwise fall back to `/dashboard` under the
-        // new acting Workspace.
-        const destination = queryReturnTo ?? "/dashboard";
-        router.replace(destination as Route);
+        // The server revalidated target membership/status AND
+        // resolved the continuation under the POST-COMMIT
+        // acting Workspace context. The browser consumes ONLY
+        // the server-returned `safeReturnTo` — the raw `?return=`
+        // query parameter is never honored client-side after a
+        // successful commit, so a cross-Workspace destination
+        // cannot reach the browser before the Workspace the
+        // customer just committed to is the actor.
+        const safeReturnTo = await commitPendingTarget();
+        const destination = safeReturnTo ?? "/dashboard";
+        router.replace(destination);
       } catch {
         // Commit failed — leave both committed state AND
         // pendingTarget untouched. Pending remains so the user
@@ -214,16 +201,15 @@ function WorkspaceSwitchPageInner() {
   };
 
   const handleCancel = () => {
-    // Cancel never touches committed state. `cancelPendingTarget`
-    // clears the in-memory candidate only. The validated
-    // `?return=` destination is honoured when one was supplied
-    // so the customer's pending resource is reachable even after
-    // the user opted out of the Workspace
-    // switch — the explicit-switch step was the only thing they
-    // bypassed.
+    // Cancel never touches committed state and NEVER consumes
+    // the target Workspace's return continuation. The customer
+    // opted out of the switch — they return to a safe
+    // current-Workspace surface (the dashboard). Following
+    // `?return=` here would land them on a destination owned
+    // by a Workspace they are no longer acting as, which is
+    // not what they chose.
     cancelPendingTarget();
-    const destination = queryReturnTo ?? "/dashboard";
-    router.replace(destination as Route);
+    router.replace("/dashboard");
   };
 
   return (

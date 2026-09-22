@@ -128,7 +128,7 @@ describe("Intent route (in-memory)", () => {
     const cookie = await signIn();
     const response = await request(app)
       .post(`/api/workspaces/${WS_ID}/intent`)
-      .send({ intent: "Hire" })
+      .send({ intent: "Hire", expectedCapabilities: [] })
       .set("Content-Type", "application/json")
       .set("Cookie", cookie);
     assert.equal(response.status, 200);
@@ -142,7 +142,7 @@ describe("Intent route (in-memory)", () => {
     const cookie = await signIn();
     const response = await request(app)
       .post(`/api/workspaces/${WS_ID}/intent`)
-      .send({ intent: "Offer" })
+      .send({ intent: "Offer", expectedCapabilities: [] })
       .set("Content-Type", "application/json")
       .set("Cookie", cookie);
     assert.equal(response.status, 200);
@@ -154,12 +154,33 @@ describe("Intent route (in-memory)", () => {
     const cookie = await signIn();
     const response = await request(app)
       .post(`/api/workspaces/${WS_ID}/intent`)
-      .send({ intent: "Both" })
+      .send({ intent: "Both", expectedCapabilities: [] })
       .set("Content-Type", "application/json")
       .set("Cookie", cookie);
     assert.equal(response.status, 200);
     const ws = response.body.user.workspaces[0];
     assert.deepEqual(ws.capabilities, ["Buyer", "Seller"]);
+  });
+
+  test("Later-add Offer with expectedCapabilities=[Buyer] provisions Seller on top of Buyer", async () => {
+    const cookie = await signIn();
+    // Initial Hire -> Buyer.
+    const hire = await request(app)
+      .post(`/api/workspaces/${WS_ID}/intent`)
+      .send({ intent: "Hire", expectedCapabilities: [] })
+      .set("Content-Type", "application/json")
+      .set("Cookie", cookie);
+    assert.equal(hire.status, 200);
+    assert.deepEqual(hire.body.user.workspaces[0].capabilities, ["Buyer"]);
+    // Later-add Offer: UI observed Buyer; the command adds
+    // Seller. Final state = Buyer+Seller.
+    const offer = await request(app)
+      .post(`/api/workspaces/${WS_ID}/intent`)
+      .send({ intent: "Offer", expectedCapabilities: ["Buyer"] })
+      .set("Content-Type", "application/json")
+      .set("Cookie", cookie);
+    assert.equal(offer.status, 200);
+    assert.deepEqual(offer.body.user.workspaces[0].capabilities, ["Buyer", "Seller"]);
   });
 
   test("Organization inverse authorization: POST /api/workspaces/<orgId>/intent returns 403 with INTENT_FORBIDDEN; zero mutation", async () => {
@@ -220,7 +241,7 @@ describe("Intent route (in-memory)", () => {
     const cookie = await signIn();
     const response = await request(app)
       .post(`/api/workspaces/${ORG_ID}/intent`)
-      .send({ intent: "Hire" })
+      .send({ intent: "Hire", expectedCapabilities: [] })
       .set("Content-Type", "application/json")
       .set("Cookie", cookie);
     assert.equal(response.status, 403);
@@ -237,7 +258,7 @@ describe("Intent route (in-memory)", () => {
     const cookie = await signIn();
     const response = await request(app)
       .post(`/api/workspaces/ws-not-a-member/intent`)
-      .send({ intent: "Hire" })
+      .send({ intent: "Hire", expectedCapabilities: [] })
       .set("Content-Type", "application/json")
       .set("Cookie", cookie);
     assert.equal(response.status, 403);
@@ -247,7 +268,7 @@ describe("Intent route (in-memory)", () => {
   test("Missing session returns SESSION_INVALID", async () => {
     const response = await request(app)
       .post(`/api/workspaces/${WS_ID}/intent`)
-      .send({ intent: "Hire" })
+      .send({ intent: "Hire", expectedCapabilities: [] })
       .set("Content-Type", "application/json");
     assert.equal(response.status, 401);
     assert.equal(response.body.error.code, "SESSION_INVALID");
@@ -264,11 +285,22 @@ describe("Intent route (in-memory)", () => {
     assert.equal(response.body.error.code, "INTENT_INVALID");
   });
 
+  test("Missing expectedCapabilities returns INTENT_INVALID (strict schema)", async () => {
+    const cookie = await signIn();
+    const response = await request(app)
+      .post(`/api/workspaces/${WS_ID}/intent`)
+      .send({ intent: "Hire" })
+      .set("Content-Type", "application/json")
+      .set("Cookie", cookie);
+    assert.equal(response.status, 400);
+    assert.equal(response.body.error.code, "INTENT_INVALID");
+  });
+
   test("Validated returnTo is echoed in the response; malformed values are silently dropped to null", async () => {
     const cookie = await signIn();
     const okResponse = await request(app)
       .post(`/api/workspaces/${WS_ID}/intent`)
-      .send({ intent: "Hire", returnTo: "/dashboard" })
+      .send({ intent: "Hire", expectedCapabilities: [], returnTo: "/dashboard" })
       .set("Content-Type", "application/json")
       .set("Cookie", cookie);
     assert.equal(okResponse.status, 200);
@@ -276,7 +308,7 @@ describe("Intent route (in-memory)", () => {
 
     const badResponse = await request(app)
       .post(`/api/workspaces/${WS_ID}/intent`)
-      .send({ intent: "Hire", returnTo: "https://evil.example/x" })
+      .send({ intent: "Hire", expectedCapabilities: [], returnTo: "https://evil.example/x" })
       .set("Content-Type", "application/json")
       .set("Cookie", cookie);
     assert.equal(badResponse.status, 200);
@@ -293,6 +325,7 @@ describe("Intent route (in-memory)", () => {
       .post(`/api/workspaces/${WS_ID}/intent`)
       .send({
         intent: "Offer",
+        expectedCapabilities: [],
         sellerAcceptance: {
           termsVersion: "1.0.0",
           termsContentHash: "a".repeat(64),
@@ -304,17 +337,20 @@ describe("Intent route (in-memory)", () => {
     assert.equal(response.body.error.code, "INTENT_INVALID");
   });
 
-  // Conflicting intent retry at the route boundary: a second
-  // `Offer` retry after a successful `Hire` would silently merge
-  // into Buyer+Seller=Both. The route must reject with
-  // INTENT_FORBIDDEN and zero unintended capability writes. The
-  // dedicated "add the other capability" command (later
-  // boundary) is the explicit path.
-  test("Conflicting intent retry (Offer after Hire) returns INTENT_FORBIDDEN; zero unintended writes", async () => {
+  // Stale-precondition conflict at the route boundary: the
+  // customer's UI observed an empty capability set; the persisted
+  // Workspace has Buyer (a concurrent submission, a stale tab,
+  // or an out-of-order refresh). The customer submits `Offer`
+  // with `expectedCapabilities: []` — the atomic primitive
+  // detects the precondition mismatch and the route returns the
+  // distinct `INTENT_CONFLICT` envelope carrying
+  // `freshCapabilities` so the UI can recover. The persisted
+  // state is unchanged.
+  test("Conflicting stale precondition (persisted=Buyer + Offer with expected=[]) returns INTENT_CONFLICT with freshCapabilities; zero writes", async () => {
     const cookie = await signIn();
     const hire = await request(app)
       .post(`/api/workspaces/${WS_ID}/intent`)
-      .send({ intent: "Hire" })
+      .send({ intent: "Hire", expectedCapabilities: [] })
       .set("Content-Type", "application/json")
       .set("Cookie", cookie);
     assert.equal(hire.status, 200);
@@ -322,15 +358,64 @@ describe("Intent route (in-memory)", () => {
 
     const offer = await request(app)
       .post(`/api/workspaces/${WS_ID}/intent`)
-      .send({ intent: "Offer" })
+      .send({ intent: "Offer", expectedCapabilities: [] })
       .set("Content-Type", "application/json")
       .set("Cookie", cookie);
-    assert.equal(offer.status, 403);
-    assert.equal(offer.body.error.code, "INTENT_FORBIDDEN");
+    assert.equal(offer.status, 409);
+    assert.equal(offer.body.error.code, "INTENT_CONFLICT");
+    assert.deepEqual(offer.body.error.freshCapabilities, ["Buyer"]);
+    assert.ok(typeof offer.body.error.requestId === "string");
 
     const view = await authRepo.getPublicUser(USER_ID);
     const personal = view!.workspaces.find((w) => w.workspaceId === WS_ID);
     assert.deepEqual(personal?.capabilities, ["Buyer"], "no silent merge into Both");
+  });
+
+  // Idempotent stale-precondition: persisted state is Both; the
+  // customer submits `Hire` with `expectedCapabilities: []`
+  // (chosen set already covered). The command is a no-op
+  // success; the route returns 200, NOT 409.
+  test("Idempotent stale precondition (persisted=Both + Hire with expected=[]) succeeds as no-op", async () => {
+    const cookie = await signIn();
+    const both = await request(app)
+      .post(`/api/workspaces/${WS_ID}/intent`)
+      .send({ intent: "Both", expectedCapabilities: [] })
+      .set("Content-Type", "application/json")
+      .set("Cookie", cookie);
+    assert.equal(both.status, 200);
+    assert.deepEqual(both.body.user.workspaces[0].capabilities, ["Buyer", "Seller"]);
+
+    const hire = await request(app)
+      .post(`/api/workspaces/${WS_ID}/intent`)
+      .send({ intent: "Hire", expectedCapabilities: [] })
+      .set("Content-Type", "application/json")
+      .set("Cookie", cookie);
+    assert.equal(hire.status, 200);
+    assert.deepEqual(hire.body.user.workspaces[0].capabilities, ["Buyer", "Seller"]);
+  });
+
+  // Later-add path through the route: the explicit
+  // `[Buyer] + Offer -> Both` shape. Confirms the route
+  // accepts the same primitive for both initial selection and
+  // later-add; the request body distinguishes them via
+  // `expectedCapabilities`.
+  test("Later-add Hire with expectedCapabilities=[Seller] provisions Buyer on top of Seller", async () => {
+    const cookie = await signIn();
+    const offer = await request(app)
+      .post(`/api/workspaces/${WS_ID}/intent`)
+      .send({ intent: "Offer", expectedCapabilities: [] })
+      .set("Content-Type", "application/json")
+      .set("Cookie", cookie);
+    assert.equal(offer.status, 200);
+    assert.deepEqual(offer.body.user.workspaces[0].capabilities, ["Seller"]);
+
+    const hire = await request(app)
+      .post(`/api/workspaces/${WS_ID}/intent`)
+      .send({ intent: "Hire", expectedCapabilities: ["Seller"] })
+      .set("Content-Type", "application/json")
+      .set("Cookie", cookie);
+    assert.equal(hire.status, 200);
+    assert.deepEqual(hire.body.user.workspaces[0].capabilities, ["Buyer", "Seller"]);
   });
 
   // Canonical Personal Workspace enforcement at the route
@@ -397,7 +482,7 @@ describe("Intent route (in-memory)", () => {
     const cookie = await signIn();
     const response = await request(app)
       .post(`/api/workspaces/${NON_CANONICAL_PERSONAL}/intent`)
-      .send({ intent: "Hire" })
+      .send({ intent: "Hire", expectedCapabilities: [] })
       .set("Content-Type", "application/json")
       .set("Cookie", cookie);
     assert.equal(response.status, 403);

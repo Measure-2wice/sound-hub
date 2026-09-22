@@ -74,6 +74,7 @@ describe("PrismaAuthRepository intent atomicity", () => {
         workspaceId: workspace.id,
         userAccountId: user.id,
         capabilities: ["Buyer", "Seller"],
+        expectedCapabilities: [],
       });
       const caps = await prisma.workspaceCapability.findMany({
         where: { workspaceId: workspace.id },
@@ -122,6 +123,7 @@ describe("PrismaAuthRepository intent atomicity", () => {
             workspaceId: ghostWorkspaceId,
             userAccountId: user.id,
             capabilities: ["Buyer", "Seller"],
+            expectedCapabilities: [],
           }),
         (err: unknown) => {
           // Real Prisma FK violation error bubbles up; we accept
@@ -165,15 +167,19 @@ describe("PrismaAuthRepository intent atomicity", () => {
 
     try {
       // Five concurrent callers, each running the FULL atomic
-      // command against the same workspace. The in-transaction upsert
-      // absorbs duplicates; every caller observes a successful
-      // commit (no throws).
+      // command against the same workspace. The Workspace-scoped
+      // advisory lock serializes the transitions; the natural
+      // unique `(workspace_id, capability)` index absorbs
+      // duplicates. Every caller observes a successful commit
+      // (no throws); final state has exactly one Buyer + one
+      // Seller row.
       await Promise.all(
         Array.from({ length: 5 }, () =>
           repo.provisionIntentAtomically({
             workspaceId: workspace.id,
             userAccountId: user.id,
             capabilities: ["Buyer", "Seller"],
+            expectedCapabilities: [],
           }),
         ),
       );

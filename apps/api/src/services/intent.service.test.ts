@@ -3,32 +3,34 @@
 // Behavioural tests for the IntentService against the in-memory
 // repository. Coverage:
 //
-//   - `Hire` provisions exactly one Buyer capability row, no
-//     Seller row.
-//   - `Offer` provisions exactly one Seller capability row.
-//   - `Both` provisions Buyer + Seller; concurrency correctness is
-//     asserted at the repository level
-//     (`prisma-auth-repository.intent.concurrency.test.ts`).
-//   - No `sellerAcceptance` request field is required on `Offer`
-//     or `Both`. #83 does NOT collect a generic Seller
-//     participation/terms acceptance at capability-provisioning
-//     time.
+//   - `Hire` on empty Personal provisions exactly Buyer.
+//   - `Offer` on empty Personal provisions exactly Seller.
+//   - `Both` on empty Personal provisions Buyer + Seller
+//     atomically.
+//   - No `sellerAcceptance` request field is required.
 //   - `DealApprover` is NEVER created.
-//   - `Not a current member` throws `INTENT_FORBIDDEN`.
-//
-// The tests run against the in-memory AuthRepository +
-// WorkspaceAuthorizationService. The unit-level tests do NOT
-// depend on Prisma; the repository-level concurrency tests
-// cover the Prisma adapter separately.
+//   - Later capability addition through the SAME command:
+//     `[Buyer] + Offer → Both`; `[Seller] + Hire → Both`.
+//   - Identical retries (chosen ⊆ persisted) are no-op idempotent
+//     success — even when `expectedCapabilities` is stale.
+//   - Stale `expectedCapabilities` against a fresh persisted
+//     state → `INTENT_CONFLICT` (NOT `INTENT_FORBIDDEN`), with the
+//     fresh state preserved.
+//   - `Not a current member` translates to `INTENT_FORBIDDEN`
+//     (authorization failure is distinct from capability-precondition
+//     mismatch).
+//   - Recovery refuses all mutations.
 
 /* eslint-disable @typescript-eslint/no-floating-promises */
 
 import assert from "node:assert/strict";
 import { describe, test } from "node:test";
 import { InMemoryAuthRepository } from "../auth-repository/in-memory-auth-repository.js";
+import { IntentConflictError } from "../auth-repository/auth-repository.js";
 import { IntentService, IntentServiceError } from "./intent.service.js";
 import { WorkspaceAuthorizationService } from "./workspace-authorization.service.js";
 import type { ConvergenceKind } from "../lib/personal-workspace-convergence-domain.js";
+import type { IntentKindV1, IntentRequestV1, MarketplaceCapabilityV1 } from "@soundhub/types";
 
 const USER_ID = "user-intent-test";
 const WS_ID = "ws-intent-test-personal";
@@ -47,6 +49,20 @@ const RECOVERY: ConvergenceKind = {
   userAccountId: USER_ID,
   reason: "pointer-workspace-missing",
 };
+
+// Helpers — the request body shape (intent + expectedCapabilities
+// + optional returnTo) is the executable contract; tests build it
+// verbatim.
+function submitEmpty(intent: IntentKindV1): IntentRequestV1 {
+  return { intent, expectedCapabilities: [] };
+}
+
+function submitWithExpected(
+  intent: IntentKindV1,
+  expectedCapabilities: readonly MarketplaceCapabilityV1[],
+): IntentRequestV1 {
+  return { intent, expectedCapabilities: [...expectedCapabilities] };
+}
 
 function buildService() {
   const authRepo = new InMemoryAuthRepository([
@@ -76,13 +92,13 @@ function buildService() {
 }
 
 describe("IntentService", () => {
-  test("Hire provisions exactly Buyer capability, no Seller", async () => {
+  test("Hire on empty Personal provisions exactly Buyer, no Seller", async () => {
     const { service, authRepo } = buildService();
     const result = await service.submitIntent({
       userAccountId: USER_ID,
       workspaceId: WS_ID,
       convergence: CONVERGED,
-      intent: { intent: "Hire" },
+      intent: submitEmpty("Hire"),
     });
     assert.equal(result.user.workspaces.length, 1);
     const personal = result.user.workspaces[0]!;
@@ -90,18 +106,17 @@ describe("IntentService", () => {
     assert.equal(personal.capabilities.includes("Seller"), false);
 
     const view = await authRepo.getPublicUser(USER_ID);
-    assert.ok(view);
-    const memberships = view.workspaces.find((w) => w.workspaceId === WS_ID);
+    const memberships = view!.workspaces.find((w) => w.workspaceId === WS_ID);
     assert.deepEqual(memberships?.capabilities, ["Buyer"]);
   });
 
-  test("Offer provisions exactly Seller capability with no participation acceptance", async () => {
+  test("Offer on empty Personal provisions exactly Seller with no participation acceptance", async () => {
     const { service, authRepo } = buildService();
     const result = await service.submitIntent({
       userAccountId: USER_ID,
       workspaceId: WS_ID,
       convergence: CONVERGED,
-      intent: { intent: "Offer" },
+      intent: submitEmpty("Offer"),
     });
     assert.deepEqual(result.user.workspaces[0]!.capabilities, ["Seller"]);
     const view = await authRepo.getPublicUser(USER_ID);
@@ -109,13 +124,13 @@ describe("IntentService", () => {
     assert.deepEqual(memberships!.capabilities, ["Seller"]);
   });
 
-  test("Both provisions Buyer + Seller atomically with no participation acceptance", async () => {
+  test("Both on empty Personal provisions Buyer + Seller atomically with no participation acceptance", async () => {
     const { service, authRepo } = buildService();
     const result = await service.submitIntent({
       userAccountId: USER_ID,
       workspaceId: WS_ID,
       convergence: CONVERGED,
-      intent: { intent: "Both" },
+      intent: submitEmpty("Both"),
     });
     assert.deepEqual(result.user.workspaces[0]!.capabilities, ["Buyer", "Seller"]);
     const view = await authRepo.getPublicUser(USER_ID);
@@ -123,7 +138,164 @@ describe("IntentService", () => {
     assert.deepEqual(memberships!.capabilities, ["Buyer", "Seller"]);
   });
 
-  test("Not a current member is translated to INTENT_FORBIDDEN", async () => {
+  test("Later-add: [Buyer] + Offer -> Both (expectedCapabilities=[Buyer])", async () => {
+    const { service, authRepo } = buildService();
+    await service.submitIntent({
+      userAccountId: USER_ID,
+      workspaceId: WS_ID,
+      convergence: CONVERGED,
+      intent: submitEmpty("Hire"),
+    });
+    // The Personal Workspace now has Buyer; the explicit
+    // later-add shape is `Offer` with the observed capability
+    // set. Final state is Buyer+Seller=Both.
+    await service.submitIntent({
+      userAccountId: USER_ID,
+      workspaceId: WS_ID,
+      convergence: CONVERGED,
+      intent: submitWithExpected("Offer", ["Buyer"]),
+    });
+    const view = await authRepo.getPublicUser(USER_ID);
+    const personal = view!.workspaces.find((w) => w.workspaceId === WS_ID);
+    assert.deepEqual(personal?.capabilities, ["Buyer", "Seller"]);
+  });
+
+  test("Later-add: [Seller] + Hire -> Both (expectedCapabilities=[Seller])", async () => {
+    const { service, authRepo } = buildService();
+    await service.submitIntent({
+      userAccountId: USER_ID,
+      workspaceId: WS_ID,
+      convergence: CONVERGED,
+      intent: submitEmpty("Offer"),
+    });
+    await service.submitIntent({
+      userAccountId: USER_ID,
+      workspaceId: WS_ID,
+      convergence: CONVERGED,
+      intent: submitWithExpected("Hire", ["Seller"]),
+    });
+    const view = await authRepo.getPublicUser(USER_ID);
+    const personal = view!.workspaces.find((w) => w.workspaceId === WS_ID);
+    assert.deepEqual(personal?.capabilities, ["Buyer", "Seller"]);
+  });
+
+  test("Idempotent retry: re-submitting the same intent against the same state is a no-op", async () => {
+    const { service, authRepo } = buildService();
+    await service.submitIntent({
+      userAccountId: USER_ID,
+      workspaceId: WS_ID,
+      convergence: CONVERGED,
+      intent: submitEmpty("Both"),
+    });
+    // Re-submit Both against the now-Both state. The chosen
+    // set `{Buyer,Seller}` is already covered; the command is
+    // a no-op success.
+    await service.submitIntent({
+      userAccountId: USER_ID,
+      workspaceId: WS_ID,
+      convergence: CONVERGED,
+      intent: submitEmpty("Both"),
+    });
+    const view = await authRepo.getPublicUser(USER_ID);
+    const personal = view!.workspaces.find((w) => w.workspaceId === WS_ID);
+    assert.deepEqual(personal?.capabilities, ["Buyer", "Seller"]);
+  });
+
+  test("Idempotent with stale expected: chosen already covered succeeds even when expectedCapabilities is stale", async () => {
+    const { service, authRepo } = buildService();
+    // Persisted state = Both.
+    await service.submitIntent({
+      userAccountId: USER_ID,
+      workspaceId: WS_ID,
+      convergence: CONVERGED,
+      intent: submitEmpty("Both"),
+    });
+    // Stale UI submits Hire with expected=[] (the state the
+    // human initially observed, before the Both submission).
+    // The chosen set {Buyer} is already covered by persisted
+    // Both — idempotent success, zero writes.
+    await service.submitIntent({
+      userAccountId: USER_ID,
+      workspaceId: WS_ID,
+      convergence: CONVERGED,
+      intent: submitWithExpected("Hire", []),
+    });
+    const view = await authRepo.getPublicUser(USER_ID);
+    const personal = view!.workspaces.find((w) => w.workspaceId === WS_ID);
+    assert.deepEqual(personal?.capabilities, ["Buyer", "Seller"]);
+  });
+
+  test("Conflicting stale precondition: persisted=Buyer + submit Offer with expected=[] -> IntentConflictError (distinct from authorization); final=Buyer", async () => {
+    const { service, authRepo } = buildService();
+    // Persisted state = Buyer.
+    await service.submitIntent({
+      userAccountId: USER_ID,
+      workspaceId: WS_ID,
+      convergence: CONVERGED,
+      intent: submitEmpty("Hire"),
+    });
+    // Stale UI observed [] (before Hire committed). Submits
+    // Offer with expected=[]. Precondition mismatch — the
+    // customer must reload and re-submit with the fresh state.
+    await assert.rejects(
+      () =>
+        service.submitIntent({
+          userAccountId: USER_ID,
+          workspaceId: WS_ID,
+          convergence: CONVERGED,
+          intent: submitWithExpected("Offer", []),
+        }),
+      (err: unknown) => {
+        // The atomic primitive's IntentConflictError bubbles
+        // up intact so the route can emit the dedicated
+        // INT-prefix envelope with the fresh capability set
+        // attached. The service does NOT collapse it into
+        // IntentServiceError — that would lose the
+        // actionable recovery payload.
+        assert.ok(err instanceof IntentConflictError);
+        assert.deepEqual(err.existing, ["Buyer"]);
+        assert.deepEqual(err.expected, []);
+        assert.deepEqual(err.fresh, ["Buyer"]);
+        return true;
+      },
+    );
+    const view = await authRepo.getPublicUser(USER_ID);
+    const personal = view!.workspaces.find((w) => w.workspaceId === WS_ID);
+    assert.deepEqual(
+      personal?.capabilities,
+      ["Buyer"],
+      "transaction rolled back; persisted state preserved",
+    );
+  });
+
+  test("Conflicting stale precondition: persisted=Seller + submit Hire with expected=[] -> IntentConflictError; final=Seller", async () => {
+    const { service, authRepo } = buildService();
+    await service.submitIntent({
+      userAccountId: USER_ID,
+      workspaceId: WS_ID,
+      convergence: CONVERGED,
+      intent: submitEmpty("Offer"),
+    });
+    await assert.rejects(
+      () =>
+        service.submitIntent({
+          userAccountId: USER_ID,
+          workspaceId: WS_ID,
+          convergence: CONVERGED,
+          intent: submitWithExpected("Hire", []),
+        }),
+      (err: unknown) => {
+        assert.ok(err instanceof IntentConflictError);
+        assert.deepEqual(err.existing, ["Seller"]);
+        return true;
+      },
+    );
+    const view = await authRepo.getPublicUser(USER_ID);
+    const personal = view!.workspaces.find((w) => w.workspaceId === WS_ID);
+    assert.deepEqual(personal?.capabilities, ["Seller"]);
+  });
+
+  test("Not a current member is translated to INTENT_FORBIDDEN (NOT INTENT_CONFLICT)", async () => {
     const { service } = buildService();
     await assert.rejects(
       () =>
@@ -131,7 +303,7 @@ describe("IntentService", () => {
           userAccountId: USER_ID,
           workspaceId: "ws-not-a-member",
           convergence: CONVERGED,
-          intent: { intent: "Hire" },
+          intent: submitEmpty("Hire"),
         }),
       (err: unknown) => {
         assert.ok(err instanceof IntentServiceError);
@@ -149,7 +321,7 @@ describe("IntentService", () => {
           userAccountId: USER_ID,
           workspaceId: WS_ID,
           convergence: RECOVERY,
-          intent: { intent: "Hire" },
+          intent: submitEmpty("Hire"),
         }),
       (err: unknown) => {
         assert.ok(err instanceof IntentServiceError);
@@ -169,7 +341,7 @@ describe("IntentService", () => {
           userAccountId: USER_ID,
           workspaceId: WS_ID,
           convergence: RECOVERY,
-          intent: { intent: "Offer" },
+          intent: submitEmpty("Offer"),
         }),
       (err: unknown) => {
         assert.ok(err instanceof IntentServiceError);
@@ -187,7 +359,7 @@ describe("IntentService", () => {
           userAccountId: USER_ID,
           workspaceId: WS_ID,
           convergence: RECOVERY,
-          intent: { intent: "Both" },
+          intent: submitEmpty("Both"),
         }),
       (err: unknown) => {
         assert.ok(err instanceof IntentServiceError);
@@ -203,124 +375,8 @@ describe("IntentService", () => {
       userAccountId: USER_ID,
       workspaceId: WS_ID,
       convergence: CONVERGED,
-      intent: { intent: "Hire" },
+      intent: submitEmpty("Hire"),
     });
     assert.equal(result.user.setupState, "converged");
-  });
-
-  // Conflicting intent retry semantics. Identical retries must
-  // succeed; conflicting retries (e.g. `Hire` after `Offer`
-  // already provisioned Seller) must stop safely with
-  // `INTENT_FORBIDDEN` and zero unintended capability writes. The
-  // dedicated "add the other capability" command (later boundary)
-  // is the explicit path to a wider capability set.
-  test("Idempotent retry: re-submitting the same intent is a no-op", async () => {
-    const { service, authRepo } = buildService();
-    await service.submitIntent({
-      userAccountId: USER_ID,
-      workspaceId: WS_ID,
-      convergence: CONVERGED,
-      intent: { intent: "Both" },
-    });
-    // Re-submit Both — must succeed without throwing.
-    await service.submitIntent({
-      userAccountId: USER_ID,
-      workspaceId: WS_ID,
-      convergence: CONVERGED,
-      intent: { intent: "Both" },
-    });
-    const view = await authRepo.getPublicUser(USER_ID);
-    const personal = view!.workspaces.find((w) => w.workspaceId === WS_ID);
-    assert.deepEqual(personal?.capabilities, ["Buyer", "Seller"]);
-  });
-
-  test("Conflicting retry: Hire after Offer (Buyer missing) throws INTENT_FORBIDDEN; zero mutation", async () => {
-    const { service, authRepo } = buildService();
-    await service.submitIntent({
-      userAccountId: USER_ID,
-      workspaceId: WS_ID,
-      convergence: CONVERGED,
-      intent: { intent: "Offer" },
-    });
-    // Now a second caller submits `Hire` — the requested set
-    // (Buyer) does not contain the existing Seller. The atomic
-    // primitive must reject (no silent merge into Both).
-    await assert.rejects(
-      () =>
-        service.submitIntent({
-          userAccountId: USER_ID,
-          workspaceId: WS_ID,
-          convergence: CONVERGED,
-          intent: { intent: "Hire" },
-        }),
-      (err: unknown) => {
-        assert.ok(err instanceof IntentServiceError);
-        assert.equal(err.code, "INTENT_FORBIDDEN");
-        return true;
-      },
-    );
-    const view = await authRepo.getPublicUser(USER_ID);
-    // Existing capability set must be unchanged — Seller only.
-    const personal = view!.workspaces.find((w) => w.workspaceId === WS_ID);
-    assert.deepEqual(personal?.capabilities, ["Seller"]);
-  });
-
-  test("Conflicting retry: Offer after Hire (Seller missing) throws INTENT_FORBIDDEN; zero mutation", async () => {
-    const { service, authRepo } = buildService();
-    await service.submitIntent({
-      userAccountId: USER_ID,
-      workspaceId: WS_ID,
-      convergence: CONVERGED,
-      intent: { intent: "Hire" },
-    });
-    await assert.rejects(
-      () =>
-        service.submitIntent({
-          userAccountId: USER_ID,
-          workspaceId: WS_ID,
-          convergence: CONVERGED,
-          intent: { intent: "Offer" },
-        }),
-      (err: unknown) => {
-        assert.ok(err instanceof IntentServiceError);
-        assert.equal(err.code, "INTENT_FORBIDDEN");
-        return true;
-      },
-    );
-    const view = await authRepo.getPublicUser(USER_ID);
-    const personal = view!.workspaces.find((w) => w.workspaceId === WS_ID);
-    assert.deepEqual(personal?.capabilities, ["Buyer"]);
-  });
-
-  test("Idempotent retry: submitting Both after Buyer-only is rejected (would silently add Seller)", async () => {
-    const { service, authRepo } = buildService();
-    await service.submitIntent({
-      userAccountId: USER_ID,
-      workspaceId: WS_ID,
-      convergence: CONVERGED,
-      intent: { intent: "Hire" },
-    });
-    // The user's first choice was `Hire`. A subsequent `Both`
-    // request would silently add Seller — that is the same
-    // conflicting-retry case. The intent command must reject; the
-    // customer must use the dedicated "add the other capability"
-    // command (later boundary) to widen the capability set.
-    await assert.rejects(
-      () =>
-        service.submitIntent({
-          userAccountId: USER_ID,
-          workspaceId: WS_ID,
-          convergence: CONVERGED,
-          intent: { intent: "Both" },
-        }),
-      (err: unknown) => {
-        assert.ok(err instanceof IntentServiceError);
-        assert.equal(err.code, "INTENT_FORBIDDEN");
-        return true;
-      },
-    );
-    const view = await authRepo.getPublicUser(USER_ID);
-    const personal = view!.workspaces.find((w) => w.workspaceId === WS_ID);
-    assert.deepEqual(personal?.capabilities, ["Buyer"]);
   });
 });

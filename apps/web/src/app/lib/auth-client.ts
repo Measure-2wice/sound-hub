@@ -26,6 +26,7 @@ import type {
   Bg1VerifyTokenResponseV1,
   IntentRequestV1,
   IntentResponseV1,
+  MarketplaceCapabilityV1,
 } from "@soundhub/types";
 
 export type { Bg1VerifyTokenResponseV1, IntentResponseV1 };
@@ -56,6 +57,13 @@ export interface AuthClientError {
   readonly code: string;
   readonly message: string;
   readonly requestId: string | null;
+  /**
+   * INTENT_CONFLICT surfaces the FRESH persisted capability set
+   * on `error.freshCapabilities` so the UI can render an
+   * actionable recovery affordance. Absent on every other
+   * envelope.
+   */
+  readonly freshCapabilities: readonly MarketplaceCapabilityV1[] | null;
 }
 
 async function parseErrorResponse(response: Response): Promise<AuthClientError> {
@@ -72,6 +80,7 @@ async function parseErrorResponse(response: Response): Promise<AuthClientError> 
       code?: string;
       message?: string;
       requestId?: string;
+      freshCapabilities?: readonly MarketplaceCapabilityV1[];
     };
   } | null;
   return {
@@ -79,6 +88,7 @@ async function parseErrorResponse(response: Response): Promise<AuthClientError> 
     code: candidate?.error?.code ?? "AUTH_FAILED",
     message: candidate?.error?.message ?? "Authentication request failed.",
     requestId: candidate?.error?.requestId ?? null,
+    freshCapabilities: candidate?.error?.freshCapabilities ?? null,
   };
 }
 
@@ -169,7 +179,9 @@ export async function signOut(): Promise<void> {
   }
 }
 
-export async function selectActingWorkspace(input: { actingWorkspaceId: string }): Promise<void> {
+export async function selectActingWorkspace(input: {
+  actingWorkspaceId: string;
+}): Promise<{ readonly safeReturnTo: string | null }> {
   const response = await fetch("/api/auth/acting-workspace", {
     method: "POST",
     headers: { "Content-Type": "application/json" },
@@ -179,6 +191,19 @@ export async function selectActingWorkspace(input: { actingWorkspaceId: string }
   if (!response.ok) {
     throw ensureError(null, await parseErrorResponse(response));
   }
+  const raw: unknown = await response.json();
+  // The server-resolved `safeReturnTo` represents CONTEXTUAL
+  // authorization — the destination is reachable from the FRESH
+  // post-commit acting Workspace. The browser consumes ONLY
+  // this value; the raw `?return=` query parameter is never
+  // honored client-side after a successful commit.
+  const body = raw as { safeReturnTo?: unknown };
+  return {
+    safeReturnTo:
+      typeof body.safeReturnTo === "string" && body.safeReturnTo.length > 0
+        ? body.safeReturnTo
+        : null,
+  };
 }
 
 /**

@@ -255,14 +255,18 @@ function mapStatus(code: ApiErrorCodeV1): number {
       return 409;
     // M2 (#83): Intent selection status mapping. 400 for malformed
     // requests, 403 for authorization rejections collapsed by the
-    // safe envelope. Intent does NOT collect a generic Seller
-    // participation/terms acceptance at capability-provisioning
-    // time; there is no separate product/legal envelope at this
-    // boundary.
+    // safe envelope, 409 for the transition precondition mismatch
+    // (the persisted capability set does not match the
+    // request's `expectedCapabilities`). Intent does NOT collect a
+    // generic Seller participation/terms acceptance at
+    // capability-provisioning time; there is no separate
+    // product/legal envelope at this boundary.
     case "INTENT_INVALID":
       return 400;
     case "INTENT_FORBIDDEN":
       return 403;
+    case "INTENT_CONFLICT":
+      return 409;
   }
 }
 

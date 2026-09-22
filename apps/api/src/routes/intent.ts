@@ -61,7 +61,11 @@
 
 import { Router, type Request, type Response } from "express";
 import { ZodError } from "zod";
-import { intentRequestV1Schema, intentResponseV1Schema } from "@soundhub/types";
+import {
+  intentConflictResponseV1Schema,
+  intentRequestV1Schema,
+  intentResponseV1Schema,
+} from "@soundhub/types";
 import type { AuthenticationService } from "../services/authentication.service.js";
 import type { IntentService, IntentServiceError } from "../services/intent.service.js";
 import type { PersonalWorkspaceConvergenceService } from "../services/personal-workspace-convergence.service.js";
@@ -77,6 +81,7 @@ import {
   SafeReturnToFallback,
   resolvePostCommandReturnDestination,
 } from "../lib/post-command-return-destination.js";
+import { IntentConflictError } from "../auth-repository/auth-repository.js";
 
 export interface IntentRouteDeps {
   readonly authenticationService: AuthenticationService;
@@ -219,6 +224,28 @@ async function handleIntent(req: Request, res: Response, deps: IntentRouteDeps):
     });
     res.status(200).json(body);
   } catch (err) {
+    if (err instanceof IntentConflictError) {
+      // The atomic primitive has already rolled back. The
+      // customer is a current member of the Personal Workspace;
+      // they acted on a stale view of its capability set. The
+      // distinct `INTENT_CONFLICT` envelope carries the FRESH
+      // capability set so the UI can render an actionable
+      // recovery affordance. The body is validated against the
+      // shared `intentConflictResponseV1Schema` before send.
+      const freshCapabilities = [...err.fresh].sort();
+      const body = intentConflictResponseV1Schema.parse({
+        error: {
+          code: "INTENT_CONFLICT",
+          message:
+            "Your Personal Workspace capabilities changed since you started. Review the current capabilities and resubmit.",
+          freshCapabilities,
+          requestId,
+        },
+      });
+      res.setHeader("x-request-id", requestId);
+      res.status(409).json(body);
+      return;
+    }
     if (err instanceof Error && err.name === "IntentServiceError") {
       const intentErr = err as IntentServiceError;
       writeSafeError(res, buildSafeError(intentErr.code, intentErr.message, undefined, requestId));

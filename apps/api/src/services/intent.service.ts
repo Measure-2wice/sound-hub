@@ -78,35 +78,18 @@ export class IntentServiceError extends Error {
 }
 
 /**
- * Translate a `WorkspaceAuthorizationService` `AuthorizationError`,
- * a `PersonalActingMembershipError`, OR an `IntentConflictError`
- * into the intent service's stable code set. The route layer
- * applies the safe-envelope mapping; this translation keeps the
- * service's contract readable at the call site.
- *
- * Coverage:
- *   - `AuthorizationError` (generic non-membership / ineligible /
- *     capability gates).
- *   - `PersonalActingMembershipError` (the Personal-Workspace
- *     boundary — see #83 remediation §2).
- *   - `IntentConflictError` (a conflicting intent retry would
- *     silently merge the existing capability rows with the
- *     requested ones into a wider set than the customer
- *     originally asked for). The atomic primitive has already
- *     rolled back; the service translates the signal into a
- *     single safe-envelope `INTENT_FORBIDDEN` so the customer
- *     sees actionable recovery rather than the implementation-
- *     internal `existing` / `requested` arrays.
- *
- * All three surface to the customer as `INTENT_FORBIDDEN` so the
- * route layer renders a single safe-envelope copy.
+ * Translate a `WorkspaceAuthorizationService` `AuthorizationError`
+ * or `PersonalActingMembershipError` into the intent service's
+ * stable authorization code. Authorization failure and
+ * capability-precondition mismatch are distinct diagnoses; the
+ * atomic primitive's `IntentConflictError` is NOT translated
+ * here — it bubbles up so the route can emit the dedicated
+ * `INTENT_CONFLICT` envelope (with the FRESH capability set
+ * attached) without going through the generic
+ * `IntentServiceError` channel.
  */
 export function translateAuthorizationError(err: unknown): IntentServiceError | null {
-  if (
-    err instanceof AuthorizationError ||
-    err instanceof PersonalActingMembershipError ||
-    err instanceof IntentConflictError
-  ) {
+  if (err instanceof AuthorizationError || err instanceof PersonalActingMembershipError) {
     return new IntentServiceError(err.message, "INTENT_FORBIDDEN");
   }
   return null;
@@ -225,23 +208,30 @@ export class IntentService {
     // `WorkspaceCapability`) triggers a Prisma error — the
     // atomicity test exercises this path to prove the rollback.
     //
-    // Conflicting intent retries (where the existing capability
-    // set would silently merge or widen into a different set
-    // than the customer originally requested) surface as
-    // `IntentConflictError` from inside the transaction; the
-    // service translates that to `INTENT_FORBIDDEN` so the
-    // customer receives a single safe-envelope copy. The
-    // dedicated "add the other capability" command (a later
-    // boundary) is the explicit path to a wider capability set.
+    // The atomic primitive is expected-state: it compares the
+    // request's `expectedCapabilities` to the persisted set
+    // inside the Workspace-scoped lock. A mismatch surfaces as
+    // `IntentConflictError` and is translated to `INTENT_CONFLICT`
+    // (HTTP 409) — distinct from authorization failures so the
+    // UI can render an actionable recovery rather than a false
+    // membership diagnosis.
     try {
       await this.deps.authRepository.provisionIntentAtomically({
         workspaceId: canonicalPersonalWorkspaceId,
         userAccountId: input.userAccountId,
         capabilities,
+        expectedCapabilities: input.intent.expectedCapabilities,
       });
     } catch (err) {
-      const translated = translateAuthorizationError(err);
-      if (translated) throw translated;
+      // Authorization failures translate to INTENT_FORBIDDEN.
+      // The atomic primitive's `IntentConflictError` is left
+      // intact so the route can emit the dedicated
+      // INTENT_CONFLICT envelope with the FRESH capability set
+      // attached — collapsing it into INTENT_FORBIDDEN would
+      // lose the actionable recovery payload.
+      if (err instanceof IntentConflictError) throw err;
+      const authTranslated = translateAuthorizationError(err);
+      if (authTranslated) throw authTranslated;
       throw err;
     }
 

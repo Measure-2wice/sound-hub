@@ -149,10 +149,15 @@ export interface ActingWorkspaceUpdateContextValue {
   /**
    * Switch page "Switch and continue". Calls the
    * `selectActingWorkspace` API; on success, writes localStorage
-   * and clears pending. On failure, throws and leaves both
-   * committed + pending untouched.
+   * and clears pending, and returns the server-resolved
+   * `safeReturnTo` (the destination the browser should navigate
+   * to under the post-commit acting Workspace context). The
+   * browser consumes ONLY this value — the raw `?return=` query
+   * parameter is never honored client-side after a successful
+   * commit. On failure, throws and leaves both committed +
+   * pending untouched.
    */
-  readonly commitPendingTarget: () => Promise<void>;
+  readonly commitPendingTarget: () => Promise<string | null>;
   /** Switch page "Cancel". Clears pending without touching committed. */
   readonly cancelPendingTarget: () => void;
   /** Sign-out + edge cases. Clears the committed localStorage value. */
@@ -161,7 +166,7 @@ export interface ActingWorkspaceUpdateContextValue {
 
 const ActingWorkspaceUpdateContext = createContext<ActingWorkspaceUpdateContextValue>({
   setPendingTarget: () => undefined,
-  commitPendingTarget: () => Promise.resolve(),
+  commitPendingTarget: () => Promise.resolve<string | null>(null),
   cancelPendingTarget: () => undefined,
   clearActingWorkspace: () => undefined,
 });
@@ -197,19 +202,23 @@ export function ActingWorkspaceProvider({ children }: { readonly children: React
     setPendingTargetId(workspaceId);
   }, []);
 
-  const commitPendingTarget = useCallback(async (): Promise<void> => {
-    if (!pendingTargetId) return;
+  const commitPendingTarget = useCallback(async (): Promise<string | null> => {
+    if (!pendingTargetId) return null;
     // Validate the candidate is still a current member of the
     // user's accessible Workspaces BEFORE calling the network.
     if (!user || !user.workspaces.some((w) => w.workspaceId === pendingTargetId)) {
       throw new Error("Pending target is no longer a current Workspace; refusing to commit.");
     }
     // Server-side revalidation via the #82 acting-workspace route
-    // (membership-not-Owner-only). On failure, leave both untouched.
-    await selectActingWorkspaceRequest({ actingWorkspaceId: pendingTargetId });
+    // (membership-not-Owner-only). The server resolves the
+    // continuation under the POST-COMMIT acting Workspace
+    // context and returns the `safeReturnTo` value the browser
+    // should consume. On failure, leave both untouched.
+    const response = await selectActingWorkspaceRequest({ actingWorkspaceId: pendingTargetId });
     writeRememberedActingWorkspaceId(pendingTargetId);
     setRemembered(pendingTargetId);
     setPendingTargetId(null);
+    return response.safeReturnTo ?? null;
   }, [pendingTargetId, user]);
 
   const cancelPendingTarget = useCallback(() => {
