@@ -372,6 +372,103 @@ describe("resolvePostCommandReturnDestination", () => {
     assert.equal(recovered, "/talent?workspaceId=ws-org-other&q=dancehall");
   });
 
+  // P1-001 (Codex CHANGES_REQUESTED): the composed cross-Workspace
+  // switch path MUST stay inside the bounded `safeReturnTo`
+  // response contract (max length 256, defined in
+  // `bg1ActingWorkspaceResponseV1Schema`). URL-encoding expands
+  // every reserved byte into a `%xx` triplet, so a 256-character
+  // input that explodes during encoding would otherwise overflow
+  // the response schema and crash the downstream parser with
+  // `too_big`. The resolver MUST bound the composed output: when
+  // the encoded-with-`?return=` form would exceed the cap, the
+  // resolver drops the preserved continuation and emits the
+  // bounded `/workspace/switch?target=<id>` form. The customer
+  // can still complete the switch; the post-commit resolver
+  // returns the documented safe fallback (`/dashboard`) for the
+  // missing continuation.
+  test("Cross-Workspace destination with a near-cap (256-char) input stays inside the safeReturnTo response contract (P1-001)", () => {
+    const user = buildUser({ personal: true, buyer: true, personalId: "ws-personal" });
+    user.workspaces.push({
+      workspaceId: "ws-org-other",
+      slug: "org-other",
+      name: "Other Org",
+      workspaceType: "Organization",
+      workspaceStatus: "Active",
+      capabilities: ["Buyer"],
+      role: "Owner",
+      joinedAt: "2025-01-01T00:00:00.000Z",
+    } as never);
+
+    // Boundary probe: a valid 256-character cross-Workspace `/talent`
+    // return. The composed switch URL (prefix + URL-encoded
+    // value) MUST stay at or below 256 characters so the
+    // `bg1ActingWorkspaceResponseV1Schema.safeReturnTo.max(256)`
+    // contract accepts the response.
+    const prefix = "/talent?workspaceId=ws-org-other&q=";
+    assert.ok(prefix.length < 256);
+    const maxReturnTo = `${prefix}${"a".repeat(256 - prefix.length)}`;
+    assert.equal(maxReturnTo.length, 256);
+
+    const result = resolvePostCommandReturnDestination({
+      returnTo: maxReturnTo,
+      freshUser: user,
+      actingWorkspaceId: "ws-personal",
+      allowedOrigin: ALLOWED_ORIGIN,
+    });
+    assert.ok(result);
+    assert.ok(
+      result.path.length <= 256,
+      `composed path must stay inside the bounded response contract (got length ${result.path.length})`,
+    );
+  });
+
+  test("Cross-Workspace destination with maximally-expanding input falls back to the bounded switch URL (P1-001)", () => {
+    // Every byte becomes `%xx` during encoding — the worst-case
+    // expansion grows a 256-character input to ~768 encoded
+    // characters. The resolver MUST drop the encoded `?return=`
+    // and emit the bounded `/workspace/switch?target=<id>` form
+    // (still a valid bounded destination, still routes through
+    // the explicit confirmation interstitial).
+    const user = buildUser({ personal: true, buyer: true, personalId: "ws-personal" });
+    user.workspaces.push({
+      workspaceId: "ws-org-other",
+      slug: "org-other",
+      name: "Other Org",
+      workspaceType: "Organization",
+      workspaceStatus: "Active",
+      capabilities: ["Buyer"],
+      role: "Owner",
+      joinedAt: "2025-01-01T00:00:00.000Z",
+    } as never);
+    // /, ?, &, = are the four percent-encoded characters in a
+    // query string. Concatenating them pads the worst case.
+    const explosive = `/?&=?&=?&=?&=?&=?&=?&=?&=?&=?&=?&=?&=?&=?&=?&=?&=?&=?&=?&=?&=?&=?&=?&=?&=?&=?&=?&=?&=?&=?&=?&=?&=?&=?&=?&=?&=?&=?&=?&=?&=?&=?&=?&=?&=?&=?`;
+    const baseline = `/talent?workspaceId=ws-org-other&x=${explosive}`;
+    // Trim or pad to 256 chars exactly.
+    const padded256 = baseline.length > 256 ? baseline.slice(0, 256) : baseline.padEnd(256, "a");
+    assert.equal(padded256.length, 256);
+
+    const result = resolvePostCommandReturnDestination({
+      returnTo: padded256,
+      freshUser: user,
+      actingWorkspaceId: "ws-personal",
+      allowedOrigin: ALLOWED_ORIGIN,
+    });
+    assert.ok(result);
+    assert.ok(
+      result.path.length <= 256,
+      `composed path must stay inside the bounded response contract (got length ${result.path.length})`,
+    );
+    // The bounded fallback form MUST NOT carry an encoded
+    // `?return=` segment when the composed output would exceed
+    // the cap — so the response parser can never see `too_big`.
+    assert.equal(
+      /[?&]return=/.test(result.path),
+      false,
+      "the bounded fallback form must NOT carry a `?return=` segment when the composed output exceeds the response contract cap",
+    );
+  });
+
   test("Same-Workspace destination (returnTo names the acting workspaceId) is kept", () => {
     const user = buildUser({ personal: true, buyer: true });
     const result = resolvePostCommandReturnDestination({

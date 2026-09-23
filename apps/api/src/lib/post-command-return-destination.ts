@@ -44,6 +44,17 @@ import {
 import { isValidReturnPath } from "./return-context.js";
 
 /**
+ * Maximum `safeReturnTo` length honored by the response contract
+ * (`bg1ActingWorkspaceResponseV1Schema.safeReturnTo` → `.max(256)`
+ * in `packages/types/src/index.ts`). The composed cross-Workspace
+ * switch path MUST stay at or below this cap or the schema parser
+ * will throw `too_big` for the entire response body. The constant
+ * names a single source of truth so the resolver, the schema, and
+ * any focused tests can all reference the same number.
+ */
+const SAFE_RETURN_TO_MAX_LENGTH = 256;
+
+/**
  * The bounded #83 return-destination set. The resolver is
  * deliberately closed: the #83 slice ships a small, named list of
  * internal routes, and unknown routes fall back to `/dashboard`.
@@ -229,9 +240,31 @@ export function resolvePostCommandReturnDestination(
       // `safeReturnTo` from the post-switch commit is the only
       // path the browser navigates to. Cancel ignores `?return=`
       // entirely (see `workspace/switch/page.tsx`).
+      //
+      // P1-001 (Codex CHANGES_REQUESTED): the composed switch
+      // URL MUST stay inside the bounded `safeReturnTo` response
+      // contract (`bg1ActingWorkspaceResponseV1Schema.safeReturnTo`
+      // max length 256). URL-encoding can expand an input —
+      // every `/`, `?`, `&`, `=`, and non-ASCII byte becomes a
+      // `%xx` triplet — so a 256-character input that expands
+      // to ~800 encoded characters would crash the downstream
+      // response parser with `too_big`. When the composed path
+      // would exceed the cap, drop the preserved `?return=` and
+      // emit the bounded `/workspace/switch?target=<id>` form;
+      // the switch still routes through the explicit confirmation
+      // interstitial, the customer can still commit, and the
+      // POST-COMMIT resolver returns the documented safe
+      // fallback (`/dashboard`) for the missing continuation.
+      const composedPath = `/workspace/switch?target=${encodeURIComponent(workspaceIdParam)}&return=${encodeURIComponent(input.returnTo)}`;
+      if (composedPath.length <= SAFE_RETURN_TO_MAX_LENGTH) {
+        return {
+          route: "/dashboard",
+          path: composedPath,
+        };
+      }
       return {
         route: "/dashboard",
-        path: `/workspace/switch?target=${encodeURIComponent(workspaceIdParam)}&return=${encodeURIComponent(input.returnTo)}`,
+        path: `/workspace/switch?target=${encodeURIComponent(workspaceIdParam)}`,
       };
     }
   }

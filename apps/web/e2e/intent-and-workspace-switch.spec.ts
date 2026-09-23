@@ -308,6 +308,163 @@ test.describe("M2 #83: intent + Workspace switching (expected-state)", () => {
     await expect(page).toHaveURL(/\/talent/);
   });
 
+  // Code-review P1-002 behavior-level coverage: the cross-Workspace
+  // continuation round-trip MUST start at the server command
+  // (`POST /api/auth/acting-workspace`) that PRODUCES the nested
+  // safeReturnTo, follow the server-resolved switch URL exactly,
+  // click Switch and continue, and land on the original
+  // destination — i.e., the URL the original
+  // `resolvePostCommandReturnDestination` did NOT directly emit.
+  // Until the server-emitted URL is exercised end-to-end, the
+  // resolver can drop, corrupt, or overflow the nested
+  // continuation while every assertion that only checks the URL
+  // shape still passes.
+  test("Validated return continuity: full chain starts at the acting-workspace command and re-resolves under the fresh actor", async ({
+    page,
+  }) => {
+    const email = `${FRESH_EMAIL_PREFIX}return-command-${Date.now()}@example.test`;
+    seedFreshUser(email);
+    await signInViaDevUrl(page, email);
+    await walkToIntentPage(page);
+    await page.getByTestId("intent-choice-hire-input").check();
+    await page.getByTestId("intent-submit").click();
+    await page.getByTestId("dashboard").waitFor();
+
+    // Capture Personal + Org workspace IDs from the selector.
+    await page.getByTestId("acting-workspace-selector").click();
+    const personalOption = page.getByTestId(/^acting-workspace-option-/).first();
+    const orgOption = page.getByTestId(/^acting-workspace-option-/).nth(1);
+    await personalOption.waitFor();
+    await orgOption.waitFor();
+    const personalId =
+      (await personalOption.getAttribute("data-testid"))?.replace("acting-workspace-option-", "") ??
+      "";
+    const orgId =
+      (await orgOption.getAttribute("data-testid"))?.replace("acting-workspace-option-", "") ?? "";
+    expect(personalId.length).toBeGreaterThan(0);
+    expect(orgId.length).toBeGreaterThan(0);
+    expect(personalId).not.toEqual(orgId);
+    await page.keyboard.press("Escape");
+
+    // Reset the localStorage pointer to Personal before driving
+    // the cross-Workspace command — the seed assigns the Org by
+    // default to exercise the switch-surface itself; the
+    // cross-Workspace branch fires when the SERVER-side
+    // `actingWorkspaceId` differs from the `returnTo`'s
+    // workspaceId param.
+    await page.evaluate(() => window.localStorage.removeItem("soundhub.actingWorkspaceId"));
+
+    // Step 1: drive the actual server command. The resolver MUST
+    // emit a nested switch URL that carries the original
+    // returnTo (URL-encoded) so the post-commit re-resolution
+    // can resume under the FRESH actor.
+    const crossResponse = await page.request.post("/api/auth/acting-workspace", {
+      data: {
+        actingWorkspaceId: personalId,
+        returnTo: `/deals?workspaceId=${orgId}`,
+      },
+    });
+    expect(crossResponse.status()).toBe(200);
+    const crossBody = (await crossResponse.json()) as { safeReturnTo: string | null };
+    expect(crossBody.safeReturnTo).toBeTruthy();
+    const safeReturnTo = crossBody.safeReturnTo!;
+    expect(safeReturnTo).toContain(`/workspace/switch?target=${orgId}&return=`);
+    // The composed switch URL MUST stay inside the bounded
+    // `bg1ActingWorkspaceResponseV1Schema.safeReturnTo.max(256)`
+    // response contract — otherwise the schema parser throws
+    // `too_big`. The happy-path returnTo is well below the
+    // boundary, so the encoded-with-`?return=` form fits.
+    expect(safeReturnTo.length).toBeLessThanOrEqual(256);
+
+    // Step 2: follow the server-resolved URL EXACTLY. The
+    // switch page reads ?target= and ?return=, the customer's
+    // click forwards the validated returnTo into
+    // commitPendingTarget, the post-commit server resolver
+    // re-resolves the continuation under the FRESH actor
+    // (=orgId), and the browser consumes only the
+    // server-returned safeReturnTo (= `/deals`).
+    await page.goto(safeReturnTo);
+    await page.waitForLoadState("networkidle");
+    await page.getByTestId("workspace-switch-page").waitFor();
+    await page.getByTestId("workspace-switch-continue").click();
+    await page.waitForURL(/\/deals(\?.*)?\/?$/);
+    await expect(page).toHaveURL(/\/deals(\?.*)?\/?$/);
+  });
+
+  // Code-review P1-001 behavior-level coverage: when the input
+  // returnTo is sized so the URL-encoded cross-Workspace
+  // composed path WOULD exceed the bounded `safeReturnTo`
+  // response contract (max length 256), the resolver MUST
+  // bound the composed output (drop the encoded `?return=`)
+  // rather than throw `too_big` during response parsing. The
+  // customer can still complete the switch and lands on the
+  // documented safe fallback (`/dashboard`) for the missing
+  // continuation.
+  test("Validated return continuity: oversize cross-Workspace returnTo stays inside the safeReturnTo contract (P1-001)", async ({
+    page,
+  }) => {
+    const email = `${FRESH_EMAIL_PREFIX}return-oversize-${Date.now()}@example.test`;
+    seedFreshUser(email);
+    await signInViaDevUrl(page, email);
+    await walkToIntentPage(page);
+    await page.getByTestId("intent-choice-hire-input").check();
+    await page.getByTestId("intent-submit").click();
+    await page.getByTestId("dashboard").waitFor();
+
+    // Capture IDs.
+    await page.getByTestId("acting-workspace-selector").click();
+    const personalOption = page.getByTestId(/^acting-workspace-option-/).first();
+    const orgOption = page.getByTestId(/^acting-workspace-option-/).nth(1);
+    await personalOption.waitFor();
+    await orgOption.waitFor();
+    const personalId =
+      (await personalOption.getAttribute("data-testid"))?.replace("acting-workspace-option-", "") ??
+      "";
+    const orgId =
+      (await orgOption.getAttribute("data-testid"))?.replace("acting-workspace-option-", "") ?? "";
+    await page.keyboard.press("Escape");
+    await page.evaluate(() => window.localStorage.removeItem("soundhub.actingWorkspaceId"));
+
+    // Construct an oversize-but-shape-valid returnTo: the
+    // length hits the documented max (256) input, but
+    // percent-encoding expands it well beyond 256 once the
+    // composed switch URL is built. The composer MUST bound
+    // itself; the route handler MUST NOT throw `too_big`.
+    const prefix = `/deals?workspaceId=${orgId}&q=`;
+    const oversize = `${prefix}${"a".repeat(256 - prefix.length)}`;
+    expect(oversize.length).toBeLessThanOrEqual(256);
+
+    const crossResponse = await page.request.post("/api/auth/acting-workspace", {
+      data: {
+        actingWorkspaceId: personalId,
+        returnTo: oversize,
+      },
+    });
+    // The response MUST be a 2xx with a valid safeReturnTo.
+    // The legacy regression — schema-parse failure causing a
+    // 500 — would show up here as a non-2xx status.
+    expect(crossResponse.status()).toBe(200);
+    const crossBody = (await crossResponse.json()) as { safeReturnTo: string | null };
+    expect(crossBody.safeReturnTo).toBeTruthy();
+    const safeReturnTo = crossBody.safeReturnTo!;
+    expect(safeReturnTo.length).toBeLessThanOrEqual(256);
+
+    // The bounded fallback form MUST NOT carry an encoded
+    // `?return=` segment when the composed output would
+    // exceed the cap. The customer can still complete the
+    // switch; the post-commit resolver returns the documented
+    // safe fallback (`/dashboard`) for the missing
+    // continuation.
+    expect(safeReturnTo).not.toContain("&return=");
+
+    await page.goto(safeReturnTo);
+    await page.waitForLoadState("networkidle");
+    await page.getByTestId("workspace-switch-page").waitFor();
+    await page.getByTestId("workspace-switch-continue").click();
+    await page.waitForURL(/\/dashboard\/?$/);
+    await expect(page).toHaveURL(/\/dashboard\/?$/);
+  });
+
   // Stale-precondition conflict recovery. UI observed []; the
   // persisted state advances to Buyer via the add-Hire-offer
   // shortcut link on the dashboard; the customer goes BACK to a
