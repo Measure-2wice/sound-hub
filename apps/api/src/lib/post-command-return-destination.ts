@@ -220,12 +220,18 @@ export function resolvePostCommandReturnDestination(
     }
     if (input.actingWorkspaceId !== null && input.actingWorkspaceId !== workspaceIdParam) {
       // Cross-Workspace: route through the switch interstitial.
-      // Browser consumes this as the next destination; the
-      // interstitial renders the explicit confirmation before
-      // the actor's persistent state changes.
+      // The ORIGINAL `returnTo` is preserved (URL-encoded) as the
+      // `return` query parameter of the switch URL — the
+      // interstitial forwards it into the post-switch
+      // acting-workspace commit, and the SERVER resolves the
+      // continuation against the FRESH actor. The browser never
+      // honors the raw `?return=` value directly; the server's
+      // `safeReturnTo` from the post-switch commit is the only
+      // path the browser navigates to. Cancel ignores `?return=`
+      // entirely (see `workspace/switch/page.tsx`).
       return {
         route: "/dashboard",
-        path: `/workspace/switch?target=${encodeURIComponent(workspaceIdParam)}`,
+        path: `/workspace/switch?target=${encodeURIComponent(workspaceIdParam)}&return=${encodeURIComponent(input.returnTo)}`,
       };
     }
   }

@@ -34,11 +34,12 @@
 //     UI never collapses two distinct presentations onto one row.
 
 import assert from "node:assert/strict";
+import { readFileSync } from "node:fs";
 import { describe, test } from "node:test";
 import { renderToStaticMarkup } from "react-dom/server";
 import type { TalentSearchResultV1 } from "@soundhub/types";
 import { ResultCard } from "./ResultCard";
-import { EmptySearchGuidance } from "./SearchPage";
+import { EmptySearchGuidance, snapshotCriteria } from "./SearchPage";
 import { EMPTY_SEARCH_GUIDANCE_MESSAGE } from "../lib/talent-search-request-builder";
 
 // Stable sample so the assertions read as a single behavioral contract
@@ -485,6 +486,217 @@ describe("EmptySearchGuidance (page-level empty-submission guard)", () => {
     assert.ok(
       html.includes('aria-live="polite"'),
       "the card must use aria-live=polite so the guidance is announced without stealing focus",
+    );
+  });
+});
+
+// Snapshot semantics (Finding 3 — results meta must describe the
+// criteria that produced the currently-displayed results, not the
+// live form state that has not been submitted yet).
+//
+// `snapshotCriteria` is the single value-snapshot boundary in
+// `SearchPage.tsx`. A later edit to the form fields must NOT
+// retroactively mutate the snapshot the meta line is built from
+// (so the meta keeps describing the criteria the API actually
+// received for the currently-displayed results).
+describe("SearchPage submitted-criteria snapshot semantics (Finding 3)", () => {
+  const baseFilters = {
+    primaryCategoryKey: "music-production",
+    independentlyPurchasableServiceKey: "remote-coaching",
+    serviceModes: ["Remote" as const],
+    basedIn: { city: "Brooklyn", region: "NY", countryCode: "us" },
+    serviceArea: { city: "", region: "", countryCode: "" },
+  };
+
+  test("snapshotCriteria copies every top-level field plus the nested basedIn/serviceArea value objects", () => {
+    const snap = snapshotCriteria("dancehall producer", baseFilters);
+    assert.equal(snap.query, "dancehall producer");
+    assert.equal(snap.filters.primaryCategoryKey, "music-production");
+    assert.equal(snap.filters.independentlyPurchasableServiceKey, "remote-coaching");
+    assert.deepEqual(snap.filters.serviceModes, ["Remote"]);
+    // Nested value objects are COPIES, not the same reference.
+    assert.notEqual(snap.filters.basedIn, baseFilters.basedIn);
+    assert.notEqual(snap.filters.serviceArea, baseFilters.serviceArea);
+    assert.equal(snap.filters.basedIn.city, "Brooklyn");
+    assert.equal(snap.filters.basedIn.countryCode, "us");
+  });
+
+  test("snapshotCriteria is decoupled from later mutation of the source filters (value snapshot, not alias)", () => {
+    // The contract: a later mutation to the live form fields
+    // (the buyer's typing in the input, the toggle of a chip)
+    // MUST NOT reach into the snapshot the meta line is built
+    // from. The fix uses a value snapshot, NOT a reference.
+    const liveFilters = {
+      primaryCategoryKey: "music-production",
+      independentlyPurchasableServiceKey: "",
+      serviceModes: ["Remote" as const],
+      basedIn: { city: "Brooklyn", region: "NY", countryCode: "us" },
+      serviceArea: { city: "", region: "", countryCode: "" },
+    };
+    const liveQuery = "dancehall producer";
+    const snap = snapshotCriteria(liveQuery, liveFilters);
+
+    // The buyer edits the form: the primary category changes,
+    // and the basedIn country code changes (case normalization).
+    // Mutating liveFilters in place simulates the buyer typing
+    // into the form fields. The snapshot MUST keep describing
+    // the criteria the API actually received for this
+    // submission.
+    (liveFilters as { primaryCategoryKey: string }).primaryCategoryKey = "mixing";
+    liveFilters.basedIn.countryCode = "jm";
+    // Strings are immutable in the JavaScript language — they
+    // cannot be mutated after construction. The snapshot's
+    // `query` field therefore keeps its value even if the
+    // buyer's `query` input is later retargeted at a
+    // different string object.
+    const nextLiveQuery = "trinidadian soca brass section";
+    assert.notEqual(nextLiveQuery, liveQuery);
+    assert.equal(snap.query, "dancehall producer");
+    assert.equal(snap.filters.primaryCategoryKey, "music-production");
+    assert.equal(snap.filters.basedIn.countryCode, "us");
+  });
+
+  test("snapshotCriteria copies serviceModes so a later push() into the live array does not change the snapshot", () => {
+    const liveFilters = {
+      primaryCategoryKey: "",
+      independentlyPurchasableServiceKey: "",
+      serviceModes: ["Remote" as const],
+      basedIn: { city: "", region: "", countryCode: "" },
+      serviceArea: { city: "", region: "", countryCode: "" },
+    };
+    const snap = snapshotCriteria("", liveFilters);
+    liveFilters.serviceModes.push("InPerson" as never);
+    assert.deepEqual(
+      snap.filters.serviceModes,
+      ["Remote"],
+      "snapshot's serviceModes array must not reflect the later push() into the live array",
+    );
+  });
+});
+
+describe("SearchPage results-meta is bound to the submitted snapshot, not the live form (Finding 3)", () => {
+  // The source-pattern assertions pin the meta render path:
+  //   - `submittedCriteria` is the state the meta reads from
+  //   - `pendingCriteriaRef.current = snapshotCriteria(query, filters)`
+  //     is captured INSIDE the submit handler BEFORE `search(...)`
+  //   - the success-commit effect promotes the ref onto the state
+  //   - the meta line argument MUST be `submittedCriteria?.query` /
+  //     `submittedCriteria?.filters`, NEVER the live `query` /
+  //     `filters`
+  const SEARCH_SOURCE = readFileSync(
+    `${new URL(".", import.meta.url).pathname}SearchPage.tsx`,
+    "utf8",
+  );
+
+  function metaRenderPath(): string {
+    const m = SEARCH_SOURCE.match(/data-testid="search-results-meta"[\s\S]*?<\/p>/);
+    assert.ok(m, "expected the search-results-meta paragraph in SearchPage");
+    return m[0];
+  }
+
+  test("search-results-meta reads from submittedCriteria (the submitted snapshot), NOT from the live query/filters state", () => {
+    const metaBlock = metaRenderPath();
+    assert.match(
+      metaBlock,
+      /submittedCriteria\?\.query/,
+      "the meta line MUST read its query from submittedCriteria (the submitted snapshot)",
+    );
+    assert.match(
+      metaBlock,
+      /submittedCriteria\?\.filters/,
+      "the meta line MUST read its filters from submittedCriteria (the submitted snapshot)",
+    );
+    // The meta block MUST NOT pass the live `query` state
+    // directly into formatResultsMeta. An edit in the form
+    // would otherwise retroactively rewrite the meta on
+    // screen for the previously-displayed results.
+    assert.equal(
+      /formatResultsMeta\(\s*query\s*,/.test(metaBlock),
+      false,
+      "the meta line MUST NOT pass the live `query` state to formatResultsMeta",
+    );
+    assert.equal(
+      /formatResultsMeta\([^,]*,\s*filters\s*\)/.test(metaBlock),
+      false,
+      "the meta line MUST NOT pass the live `filters` state to formatResultsMeta",
+    );
+  });
+
+  test("submit handler captures the snapshot BEFORE dispatching the search", () => {
+    // The snapshot MUST be taken at the moment a search is
+    // actually dispatched (i.e., AFTER the empty/invalid
+    // guard passes), NOT at every keystroke. A later edit to
+    // the form MUST NOT change the meta on screen until the
+    // user submits again.
+    const submitMatch = SEARCH_SOURCE.match(
+      /handleSubmit\s*=\s*\(e\s*:\s*FormEvent\)\s*=>\s*\{[\s\S]*?\n\s*\};/,
+    );
+    assert.ok(submitMatch, "expected the handleSubmit handler body in SearchPage");
+    const body = submitMatch[0];
+    // Snapshot capture MUST be inside the handler body.
+    assert.match(
+      body,
+      /pendingCriteriaRef\.current\s*=\s*snapshotCriteria\s*\(\s*query\s*,\s*filters\s*\)/,
+      "the submit handler MUST capture a snapshotCriteria(query, filters) call into pendingCriteriaRef",
+    );
+    // The snapshot MUST be captured BEFORE the search() call.
+    const snapshotIdx = body.indexOf("pendingCriteriaRef.current = snapshotCriteria");
+    const searchIdx = body.indexOf("void search(");
+    assert.ok(snapshotIdx >= 0 && searchIdx >= 0, "expected snapshot capture and search dispatch");
+    assert.ok(
+      snapshotIdx < searchIdx,
+      "the snapshot MUST be captured BEFORE the search() call so the snapshot matches what the search received",
+    );
+  });
+
+  test("submit handler captures the snapshot only AFTER the empty/invalid submission guard passes", () => {
+    // The snapshot must NOT be taken for an empty submission
+    // — those are blocked by the page-level guard and never
+    // dispatch. Capturing early would mark the snapshot ref
+    // even though no search was sent.
+    const submitMatch = SEARCH_SOURCE.match(
+      /handleSubmit\s*=\s*\(e\s*:\s*FormEvent\)\s*=>\s*\{[\s\S]*?\n\s*\};/,
+    );
+    assert.ok(submitMatch, "expected the handleSubmit handler body in SearchPage");
+    const body = submitMatch[0];
+    const guardIdx = body.indexOf("guard.message");
+    const snapshotIdx = body.indexOf("pendingCriteriaRef.current = snapshotCriteria");
+    assert.ok(guardIdx >= 0 && snapshotIdx >= 0, "expected guard + snapshot references");
+    assert.ok(
+      guardIdx < snapshotIdx,
+      "the empty/invalid-submission guard MUST run BEFORE the snapshot capture",
+    );
+  });
+
+  test("success-commit effect promotes the pending snapshot to the React state used by the meta line", () => {
+    // The commit effect MUST key off `results` (the search
+    // hook's success state) AND `pendingCriteriaRef.current`
+    // so the snapshot only lands on the rendered meta when the
+    // corresponding response actually succeeded.
+    const effectMatch = SEARCH_SOURCE.match(
+      /useEffect\(\s*\(\)\s*=>\s*\{[\s\S]*?\},\s*\[results\]\s*\)/,
+    );
+    assert.ok(effectMatch, "expected the success-commit useEffect keyed off [results]");
+    const body = effectMatch[0];
+    assert.match(
+      body,
+      /results\s*!==\s*null/,
+      "the commit effect MUST only fire when results !== null (a successful response arrived)",
+    );
+    assert.match(
+      body,
+      /pendingCriteriaRef\.current\s*!==\s*null/,
+      "the commit effect MUST only fire when there is a pending snapshot",
+    );
+    assert.match(
+      body,
+      /setSubmittedCriteria\(\s*pendingCriteriaRef\.current\s*\)/,
+      "the commit effect MUST promote the pending snapshot to setSubmittedCriteria",
+    );
+    assert.match(
+      body,
+      /pendingCriteriaRef\.current\s*=\s*null/,
+      "the commit effect MUST clear the pending ref so it doesn't double-promote",
     );
   });
 });

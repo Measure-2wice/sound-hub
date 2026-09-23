@@ -137,6 +137,170 @@ describe("dashboard recovery surface (M2 #82)", () => {
       "expected the truthful 'memberships have not been changed' language",
     );
   });
+
+  test("recovery sign-out is bounded: signingOut state prevents duplicate submissions while pending", () => {
+    // The recovery sign-out button MUST carry a `signingOut`
+    // state so a customer who double-clicks the button does not
+    // launch two parallel sign-out requests, and so the button
+    // reflects a pending sign-out to assistive technology.
+    const recoveryBlock = DASHBOARD_PAGE_SOURCE.match(
+      /function\s+RecoverySurface[\s\S]*?<\/Card>\s*\n\s*\{organizationMemberships[\s\S]*?\)\s*\}\s*\n/,
+    );
+    assert.ok(recoveryBlock, "expected a RecoverySurface function body");
+    const body = recoveryBlock[0];
+
+    // The state hook MUST be declared.
+    assert.match(
+      body,
+      /useState\(\s*false\s*\)/,
+      "recovery surface MUST carry a signingOut boolean state",
+    );
+    assert.match(
+      body,
+      /const\s*\[\s*signOutError\s*,\s*setSignOutError\s*\]\s*=\s*useState/,
+      "recovery surface MUST carry a signOutError state",
+    );
+
+    // The click handler MUST guard against duplicate submissions
+    // while pending.
+    assert.match(
+      body,
+      /if\s*\(\s*signingOut\s*\)\s*return/,
+      "recovery sign-out handler MUST short-circuit when signingOut is true",
+    );
+
+    // The handler MUST wrap the async sign-out in a try/catch
+    // so a failure surfaces observable UI state instead of
+    // silently disappearing as an unhandled rejection.
+    assert.match(
+      body,
+      /try\s*\{[\s\S]*?signOutAndRefresh\(\)[\s\S]*?\}\s*catch/,
+      "recovery sign-out handler MUST wrap signOutAndRefresh in try/catch",
+    );
+
+    // The catch branch MUST NOT rethrow a raw transport /
+    // provider error message; it MUST set a bounded
+    // customer-safe message.
+    assert.match(
+      body,
+      /setSignOutError\(/,
+      "recovery sign-out handler MUST set a bounded signOutError on failure",
+    );
+
+    // The pending state MUST be reset on both the success and
+    // failure paths so the button does not get stuck in the
+    // "Signing out…" affordance.
+    assert.match(
+      body,
+      /finally\s*\{\s*setSigningOut\(\s*false\s*\)/,
+      "recovery sign-out handler MUST reset signingOut in finally",
+    );
+
+    // The button MUST carry `disabled={signingOut}` so a
+    // repeated click does not queue a second submission.
+    const signOutButtonMatch = body.match(
+      /<button[\s\S]*?data-testid="dashboard-recovery-sign-out"[\s\S]*?<\/button>/,
+    );
+    assert.ok(signOutButtonMatch, "expected the recovery sign-out button element");
+    assert.match(
+      signOutButtonMatch[0],
+      /disabled=\{signingOut\}/,
+      "the recovery sign-out button MUST be disabled while signingOut",
+    );
+    assert.match(
+      signOutButtonMatch[0],
+      /aria-busy=\{signingOut\}/,
+      "the recovery sign-out button MUST expose aria-busy while signingOut",
+    );
+  });
+
+  test("recovery sign-out navigates only on success", () => {
+    // The handler MUST navigate to the public surface ONLY
+    // inside the success branch. The catch branch MUST NOT
+    // navigate — a failed sign-out keeps the customer on the
+    // recovery surface so they can retry.
+    const recoveryBlock = DASHBOARD_PAGE_SOURCE.match(
+      /function\s+RecoverySurface[\s\S]*?<\/Card>\s*\n\s*\{organizationMemberships[\s\S]*?\)\s*\}\s*\n/,
+    );
+    assert.ok(recoveryBlock, "expected a RecoverySurface function body");
+    const body = recoveryBlock[0];
+
+    // Locate the success branch (between `try {` and `catch`).
+    const tryMatch = body.match(/try\s*\{([\s\S]*?)\}\s*catch\s*\{([\s\S]*?)\}/);
+    assert.ok(tryMatch, "expected a try/catch wrapping the sign-out network call");
+    const tryBranch = tryMatch[1] ?? "";
+    const catchBranch = tryMatch[2] ?? "";
+
+    // Navigation (router.replace("/")) MUST live in the
+    // success branch.
+    assert.match(
+      tryBranch,
+      /router\.replace\(\s*["']\/["']\s*\)/,
+      "navigation MUST happen on success, not on failure",
+    );
+
+    // The catch branch MUST NOT call router.replace. A failed
+    // sign-out keeps the customer on the recovery surface so
+    // they can read the error message and retry.
+    assert.equal(
+      /router\.replace\s*\(/.test(catchBranch),
+      false,
+      "the catch branch MUST NOT navigate — the customer must remain on the recovery surface so they can retry",
+    );
+
+    // The catch branch MUST set a bounded error state.
+    assert.match(
+      catchBranch,
+      /setSignOutError\(/,
+      "the catch branch MUST set a bounded signOutError message",
+    );
+  });
+
+  test("recovery sign-out error is surfaced with role=alert and contains no raw transport/provider text", () => {
+    // The recovery surface MUST render the bounded signOutError
+    // through the Alert primitive so screen readers announce
+    // the failure immediately. Raw transport / provider error
+    // text MUST NOT reach the customer.
+    const recoveryBlock = DASHBOARD_PAGE_SOURCE.match(
+      /function\s+RecoverySurface[\s\S]*?<\/Card>\s*\n\s*\{organizationMemberships[\s\S]*?\)\s*\}\s*\n/,
+    );
+    assert.ok(recoveryBlock, "expected a RecoverySurface function body");
+    const body = recoveryBlock[0];
+
+    // The error region MUST be stable-testid'd and routed
+    // through the Alert primitive.
+    assert.match(
+      body,
+      /data-testid="dashboard-recovery-sign-out-error"/,
+      "recovery surface MUST render a stable testid on the sign-out error region",
+    );
+    assert.match(
+      body,
+      /<Alert[\s\S]*?role="alert"[\s\S]*?variant="failure"/,
+      'the sign-out error MUST render through <Alert role="alert" variant="failure">',
+    );
+
+    // The customer-facing copy in the catch branch MUST be a
+    // bounded sentence; it MUST NOT pass `err.message` or
+    // `String(err)` through verbatim.
+    assert.equal(
+      /setSignOutError\(\s*err\.message\s*\)/.test(body),
+      false,
+      "the catch branch MUST NOT pass `err.message` through verbatim",
+    );
+    assert.equal(
+      /setSignOutError\(\s*String\(\s*err\s*\)\s*\)/.test(body),
+      false,
+      "the catch branch MUST NOT pass `String(err)` through verbatim",
+    );
+
+    // The bounded message MUST be present in the source.
+    assert.match(
+      body,
+      /Sign-out could not be completed\./,
+      "the catch branch MUST set a bounded customer-safe sign-out error message",
+    );
+  });
 });
 
 describe("dashboard loading surface (M2 #82)", () => {

@@ -468,7 +468,39 @@ function RecoverySurface({
 }) {
   const { signOutAndRefresh } = useSession();
   const router = useRouter();
+  // Bounded sign-out state: the recovery surface cannot fire
+  // duplicate sign-out requests while one is in flight, and a
+  // failure leaves the customer on the recovery surface with
+  // a role="alert" message so the failed sign-out is visible
+  // (instead of silently leaving the user with no feedback
+  // and no way to retry).
+  const [signingOut, setSigningOut] = useState(false);
+  const [signOutError, setSignOutError] = useState<string | null>(null);
   const organizationMemberships = user.workspaces.filter((w) => w.workspaceType === "Organization");
+  const handleSignOut = () => {
+    if (signingOut) return;
+    setSigningOut(true);
+    setSignOutError(null);
+    void (async () => {
+      try {
+        await signOutAndRefresh();
+        // Navigate ONLY on a successful sign-out. A failed
+        // sign-out leaves the user on the recovery surface
+        // with a role="alert" error so they can retry without
+        // being silently redirected to a state that no longer
+        // matches their session.
+        router.replace("/");
+      } catch {
+        // Bounded, customer-safe message. Raw transport /
+        // provider error text never reaches the customer;
+        // the surfaced copy names the action and invites a
+        // retry without leaking internals.
+        setSignOutError("Sign-out could not be completed. Please try again in a moment.");
+      } finally {
+        setSigningOut(false);
+      }
+    })();
+  };
   return (
     <div className="min-h-screen bg-canvas">
       <div className="max-w-2xl mx-auto px-6 py-12 space-y-6" data-testid="dashboard-recovery">
@@ -493,17 +525,21 @@ function RecoverySurface({
             </p>
             <button
               type="button"
-              onClick={() => {
-                void (async () => {
-                  await signOutAndRefresh();
-                  router.replace("/");
-                })();
-              }}
-              className="mt-3 inline-flex items-center justify-center min-h-[44px] min-w-[44px] py-3 px-4 text-base font-medium text-aubergine hover:text-aubergine-hover border border-aubergine rounded focus:outline-none focus-visible:outline focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-aubergine"
+              onClick={handleSignOut}
+              disabled={signingOut}
+              aria-busy={signingOut}
+              className="mt-3 inline-flex items-center justify-center min-h-[44px] min-w-[44px] py-3 px-4 text-base font-medium text-aubergine hover:text-aubergine-hover border border-aubergine rounded focus:outline-none focus-visible:outline focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-aubergine disabled:opacity-60 disabled:cursor-not-allowed"
               data-testid="dashboard-recovery-sign-out"
             >
-              Sign out
+              {signingOut ? "Signing out…" : "Sign out"}
             </button>
+            {signOutError && (
+              <div className="mt-3" data-testid="dashboard-recovery-sign-out-error">
+                <Alert role="alert" variant="failure" title="Sign-out failed">
+                  {signOutError}
+                </Alert>
+              </div>
+            )}
           </Card.Content>
         </Card>
         {organizationMemberships.length > 0 && (

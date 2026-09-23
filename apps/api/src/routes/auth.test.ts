@@ -1220,7 +1220,7 @@ describe("BG1 auth routes — cross-Workspace returnTo (P1-001)", () => {
     }).app;
   });
 
-  test("P1-001: switch from Personal→Org with returnTo '/talent?workspace=<other>' routes through /workspace/switch?target=<other>", async () => {
+  test("P1-001: switch from Personal→Org with returnTo '/talent?workspace=<other>' routes through /workspace/switch?target=<other> with the original returnTo preserved", async () => {
     const cookie = await signIn(app, adapter, "cross-ws@example.com");
     const response = await request(app)
       .post("/api/auth/acting-workspace")
@@ -1235,9 +1235,25 @@ describe("BG1 auth routes — cross-Workspace returnTo (P1-001)", () => {
     // NOT the one named in `?workspace=<PERSONAL_ID>`; the
     // resolver routes the destination through the switch
     // interstitial so the explicit confirmation happens first.
+    // The ORIGINAL `returnTo` is URL-encoded into the switch
+    // path's `?return=` parameter so the post-switch server can
+    // re-resolve the continuation under the FRESH actor (now
+    // PERSONAL_ID). The resolver trips the cross-Workspace
+    // branch again because ORG_ID named PERSONAL_ID, but this
+    // time the actingWorkspaceId passed into the second pass is
+    // PERSONAL_ID — the continuation is now reachable under the
+    // committed actor.
+    const safePath: string = response.body.safeReturnTo;
+    assert.ok(
+      safePath.startsWith(`/workspace/switch?target=${encodeURIComponent(PERSONAL_ID)}&return=`),
+      `expected safeReturnTo to begin with the cross-Workspace switch path (got ${safePath})`,
+    );
+    // The encoded `return` value MUST round-trip back to the
+    // original `/talent?workspace=<PERSONAL_ID>` path.
+    const parsed = new URLSearchParams(safePath.slice(safePath.indexOf("?") + 1));
     assert.equal(
-      response.body.safeReturnTo,
-      `/workspace/switch?target=${encodeURIComponent(PERSONAL_ID)}`,
+      decodeURIComponent(parsed.get("return") ?? ""),
+      `/talent?workspace=${PERSONAL_ID}`,
     );
   });
 

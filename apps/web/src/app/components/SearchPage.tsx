@@ -66,7 +66,7 @@
 //     - the truthful error state when the request fails
 //   It does NOT port fictional creator data from the Stitch mock.
 
-import { useEffect, useMemo, useState, type FormEvent, type ReactNode } from "react";
+import { useEffect, useMemo, useRef, useState, type FormEvent, type ReactNode } from "react";
 import { isRetriableErrorCode, useSearch } from "../hooks/useSearch";
 import {
   getEmptySearchSubmissionMessage,
@@ -104,6 +104,18 @@ export function SearchPage() {
   // criteria. While set, the hook's dispatch is skipped so no API
   // request is made for an empty submission.
   const [emptySearchMessage, setEmptySearchMessage] = useState<string | null>(null);
+
+  // Pending criteria snapshot for the in-flight submission. A
+  // ref (not state) so updates do not re-render the form; the
+  // success-commit effect below promotes it to React state when
+  // the corresponding response lands.
+  const pendingCriteriaRef = useRef<SubmittedCriteria | null>(null);
+  // The criteria that produced the currently-rendered results.
+  // `null` until the first successful submission commits. The
+  // results meta reads from this state, NOT from the live `query`
+  // / `filters` form values — a change in the form that has not
+  // been submitted must NOT change the meta on screen.
+  const [submittedCriteria, setSubmittedCriteria] = useState<SubmittedCriteria | null>(null);
 
   // Canonical categories from `GET /api/metadata/categories`. The
   // browser NEVER holds a second, independently deployable list of
@@ -152,8 +164,34 @@ export function SearchPage() {
       return;
     }
     setEmptySearchMessage(null);
+    // Capture the criteria for THIS submission in a value
+    // snapshot (shallow clone of `filters`) so a later edit to
+    // the form cannot retroactively mutate the snapshot. The
+    // meta line MUST describe the criteria that produced the
+    // currently-displayed results — not the live form fields
+    // that have not been submitted yet.
+    pendingCriteriaRef.current = snapshotCriteria(query, filters);
     void search(query, filters);
   };
+
+  // Commit the captured criteria to React state ONLY when the
+  // corresponding response succeeds. The meta line tracks
+  // "which criteria produced the currently-displayed results",
+  // not "what the form currently says":
+  //   - while a previous A is on screen, the user can edit to B
+  //     without submitting and the meta must keep describing A.
+  //   - if a new search B fails, the previous A results stay
+  //     on screen and the meta must keep describing A.
+  //   - when a new search B succeeds, the meta must describe B.
+  // The hook's own results/error state already clears `results`
+  // on failure, so the meta only needs to track the success
+  // commit.
+  useEffect(() => {
+    if (results !== null && pendingCriteriaRef.current !== null) {
+      setSubmittedCriteria(pendingCriteriaRef.current);
+      pendingCriteriaRef.current = null;
+    }
+  }, [results]);
 
   const unmatchedFieldErrors = useMemo<readonly ApiFieldErrorV1[]>(
     () => fieldErrors.filter((err) => !isControlledRequiredPath(err.path)),
@@ -370,7 +408,10 @@ export function SearchPage() {
                 {results.results.length === 1 ? "" : "s"}
               </h2>
               <p className="text-sm text-muted" data-testid="search-results-meta">
-                {formatResultsMeta(query, filters)}
+                {formatResultsMeta(
+                  submittedCriteria?.query ?? "",
+                  submittedCriteria?.filters ?? filters,
+                )}
               </p>
             </div>
             <div className="grid grid-cols-1 md:grid-cols-2 xl:grid-cols-3 gap-6">
@@ -459,3 +500,41 @@ function EmptySearchGuidanceImpl({ message }: { readonly message: string | null 
 }
 
 export const EmptySearchGuidance = EmptySearchGuidanceImpl;
+
+/**
+ * Snapshot of the (query, filters) tuple at the moment a
+ * search is actually dispatched. The search-results meta line
+ * describes this snapshot — never the live form state — so an
+ * edit to the form that has not been submitted yet cannot
+ * change the meta text on screen.
+ */
+export interface SubmittedCriteria {
+  readonly query: string;
+  readonly filters: RequiredFiltersValue;
+}
+
+/**
+ * Take a shallow value snapshot of the criteria tuple so a
+ * later mutation to the live `filters` state (or to the
+ * `basedIn.countryCode`/`serviceArea` nested objects) cannot
+ * retroactively rewrite the snapshot the meta line is built
+ * from. The shallow copy at the top level is paired with
+ * explicit copies of the `basedIn` and `serviceArea` value
+ * objects; the underlying strings/arrays remain immutable from
+ * the caller's perspective.
+ *
+ * Exported so unit tests can target the snapshot semantics
+ * directly without rendering the full page.
+ */
+export function snapshotCriteria(query: string, filters: RequiredFiltersValue): SubmittedCriteria {
+  return {
+    query,
+    filters: {
+      primaryCategoryKey: filters.primaryCategoryKey,
+      independentlyPurchasableServiceKey: filters.independentlyPurchasableServiceKey,
+      serviceModes: filters.serviceModes.slice(),
+      basedIn: { ...filters.basedIn },
+      serviceArea: { ...filters.serviceArea },
+    },
+  };
+}

@@ -257,7 +257,7 @@ describe("resolvePostCommandReturnDestination", () => {
     );
   });
 
-  test("Cross-Workspace destination (returnTo names a different accessible workspaceId) routes through the switch interstitial (P1-003)", () => {
+  test("Cross-Workspace destination (returnTo names a different accessible workspaceId) routes through the switch interstitial with the original returnTo preserved (P1-003)", () => {
     const user = buildUser({ personal: true, buyer: true, personalId: "ws-personal" });
     user.workspaces.push({
       workspaceId: "ws-org-other",
@@ -277,11 +277,99 @@ describe("resolvePostCommandReturnDestination", () => {
     });
     // The accessible-but-different workspaceId is routed through
     // the switch interstitial instead of leaking a
-    // cross-Workspace destination.
-    assert.deepEqual(result, {
-      route: "/dashboard",
-      path: "/workspace/switch?target=ws-org-other",
+    // cross-Workspace destination. The ORIGINAL `returnTo` is
+    // preserved (URL-encoded) as the `return` query parameter
+    // so the post-switch server resolver can re-resolve the
+    // continuation under the FRESH post-switch actor.
+    assert.equal(result?.route, "/dashboard");
+    assert.ok(result, "expected a cross-Workspace ResolvedDestination");
+    const switchPath = result.path;
+    assert.ok(
+      switchPath.startsWith("/workspace/switch?target=ws-org-other&return="),
+      `switch path must carry the original returnTo as a URL-encoded ?return= value (got ${switchPath})`,
+    );
+    // The encoded `return` value must round-trip back to the
+    // original `/deals?workspaceId=ws-org-other` path when the
+    // switch page reads it back via URLSearchParams.
+    const parsed = new URLSearchParams(switchPath.slice(switchPath.indexOf("?") + 1));
+    const recovered = decodeURIComponent(parsed.get("return") ?? "");
+    assert.equal(recovered, "/deals?workspaceId=ws-org-other");
+  });
+
+  test("Cross-Workspace continuation is re-resolved against the post-switch acting Workspace (P1-003)", () => {
+    // Round-trip guarantee: when the switch page calls the
+    // acting-workspace commit with the preserved `?return=`
+    // value, the server resolver runs AGAIN with the
+    // POST-SWITCH actor. The result must resolve back to the
+    // ORIGINAL cross-Workspace destination (now reachable
+    // under the new actor) so the browser navigates there
+    // instead of dropping to /dashboard.
+    const user = buildUser({ personal: true, buyer: true, personalId: "ws-personal" });
+    user.workspaces.push({
+      workspaceId: "ws-org-other",
+      slug: "org-other",
+      name: "Other Org",
+      workspaceType: "Organization",
+      workspaceStatus: "Active",
+      capabilities: ["Buyer"],
+      role: "Owner",
+      joinedAt: "2025-01-01T00:00:00.000Z",
+    } as never);
+
+    // Step 1: acting as `ws-personal`, returnTo names the
+    // OTHER accessible Workspace — cross-Workspace branch
+    // routes through the switch interstitial.
+    const firstPass = resolvePostCommandReturnDestination({
+      returnTo: "/deals?workspaceId=ws-org-other",
+      freshUser: user,
+      actingWorkspaceId: "ws-personal",
+      allowedOrigin: ALLOWED_ORIGIN,
     });
+    assert.ok(firstPass);
+    const switchPath = firstPass.path;
+    const parsed = new URLSearchParams(switchPath.slice(switchPath.indexOf("?") + 1));
+    const preservedReturnTo = parsed.get("return");
+    assert.ok(preservedReturnTo);
+
+    // Step 2: the post-switch acting-Workspace is the OTHER
+    // workspace. Re-running the resolver with the same
+    // `freshUser` (post-switch server response) and the
+    // preserved `returnTo` resolves to the original
+    // destination.
+    const secondPass = resolvePostCommandReturnDestination({
+      returnTo: preservedReturnTo,
+      freshUser: user,
+      actingWorkspaceId: "ws-org-other",
+      allowedOrigin: ALLOWED_ORIGIN,
+    });
+    assert.equal(secondPass?.route, "/deals");
+    assert.equal(secondPass?.path, "/deals");
+  });
+
+  test("Cross-Workspace destination with trailing query params preserves the FULL validated original (P1-003)", () => {
+    // The preserved `?return=` MUST carry every query parameter
+    // the customer had on the URL, not just the workspaceId.
+    const user = buildUser({ personal: true, buyer: true, personalId: "ws-personal" });
+    user.workspaces.push({
+      workspaceId: "ws-org-other",
+      slug: "org-other",
+      name: "Other Org",
+      workspaceType: "Organization",
+      workspaceStatus: "Active",
+      capabilities: ["Buyer"],
+      role: "Owner",
+      joinedAt: "2025-01-01T00:00:00.000Z",
+    } as never);
+    const result = resolvePostCommandReturnDestination({
+      returnTo: "/talent?workspaceId=ws-org-other&q=dancehall",
+      freshUser: user,
+      actingWorkspaceId: "ws-personal",
+      allowedOrigin: ALLOWED_ORIGIN,
+    });
+    assert.ok(result);
+    const parsed = new URLSearchParams(result.path.slice(result.path.indexOf("?") + 1));
+    const recovered = decodeURIComponent(parsed.get("return") ?? "");
+    assert.equal(recovered, "/talent?workspaceId=ws-org-other&q=dancehall");
   });
 
   test("Same-Workspace destination (returnTo names the acting workspaceId) is kept", () => {
