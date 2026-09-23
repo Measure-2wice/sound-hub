@@ -391,16 +391,15 @@ test.describe("M2 #83: intent + Workspace switching (expected-state)", () => {
     await expect(page).toHaveURL(/\/deals(\?.*)?\/?$/);
   });
 
-  // Code-review P1-001 behavior-level coverage: when the input
-  // returnTo is sized so the URL-encoded cross-Workspace
-  // composed path WOULD exceed the bounded `safeReturnTo`
-  // response contract (max length 256), the resolver MUST
-  // bound the composed output (drop the encoded `?return=`)
-  // rather than throw `too_big` during response parsing. The
-  // customer can still complete the switch and lands on the
-  // documented safe fallback (`/dashboard`) for the missing
-  // continuation.
-  test("Validated return continuity: oversize cross-Workspace returnTo stays inside the safeReturnTo contract (P1-001)", async ({
+  // Behavior-level coverage: when the input returnTo is sized so
+  // the URL-encoded cross-Workspace composed path WOULD exceed
+  // the bounded `safeReturnTo` response contract (max length
+  // 256), the resolver MUST bound the composed output (drop the
+  // encoded `?return=`) rather than throw `too_big` during
+  // response parsing. The customer can still complete the
+  // switch and lands on the documented safe fallback
+  // (`/dashboard`) for the missing continuation.
+  test("Validated return continuity: oversize cross-Workspace returnTo stays inside the safeReturnTo contract", async ({
     page,
   }) => {
     const email = `${FRESH_EMAIL_PREFIX}return-oversize-${Date.now()}@example.test`;

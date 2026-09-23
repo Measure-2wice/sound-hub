@@ -241,13 +241,13 @@ export function resolvePostCommandReturnDestination(
       // path the browser navigates to. Cancel ignores `?return=`
       // entirely (see `workspace/switch/page.tsx`).
       //
-      // P1-001 (Codex CHANGES_REQUESTED): the composed switch
-      // URL MUST stay inside the bounded `safeReturnTo` response
-      // contract (`bg1ActingWorkspaceResponseV1Schema.safeReturnTo`
-      // max length 256). URL-encoding can expand an input —
-      // every `/`, `?`, `&`, `=`, and non-ASCII byte becomes a
-      // `%xx` triplet — so a 256-character input that expands
-      // to ~800 encoded characters would crash the downstream
+      // The composed switch URL MUST stay inside the bounded
+      // `safeReturnTo` response contract
+      // (`bg1ActingWorkspaceResponseV1Schema.safeReturnTo` max
+      // length 256). URL-encoding can expand an input — every
+      // `/`, `?`, `&`, `=`, and non-ASCII byte becomes a `%xx`
+      // triplet — so a 256-character input that expands to
+      // ~800 encoded characters would crash the downstream
       // response parser with `too_big`. When the composed path
       // would exceed the cap, drop the preserved `?return=` and
       // emit the bounded `/workspace/switch?target=<id>` form;

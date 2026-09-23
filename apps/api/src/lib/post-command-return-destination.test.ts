@@ -372,21 +372,20 @@ describe("resolvePostCommandReturnDestination", () => {
     assert.equal(recovered, "/talent?workspaceId=ws-org-other&q=dancehall");
   });
 
-  // P1-001 (Codex CHANGES_REQUESTED): the composed cross-Workspace
-  // switch path MUST stay inside the bounded `safeReturnTo`
-  // response contract (max length 256, defined in
-  // `bg1ActingWorkspaceResponseV1Schema`). URL-encoding expands
-  // every reserved byte into a `%xx` triplet, so a 256-character
-  // input that explodes during encoding would otherwise overflow
-  // the response schema and crash the downstream parser with
-  // `too_big`. The resolver MUST bound the composed output: when
-  // the encoded-with-`?return=` form would exceed the cap, the
-  // resolver drops the preserved continuation and emits the
-  // bounded `/workspace/switch?target=<id>` form. The customer
-  // can still complete the switch; the post-commit resolver
-  // returns the documented safe fallback (`/dashboard`) for the
-  // missing continuation.
-  test("Cross-Workspace destination with a near-cap (256-char) input stays inside the safeReturnTo response contract (P1-001)", () => {
+  // The composed cross-Workspace switch path MUST stay inside the
+  // bounded `safeReturnTo` response contract (max length 256,
+  // defined in `bg1ActingWorkspaceResponseV1Schema`). URL-encoding
+  // expands every reserved byte into a `%xx` triplet, so a
+  // 256-character input that explodes during encoding would
+  // otherwise overflow the response schema and crash the
+  // downstream parser with `too_big`. The resolver MUST bound the
+  // composed output: when the encoded-with-`?return=` form would
+  // exceed the cap, the resolver drops the preserved continuation
+  // and emits the bounded `/workspace/switch?target=<id>` form.
+  // The customer can still complete the switch; the post-commit
+  // resolver returns the documented safe fallback (`/dashboard`)
+  // for the missing continuation.
+  test("Cross-Workspace destination with a near-cap (256-char) input stays inside the safeReturnTo response contract", () => {
     const user = buildUser({ personal: true, buyer: true, personalId: "ws-personal" });
     user.workspaces.push({
       workspaceId: "ws-org-other",
@@ -422,7 +421,7 @@ describe("resolvePostCommandReturnDestination", () => {
     );
   });
 
-  test("Cross-Workspace destination with maximally-expanding input falls back to the bounded switch URL (P1-001)", () => {
+  test("Cross-Workspace destination with maximally-expanding input falls back to the bounded switch URL", () => {
     // Every byte becomes `%xx` during encoding — the worst-case
     // expansion grows a 256-character input to ~768 encoded
     // characters. The resolver MUST drop the encoded `?return=`
