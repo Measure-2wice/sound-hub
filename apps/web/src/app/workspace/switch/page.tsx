@@ -345,9 +345,14 @@ const BOUNDED_SWITCH_ROUTES: readonly string[] = postCommandRouteValuesV1;
  * rather than reaching the browser as an untyped string.
  */
 function toTypedSwitchRoute(safeReturnTo: string | null): Route<string> {
-  const fallback = "/dashboard" as Route<string>;
+  const fallback: Route<string> = "/dashboard";
   if (safeReturnTo === null) return fallback;
   const pathOnly = safeReturnTo.split("?")[0] ?? "";
+  // The server returns `safeReturnTo` from a bounded closed enum, so
+  // any value whose path-prefix matches a bounded route IS a valid
+  // `Route<string>`. The cast is gated by an explicit local match so
+  // out-of-set values fall back to `/dashboard` rather than reaching
+  // the browser as an untyped string.
   if (BOUNDED_SWITCH_ROUTES.includes(pathOnly)) {
     return safeReturnTo as Route<string>;
   }
