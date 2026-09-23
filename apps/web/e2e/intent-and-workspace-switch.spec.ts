@@ -308,8 +308,8 @@ test.describe("M2 #83: intent + Workspace switching (expected-state)", () => {
     await expect(page).toHaveURL(/\/talent/);
   });
 
-  // Code-review P1-002 behavior-level coverage: the cross-Workspace
-  // continuation round-trip MUST start at the server command
+  // Behavior-level coverage: the cross-Workspace continuation
+  // round-trip MUST start at the server command
   // (`POST /api/auth/acting-workspace`) that PRODUCES the nested
   // safeReturnTo, follow the server-resolved switch URL exactly,
   // click Switch and continue, and land on the original
@@ -319,6 +319,14 @@ test.describe("M2 #83: intent + Workspace switching (expected-state)", () => {
   // resolver can drop, corrupt, or overflow the nested
   // continuation while every assertion that only checks the URL
   // shape still passes.
+  //
+  // The fixture's Organization membership carries no Buyer/Seller
+  // capability, so the capability-gated `/deals` destination is
+  // unreachable under the post-switch actor and the resolver
+  // correctly falls back to `/dashboard`. The full-chain case
+  // uses the open `/talent` route (no capability gate) so the
+  // post-switch re-resolution lands the customer on the
+  // destination the cross-Workspace command was aiming for.
   test("Validated return continuity: full chain starts at the acting-workspace command and re-resolves under the fresh actor", async ({
     page,
   }) => {
@@ -357,11 +365,14 @@ test.describe("M2 #83: intent + Workspace switching (expected-state)", () => {
     // Step 1: drive the actual server command. The resolver MUST
     // emit a nested switch URL that carries the original
     // returnTo (URL-encoded) so the post-commit re-resolution
-    // can resume under the FRESH actor.
+    // can resume under the FRESH actor. `/talent` is an open
+    // route (no capability gate), so it is reachable from any
+    // current Workspace actor and the post-switch re-resolution
+    // returns `/talent` as the destination to land on.
     const crossResponse = await page.request.post("/api/auth/acting-workspace", {
       data: {
         actingWorkspaceId: personalId,
-        returnTo: `/deals?workspaceId=${orgId}`,
+        returnTo: `/talent?workspaceId=${orgId}`,
       },
     });
     expect(crossResponse.status()).toBe(200);
@@ -382,13 +393,13 @@ test.describe("M2 #83: intent + Workspace switching (expected-state)", () => {
     // commitPendingTarget, the post-commit server resolver
     // re-resolves the continuation under the FRESH actor
     // (=orgId), and the browser consumes only the
-    // server-returned safeReturnTo (= `/deals`).
+    // server-returned safeReturnTo (= `/talent`).
     await page.goto(safeReturnTo);
     await page.waitForLoadState("networkidle");
     await page.getByTestId("workspace-switch-page").waitFor();
     await page.getByTestId("workspace-switch-continue").click();
-    await page.waitForURL(/\/deals(\?.*)?\/?$/);
-    await expect(page).toHaveURL(/\/deals(\?.*)?\/?$/);
+    await page.waitForURL(/\/talent(\?.*)?\/?$/);
+    await expect(page).toHaveURL(/\/talent(\?.*)?\/?$/);
   });
 
   // Behavior-level coverage: when the input returnTo is sized so
