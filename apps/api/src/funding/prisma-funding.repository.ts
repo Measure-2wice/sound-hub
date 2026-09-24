@@ -325,73 +325,29 @@ export class PrismaFundingRepository implements FundingRepository {
   //
   // Guarded UPDATE: a slow failing provider attempt must NOT be
   // able to demote a Confirmed PaymentIntent that a concurrent
-  // success has already committed. The implementation is now a
-  // short Serializable transaction that takes a `SELECT ...
-  // FOR UPDATE` lock on the intent row BEFORE the guarded
-  // UPDATE: if a concurrent success transaction (`fundDealIn
-  // Transaction` opens the same Serializable row lock first),
-  // this method BLOCKS until that transaction either commits
-  // (intent row reads as `Confirmed` → method returns
-  // `ALREADY_CONFIRMED`) or rolls back (intent row reads as
-  // `Created` → method falls through to the guarded UPDATE
-  // that sets the row to `Failed`). The original
-  // `WHERE providerState <> 'Confirmed'` predicate still
-  // defends the persisted-state invariant — a later failure
-  // MUST NOT demote a `Confirmed` intent — and the FOR UPDATE
-  // pre-acquisition makes the race deterministic regardless of
-  // which side reaches PostgreSQL first. See ticket #64 P0-002.
-  //
-  // Bounded P2034 retry mirrors `fundDealInTransaction`:
-  // Serializable isolation can surface a serialization conflict
-  // (P2034) when the transaction's snapshot is invalidated by
-  // a concurrent committed write that touched a row the
-  // transaction read. The bounded retry budget
-  // (`P2034_RETRY_BUDGET`) retries up to that many times; on
-  // exhaustion the adapter surfaces
-  // `CONCURRENCY_RETRY_EXHAUSTED` so the route layer maps it
-  // onto a safe envelope rather than leaking the raw Prisma
-  // P2034. The persisted-state invariant — once Confirmed is
-  // committed, a later failure cannot demote it — is preserved
-  // across all retry attempts: each guarded UPDATE carries the
-  // same `WHERE providerState <> 'Confirmed'` predicate, so a
-  // retry that observes a Confirmed row simply returns
-  // `ALREADY_CONFIRMED` rather than overwriting.
+  // success has already committed. The predicate
+  // `"providerState" <> 'Confirmed'` makes the UPDATE a no-op when
+  // the row is already Confirmed; the caller (the service) maps
+  // the `ALREADY_CONFIRMED` return onto the idempotent success
+  // path. See ticket #64 P0-002.
   async recordPaymentIntentFailureInTransaction(
     input: RecordPaymentIntentFailureInput,
   ): Promise<RecordPaymentIntentFailureResult> {
-    const envelope = await runWithBoundedP2034Retry(() =>
-      this.runRecordPaymentIntentFailureTx(input),
-    );
-    if (envelope.outcome.kind === "exhausted") {
-      return { ok: false, reason: "CONCURRENCY_RETRY_EXHAUSTED" };
-    }
-    return envelope.outcome.value;
-  }
-
-  private async runRecordPaymentIntentFailureTx(
-    input: RecordPaymentIntentFailureInput,
-  ): Promise<RecordPaymentIntentFailureResult> {
-    return this.prisma.$transaction(
-      async (tx) => {
-        await tx.$queryRaw`SELECT id FROM payment_intents WHERE id = ${input.paymentIntentId} FOR UPDATE`;
-        const updated = await tx.paymentIntent.updateMany({
-          where: {
-            id: input.paymentIntentId,
-            providerState: { not: "Confirmed" },
-          },
-          data: {
-            providerState: "Failed",
-            failureReasonCode: input.failureReasonCode,
-            failureDetailCategory: input.failureDetailCategory,
-          },
-        });
-        if (updated.count === 1) {
-          return { ok: true as const, persisted: true };
-        }
-        return { ok: true as const, persisted: false, reason: "ALREADY_CONFIRMED" };
+    const updated = await this.prisma.paymentIntent.updateMany({
+      where: {
+        id: input.paymentIntentId,
+        providerState: { not: "Confirmed" },
       },
-      { isolationLevel: "Serializable" },
-    );
+      data: {
+        providerState: "Failed",
+        failureReasonCode: input.failureReasonCode,
+        failureDetailCategory: input.failureDetailCategory,
+      },
+    });
+    if (updated.count === 1) {
+      return { ok: true, persisted: true };
+    }
+    return { ok: true, persisted: false, reason: "ALREADY_CONFIRMED" };
   }
 
   // ---------- fundDealInTransaction ----------
@@ -566,7 +522,7 @@ export class PrismaFundingRepository implements FundingRepository {
             input: persistInput,
           }),
         };
-        const outcome = await useCase(
+        const outcome = useCase(
           {
             preauth,
             activation,

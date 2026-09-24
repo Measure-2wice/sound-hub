@@ -418,7 +418,7 @@ export class InMemoryFundingRepository implements FundingRepository {
           input: persistInput,
         }),
       };
-      const outcome = await useCase(
+      const outcome = useCase(
         {
           preauth: preauthSnapshot,
           activation: activationSnapshot,

@@ -239,24 +239,10 @@ export type FundDealUseCaseOutcome =
       };
     };
 
-/**
- * The Phase-3 use-case callback. The repository runs the closure
- * inside the Serializable transaction AFTER every `SELECT ... FOR
- * UPDATE` row lock has been acquired, so the locked snapshot the
- * use case re-evaluates against is the same one any concurrent
- * attempt would observe.
- *
- * The callback MAY be async: the repository `await`s the return.
- * The async form is used by behavior-level concurrency tests to
- * synchronize a deterministic interleaving between the in-flight
- * success and a late-arriving failure. Production use cases remain
- * synchronous; `await` on a non-Promise value is a no-op, so the
- * behavior is unchanged for the existing sync callers.
- */
 export type FundDealUseCase = (
   ctx: FundDealUseCaseContext,
   tools: FundDealUseCaseTools,
-) => FundDealUseCaseOutcome | Promise<FundDealUseCaseOutcome>;
+) => FundDealUseCaseOutcome;
 
 export interface FundDealTransactionInput {
   readonly dealId: string;
@@ -278,18 +264,10 @@ export interface FundDealTransactionInput {
  * service uses this to surface a safe envelope when the no-op
  * branch is taken so concurrent callers do not disagree about the
  * intent's terminal state.
- *
- * The bounded P2034 retry budget may be exhausted under sustained
- * serialization contention; the adapter surfaces that as a third
- * outcome so the route layer maps it onto a safe envelope rather
- * than leaking the raw Prisma P2034. See `fundDealInTransaction`
- * for the matching `CONCURRENCY_RETRY_EXHAUSTED` reason on the
- * Phase-3 path.
  */
 export type RecordPaymentIntentFailureResult =
   | { readonly ok: true; readonly persisted: true }
-  | { readonly ok: true; readonly persisted: false; readonly reason: "ALREADY_CONFIRMED" }
-  | { readonly ok: false; readonly reason: "CONCURRENCY_RETRY_EXHAUSTED" };
+  | { readonly ok: true; readonly persisted: false; readonly reason: "ALREADY_CONFIRMED" };
 
 // ---------- Public DTO mapping surface ----------
 

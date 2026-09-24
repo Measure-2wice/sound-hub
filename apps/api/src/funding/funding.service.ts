@@ -296,19 +296,6 @@ export class FundingService {
           failureReasonCode: "EscrowProviderUnavailable",
           failureDetailCategory: category,
         });
-        // Bounded P2034 retry exhaustion: the failure recorder
-        // could not commit the failure under the retry budget.
-        // Surface a safe envelope (mapped onto
-        // BG6_FUNDING_INTERNAL_FAILED) so the raw Prisma
-        // conflict code never leaks. A persisted outcome that
-        // observed an already-Confirmed intent falls through
-        // to the convergence re-check below.
-        if (failure.ok === false) {
-          throw new FundingServiceError(
-            "The marketplace is busy; please retry.",
-            "BG6_FUNDING_INTERNAL_FAILED",
-          );
-        }
         if (!failure.persisted) {
           const converged = await this.findAuthorizedConfirmedSuccess(input);
           if (converged) return converged;
@@ -410,16 +397,6 @@ export class FundingService {
           failureReasonCode: mismatchReasonToCode(activationResult.reason),
           failureDetailCategory: "CONFIRMATION_MISMATCH",
         });
-        // Bounded P2034 retry exhaustion: the failure recorder
-        // could not commit the failure under the retry budget.
-        // Surface a safe envelope so the raw Prisma conflict
-        // code never leaks.
-        if (failure.ok === false) {
-          throw new FundingServiceError(
-            "The marketplace is busy; please retry.",
-            "BG6_FUNDING_INTERNAL_FAILED",
-          );
-        }
         if (!failure.persisted) {
           const converged = await this.findAuthorizedConfirmedSuccess(input);
           if (converged) return converged;
