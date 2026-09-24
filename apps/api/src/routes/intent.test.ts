@@ -32,7 +32,7 @@ import { PersonalWorkspaceConvergenceService } from "../services/personal-worksp
 import { WorkspaceAuthorizationService } from "../services/workspace-authorization.service.js";
 import { AuthenticationService } from "../services/authentication.service.js";
 import { DeterministicIdentityAdapter } from "../identity/deterministic-identity-adapter.js";
-import { resolveRequestId } from "./intent.js";
+import { resolveRequestId } from "../lib/request-id.js";
 
 const USER_ID = "user-intent-route-test";
 const WS_ID = "ws-intent-route-test-personal";
@@ -984,5 +984,209 @@ describe("Intent route (in-memory)", () => {
     // tests above. We intentionally do NOT replicate them as
     // supertest cases because the HTTP transport never reaches
     // the route handler.
+  });
+});
+
+// ---------- Global error middleware — request-id sanitization (M2 #83) ----------
+//
+// Round 6 of codex review re-flagged the global middleware in
+// `apps/api/src/index.ts` as the second reachable format-string
+// sink for the intent request. The route-local `console.error`
+// in `intent.ts:278` was already constant; pre-`try` failures
+// (resolveSession, intentRequestV1Schema, resolveConvergence)
+// fall through to the global error middleware, whose
+// `console.error` interpolated `${requestId}` into the format
+// string AND whose request-id boundary only had the length-
+// only check. Both surfaces now route through the shared
+// `lib/request-id` sanitizer and the global logger uses a
+// constant format string.
+//
+// These regression tests prove the end-to-end invariant: an
+// attacker-supplied malicious header value cannot reach any
+// downstream log/header/response sink, regardless of which
+// code path a failure takes.
+describe("Global error middleware — pre-inner-try rejection (M2 #83 CodeQL hardening)", () => {
+  const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+  const adapter = new DeterministicIdentityAdapter({ allowDevVerificationUrl: true });
+
+  function buildAppWithFailOnNextConvergence(): Promise<{
+    app: import("express").Application;
+    enableNextFailure: () => void;
+  }> {
+    const stubAuthRepo = new InMemoryAuthRepository([
+      {
+        userAccountId: USER_ID,
+        email: EMAIL,
+        identityProvider: "deterministic",
+        identitySubject: SUBJECT,
+        memberships: [
+          {
+            workspaceId: WS_ID,
+            slug: "intent-route-personal",
+            name: "Intent Route Personal",
+            workspaceType: "Personal",
+            workspaceStatus: "Active",
+            role: "Owner",
+            capabilities: [],
+          },
+        ],
+      },
+    ]);
+
+    // The auth flow also uses `resolveConvergence` (it
+    // classifies the user's setup state during magic-link
+    // and verify-token), so an "always throws" stub breaks
+    // sign-in. The wrapper delegates to the real service
+    // during auth, then is flipped to throw once the test
+    // reaches the intent pre-inner-try dependency.
+    const realConvergence = new PersonalWorkspaceConvergenceService({
+      authRepository: stubAuthRepo,
+    });
+    let shouldThrowNext = false;
+    const failingConvergence: PersonalWorkspaceConvergenceService = {
+      resolveConvergence: async (input: { userAccountId: string }) => {
+        if (shouldThrowNext) {
+          shouldThrowNext = false;
+          throw new Error("simulated pre-inner-try failure (resolveConvergence)");
+        }
+        return await realConvergence.resolveConvergence(input);
+      },
+      createInitialConvergence: realConvergence.createInitialConvergence.bind(realConvergence),
+      attachExistingConvergence: realConvergence.attachExistingConvergence.bind(realConvergence),
+    } as unknown as PersonalWorkspaceConvergenceService;
+
+    const authenticationService = new AuthenticationService({
+      identityAdapter: adapter,
+      authRepository: stubAuthRepo,
+      personalWorkspaceConvergenceService: failingConvergence,
+    });
+    const workspaceAuthorizationService = new WorkspaceAuthorizationService({
+      authRepository: stubAuthRepo,
+    });
+    const intentService = new IntentService({
+      authRepository: stubAuthRepo,
+      workspaceAuthorizationService,
+    });
+
+    const app = buildApp({
+      authenticationService,
+      workspaceAuthorizationService,
+      authRepository: stubAuthRepo,
+      identityAdapter: adapter,
+      intentService,
+      personalWorkspaceConvergenceService: failingConvergence,
+      prismaClient: stubPrisma,
+    }).app;
+
+    return {
+      app,
+      enableNextFailure: () => {
+        shouldThrowNext = true;
+      },
+    };
+  }
+
+  async function signInTo(stubApp: import("express").Application): Promise<string> {
+    const magic = await request(stubApp)
+      .post("/api/auth/magic-link")
+      .send({ email: EMAIL })
+      .set("Content-Type", "application/json");
+    assert.equal(magic.status, 200);
+    const verifyUrl: string = magic.body.devVerificationUrl;
+    const token = new URL(verifyUrl, "http://localhost").searchParams.get("token");
+    assert.ok(token, "verification token missing");
+    const verify = await request(stubApp)
+      .post("/api/auth/verify-token")
+      .send({ verificationToken: token })
+      .set("Content-Type", "application/json");
+    assert.equal(verify.status, 200);
+    const setCookie = verify.headers["set-cookie"];
+    const cookieStr = Array.isArray(setCookie) ? setCookie.join(";") : (setCookie ?? "");
+    const m = /soundhub_session=([^;]+)/.exec(cookieStr);
+    assert.ok(m, "session cookie missing");
+    return `soundhub_session=${m[1]}`;
+  }
+
+  test("pre-inner-try rejection with x-request-id='evil%s' falls back to a sanitized UUID", async () => {
+    const { app: stubApp, enableNextFailure } = await buildAppWithFailOnNextConvergence();
+    const cookie = await signInTo(stubApp);
+    enableNextFailure();
+    const malicious = "evil%s-injection";
+    const response = await request(stubApp)
+      .post(`/api/workspaces/${WS_ID}/intent`)
+      .send({ intent: "Hire", expectedCapabilities: [], returnTo: "/deals" })
+      .set("Content-Type", "application/json")
+      .set("Cookie", cookie)
+      .set("x-request-id", malicious);
+
+    // The error escapes the inner `try` and reaches the global
+    // error middleware, which builds a safe-error envelope
+    // (status 500, code SEARCH_FAILED) using `req.requestId` —
+    // which by that point is the sanitized value set by the
+    // boundary middleware (NOT the raw header).
+    assert.equal(
+      response.status,
+      500,
+      "the global error middleware MUST produce 500 for unhandled failures",
+    );
+    assert.equal(
+      response.body.error?.code,
+      "SEARCH_FAILED",
+      "the global error middleware MUST echo SEARCH_FAILED (NOT the raw exception text)",
+    );
+    const correlationId = response.headers["x-request-id"];
+    assert.ok(
+      typeof correlationId === "string",
+      "the response x-request-id header MUST be set even on global-middleware failures",
+    );
+    assert.notEqual(
+      correlationId,
+      malicious,
+      "the response x-request-id MUST NOT equal the attacker's malicious header value",
+    );
+    assert.match(
+      correlationId,
+      UUID_RE,
+      "the response x-request-id MUST be a freshly generated UUID (defense-in-depth fallback)",
+    );
+  });
+
+  test("pre-inner-try rejection with a safe ULID-shaped header round-trips the correlation id", async () => {
+    // End-to-end correlation invariant: a legitimate client
+    // can correlate the response with its request even when
+    // the request fails AFTER auth but BEFORE the inner try.
+    const { app: stubApp, enableNextFailure } = await buildAppWithFailOnNextConvergence();
+    const cookie = await signInTo(stubApp);
+    enableNextFailure();
+    const safe = "01ARZ3NDEKTSV4RRFFQ69G5FAV";
+    const response = await request(stubApp)
+      .post(`/api/workspaces/${WS_ID}/intent`)
+      .send({ intent: "Hire", expectedCapabilities: [], returnTo: "/deals" })
+      .set("Content-Type", "application/json")
+      .set("Cookie", cookie)
+      .set("x-request-id", safe);
+    assert.equal(response.status, 500);
+    assert.equal(
+      response.headers["x-request-id"],
+      safe,
+      "a safe ULID-shaped x-request-id MUST round-trip through the global error middleware unchanged",
+    );
+  });
+
+  test("pre-inner-try rejection without an x-request-id produces a generated UUID", async () => {
+    const { app: stubApp, enableNextFailure } = await buildAppWithFailOnNextConvergence();
+    const cookie = await signInTo(stubApp);
+    enableNextFailure();
+    const response = await request(stubApp)
+      .post(`/api/workspaces/${WS_ID}/intent`)
+      .send({ intent: "Hire", expectedCapabilities: [], returnTo: "/deals" })
+      .set("Content-Type", "application/json")
+      .set("Cookie", cookie);
+    assert.equal(response.status, 500);
+    assert.match(
+      response.headers["x-request-id"] as string,
+      UUID_RE,
+      "a missing x-request-id MUST fall back to a generated UUID even on global-middleware failures",
+    );
   });
 });

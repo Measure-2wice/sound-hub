@@ -69,12 +69,8 @@ import {
 import type { AuthenticationService } from "../services/authentication.service.js";
 import type { IntentService, IntentServiceError } from "../services/intent.service.js";
 import type { PersonalWorkspaceConvergenceService } from "../services/personal-workspace-convergence.service.js";
-import {
-  buildFieldErrors,
-  buildSafeError,
-  generateRequestId,
-  writeSafeError,
-} from "../lib/errors.js";
+import { buildFieldErrors, buildSafeError, writeSafeError } from "../lib/errors.js";
+import { resolveRequestId } from "../lib/request-id.js";
 import { SESSION_COOKIE } from "../lib/session-cookie.js";
 import { isValidReturnPath } from "../lib/return-context.js";
 import {
@@ -355,34 +351,19 @@ function parseIntentRequestBody(req: Request, res: Response, next: (err?: unknow
 //      JSON.stringify escapes `<>"`, but log-line splitting via
 //      `\n` is still a hygiene concern.
 //
-// The allow-list is conservative and covers SoundHub's UUID/ULID
-// shape plus common separator characters used by upstream tracing
-// systems (`.`, `_`, `-`). Anything outside the allow-list, plus
-// empty / over-length values, falls back to `generateRequestId()` —
-// the same UUID the route produces when the header is absent.
-const SAFE_REQUEST_ID_PATTERN = /^[A-Za-z0-9._-]+$/;
-const SAFE_REQUEST_ID_MAX_LENGTH = 128;
-
-// Exported for testability — the integration tests go through
-// supertest, but Node's HTTP client blocks CR/LF and other
-// control bytes at `setHeader` time with `ERR_INVALID_CHAR`
-// BEFORE the request is sent. That transport-level guard is
-// the first line of defense; this function is the second.
-// Direct unit tests pin the regex + length-bound behavior
-// independently of the HTTP layer.
-export function resolveRequestId(req: Request): string {
-  const incoming = req.headers["x-request-id"];
-  if (typeof incoming !== "string") {
-    return generateRequestId();
-  }
-  if (incoming.length === 0 || incoming.length > SAFE_REQUEST_ID_MAX_LENGTH) {
-    return generateRequestId();
-  }
-  if (!SAFE_REQUEST_ID_PATTERN.test(incoming)) {
-    return generateRequestId();
-  }
-  return incoming;
-}
+// The allow-list (`resolveRequestId` in `lib/request-id.ts`)
+// covers SoundHub's UUID/ULID shape plus common separator
+// characters used by upstream tracing systems (`.`, `_`, `-`).
+// Anything outside the allow-list, plus empty / over-length
+// values, falls back to `generateRequestId()`.
+//
+// The same helper is consumed by the global error middleware
+// in `apps/api/src/index.ts` so that pre-`try` failures (auth
+// resolution, convergence) — which fall through to the global
+// error handler — still surface a sanitized correlation id.
+// Defense-in-depth: the route-local log statement also uses
+// a constant format string so an attacker cannot steer
+// `util.format` substitution even if the allow-list regresses.
 
 /**
  * Read the opaque session id from the request's `Cookie` header.

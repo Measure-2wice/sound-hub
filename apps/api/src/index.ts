@@ -60,6 +60,7 @@ import {
 } from "./matchmaker/ai-adapter-factory.js";
 import type { SmokeResult } from "./identity/managed-identity-adapter.js";
 import { buildSafeError, generateRequestId, writeSafeError } from "./lib/errors.js";
+import { resolveRequestId } from "./lib/request-id.js";
 
 export interface AppOptions {
   readonly service?: TalentSearchService;
@@ -381,12 +382,25 @@ export function buildApp(options: AppOptions = {}): BuiltApp {
     }),
   );
 
+  // Global request-id sanitizer (M2 #83 CodeQL hardening).
+  //
+  // The untrusted `x-request-id` header is sanitized at the
+  // application boundary via `lib/request-id`. The resulting
+  // value is the ONLY one consumed by every downstream sink:
+  //   - the per-route handlers (which call this same helper
+  //     again — idempotent);
+  //   - the 404 fallback below;
+  //   - the error middleware below, whose `console.error` used
+  //     to interpolate `${requestId}` into the format string
+  //     and was the second reachable format-string sink flagged
+  //     by CodeQL after the route-local sink in
+  //     `apps/api/src/routes/intent.ts` was fixed.
+  //
+  // Storing the sanitized value on the request and reading it
+  // back in the error middlewares eliminates the gap between
+  // the route-local sink and the global sink.
   app.use((req, res, next) => {
-    const incoming = req.headers["x-request-id"];
-    const requestId =
-      typeof incoming === "string" && incoming.length > 0 && incoming.length <= 128
-        ? incoming
-        : generateRequestId();
+    const requestId = resolveRequestId(req);
     res.setHeader("x-request-id", requestId);
     (req as Request & { requestId?: string }).requestId = requestId;
     next();
@@ -482,8 +496,21 @@ export function buildApp(options: AppOptions = {}): BuiltApp {
   // Error middleware
   app.use((err: Error, req: Request, res: Response, _next: NextFunction) => {
     void _next;
-    const requestId = (req as Request & { requestId?: string }).requestId ?? generateRequestId();
-    console.error(`[talent-search] requestId=${requestId} unhandled:`, err);
+    // The sanitized request id is stored on `req.requestId`
+    // by the boundary middleware above; if that middleware did
+    // not run for some reason, fall back to a freshly generated
+    // UUID — never echo the raw header value here.
+    const requestId = (req as Request & { requestId?: string }).requestId ?? resolveRequestId(req);
+    // The format string MUST be a literal constant — Node's
+    // `console.error` passes its first argument through
+    // `util.format`, which interprets `%s`, `%d`, `%o`, `%j`,
+    // etc. as format specifiers. Earlier passes interpolated
+    // `requestId` directly into the template literal; once an
+    // untrusted `x-request-id` reaches here, an attacker-
+    // supplied `%s` would steer util.format substitution. The
+    // value is also pre-sanitized by the boundary middleware
+    // (M2 #83 CodeQL hardening) as defense-in-depth.
+    console.error("[talent-search] requestId=%s unhandled:", requestId, err);
     const safe = buildSafeError(
       "SEARCH_FAILED",
       "An unexpected error occurred while processing the request.",
