@@ -263,7 +263,19 @@ async function handleIntent(req: Request, res: Response, deps: IntentRouteDeps):
     }
     // Mirror the BG1 pattern: surface AUTH_FAILED for unexpected
     // internal failures without echoing the underlying message.
-    console.error(`[intent] requestId=${requestId} unhandled:`, err);
+    //
+    // The format string MUST be a literal constant — Node's
+    // `console.error` passes its first argument through
+    // `util.format`, which interprets `%s`, `%d`, `%o`, `%j`,
+    // etc. as format specifiers. Earlier passes interpolated
+    // `requestId` directly into the template literal; once an
+    // untrusted `x-request-id` reaches here, an attacker-supplied
+    // `%s` would steer util.format substitution. Keeping the
+    // format string constant and passing `requestId` as a
+    // substitution value removes that path. The hardened
+    // `resolveRequestId` already enforces a character allow-list
+    // as defense-in-depth (CodeQL hardening, M2 #83).
+    console.error("[intent] requestId=%s unhandled:", requestId, err);
     writeSafeError(
       res,
       buildSafeError(
@@ -328,12 +340,48 @@ function parseIntentRequestBody(req: Request, res: Response, next: (err?: unknow
   });
 }
 
-function resolveRequestId(req: Request): string {
+// Bounded request-id allow-list (M2 #83 CodeQL hardening).
+//
+// `x-request-id` is an untrusted client header. Its value flows to:
+//   1. `console.error("[intent] requestId=...")` — Node's console
+//      passes its first arg through `util.format`, which interprets
+//      `%s`, `%d`, `%o`, `%j`, etc. as format specifiers. A header
+//      containing those placeholders would let an attacker steer
+//      util.format substitution and pollute the log line.
+//   2. `res.setHeader("x-request-id", ...)` — Node rejects CRLF but
+//      cannot defang other control bytes; the policy below covers
+//      those uniformly.
+//   3. The safe-error response body via `buildSafeError`.
+//      JSON.stringify escapes `<>"`, but log-line splitting via
+//      `\n` is still a hygiene concern.
+//
+// The allow-list is conservative and covers SoundHub's UUID/ULID
+// shape plus common separator characters used by upstream tracing
+// systems (`.`, `_`, `-`). Anything outside the allow-list, plus
+// empty / over-length values, falls back to `generateRequestId()` —
+// the same UUID the route produces when the header is absent.
+const SAFE_REQUEST_ID_PATTERN = /^[A-Za-z0-9._-]+$/;
+const SAFE_REQUEST_ID_MAX_LENGTH = 128;
+
+// Exported for testability — the integration tests go through
+// supertest, but Node's HTTP client blocks CR/LF and other
+// control bytes at `setHeader` time with `ERR_INVALID_CHAR`
+// BEFORE the request is sent. That transport-level guard is
+// the first line of defense; this function is the second.
+// Direct unit tests pin the regex + length-bound behavior
+// independently of the HTTP layer.
+export function resolveRequestId(req: Request): string {
   const incoming = req.headers["x-request-id"];
-  if (typeof incoming === "string" && incoming.length > 0 && incoming.length <= 128) {
-    return incoming;
+  if (typeof incoming !== "string") {
+    return generateRequestId();
   }
-  return generateRequestId();
+  if (incoming.length === 0 || incoming.length > SAFE_REQUEST_ID_MAX_LENGTH) {
+    return generateRequestId();
+  }
+  if (!SAFE_REQUEST_ID_PATTERN.test(incoming)) {
+    return generateRequestId();
+  }
+  return incoming;
 }
 
 /**
