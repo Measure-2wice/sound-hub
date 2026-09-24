@@ -37,7 +37,7 @@
 //     different from the current acting Workspace.
 
 import { useRouter, useSearchParams } from "next/navigation";
-import { useEffect, useId, useMemo, useRef, useState } from "react";
+import { Suspense, useEffect, useId, useMemo, useRef, useState } from "react";
 import { useActingWorkspace, useSetActingWorkspace, useSession } from "./SessionProvider";
 import { isLocallyValidReturnPath } from "../lib/return-path-shape";
 
@@ -46,7 +46,31 @@ interface ActingWorkspaceSelectorProps {
   readonly variant: "desktop" | "mobile-compact";
 }
 
-export function ActingWorkspaceSelector({ variant }: ActingWorkspaceSelectorProps) {
+/**
+ * The selector reads `?return=` via `useSearchParams` so it can thread
+ * the dashboard's cross-Workspace continuation forward into the
+ * `/workspace/switch` interstitial. Under Next.js 15 prerender that
+ * hook MUST be inside a Suspense boundary at static-export time, or
+ * `next build` aborts on the first page that mounts the selector (any
+ * page under the root layout — including `/deals`).
+ *
+ * The component is therefore split into an outer wrapper that owns
+ * the Suspense boundary and an inner component that actually calls
+ * `useSearchParams`. The boundary's `fallback` is `null` because the
+ * selector synchronously resolves to `null` when there is no session
+ * or only one accessible Workspace, and to a passive label otherwise
+ * — there is no useful intermediate UI to render during the brief
+ * search-params resolution window.
+ */
+export function ActingWorkspaceSelector(props: ActingWorkspaceSelectorProps) {
+  return (
+    <Suspense fallback={null}>
+      <ActingWorkspaceSelectorInner {...props} />
+    </Suspense>
+  );
+}
+
+function ActingWorkspaceSelectorInner({ variant }: ActingWorkspaceSelectorProps) {
   const { user } = useSession();
   const { actingWorkspace, actingWorkspaceId } = useActingWorkspace();
   const { setPendingTarget } = useSetActingWorkspace();

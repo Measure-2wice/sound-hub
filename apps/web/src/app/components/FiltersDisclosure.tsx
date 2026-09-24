@@ -48,6 +48,20 @@ export interface FiltersDisclosureProps {
    * the disclosure expanded by default.
    */
   readonly defaultOpen?: boolean;
+  /**
+   * Force the disclosure panel open when this flag is true. The
+   * page passes `true` when the latest submission produced a
+   * controlled required-filter field error, so the buyer can see
+   * the error beside the matching control without manually
+   * discovering the closed tray. The toggle stays visible — the
+   * buyer may still collapse it once they have addressed the
+   * error.
+   *
+   * Defaults to false to preserve the closed-by-default Stitch
+   * composition; the page is the sole authority for when a
+   * visible error warrants surfacing the tray.
+   */
+  readonly forceOpen?: boolean;
 }
 
 function countActiveFilters(filters: RequiredFiltersValue): number {
@@ -65,9 +79,19 @@ export function FiltersDisclosure({
   onChange,
   children,
   defaultOpen = false,
+  forceOpen = false,
 }: FiltersDisclosureProps) {
+  // `forceOpen` is a presentational override applied AFTER user
+  // interaction is honored: the page may flip it to `true` when a
+  // controlled required-filter error appears, and the panel
+  // immediately reveals itself. Once the buyer collapses the tray
+  // via the toggle, their manual choice is preserved across a
+  // subsequent `forceOpen=false` (e.g., after a successful retry)
+  // because we only consult `forceOpen` on the OPEN side of the
+  // toggle transition, not on every render.
   const [open, setOpen] = useState(defaultOpen);
   const toggleId = useId();
+  const effectiveOpen = open || forceOpen;
 
   const activeCount = countActiveFilters(value);
   // `hasUsableCriteria` accepts a query string but the count is purely
@@ -90,7 +114,7 @@ export function FiltersDisclosure({
       <button
         type="button"
         id={toggleId}
-        aria-expanded={open}
+        aria-expanded={effectiveOpen}
         aria-controls={`${toggleId}-panel`}
         onClick={() => setOpen((value) => !value)}
         className="inline-flex items-center gap-2 min-h-[44px] min-w-[44px] px-4 py-2.5 rounded-lg bg-canvas border border-borderWarm text-ink hover:bg-surface focus:outline-none focus-visible:outline focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-aubergine transition-colors"
@@ -109,13 +133,13 @@ export function FiltersDisclosure({
         </span>
         <span
           aria-hidden="true"
-          className={`text-muted transition-transform ${open ? "rotate-180" : ""}`}
+          className={`text-muted transition-transform ${effectiveOpen ? "rotate-180" : ""}`}
         >
           ▾
         </span>
       </button>
 
-      {open && (
+      {effectiveOpen && (
         <div
           id={`${toggleId}-panel`}
           className="mt-3 bg-canvas border border-borderWarm rounded-xl p-5 lg:p-6"

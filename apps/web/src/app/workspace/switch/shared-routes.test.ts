@@ -84,3 +84,66 @@ describe("post-command return routes shared across server + client (M2 #83 P2-00
     }
   });
 });
+
+describe("M2 #83: deep-link switch target lookup — Active-only gate", () => {
+  // Background: a deep link to `/workspace/switch?target=<id>` must
+  // NEVER render the `Switch and continue` button for a Suspended
+  // or non-Active target. The promotion effect (which sets
+  // `pendingTarget` from a query parameter when no pending target
+  // is present) already enforces the Active gate; the fallback
+  // target lookup (used when the buyer lands directly on the page
+  // without an explicit selector click) MUST apply the same gate.
+  // Otherwise the page would show a commit button for a target
+  // the server refuses to switch to, then silently no-op.
+
+  test('the fallback target lookup filters by `workspaceStatus === "Active"`', () => {
+    // The `useMemo` body for `target` is the second such block in
+    // the file (the first block is for `queryReturnTo`). We pin the
+    // Active-only filter inside that block so a regression that
+    // drops the gate fails the suite.
+    const targetMemoMatch = CLIENT_SWITCH_SOURCE.match(
+      /const\s+target\s*=\s*useMemo\s*\(\s*\(\)\s*=>\s*\{[\s\S]*?\}\s*,\s*\[\s*pendingTarget\s*,\s*queryTargetId\s*,\s*user\s*\]\s*\)/,
+    );
+    assert.ok(targetMemoMatch, "the page MUST define a target useMemo");
+    assert.match(
+      targetMemoMatch[0],
+      /workspaceStatus\s*===\s*["']Active["']/,
+      'the fallback target lookup MUST filter by `workspaceStatus === "Active"` so a deep link to a Suspended target cannot render the commit button',
+    );
+    assert.match(
+      targetMemoMatch[0],
+      /user\.workspaces\.find\s*\(/,
+      "the fallback target lookup MUST resolve via `user.workspaces.find(...)` so an inaccessible target returns null",
+    );
+  });
+
+  test("the page renders the unavailable surface when `target` is null and never the commit button", () => {
+    // `target === null` is the documented unavailable-state signal.
+    // The page must render the `switch-unavailable` surface AND
+    // never the `workspace-switch-continue` button in that branch.
+    // There are two `switch-back-to-dashboard` buttons in the
+    // source (the signed-out branch + the unavailable branch) — we
+    // locate the unavailable branch by anchoring on its
+    // `!actingWorkspace || !target` guard and capture only the
+    // body up to the matching closing brace of the rendered JSX
+    // root (which contains the explicit dashboard action).
+    const unavailableBranchMatch = CLIENT_SWITCH_SOURCE.match(
+      /if\s*\(\s*!actingWorkspace\s*\|\|\s*!target\s*\)\s*\{[\s\S]*?data-testid="switch-unavailable"[\s\S]*?Return to dashboard[\s\S]*?\}\s*\}/,
+    );
+    assert.ok(
+      unavailableBranchMatch,
+      "the page MUST render the `switch-unavailable` surface when `target` is null with a `Return to dashboard` recovery action",
+    );
+    // The unavailable branch must NOT contain the commit button
+    // — its action surface is the `switch-back-to-dashboard`
+    // button only.
+    assert.ok(
+      !unavailableBranchMatch[0].includes("workspace-switch-continue"),
+      "the unavailable branch MUST NOT render the `Switch and continue` button",
+    );
+    assert.ok(
+      unavailableBranchMatch[0].includes("switch-back-to-dashboard"),
+      "the unavailable branch MUST render the explicit `Return to dashboard` button so the buyer can recover without a silent no-op",
+    );
+  });
+});

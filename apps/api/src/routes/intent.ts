@@ -198,13 +198,23 @@ async function handleIntent(req: Request, res: Response, deps: IntentRouteDeps):
 
     // Resolve `safeReturnTo` against the FRESH post-provision
     // user payload. The browser consumes only this value.
+    //
+    // `actingWorkspaceId` MUST be the canonical Personal Workspace
+    // id the intent command was just validated against — that is
+    // the path `workspaceId`, which the service verified is the
+    // convergence pointer and a current Personal membership
+    // (Personal-Workspace-only authorization). Re-deriving the
+    // "first Personal" from `result.user.workspaces[]` is unsafe:
+    // a user with more than one accessible Personal Workspace
+    // (e.g., a canonical Personal + a non-canonical accessible
+    // alternative) would have continuation resolution evaluated
+    // against the wrong actor.
     let safeReturnTo: string | null = null;
     try {
       const resolvedDestination = resolvePostCommandReturnDestination({
         returnTo: shapeValidatedReturn,
         freshUser: result.user,
-        actingWorkspaceId:
-          result.user.workspaces.find((w) => w.workspaceType === "Personal")?.workspaceId ?? null,
+        actingWorkspaceId: workspaceId,
         allowedOrigin: deps.allowedReturnOrigin,
       });
       safeReturnTo = resolvedDestination?.path ?? null;

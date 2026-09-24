@@ -198,6 +198,22 @@ export function SearchPage() {
     [fieldErrors],
   );
 
+  // The FiltersDisclosure tray defaults closed. When the latest
+  // submission produced a controlled required-filter field error
+  // (for example a malformed `basedIn.countryCode`), the error
+  // renders beside the matching control INSIDE the disclosure — so
+  // if the tray stays closed the buyer cannot see the error and
+  // the submission appears to have been ignored. Surfacing the
+  // error therefore requires opening the tray. The page is the
+  // sole authority: when a controlled error is present, force the
+  // disclosure open; otherwise the closed-by-default Stitch
+  // composition is preserved.
+  const controlledRequiredErrors = useMemo<readonly ApiFieldErrorV1[]>(
+    () => fieldErrors.filter((err) => isControlledRequiredPath(err.path)),
+    [fieldErrors],
+  );
+  const forceFiltersOpen = controlledRequiredErrors.length > 0;
+
   const usable = hasUsableCriteria(query, filters);
   const showEmptyState = !isLoading && results !== null && results.results.length === 0 && usable;
 
@@ -290,7 +306,7 @@ export function SearchPage() {
         </section>
 
         {/* ============== FILTERS DISCLOSURE ============== */}
-        <FiltersDisclosure value={filters} onChange={setFilters}>
+        <FiltersDisclosure value={filters} onChange={setFilters} forceOpen={forceFiltersOpen}>
           <RequiredFilters
             value={filters}
             onChange={setFilters}

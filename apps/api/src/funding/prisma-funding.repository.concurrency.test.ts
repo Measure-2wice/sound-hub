@@ -25,6 +25,7 @@ import type { EscrowConfirmation, EscrowProvider } from "../escrow/escrow-provid
 import { assertDisposableTestDatabase, readTestDatabaseUrl } from "../lib/test-database.js";
 import { FundingService, FundingServiceError } from "./funding.service.js";
 import { PrismaFundingRepository } from "./prisma-funding.repository.js";
+import type { FundDealUseCase } from "./funding.repository.js";
 
 const BUYER_USER_ID = "user-bg6c-buyer";
 const SELLER_USER_ID = "user-bg6c-seller";
@@ -383,16 +384,64 @@ test("success racing failure: a Confirmed intent is never demoted to Failed (P0-
     correlationId: "corr_success_race_failure",
   });
   if (!created.ok) throw new Error("seed failed");
-  const accept = ({ paymentIntentId }: { paymentIntentId: string }) =>
-    ({
+
+  // Deterministic interleaving barrier.
+  //
+  // The repository runs the use case INSIDE the Serializable
+  // transaction AFTER every `SELECT ... FOR UPDATE` row lock
+  // has been acquired. An async use case that awaits a test-
+  // controlled promise therefore holds the FOR UPDATE locks
+  // for as long as the test wishes, which gives us a precise
+  // way to order the success and failure without relying on
+  // the JS microtask scheduler.
+  //
+  //   1. Launch the success transaction (returns a promise).
+  //   2. `await successReached` — the use case has run, the
+  //      success is now in-flight, and every FOR UPDATE lock
+  //      it acquired is held open. The success is provably
+  //      "in flight / holds the relevant lock" (the user's
+  //      bullet (1)).
+  //   3. Launch the failure transaction. Its first statement
+  //      is `SELECT id FROM payment_intents WHERE id = ?
+  //      FOR UPDATE` on the SAME row the success already
+  //      holds. The failure BLOCKS on PostgreSQL's row lock
+  //      until the success commits or rolls back. The failure
+  //      is provably "begins while success is still in
+  //      flight" (bullet (2)).
+  //   4. `resolveContinue()` — the use case returns
+  //      `persist`, the success commits Confirmed, and the
+  //      row lock is released.
+  //   5. The failure's blocked FOR UPDATE returns the post-
+  //      commit Confirmed row; the guarded `WHERE
+  //      providerState <> 'Confirmed'` UPDATE matches 0 rows;
+  //      the method returns `{ ok: true, persisted: false,
+  //      reason: "ALREADY_CONFIRMED" }`. The failure is
+  //      "forced to observe the post-success Confirmed state"
+  //      (bullet (3)) and "returns the expected non-demoting
+  //      result" (bullet (5)).
+  //   6. Final state: Confirmed + Active. Confirmed is NOT
+  //      demoted to Failed (bullet (4)).
+  let resolveReached!: () => void;
+  let resolveContinue!: () => void;
+  const successReached = new Promise<void>((resolve) => {
+    resolveReached = resolve;
+  });
+  const continuePromise = new Promise<void>((resolve) => {
+    resolveContinue = resolve;
+  });
+  const accept: FundDealUseCase = async () => {
+    resolveReached();
+    await continuePromise;
+    return {
       kind: "persist",
       input: {
-        paymentIntentId,
+        paymentIntentId: created.value.id,
         providerReference: "mock_race_success",
         confirmedAt: new Date("2026-09-03T12:00:00.000Z"),
         acceptedAt: new Date("2026-09-03T12:00:00.000Z"),
       },
-    }) as const;
+    } as const;
+  };
   const successPromise = repoA.fundDealInTransaction(
     {
       dealId: DEAL_ID,
@@ -405,36 +454,26 @@ test("success racing failure: a Confirmed intent is never demoted to Failed (P0-
     },
     accept,
   );
-  // Deterministic ordering: a real CI run cannot rely on the JS
-  // microtask queue to put the success's BEGIN ahead of the
-  // failure's autocommit updateMany. Holding the FOR UPDATE
-  // row lock in the failure method now guarantees the failure
-  // BLOCKS until the success transaction commits (or rolls
-  // back), so the sequential `await successSettled` produces
-  // the same observable outcome as a race that happens to
-  // land the success first — and makes the test pass under
-  // any scheduler ordering. The persisted-state invariant
-  // being verified ("once Confirmed is committed, a later
-  // failure cannot demote it") is unchanged.
-  const successSettled = successPromise.then(
-    () => ({ kind: "success" as const }),
-    (err: unknown) => ({ kind: "error" as const, err }),
-  );
-  const successResolved = await successSettled;
-  assert.equal(
-    successResolved.kind,
-    "success",
-    "expected the seed success attempt to commit before the failure fires",
-  );
+  await successReached;
   const failurePromise = repoB.recordPaymentIntentFailureInTransaction({
     paymentIntentId: created.value.id,
     failureReasonCode: "EscrowProviderUnavailable",
     failureDetailCategory: "PROVIDER_UNAVAILABLE",
   });
-  const failureResult = await failurePromise;
-  assert.deepEqual(failureResult, { ok: true, persisted: false, reason: "ALREADY_CONFIRMED" });
-  // Final observable state: exactly one intent, Confirmed, and Deal
-  // is Active. NO Active + Failed state may be observable.
+  // The failure is now in-flight; its first `SELECT ... FOR
+  // UPDATE` on the intent row is BLOCKED behind the success's
+  // held row lock. We release the success so it can commit.
+  resolveContinue();
+  const [failureResult, successResult] = await Promise.all([failurePromise, successPromise]);
+  assert.equal(successResult.ok, true, "expected the success transaction to commit");
+  assert.deepEqual(
+    failureResult,
+    { ok: true, persisted: false, reason: "ALREADY_CONFIRMED" },
+    "a failure that arrives while a success transaction holds the FOR UPDATE lock MUST observe the post-commit Confirmed state and return ALREADY_CONFIRMED",
+  );
+  // Final observable state: exactly one intent, Confirmed,
+  // and Deal is Active. NO Active + Failed state may be
+  // observable.
   const deal = await prismaA.deal.findUnique({ where: { id: DEAL_ID } });
   assert.equal(deal?.status, "Active");
   const intent = await prismaA.paymentIntent.findUnique({ where: { id: created.value.id } });

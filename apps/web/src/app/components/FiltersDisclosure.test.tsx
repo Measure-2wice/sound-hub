@@ -145,4 +145,32 @@ describe("FiltersDisclosure — post-#83 visual-parity", () => {
       "the badge MUST expose data-active=false on the empty state so styling can distinguish zero from nonzero",
     );
   });
+
+  test("forceOpen reveals the panel and children even when the user has not clicked the toggle", () => {
+    // The page sets forceOpen=true when the latest submission
+    // produced a controlled required-filter field error, so the
+    // buyer can see the error beside the matching control without
+    // manually discovering the closed tray. The toggle stays
+    // visible — the buyer may still collapse it after they have
+    // addressed the error.
+    const html = renderToStaticMarkup(
+      <FiltersDisclosure value={EMPTY_FILTERS} onChange={() => undefined} forceOpen>
+        <div data-testid="child-marker" />
+      </FiltersDisclosure>,
+    );
+
+    assert.ok(
+      html.includes('data-testid="filters-disclosure-panel"'),
+      "panel MUST render when forceOpen is true",
+    );
+    assert.ok(
+      html.includes('data-testid="child-marker"'),
+      "children MUST render inside the panel when forceOpen is true",
+    );
+    assert.match(
+      html,
+      /aria-expanded="true"/,
+      "toggle MUST expose aria-expanded=true when forceOpen is true so screen readers announce the open state",
+    );
+  });
 });

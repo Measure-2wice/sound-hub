@@ -113,7 +113,19 @@ function WorkspaceSwitchPageInner() {
   const target = useMemo(() => {
     if (pendingTarget) return pendingTarget;
     if (!user || !queryTargetId) return null;
-    return user.workspaces.find((w) => w.workspaceId === queryTargetId) ?? null;
+    // Only Active Workspaces may render as a valid switch target.
+    // A deep link to a Suspended or non-Active Workspace must fall
+    // through to the unavailable surface — never present a
+    // "Switch and continue" button for a target that cannot
+    // actually be committed. The promotion effect above enforces
+    // the same Active gate before any pendingTarget is set; this
+    // lookup applies the same gate when the buyer lands directly
+    // on the switch page without an explicit selector click.
+    return (
+      user.workspaces.find(
+        (w) => w.workspaceId === queryTargetId && w.workspaceStatus === "Active",
+      ) ?? null
+    );
   }, [pendingTarget, queryTargetId, user]);
 
   const [submitting, setSubmitting] = useState(false);

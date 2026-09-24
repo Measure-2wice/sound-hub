@@ -553,4 +553,117 @@ describe("Intent route (in-memory)", () => {
     assert.deepEqual(canonical?.capabilities, []);
     assert.deepEqual(nonCanonical?.capabilities, []);
   });
+
+  // B4: with more than one accessible Personal Workspace, the route
+  // MUST resolve `safeReturnTo` against the canonical Personal
+  // Workspace the intent command was just validated against — the
+  // path `workspaceId`. Re-deriving "first Personal" from
+  // `result.user.workspaces[]` is unsafe because that ordering is
+  // not authoritative; the canonical pointer is the convergence
+  // pointer, which equals the validated path id.
+  //
+  // The fixture has two accessible Personal Workspaces:
+  //   - WS_ID: Owner role, convergence pointer (canonical).
+  //   - SECOND_PERSONAL: Admin role, inserted FIRST so the
+  //     insertion-order iteration of `membershipsById.values()`
+  //     surfaces it ahead of WS_ID.
+  // After `Hire`, WS_ID holds Buyer capability; SECOND_PERSONAL
+  // holds none. With the fix, the route uses WS_ID (the path
+  // workspaceId) as the `actingWorkspaceId` for the post-command
+  // resolver; the `/deals` capability gate (Buyer | Seller) is
+  // satisfied and `safeReturnTo === "/deals"`. Without the fix,
+  // the route re-derives the first Personal — which is
+  // SECOND_PERSONAL — and the gate fails, dropping to the safe
+  // fallback `/dashboard`.
+  test("B4: with more than one accessible Personal Workspace, safeReturnTo resolves against the canonical (path) workspaceId", async () => {
+    const SECOND_PERSONAL = "ws-intent-route-personal-second";
+    authRepo = new InMemoryAuthRepository([
+      {
+        userAccountId: USER_ID,
+        email: EMAIL,
+        identityProvider: "deterministic",
+        identitySubject: SUBJECT,
+        memberships: [
+          // INSERTED FIRST so the iteration over
+          // `membershipsById.values()` puts this Personal
+          // ahead of WS_ID in `result.user.workspaces`. The
+          // canonical pointer is still WS_ID; this row exists
+          // only to exercise the "first Personal is not
+          // canonical" branch that motivated the fix.
+          {
+            workspaceId: SECOND_PERSONAL,
+            slug: "intent-route-personal-second",
+            name: "Intent Route Personal (second, non-canonical)",
+            workspaceType: "Personal",
+            workspaceStatus: "Active",
+            role: "Admin",
+            capabilities: [],
+          },
+          {
+            workspaceId: WS_ID,
+            slug: "intent-route-personal",
+            name: "Intent Route Personal",
+            workspaceType: "Personal",
+            workspaceStatus: "Active",
+            role: "Owner",
+            capabilities: [],
+          },
+        ],
+      },
+    ]);
+    personalWorkspaceConvergenceService = new PersonalWorkspaceConvergenceService({
+      authRepository: authRepo,
+    });
+    authenticationService = new AuthenticationService({
+      identityAdapter: adapter,
+      authRepository: authRepo,
+      personalWorkspaceConvergenceService,
+    });
+    workspaceAuthorizationService = new WorkspaceAuthorizationService({
+      authRepository: authRepo,
+    });
+    intentService = new IntentService({
+      authRepository: authRepo,
+      workspaceAuthorizationService,
+    });
+    app = buildApp({
+      authenticationService,
+      workspaceAuthorizationService,
+      authRepository: authRepo,
+      identityAdapter: adapter,
+      intentService,
+      personalWorkspaceConvergenceService,
+      prismaClient: stubPrisma,
+    }).app;
+
+    const cookie = await signIn();
+    // Submit Hire against the CANONICAL path id (WS_ID). The
+    // intent service validates the canonical pointer, then
+    // provisions Buyer capability on WS_ID. The non-canonical
+    // Admin Personal (SECOND_PERSONAL) receives no capability.
+    const response = await request(app)
+      .post(`/api/workspaces/${WS_ID}/intent`)
+      .send({ intent: "Hire", expectedCapabilities: [], returnTo: "/deals" })
+      .set("Content-Type", "application/json")
+      .set("Cookie", cookie);
+    assert.equal(response.status, 200);
+
+    // The post-command destination resolver evaluates the
+    // capability gate against the FRESH user payload using the
+    // path `workspaceId` as `actingWorkspaceId`. WS_ID now
+    // holds Buyer capability; the `/deals` gate is satisfied
+    // and `safeReturnTo` echoes the validated returnTo.
+    assert.equal(
+      response.body.safeReturnTo,
+      "/deals",
+      "safeReturnTo MUST resolve against the canonical Personal Workspace id (the validated path workspaceId), not a re-derived 'first Personal'",
+    );
+
+    // Sanity: the persisted state matches expectations.
+    const view = await authRepo.getPublicUser(USER_ID);
+    const canonical = view!.workspaces.find((w) => w.workspaceId === WS_ID);
+    const nonCanonical = view!.workspaces.find((w) => w.workspaceId === SECOND_PERSONAL);
+    assert.deepEqual(canonical?.capabilities, ["Buyer"]);
+    assert.deepEqual(nonCanonical?.capabilities, []);
+  });
 });

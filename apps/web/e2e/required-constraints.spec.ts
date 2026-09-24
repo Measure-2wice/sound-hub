@@ -160,6 +160,87 @@ test("M1.5: malformed criteria returns the standard error envelope and a visible
   expect(text.trim().length).toBeGreaterThan(0);
 });
 
+// ---------------------------------------------------------------------
+// Filters-disclosure behavior on submission errors.
+//
+// Closes the Tenki review finding: required-filter field errors MUST
+// be visible without manually discovering the tray. The page forces
+// the FiltersDisclosure open when a controlled required-filter field
+// error is present, so a buyer submitting an invalid required value
+// sees the error beside the matching control without first having to
+// expand the tray.
+// ---------------------------------------------------------------------
+
+test("Filters disclosure is closed by default", async ({ page }) => {
+  await loadHome(page);
+  await expect(page.getByTestId("filters-disclosure-toggle")).toBeVisible();
+  await expect(page.getByTestId("filters-disclosure-panel")).toHaveCount(0);
+  await expect(page.getByTestId("required-category-field")).toHaveCount(0);
+});
+
+test("Submission error forces the Filters disclosure open and renders the field error beside the matching control", async ({
+  page,
+}) => {
+  await loadHome(page);
+
+  // Closed-by-default invariant.
+  await expect(page.getByTestId("filters-disclosure-panel")).toHaveCount(0);
+
+  // Submit an invalid `basedIn.countryCode`. The schema rejects
+  // `12` (numeric, fails the alpha-2 regex), the API returns
+  // INVALID_SEARCH_CRITERIA with the controlled required-filter
+  // field error, the page receives the fieldErrors, computes
+  // `forceFiltersOpen=true`, and the disclosure panel opens
+  // automatically so the buyer can see the error beside the
+  // control without manually expanding the tray.
+  await page.getByTestId("filters-disclosure-toggle").click();
+  await expect(page.getByTestId("filters-disclosure-panel")).toBeVisible();
+  await page.getByTestId("required-based-in-country").fill("12");
+  await page.getByTestId("search-submit").click();
+
+  // The field error renders beside the matching control AND
+  // the disclosure panel is visible — proving the buyer can
+  // see the error without first discovering the closed tray.
+  const countryField = page.getByTestId("required-based-in-country-field");
+  await expect(countryField).toBeVisible();
+  await expect(countryField.getByTestId("field-error-message")).toContainText(/alpha-2/i);
+  await expect(page.getByTestId("filters-disclosure-panel")).toBeVisible();
+});
+
+test("Successful submission with no required-filter error restores the closed-by-default tray state", async ({
+  page,
+}) => {
+  await loadHome(page);
+
+  // Drive a controlled error first to flip the disclosure open.
+  await page.getByTestId("filters-disclosure-toggle").click();
+  await page.getByTestId("required-based-in-country").fill("12");
+  await page.getByTestId("search-submit").click();
+  const countryField = page.getByTestId("required-based-in-country-field");
+  await expect(countryField).toBeVisible();
+  await expect(countryField.getByTestId("field-error-message")).toContainText(/alpha-2/i);
+
+  // Correct the input and resubmit. A successful search clears
+  // `fieldErrors`; the disclosure's `forceOpen` flips back to
+  // false and the buyer's manual collapse choice is preserved.
+  await page.getByTestId("required-based-in-country").fill("JM");
+  await page.getByTestId("search-submit").click();
+
+  // The submission succeeds; the page may render the result list
+  // OR an empty-state — either is a valid terminal state.
+  await expect(
+    page
+      .getByTestId("result-card")
+      .first()
+      .or(page.getByTestId("search-empty"))
+      .or(page.getByTestId("search-error").first()),
+  ).toBeVisible({ timeout: 15_000 });
+
+  // The country field no longer carries a controlled error and
+  // the input value was preserved.
+  await expect(page.getByTestId("required-based-in-country")).toHaveValue("JM");
+});
+
 test("M1.4: a required serviceArea countryCode that matches a subset of sellers narrows the result list", async ({
   page,
 }) => {

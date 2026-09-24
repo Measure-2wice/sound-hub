@@ -340,7 +340,35 @@ export class PrismaFundingRepository implements FundingRepository {
   // MUST NOT demote a `Confirmed` intent — and the FOR UPDATE
   // pre-acquisition makes the race deterministic regardless of
   // which side reaches PostgreSQL first. See ticket #64 P0-002.
+  //
+  // Bounded P2034 retry mirrors `fundDealInTransaction`:
+  // Serializable isolation can surface a serialization conflict
+  // (P2034) when the transaction's snapshot is invalidated by
+  // a concurrent committed write that touched a row the
+  // transaction read. The bounded retry budget
+  // (`P2034_RETRY_BUDGET`) retries up to that many times; on
+  // exhaustion the adapter surfaces
+  // `CONCURRENCY_RETRY_EXHAUSTED` so the route layer maps it
+  // onto a safe envelope rather than leaking the raw Prisma
+  // P2034. The persisted-state invariant — once Confirmed is
+  // committed, a later failure cannot demote it — is preserved
+  // across all retry attempts: each guarded UPDATE carries the
+  // same `WHERE providerState <> 'Confirmed'` predicate, so a
+  // retry that observes a Confirmed row simply returns
+  // `ALREADY_CONFIRMED` rather than overwriting.
   async recordPaymentIntentFailureInTransaction(
+    input: RecordPaymentIntentFailureInput,
+  ): Promise<RecordPaymentIntentFailureResult> {
+    const envelope = await runWithBoundedP2034Retry(() =>
+      this.runRecordPaymentIntentFailureTx(input),
+    );
+    if (envelope.outcome.kind === "exhausted") {
+      return { ok: false, reason: "CONCURRENCY_RETRY_EXHAUSTED" };
+    }
+    return envelope.outcome.value;
+  }
+
+  private async runRecordPaymentIntentFailureTx(
     input: RecordPaymentIntentFailureInput,
   ): Promise<RecordPaymentIntentFailureResult> {
     return this.prisma.$transaction(
@@ -358,9 +386,9 @@ export class PrismaFundingRepository implements FundingRepository {
           },
         });
         if (updated.count === 1) {
-          return { ok: true, persisted: true };
+          return { ok: true as const, persisted: true };
         }
-        return { ok: true, persisted: false, reason: "ALREADY_CONFIRMED" };
+        return { ok: true as const, persisted: false, reason: "ALREADY_CONFIRMED" };
       },
       { isolationLevel: "Serializable" },
     );
@@ -538,7 +566,7 @@ export class PrismaFundingRepository implements FundingRepository {
             input: persistInput,
           }),
         };
-        const outcome = useCase(
+        const outcome = await useCase(
           {
             preauth,
             activation,
