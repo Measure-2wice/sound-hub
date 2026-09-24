@@ -218,11 +218,16 @@ test("Disclosure lifecycle: forced-open → buyer collapse while forced → corr
   //   `forceOpen` flips back to false. The flow:
   //
   //     1. The disclosure is closed by default. The buyer opens
-  //        it to reach the hidden `basedIn.countryCode` control.
+  //        it to reach the conditional `basedIn.countryCode`
+  //        control.
   //     2. The buyer enters an invalid value ("12"), then
-  //        closes the tray via the toggle. The filter state is
-  //        preserved (the inputs are hidden, not unmounted); the
-  //        buyer's `open` choice is now `false`.
+  //        closes the tray via the toggle. Closing the tray
+  //        unmounts the disclosure's children (the conditional
+  //        panel render drops them), but the filter value lives
+  //        in the parent (RequiredFilters is fully controlled
+  //        via `value`/`onChange`), so re-opening re-mounts the
+  //        input with "12" intact. The buyer's `open` choice is
+  //        now `false`.
   //     3. The buyer submits. The schema rejects "12" and the
   //        page flips `forceOpen=true`. The forced-open tray
   //        reveals the field-level error beside the control
@@ -232,10 +237,14 @@ test("Disclosure lifecycle: forced-open → buyer collapse while forced → corr
   //        `forceOpen` is true. The click captures a user
   //        dismissal, not a mutation of `open`.
   //     5. The buyer re-opens the tray, corrects the input to
-  //        a valid value ("JM"), and resubmits. The submission
-  //        succeeds and `forceOpen` flips back to false. The
+  //        a valid value ("JM"), resubmits, and the submission
+  //        succeeds. `forceOpen` flips back to false and the
   //        buyer's prior `open=false` choice is restored — the
   //        tray MUST return to the closed-by-default state.
+  //        The corrected "JM" value must survive the unmount
+  //        that closes the tray, which is verified by
+  //        deliberately reopening the disclosure and asserting
+  //        the (re-mounted) input still reads "JM".
   //
   //   The lifecycle stages are individually asserted via
   //   `aria-expanded` and panel visibility checks. A `search-error`
@@ -294,12 +303,19 @@ test("Disclosure lifecycle: forced-open → buyer collapse while forced → corr
   );
 
   // Step 5 — buyer re-opens the tray, corrects the input, and
-  // resubmits. The submission succeeds; `forceOpen` flips back
-  // to false; the buyer's prior `open=false` choice is
-  // restored.
+  // resubmits. Asserting the corrected value BEFORE submitting
+  // is required because the conditional panel render unmounts
+  // the input as soon as `forceOpen` flips back to false on
+  // success — `toHaveValue` cannot wait on a non-existent
+  // element. Post-success value preservation is verified
+  // separately by deliberately reopening the disclosure and
+  // re-inspecting the (re-mounted) input.
   await page.getByTestId("filters-disclosure-toggle").click();
   await expect(page.getByTestId("filters-disclosure-panel")).toBeVisible();
   await page.getByTestId("required-based-in-country").fill("JM");
+  // Pre-submit value check: confirm the corrected value is
+  // actually on the visible input before we click submit.
+  await expect(page.getByTestId("required-based-in-country")).toHaveValue("JM");
   await page.getByTestId("search-submit").click();
 
   // The submission succeeds — only result-card OR search-empty
@@ -310,13 +326,33 @@ test("Disclosure lifecycle: forced-open → buyer collapse while forced → corr
   ).toBeVisible({ timeout: 15_000 });
   await expect(page.getByTestId("search-error")).toHaveCount(0);
 
-  // The country field no longer carries a controlled error and
-  // the input value was preserved.
-  await expect(page.getByTestId("required-based-in-country")).toHaveValue("JM");
-
   // The disclosure panel MUST close once the error clears —
   // the buyer's pre-error closed-by-default choice is the
-  // documented target.
+  // documented target. The conditional render unmounts the
+  // `required-based-in-country` input along with the panel.
+  await expect(page.getByTestId("filters-disclosure-panel")).toHaveCount(0);
+  await expect(page.getByTestId("filters-disclosure-toggle")).toHaveAttribute(
+    "aria-expanded",
+    "false",
+  );
+
+  // State-preservation invariant: the corrected "JM" value
+  // survives the unmount/remount cycle. The buyer can reopen
+  // the disclosure to inspect the preserved input — RequiredFilters
+  // is parent-controlled, so the value lives in the parent and
+  // the unmounted children's re-mount re-binds it on the same
+  // wire. Asserting the post-closed value via `toHaveValue` on
+  // the unmounted input is unsound (the element is gone), so we
+  // reopen and verify against the re-mounted input instead.
+  await page.getByTestId("filters-disclosure-toggle").click();
+  await expect(page.getByTestId("filters-disclosure-panel")).toBeVisible();
+  await expect(page.getByTestId("required-based-in-country")).toHaveValue("JM");
+
+  // Collapse once more to leave the disclosure in the documented
+  // closed-by-default state — the buyer's post-success `open`
+  // choice is now `false` (this is the click on a no-longer-
+  // forced disclosure, so it mutates `open` directly).
+  await page.getByTestId("filters-disclosure-toggle").click();
   await expect(page.getByTestId("filters-disclosure-panel")).toHaveCount(0);
   await expect(page.getByTestId("filters-disclosure-toggle")).toHaveAttribute(
     "aria-expanded",
