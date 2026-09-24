@@ -71,13 +71,14 @@ const FRESH_EMAIL_PREFIX = "m2-83-intent-";
 const SEED_HELPER = resolvePath(__dirname, "../../api/src/test-helpers/multi-workspace-user.ts");
 const SEED_RUNNER = resolvePath(__dirname, "../../api/node_modules/.bin/tsx");
 
-function seedFreshUser(email: string): void {
+function seedFreshUser(email: string, options: { suspendOrganization?: boolean } = {}): void {
   execFileSync(SEED_RUNNER, [SEED_HELPER, email], {
     cwd: resolvePath(__dirname, "../../api"),
     env: {
       ...process.env,
       TEST_DATABASE_URL: APPROVED_DISPOSABLE_TEST_DATABASE_URL,
       NODE_ENV: "test",
+      SUSPEND_ORG: options.suspendOrganization ? "1" : "",
     },
     stdio: "inherit",
   });
@@ -626,5 +627,92 @@ test.describe("M2 #83: intent + Workspace switching (expected-state)", () => {
     await expect(page.getByTestId("intent-choice-offer")).toBeVisible();
     await expect(page.getByTestId("intent-choice-both")).toBeVisible();
     await expect(page.getByTestId("intent-submit")).toBeVisible();
+  });
+
+  // Behavior-level coverage for the deep-link switch page
+  // (Tenki review, P2-002). The pre-cleanup PR carried source-
+  // level regex assertions that could pass while the runtime
+  // deep-link behavior was broken; these tests drive the real
+  // browser through the seeded Workspace set and assert what
+  // the page actually renders.
+  //
+  // Each case below verifies the SAME invariant from a
+  // different angle: a deep link whose target cannot be
+  // committed (Suspended or inaccessible) MUST render the
+  // `switch-unavailable` surface and MUST NOT render the
+  // `workspace-switch-continue` button. The browser is the
+  // browser seam; the assertions are DOM-visible behaviors
+  // the testid surface already exposes.
+  test("P2-002: deep link to a Suspended target renders switch-unavailable and does NOT render the commit button", async ({
+    page,
+  }) => {
+    const email = `${FRESH_EMAIL_PREFIX}suspended-${Date.now()}@example.test`;
+    seedFreshUser(email, { suspendOrganization: true });
+    await signInViaDevUrl(page, email);
+    await page.getByTestId("dashboard").waitFor();
+
+    // Provision Buyer on the Personal Workspace so the dashboard
+    // surface is steady and the selector dropdown is exposed (the
+    // selector needs two accessible Workspaces to render). The
+    // Organization is Suspended, so it never appears in the
+    // selector's Active list — we navigate to the switch page
+    // directly with `?target=<suspendedOrgId>` to exercise the
+    // deep-link.
+    await walkToIntentPage(page);
+    await page.getByTestId("intent-choice-hire-input").check();
+    await page.getByTestId("intent-submit").click();
+    await page.getByTestId("dashboard").waitFor();
+    await page.evaluate(() => window.localStorage.removeItem("soundhub.actingWorkspaceId"));
+
+    // Drive a real /api/auth/me so we can capture the Suspended
+    // Organization's id without rendering the selector (the
+    // selector filters Suspended entries out of the Active list).
+    const meResponse = await page.request.get("/api/auth/me");
+    expect(meResponse.status()).toBe(200);
+    const meBody = (await meResponse.json()) as {
+      user: { workspaces: readonly { workspaceId: string; workspaceStatus: string }[] };
+    };
+    const suspendedOrg = meBody.user.workspaces.find((w) => w.workspaceStatus === "Suspended");
+    expect(suspendedOrg, "seed fixture MUST expose one Suspended Workspace").toBeTruthy();
+    const suspendedOrgId = suspendedOrg!.workspaceId;
+
+    // Deep-link to the Suspended Workspace. The page MUST fall
+    // through to the unavailable surface — never expose a
+    // "Switch and continue" button for a target the server
+    // refuses to commit.
+    await page.goto(`/workspace/switch?target=${suspendedOrgId}`);
+    await expect(page.getByTestId("switch-unavailable")).toBeVisible();
+    await expect(page.getByTestId("workspace-switch-continue")).toHaveCount(0);
+    await expect(page.getByTestId("workspace-switch-page")).toHaveCount(0);
+    // Recovery affordance: the unavailable surface renders the
+    // explicit "Return to dashboard" button so the buyer can
+    // navigate away without a silent no-op.
+    await expect(page.getByTestId("switch-back-to-dashboard")).toBeVisible();
+  });
+
+  test("P2-002: deep link to an inaccessible target (random UUID) renders switch-unavailable and does NOT render the commit button", async ({
+    page,
+  }) => {
+    const email = `${FRESH_EMAIL_PREFIX}inaccessible-${Date.now()}@example.test`;
+    seedFreshUser(email);
+    await signInViaDevUrl(page, email);
+    await page.getByTestId("dashboard").waitFor();
+    await page.evaluate(() => window.localStorage.removeItem("soundhub.actingWorkspaceId"));
+
+    // Walk the dashboard to steady state. No special fixture is
+    // needed — we drive a random UUID that no Workspace row in
+    // the database can match.
+    await walkToIntentPage(page);
+    await page.getByTestId("intent-choice-hire-input").check();
+    await page.getByTestId("intent-submit").click();
+    await page.getByTestId("dashboard").waitFor();
+    await page.evaluate(() => window.localStorage.removeItem("soundhub.actingWorkspaceId"));
+
+    const randomUuid = `ws-not-real-${Math.random().toString(36).slice(2, 10)}-${Date.now().toString(36)}`;
+    await page.goto(`/workspace/switch?target=${randomUuid}`);
+    await expect(page.getByTestId("switch-unavailable")).toBeVisible();
+    await expect(page.getByTestId("workspace-switch-continue")).toHaveCount(0);
+    await expect(page.getByTestId("workspace-switch-page")).toHaveCount(0);
+    await expect(page.getByTestId("switch-back-to-dashboard")).toBeVisible();
   });
 });

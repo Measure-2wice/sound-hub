@@ -27,7 +27,7 @@
 //     badge never displays "5" while the underlying filters are all
 //     blank.
 
-import { useCallback, useId, useState, type ReactNode } from "react";
+import { useCallback, useEffect, useId, useState, type ReactNode } from "react";
 import {
   hasUsableCriteria,
   isLocationFilterValueNonEmpty,
@@ -53,9 +53,18 @@ export interface FiltersDisclosureProps {
    * page passes `true` when the latest submission produced a
    * controlled required-filter field error, so the buyer can see
    * the error beside the matching control without manually
-   * discovering the closed tray. The toggle stays visible — the
-   * buyer may still collapse it once they have addressed the
-   * error.
+   * discovering the closed tray.
+   *
+   * Lifecycle (Tenki review, P2-001): `forceOpen` is a one-shot
+   * surfacing signal — flipping it to `true` opens the tray;
+   * flipping it back to `false` honors the buyer's manual
+   * choice captured under `open`. While `forceOpen` is true the
+   * buyer may still collapse the tray (the toggle button is the
+   * user-facing affordance for that) — the collapse is captured
+   * in `userDismissedForce`, not by mutating `open`, so the
+   * follow-up `forceOpen=false` reverts to the buyer's prior
+   * `open` choice (default-closed) rather than to the
+   * post-collapse state.
    *
    * Defaults to false to preserve the closed-by-default Stitch
    * composition; the page is the sole authority for when a
@@ -81,17 +90,23 @@ export function FiltersDisclosure({
   defaultOpen = false,
   forceOpen = false,
 }: FiltersDisclosureProps) {
-  // `forceOpen` is a presentational override applied AFTER user
-  // interaction is honored: the page may flip it to `true` when a
-  // controlled required-filter error appears, and the panel
-  // immediately reveals itself. Once the buyer collapses the tray
-  // via the toggle, their manual choice is preserved across a
-  // subsequent `forceOpen=false` (e.g., after a successful retry)
-  // because we only consult `forceOpen` on the OPEN side of the
-  // toggle transition, not on every render.
+  // Lifecycle (Tenki review, P2-001): `forceOpen` opens the tray
+  // while it is true. The buyer may collapse the tray via the
+  // toggle — that click flips `userDismissedForce`, NOT `open`,
+  // so the buyer's manual `open` choice (default-closed) is
+  // preserved when `forceOpen` flips back to false. A subsequent
+  // error (forceOpen re-asserting true) resets the dismissal so
+  // the new error surfaces the tray.
   const [open, setOpen] = useState(defaultOpen);
+  const [userDismissedForce, setUserDismissedForce] = useState(false);
+  // Reset `userDismissedForce` on every `forceOpen` transition.
+  // The deps array intentionally uses only `forceOpen` — `open`
+  // and the dismiss flag themselves must NOT trigger this effect.
+  useEffect(() => {
+    setUserDismissedForce(false);
+  }, [forceOpen]);
   const toggleId = useId();
-  const effectiveOpen = open || forceOpen;
+  const effectiveOpen = forceOpen ? !userDismissedForce : open;
 
   const activeCount = countActiveFilters(value);
   // `hasUsableCriteria` accepts a query string but the count is purely
@@ -109,6 +124,20 @@ export function FiltersDisclosure({
     });
   }, [onChange]);
 
+  // Toggle handler (Tenki review, P2-001): the click always flips
+  // the visible `effectiveOpen` state regardless of which branch
+  // drives it. While `forceOpen` is true, the click targets the
+  // dismissal flag (so the buyer's prior `open` choice stays
+  // intact for the follow-up `forceOpen=false` transition); once
+  // `forceOpen` releases, the click targets `open` directly.
+  const handleToggle = useCallback(() => {
+    if (forceOpen) {
+      setUserDismissedForce((dismissed) => !dismissed);
+    } else {
+      setOpen((value) => !value);
+    }
+  }, [forceOpen]);
+
   return (
     <section data-testid="filters-disclosure" aria-label="Search filters">
       <button
@@ -116,7 +145,7 @@ export function FiltersDisclosure({
         id={toggleId}
         aria-expanded={effectiveOpen}
         aria-controls={`${toggleId}-panel`}
-        onClick={() => setOpen((value) => !value)}
+        onClick={handleToggle}
         className="inline-flex items-center gap-2 min-h-[44px] min-w-[44px] px-4 py-2.5 rounded-lg bg-canvas border border-borderWarm text-ink hover:bg-surface focus:outline-none focus-visible:outline focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-aubergine transition-colors"
         data-testid="filters-disclosure-toggle"
       >

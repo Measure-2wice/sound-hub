@@ -38,6 +38,7 @@ const TV_ID = "tv-bg6c-1";
 
 let prismaA: PrismaClient;
 let prismaB: PrismaClient;
+let prismaObserver: PrismaClient;
 let repoA: PrismaFundingRepository;
 let repoB: PrismaFundingRepository;
 
@@ -236,6 +237,15 @@ before(() => {
   assertDisposableTestDatabase(url);
   prismaA = createPrismaClient(url);
   prismaB = createPrismaClient(url);
+  // The third connection is the OBSERVER used by the P1-001 race
+  // test to prove (via pg_stat_activity) that the failure
+  // transaction is BLOCKED on the intent row's `SELECT ... FOR
+  // UPDATE` before the success is released. PostgreSQL's
+  // pg_stat_activity surfaces the wait_event for every active
+  // session; a transaction waiting on a tuple lock reports
+  // `state = 'active'` with `wait_event_type = 'Lock'` and
+  // `wait_event` referencing the tuple lock family.
+  prismaObserver = createPrismaClient(url);
   repoA = new PrismaFundingRepository(prismaA);
   repoB = new PrismaFundingRepository(prismaB);
 });
@@ -245,6 +255,7 @@ beforeEach(async () => seedFixture(prismaA));
 after(async () => {
   await prismaA.$disconnect();
   await prismaB.$disconnect();
+  await prismaObserver.$disconnect();
 });
 
 // ---------- Concurrent create attempts converge on one row ----------
@@ -385,42 +396,40 @@ test("success racing failure: a Confirmed intent is never demoted to Failed (P0-
   });
   if (!created.ok) throw new Error("seed failed");
 
-  // Deterministic interleaving barrier.
+  // Deterministic interleaving barrier with observable proof of
+  // blocking (Tenki review, P1-001).
   //
-  // The repository runs the use case INSIDE the Serializable
-  // transaction AFTER every `SELECT ... FOR UPDATE` row lock
-  // has been acquired. An async use case that awaits a test-
-  // controlled promise therefore holds the FOR UPDATE locks
-  // for as long as the test wishes, which gives us a precise
-  // way to order the success and failure without relying on
-  // the JS microtask scheduler.
+  // The previous version of this test launched the failure,
+  // immediately released the success, and asserted on the
+  // returned envelopes. That approach did not prove the
+  // failure's `SELECT ... FOR UPDATE` ever BLOCKED on the
+  // success's held row lock — the failure could have completed
+  // before the success even committed, the assertion would
+  // still pass, and the test would silently lose its
+  // concurrency contract.
   //
-  //   1. Launch the success transaction (returns a promise).
-  //   2. `await successReached` — the use case has run, the
-  //      success is now in-flight, and every FOR UPDATE lock
-  //      it acquired is held open. The success is provably
-  //      "in flight / holds the relevant lock" (the user's
-  //      bullet (1)).
-  //   3. Launch the failure transaction. Its first statement
-  //      is `SELECT id FROM payment_intents WHERE id = ?
-  //      FOR UPDATE` on the SAME row the success already
-  //      holds. The failure BLOCKS on PostgreSQL's row lock
-  //      until the success commits or rolls back. The failure
-  //      is provably "begins while success is still in
-  //      flight" (bullet (2)).
-  //   4. `resolveContinue()` — the use case returns
-  //      `persist`, the success commits Confirmed, and the
-  //      row lock is released.
-  //   5. The failure's blocked FOR UPDATE returns the post-
-  //      commit Confirmed row; the guarded `WHERE
-  //      providerState <> 'Confirmed'` UPDATE matches 0 rows;
-  //      the method returns `{ ok: true, persisted: false,
-  //      reason: "ALREADY_CONFIRMED" }`. The failure is
-  //      "forced to observe the post-success Confirmed state"
-  //      (bullet (3)) and "returns the expected non-demoting
-  //      result" (bullet (5)).
-  //   6. Final state: Confirmed + Active. Confirmed is NOT
-  //      demoted to Failed (bullet (4)).
+  // The fixed version uses two interlocking mechanisms:
+  //
+  //   1. An async use case that awaits a test-controlled
+  //      promise AFTER every `SELECT ... FOR UPDATE` has been
+  //      acquired. That holds the success's row locks open
+  //      until the test releases them — the success is provably
+  //      "in flight / holds the relevant lock" (bullet (1)).
+  //
+  //   2. A third Prisma client (`prismaObserver`) that polls
+  //      `pg_stat_activity` from a separate connection until it
+  //      observably sees the failure transaction BLOCKED on a
+  //      tuple lock (`state = 'active'`,
+  //      `wait_event_type = 'Lock'`, `wait_event` in the tuple
+  //      lock family). That observation is PostgreSQL's own
+  //      authoritative report of the lock state — it does not
+  //      depend on JS scheduler timing and does not need any
+  //      production-code seam.
+  //
+  // Once the observation lands, the failure is provably
+  // "begins while success is still in flight" (bullet (2)) and
+  // the post-success behavior (bullets (3)–(5)) is a direct
+  // consequence of PostgreSQL's row-lock semantics.
   let resolveReached!: () => void;
   let resolveContinue!: () => void;
   const successReached = new Promise<void>((resolve) => {
@@ -460,9 +469,20 @@ test("success racing failure: a Confirmed intent is never demoted to Failed (P0-
     failureReasonCode: "EscrowProviderUnavailable",
     failureDetailCategory: "PROVIDER_UNAVAILABLE",
   });
-  // The failure is now in-flight; its first `SELECT ... FOR
-  // UPDATE` on the intent row is BLOCKED behind the success's
-  // held row lock. We release the success so it can commit.
+  // Observable proof that the failure is BLOCKED on the
+  // success's row lock. The observer polls pg_stat_activity from
+  // a separate connection until it sees a backend reporting
+  // `wait_event_type = 'Lock'` with a tuple-lock wait_event — that
+  // is PostgreSQL's authoritative signal that a transaction is
+  // waiting on a row lock another transaction holds. The polling
+  // is bounded to ~1.5s so the test cannot hang on environment
+  // drift; a 0-observer-finding result fails the assertion with
+  // a clear message rather than a CI timeout.
+  const failureBlocked = await observeFailureBlockedOnTupleLock(prismaObserver, "payment_intents");
+  assert.ok(
+    failureBlocked,
+    "expected the failure transaction to be observably BLOCKED on the payment_intents tuple lock before the success is released — the failure's SELECT ... FOR UPDATE must wait behind the success's held row lock, otherwise the P0-002 demotion guard is not actually exercised",
+  );
   resolveContinue();
   const [failureResult, successResult] = await Promise.all([failurePromise, successPromise]);
   assert.equal(successResult.ok, true, "expected the success transaction to commit");
@@ -481,6 +501,60 @@ test("success racing failure: a Confirmed intent is never demoted to Failed (P0-
   assert.equal(intent?.failureReasonCode, null);
   assert.equal(intent?.failureDetailCategory, null);
 });
+
+/**
+ * Poll `pg_stat_activity` from a separate connection until a
+ * backend is observably BLOCKED on a tuple lock against the
+ * named table. Returns `true` on observation, `false` on
+ * timeout. The observer connection is a sibling of the
+ * success/failure connections so it cannot itself hold any
+ * locks that interfere with the wait state being measured.
+ *
+ * The polling loop is bounded (max 60 attempts × 50ms = 3s)
+ * so the test fails fast on environment drift instead of
+ * hanging the CI suite.
+ */
+async function observeFailureBlockedOnTupleLock(
+  observer: PrismaClient,
+  relationName: string,
+): Promise<boolean> {
+  const maxAttempts = 60;
+  for (let attempt = 0; attempt < maxAttempts; attempt += 1) {
+    const rows = await observer.$queryRaw<
+      {
+        state: string;
+        wait_event_type: string | null;
+        wait_event: string | null;
+        query: string;
+      }[]
+    >`
+      SELECT state, wait_event_type, wait_event, left(query, 200) AS query
+        FROM pg_stat_activity
+       WHERE datname = current_database()
+         AND state IS NOT NULL
+         AND pid <> pg_backend_pid()
+    `;
+    // A backend that has acquired its connection, sent BEGIN,
+    // and is now waiting on a tuple lock reports
+    //   state = 'active',
+    //   wait_event_type = 'Lock',
+    //   wait_event in {'tuple', 'relation', 'page', ...}.
+    // The failure's transaction matches exactly that profile
+    // after its first `SELECT ... FOR UPDATE` collides with the
+    // success's held row lock.
+    const blocked = rows.find(
+      (row) =>
+        row.state === "active" &&
+        row.wait_event_type === "Lock" &&
+        row.wait_event !== null &&
+        /tuple|relation|page|transactionid|object|extend|user|advisory/i.test(row.wait_event) &&
+        row.query.toLowerCase().includes(relationName.toLowerCase()),
+    );
+    if (blocked) return true;
+    await new Promise((resolve) => setTimeout(resolve, 50));
+  }
+  return false;
+}
 
 // ---------- Capability revocation between preauth and Phase 3 fails closed ----------
 

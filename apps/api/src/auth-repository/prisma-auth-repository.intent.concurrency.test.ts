@@ -21,16 +21,25 @@ import { before, describe, test } from "node:test";
 import { createPrismaClient } from "@soundhub/db";
 import type { PrismaClient } from "@soundhub/db";
 import { PrismaAuthRepository } from "./prisma-auth-repository.js";
+import { assertDisposableTestDatabase, readTestDatabaseUrl } from "../lib/test-database.js";
 
-const TEST_DATABASE_URL =
-  process.env.TEST_DATABASE_URL ?? "postgresql://soundhub:password@localhost:5433/soundhub_m1_test";
+// Fail-closed guard: this test writes to PostgreSQL. The approved
+// disposable database is the ONLY acceptable target. Match the
+// sibling repository tests so a stray `TEST_DATABASE_URL` against
+// the QA database or a remote host is rejected before any Prisma
+// client is constructed.
+const TEST_DATABASE_URL = process.env.TEST_DATABASE_URL;
 
 describe("PrismaAuthRepository intent concurrency (atomic command)", () => {
   let prisma: PrismaClient;
   let repo: PrismaAuthRepository;
 
   before(() => {
-    prisma = createPrismaClient(TEST_DATABASE_URL);
+    if (!TEST_DATABASE_URL) {
+      throw new Error("TEST_DATABASE_URL is required for the disposable-test concurrency suite");
+    }
+    assertDisposableTestDatabase(readTestDatabaseUrl());
+    prisma = createPrismaClient(readTestDatabaseUrl());
     repo = new PrismaAuthRepository(prisma);
   });
 

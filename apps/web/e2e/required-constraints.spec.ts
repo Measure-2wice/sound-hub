@@ -213,16 +213,41 @@ test("Successful submission with no required-filter error restores the closed-by
   await loadHome(page);
 
   // Drive a controlled error first to flip the disclosure open.
-  await page.getByTestId("filters-disclosure-toggle").click();
   await page.getByTestId("required-based-in-country").fill("12");
   await page.getByTestId("search-submit").click();
   const countryField = page.getByTestId("required-based-in-country-field");
   await expect(countryField).toBeVisible();
   await expect(countryField.getByTestId("field-error-message")).toContainText(/alpha-2/i);
+  // The submission error surfaces the disclosure panel.
+  await expect(page.getByTestId("filters-disclosure-panel")).toBeVisible();
+  await expect(page.getByTestId("filters-disclosure-toggle")).toHaveAttribute(
+    "aria-expanded",
+    "true",
+  );
+
+  // While forceOpen is true, the buyer can collapse the tray via
+  // the toggle button — that click captures a user-dismissal,
+  // NOT a mutation of the buyer's `open` choice. The field-level
+  // error must still be visible (the error has not cleared; the
+  // buyer just collapsed the tray to read it elsewhere or to
+  // focus on the input).
+  await page.getByTestId("filters-disclosure-toggle").click();
+  await expect(page.getByTestId("filters-disclosure-panel")).toHaveCount(0);
+  await expect(page.getByTestId("filters-disclosure-toggle")).toHaveAttribute(
+    "aria-expanded",
+    "false",
+  );
+
+  // Re-open the tray to correct the input. The buyer's
+  // `forceOpen` is still true (the error has not cleared), so
+  // clicking the toggle again re-surfaces the panel.
+  await page.getByTestId("filters-disclosure-toggle").click();
+  await expect(page.getByTestId("filters-disclosure-panel")).toBeVisible();
 
   // Correct the input and resubmit. A successful search clears
   // `fieldErrors`; the disclosure's `forceOpen` flips back to
-  // false and the buyer's manual collapse choice is preserved.
+  // false and the disclosure collapses to the closed-by-default
+  // Stitch composition.
   await page.getByTestId("required-based-in-country").fill("JM");
   await page.getByTestId("search-submit").click();
 
@@ -239,6 +264,14 @@ test("Successful submission with no required-filter error restores the closed-by
   // The country field no longer carries a controlled error and
   // the input value was preserved.
   await expect(page.getByTestId("required-based-in-country")).toHaveValue("JM");
+
+  // The disclosure panel MUST close once the error clears —
+  // the buyer's default-closed choice is the documented target.
+  await expect(page.getByTestId("filters-disclosure-panel")).toHaveCount(0);
+  await expect(page.getByTestId("filters-disclosure-toggle")).toHaveAttribute(
+    "aria-expanded",
+    "false",
+  );
 });
 
 test("M1.4: a required serviceArea countryCode that matches a subset of sellers narrows the result list", async ({

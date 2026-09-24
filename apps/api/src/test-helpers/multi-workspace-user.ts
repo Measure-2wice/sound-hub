@@ -48,15 +48,32 @@ export interface MultiWorkspaceUserResult {
   readonly organizationWorkspaceId: string;
 }
 
+export interface SeedMultiWorkspaceUserOptions {
+  /**
+   * If `true`, create the Organization Workspace with `status =
+   * "Suspended"`. The user still holds an Owner membership on
+   * the row, so `user.workspaces[]` returns it for the Acting-
+   * Workspace selector, but the switch page's Active-only gate
+   * MUST fall through to the unavailable surface for a deep
+   * link to it. Defaults to `false` so every existing caller
+   * continues to seed the canonical Active Organization fixture.
+   */
+  readonly suspendOrganization?: boolean;
+}
+
 /**
  * Seed a multi-Workspace user against the approved disposable test
  * database. Fail-closed by `assertDisposableTestDatabase` BEFORE
  * any Prisma client is constructed.
  */
-export async function seedMultiWorkspaceUser(email: string): Promise<MultiWorkspaceUserResult> {
+export async function seedMultiWorkspaceUser(
+  email: string,
+  options: SeedMultiWorkspaceUserOptions = {},
+): Promise<MultiWorkspaceUserResult> {
   if (!email) {
     throw new Error("seedMultiWorkspaceUser: email argument is required");
   }
+  const suspendOrganization = options.suspendOrganization === true;
   const url = readTestDatabaseUrl();
   assertDisposableTestDatabase(url);
 
@@ -90,7 +107,7 @@ export async function seedMultiWorkspaceUser(email: string): Promise<MultiWorksp
         slug: organizationSlug,
         name: "Multi-Workspace Test Organization",
         type: "Organization",
-        status: "Active",
+        status: suspendOrganization ? "Suspended" : "Active",
         ownerUserId: user.id,
       },
     });
@@ -130,10 +147,15 @@ if (isMainModule) {
     console.error("Usage: multi-workspace-user.ts <email> (requires TEST_DATABASE_URL)");
     process.exit(1);
   }
-  seedMultiWorkspaceUser(email)
+  // The CLI is the e2e browser seam's primary entry point. Tests
+  // that need a Suspended Organization Workspace opt in via
+  // SUSPEND_ORG=1 in the spawned env (without changing the CLI
+  // signature the existing Playwright fixtures already use).
+  const suspendOrganization = process.env.SUSPEND_ORG === "1";
+  seedMultiWorkspaceUser(email, { suspendOrganization })
     .then((result) => {
       console.log(
-        `✓ seeded multi-workspace user: ${email} (userId=${result.userAccountId} personal=${result.personalWorkspaceId} org=${result.organizationWorkspaceId})`,
+        `✓ seeded multi-workspace user: ${email} (userId=${result.userAccountId} personal=${result.personalWorkspaceId} org=${result.organizationWorkspaceId}${suspendOrganization ? " suspended" : ""})`,
       );
     })
     .catch((err: unknown) => {

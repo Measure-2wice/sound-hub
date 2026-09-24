@@ -583,13 +583,13 @@ export class PrismaAuthRepository implements AuthRepository {
  *     set-difference `chosen − existing`, the rows the
  *     command will insert.
  *
- *   - `{ kind: "conflict", existing, expected, fresh }` when
+ *   - `{ kind: "conflict", existing, expected }` when
  *     the persisted `existing` differs from
  *     `expectedCapabilities`. The transaction MUST roll back;
- *     `fresh` is the post-write state the command WOULD have
- *     produced (i.e., `existing ∪ chosen`) so the UI can
- *     surface both the persisted reality and the requested
- *     addition.
+ *     the route layer surfaces a separate
+ *     `INTENT_CONFLICT` envelope carrying the FRESH
+ *     capability set so the UI can render both the persisted
+ *     reality and the requested addition.
  *
  * Idempotency invariant: a stale `expectedCapabilities`
  * produces idempotent success (not a conflict) when the chosen

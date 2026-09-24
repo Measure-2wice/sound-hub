@@ -15,6 +15,9 @@
 
 import assert from "node:assert/strict";
 import { renderToStaticMarkup } from "react-dom/server";
+import { createElement } from "react";
+import { createRoot } from "react-dom/client";
+import { act } from "react";
 import { describe, test } from "node:test";
 import { FiltersDisclosure } from "./FiltersDisclosure";
 import type { RequiredFiltersValue } from "../lib/talent-search-request-builder";
@@ -172,5 +175,83 @@ describe("FiltersDisclosure — post-#83 visual-parity", () => {
       /aria-expanded="true"/,
       "toggle MUST expose aria-expanded=true when forceOpen is true so screen readers announce the open state",
     );
+  });
+
+  test("forceOpen respects user-dismissed collapse via the toggle button (P2-001 lifecycle)", () => {
+    // Background: the previous implementation computed
+    // `effectiveOpen = open || forceOpen`, which made the toggle
+    // button a no-op while forceOpen was true (clicking it could
+    // not collapse the tray, and the tray stayed open after
+    // forceOpen flipped back to false because `open` had been
+    // mutated to true). The fixed lifecycle splits the toggle
+    // intent: while forceOpen is true the click flips a
+    // userDismissal flag (preserving `open` for the follow-up
+    // forceOpen=false transition).
+    //
+    // We exercise the click handler through a real React 18
+    // `createRoot` mount in the JSDOM bootstrap registered by
+    // `--import ./src/test-setup.mjs`. The shared setup
+    // polyfills the DOM globals the React renderer needs.
+    const container = document.createElement("div");
+    document.body.appendChild(container);
+    const root = createRoot(container);
+    try {
+      act(() => {
+        root.render(
+          createElement(FiltersDisclosure, {
+            value: EMPTY_FILTERS,
+            onChange: () => undefined,
+            forceOpen: true,
+            children: null,
+          }),
+        );
+      });
+      // Initial render: panel is open because forceOpen is true.
+      assert.ok(
+        container.querySelector('[data-testid="filters-disclosure-panel"]'),
+        "panel MUST render when forceOpen is true on first render",
+      );
+
+      // Buyer clicks the toggle to collapse the tray while
+      // forceOpen is still true. The click targets the
+      // userDismissal flag — the panel MUST close.
+      const toggle = container.querySelector('[data-testid="filters-disclosure-toggle"]');
+      assert.ok(toggle, "toggle button MUST render");
+      const button = toggle as HTMLButtonElement;
+      act(() => {
+        button.click();
+      });
+      assert.equal(
+        container.querySelector('[data-testid="filters-disclosure-panel"]'),
+        null,
+        "panel MUST close after the buyer clicks toggle while forceOpen is true",
+      );
+      assert.equal(
+        button.getAttribute("aria-expanded"),
+        "false",
+        "aria-expanded MUST be false after a buyer collapse while forceOpen is true",
+      );
+
+      // Re-opening: buyer clicks again to bring the panel back.
+      // While forceOpen is still true, the click clears the
+      // dismissal flag and the panel re-appears.
+      act(() => {
+        button.click();
+      });
+      assert.ok(
+        container.querySelector('[data-testid="filters-disclosure-panel"]'),
+        "panel MUST re-open when the buyer clicks toggle again while forceOpen is still true",
+      );
+      assert.equal(
+        button.getAttribute("aria-expanded"),
+        "true",
+        "aria-expanded MUST be true after the buyer re-opens while forceOpen is still true",
+      );
+    } finally {
+      act(() => {
+        root.unmount();
+      });
+      container.remove();
+    }
   });
 });
