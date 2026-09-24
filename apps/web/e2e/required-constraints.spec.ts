@@ -207,23 +207,41 @@ test("Submission error forces the Filters disclosure open and renders the field 
   await expect(page.getByTestId("filters-disclosure-panel")).toBeVisible();
 });
 
-test("Disclosure lifecycle: forced-open → buyer collapse → correction → successful resubmit returns to the closed-by-default state", async ({
+test("Disclosure lifecycle: forced-open → buyer collapse while forced → correction → successful resubmit restores the pre-error closed state", async ({
   page,
 }) => {
-  // Lifecycle covered (Tenki review, P2-001):
-  //   1. The disclosure is closed by default. The buyer opens it
-  //      by clicking the toggle.
-  //   2. The buyer enters an invalid `basedIn.countryCode` and
-  //      submits. The schema rejects `12` and the page surfaces
-  //      the field-level error AND keeps the tray open via the
-  //      `forceOpen` flag.
-  //   3. While `forceOpen` is true, the buyer clicks the toggle
-  //      to collapse the tray (the click captures a user
-  //      dismissal, not a mutation of the buyer's `open` choice).
-  //   4. The buyer re-opens the tray, corrects the input, and
-  //      resubmits. The submission succeeds and `forceOpen`
-  //      flips back to false; the tray MUST return to the
-  //      closed-by-default state.
+  // Lifecycle covered (Tenki review, P2-001 + review follow-up):
+  //
+  //   The disclosure is closed by default. To prove restoration
+  //   to the closed state after a controlled error clears, the
+  //   buyer's prior `open` choice MUST be `false` at the moment
+  //   `forceOpen` flips back to false. The flow:
+  //
+  //     1. The disclosure is closed by default. The buyer opens
+  //        it to reach the hidden `basedIn.countryCode` control.
+  //     2. The buyer enters an invalid value ("12"), then
+  //        closes the tray via the toggle. The filter state is
+  //        preserved (the inputs are hidden, not unmounted); the
+  //        buyer's `open` choice is now `false`.
+  //     3. The buyer submits. The schema rejects "12" and the
+  //        page flips `forceOpen=true`. The forced-open tray
+  //        reveals the field-level error beside the control
+  //        WITHOUT requiring a manual expand — the documented
+  //        surfacing behavior.
+  //     4. The buyer collapses the tray via the toggle while
+  //        `forceOpen` is true. The click captures a user
+  //        dismissal, not a mutation of `open`.
+  //     5. The buyer re-opens the tray, corrects the input to
+  //        a valid value ("JM"), and resubmits. The submission
+  //        succeeds and `forceOpen` flips back to false. The
+  //        buyer's prior `open=false` choice is restored — the
+  //        tray MUST return to the closed-by-default state.
+  //
+  //   The lifecycle stages are individually asserted via
+  //   `aria-expanded` and panel visibility checks. A `search-error`
+  //   terminal state is NOT acceptable evidence of a successful
+  //   resubmission — only `result-card` or `search-empty` count
+  //   as success.
   await loadHome(page);
 
   // Step 1 — closed-by-default invariant.
@@ -234,15 +252,27 @@ test("Disclosure lifecycle: forced-open → buyer collapse → correction → su
   );
 
   // Step 1 cont. — buyer opens the disclosure to reach the
-  // hidden field. The required-by-default filter controls live
+  // hidden field. Required-by-default filter controls live
   // inside the disclosure; the test MUST open the tray before
   // it can interact with them.
   await page.getByTestId("filters-disclosure-toggle").click();
   await expect(page.getByTestId("filters-disclosure-panel")).toBeVisible();
 
-  // Step 2 — submit an invalid value, forceOpen keeps the tray
-  // open AND the field-level error renders beside the control.
+  // Step 2 — buyer enters an invalid value, then closes the
+  // tray via the toggle. The filter state persists; the buyer's
+  // `open` choice is now `false`.
   await page.getByTestId("required-based-in-country").fill("12");
+  await page.getByTestId("filters-disclosure-toggle").click();
+  await expect(page.getByTestId("filters-disclosure-panel")).toHaveCount(0);
+  await expect(page.getByTestId("filters-disclosure-toggle")).toHaveAttribute(
+    "aria-expanded",
+    "false",
+  );
+
+  // Step 3 — submit. The schema rejects "12" and the page
+  // flips `forceOpen=true`. The forced-open tray reveals the
+  // field-level error beside the control WITHOUT requiring a
+  // manual expand — the documented surfacing behavior.
   await page.getByTestId("search-submit").click();
   const countryField = page.getByTestId("required-based-in-country-field");
   await expect(countryField).toBeVisible();
@@ -253,11 +283,9 @@ test("Disclosure lifecycle: forced-open → buyer collapse → correction → su
     "true",
   );
 
-  // Step 3 — buyer collapses the tray via the toggle while
-  // forceOpen is true. The click captures a user dismissal; the
-  // field-level error is unchanged (the submission error has
-  // not cleared) so the buyer can read it elsewhere or focus
-  // on the input.
+  // Step 4 — buyer collapses the tray via the toggle while
+  // forceOpen is true. The click captures a user dismissal;
+  // the field-level error is unchanged.
   await page.getByTestId("filters-disclosure-toggle").click();
   await expect(page.getByTestId("filters-disclosure-panel")).toHaveCount(0);
   await expect(page.getByTestId("filters-disclosure-toggle")).toHaveAttribute(
@@ -265,30 +293,30 @@ test("Disclosure lifecycle: forced-open → buyer collapse → correction → su
     "false",
   );
 
-  // Step 4 — buyer re-opens the tray, corrects the input, and
+  // Step 5 — buyer re-opens the tray, corrects the input, and
   // resubmits. The submission succeeds; `forceOpen` flips back
-  // to false; the tray returns to the closed-by-default state.
+  // to false; the buyer's prior `open=false` choice is
+  // restored.
   await page.getByTestId("filters-disclosure-toggle").click();
   await expect(page.getByTestId("filters-disclosure-panel")).toBeVisible();
   await page.getByTestId("required-based-in-country").fill("JM");
   await page.getByTestId("search-submit").click();
 
-  // The submission succeeds; the page may render the result
-  // list OR an empty-state — either is a valid terminal state.
+  // The submission succeeds — only result-card OR search-empty
+  // count as success; search-error is explicitly NOT acceptable
+  // evidence of a successful resubmission.
   await expect(
-    page
-      .getByTestId("result-card")
-      .first()
-      .or(page.getByTestId("search-empty"))
-      .or(page.getByTestId("search-error").first()),
+    page.getByTestId("result-card").first().or(page.getByTestId("search-empty")),
   ).toBeVisible({ timeout: 15_000 });
+  await expect(page.getByTestId("search-error")).toHaveCount(0);
 
   // The country field no longer carries a controlled error and
   // the input value was preserved.
   await expect(page.getByTestId("required-based-in-country")).toHaveValue("JM");
 
   // The disclosure panel MUST close once the error clears —
-  // the buyer's default-closed choice is the documented target.
+  // the buyer's pre-error closed-by-default choice is the
+  // documented target.
   await expect(page.getByTestId("filters-disclosure-panel")).toHaveCount(0);
   await expect(page.getByTestId("filters-disclosure-toggle")).toHaveAttribute(
     "aria-expanded",
