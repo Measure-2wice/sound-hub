@@ -325,29 +325,45 @@ export class PrismaFundingRepository implements FundingRepository {
   //
   // Guarded UPDATE: a slow failing provider attempt must NOT be
   // able to demote a Confirmed PaymentIntent that a concurrent
-  // success has already committed. The predicate
-  // `"providerState" <> 'Confirmed'` makes the UPDATE a no-op when
-  // the row is already Confirmed; the caller (the service) maps
-  // the `ALREADY_CONFIRMED` return onto the idempotent success
-  // path. See ticket #64 P0-002.
+  // success has already committed. The implementation is now a
+  // short Serializable transaction that takes a `SELECT ...
+  // FOR UPDATE` lock on the intent row BEFORE the guarded
+  // UPDATE: if a concurrent success transaction (`fundDealIn
+  // Transaction` opens the same Serializable row lock first),
+  // this method BLOCKS until that transaction either commits
+  // (intent row reads as `Confirmed` → method returns
+  // `ALREADY_CONFIRMED`) or rolls back (intent row reads as
+  // `Created` → method falls through to the guarded UPDATE
+  // that sets the row to `Failed`). The original
+  // `WHERE providerState <> 'Confirmed'` predicate still
+  // defends the persisted-state invariant — a later failure
+  // MUST NOT demote a `Confirmed` intent — and the FOR UPDATE
+  // pre-acquisition makes the race deterministic regardless of
+  // which side reaches PostgreSQL first. See ticket #64 P0-002.
   async recordPaymentIntentFailureInTransaction(
     input: RecordPaymentIntentFailureInput,
   ): Promise<RecordPaymentIntentFailureResult> {
-    const updated = await this.prisma.paymentIntent.updateMany({
-      where: {
-        id: input.paymentIntentId,
-        providerState: { not: "Confirmed" },
+    return this.prisma.$transaction(
+      async (tx) => {
+        await tx.$queryRaw`SELECT id FROM payment_intents WHERE id = ${input.paymentIntentId} FOR UPDATE`;
+        const updated = await tx.paymentIntent.updateMany({
+          where: {
+            id: input.paymentIntentId,
+            providerState: { not: "Confirmed" },
+          },
+          data: {
+            providerState: "Failed",
+            failureReasonCode: input.failureReasonCode,
+            failureDetailCategory: input.failureDetailCategory,
+          },
+        });
+        if (updated.count === 1) {
+          return { ok: true, persisted: true };
+        }
+        return { ok: true, persisted: false, reason: "ALREADY_CONFIRMED" };
       },
-      data: {
-        providerState: "Failed",
-        failureReasonCode: input.failureReasonCode,
-        failureDetailCategory: input.failureDetailCategory,
-      },
-    });
-    if (updated.count === 1) {
-      return { ok: true, persisted: true };
-    }
-    return { ok: true, persisted: false, reason: "ALREADY_CONFIRMED" };
+      { isolationLevel: "Serializable" },
+    );
   }
 
   // ---------- fundDealInTransaction ----------

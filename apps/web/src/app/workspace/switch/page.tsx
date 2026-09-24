@@ -333,31 +333,79 @@ function WorkspaceSwitchPageInner() {
  * this typed client narrowing helper — adding a route in the
  * resolver extends the same shared list, so a server-returnable
  * value can never be silently rejected here.
+ *
+ * The `as const` on the source tuple keeps every entry's literal
+ * type. The `BOUNDED_SWITCH_ROUTE_LITERALS` derived union is exactly
+ * `${StaticRoutes}` (a subset of `StaticRoutes`); the typed
+ * template-literal composition in `toTypedSwitchRoute` produces
+ * a value of type `${StaticRoutes}${SearchOrHash}` which is one
+ * of the arms of `Route<string>`. The function therefore returns
+ * `Route<string>` with no `as Route<string>` cast at the boundary.
  */
-const BOUNDED_SWITCH_ROUTES: readonly string[] = postCommandRouteValuesV1;
+type BoundedSwitchRouteLiteral = (typeof postCommandRouteValuesV1)[number];
+const BOUNDED_SWITCH_ROUTE_LITERALS: readonly BoundedSwitchRouteLiteral[] =
+  postCommandRouteValuesV1;
+
+/**
+ * Runtime/type guard: returns true when `candidate` matches one
+ * of the bounded route literals. Reuses the shared closed enum
+ * from `@soundhub/types` so the client can never drift from the
+ * server-side authorising list. The cast inside `has()` is
+ * strictly the type-cast the runtime helper needs to satisfy the
+ * readonly tuple's `.includes(string)` signature; it does not
+ * cross the function boundary that the typed narrowing helper
+ * upholds.
+ */
+function isBoundedSwitchRouteLiteral(candidate: string): candidate is BoundedSwitchRouteLiteral {
+  return (BOUNDED_SWITCH_ROUTE_LITERALS as readonly string[]).includes(candidate);
+}
+
+/**
+ * The server-resolved query suffix is restricted to the typed
+ * `SearchOrHash` arm of `Route<string>` (`?${string} | #${string}`,
+ * or empty when no suffix is present). `SearchOrHash` is the
+ * only suffix shape `Route<string>` accepts, so matching it
+ * here is sufficient to compose a valid typed route.
+ */
+type SearchOrHashSuffix = "" | `?${string}` | `#${string}`;
+function isSearchOrHashSuffix(value: string): value is SearchOrHashSuffix {
+  return value === "" || value.startsWith("?") || value.startsWith("#");
+}
 
 /**
  * Narrow a server-resolved `safeReturnTo` value into the typed
  * `Route<string>` representation the Next.js router expects.
  * The server already constrains the value to the bounded #83 set;
- * this helper exists so the typed cast is gated by an explicit
- * local match — out-of-set values fall back to `/dashboard`
- * rather than reaching the browser as an untyped string.
+ * this helper exists so the typed narrowing is gated by an
+ * explicit local match — out-of-set values fall back to
+ * `/dashboard` rather than reaching the browser as an untyped
+ * string.
+ *
+ * The function has no `as Route<string>` cast at the boundary:
+ * after the runtime guard, `pathOnly` is a typed literal from
+ * the closed enum; after the runtime guard, `querySuffix` is
+ * `SearchOrHash`; the template-literal composition
+ * `\`${pathOnly}${querySuffix}\`` is therefore
+ * `\`${BoundedSwitchRouteLiteral}${SearchOrHashSuffix}\``, which
+ * is a subset of `\`${StaticRoutes}${SearchOrHash}\`` and
+ * therefore assignable to `Route<string>`.
  */
 function toTypedSwitchRoute(safeReturnTo: string | null): Route<string> {
   if (safeReturnTo === null) return "/dashboard";
   const pathOnly = safeReturnTo.split("?")[0] ?? "";
-  // The server returns `safeReturnTo` from a bounded closed enum, so
-  // any value whose path-prefix matches a bounded route IS a valid
-  // `Route<string>`. The cast is gated by an explicit local match so
-  // out-of-set values fall back to `/dashboard` rather than reaching
-  // the browser as an untyped string.
-  if (!BOUNDED_SWITCH_ROUTES.includes(pathOnly)) return "/dashboard";
-  // Re-derive the typed route from `pathOnly` (a literal after the
-  // `BOUNDED_SWITCH_ROUTES.includes` check) plus any query string.
-  // The concatenated type matches `StaticRoutes | \`${StaticRoutes}?<...>\``,
-  // which is exactly `Route<string>`.
+  if (!isBoundedSwitchRouteLiteral(pathOnly)) return "/dashboard";
   const queryIndex = safeReturnTo.indexOf("?");
-  const querySuffix = queryIndex === -1 ? "" : safeReturnTo.slice(queryIndex);
-  return (pathOnly + querySuffix) as Route<string>;
+  const rawSuffix = queryIndex === -1 ? "" : safeReturnTo.slice(queryIndex);
+  if (!isSearchOrHashSuffix(rawSuffix)) {
+    // Defensive: if the suffix is not a valid `SearchOrHash`,
+    // return the bare typed route rather than producing a
+    // string the router cannot accept.
+    return pathOnly;
+  }
+  // `${BoundedSwitchRouteLiteral}${SearchOrHashSuffix}` is a
+  // subset of `${StaticRoutes}${SearchOrHash}`, which is a
+  // valid `Route<string>` arm. TypeScript infers the template
+  // literal at compile time from the operand types so the
+  // boundary does NOT need a cast.
+  return `${pathOnly}${rawSuffix}`;
 }

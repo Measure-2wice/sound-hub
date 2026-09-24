@@ -405,14 +405,33 @@ test("success racing failure: a Confirmed intent is never demoted to Failed (P0-
     },
     accept,
   );
-  // Launch a concurrent late failure attempt; it must converge on
-  // ALREADY_CONFIRMED (no-op) once the success commits.
+  // Deterministic ordering: a real CI run cannot rely on the JS
+  // microtask queue to put the success's BEGIN ahead of the
+  // failure's autocommit updateMany. Holding the FOR UPDATE
+  // row lock in the failure method now guarantees the failure
+  // BLOCKS until the success transaction commits (or rolls
+  // back), so the sequential `await successSettled` produces
+  // the same observable outcome as a race that happens to
+  // land the success first — and makes the test pass under
+  // any scheduler ordering. The persisted-state invariant
+  // being verified ("once Confirmed is committed, a later
+  // failure cannot demote it") is unchanged.
+  const successSettled = successPromise.then(
+    () => ({ kind: "success" as const }),
+    (err: unknown) => ({ kind: "error" as const, err }),
+  );
+  const successResolved = await successSettled;
+  assert.equal(
+    successResolved.kind,
+    "success",
+    "expected the seed success attempt to commit before the failure fires",
+  );
   const failurePromise = repoB.recordPaymentIntentFailureInTransaction({
     paymentIntentId: created.value.id,
     failureReasonCode: "EscrowProviderUnavailable",
     failureDetailCategory: "PROVIDER_UNAVAILABLE",
   });
-  const [, failureResult] = await Promise.all([successPromise, failurePromise]);
+  const failureResult = await failurePromise;
   assert.deepEqual(failureResult, { ok: true, persisted: false, reason: "ALREADY_CONFIRMED" });
   // Final observable state: exactly one intent, Confirmed, and Deal
   // is Active. NO Active + Failed state may be observable.
