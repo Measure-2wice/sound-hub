@@ -1,6 +1,11 @@
 # Milestone 2: Authenticated Workspaces and Seller Onboarding
 
-- **Status:** Approved product and engineering specification
+> **Historical roadmap input:** This specification is preserved for traceability but is superseded
+> as the Milestone 2 completion contract by
+> `docs/specs/milestone-2-reconciled-personal-workspace-onboarding.md`. Requirements not retained in
+> the reconciled scope are mapped there to named later roadmap destinations.
+
+- **Status:** Historical; superseded and preserved only for traceability — not authoritative for implementation
 - **Depends on:** Accepted Milestone 1.1 implementation and Gate 0 schema reconciliation
 - **Domain language:** `CONTEXT.md`
 - **Architecture decisions:** ADRs 0001–0006

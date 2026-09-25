@@ -25,6 +25,7 @@ import { buildApp } from "../index.js";
 import { DeterministicIdentityAdapter } from "../identity/deterministic-identity-adapter.js";
 import { InMemoryAuthRepository } from "../auth-repository/in-memory-auth-repository.js";
 import { AuthenticationService } from "../services/authentication.service.js";
+import { PersonalWorkspaceConvergenceService } from "../services/personal-workspace-convergence.service.js";
 import { WorkspaceAuthorizationService } from "../services/workspace-authorization.service.js";
 import { DeterministicStorageAdapter } from "../storage/deterministic-storage-adapter.js";
 import { InMemoryAudioRepository } from "../audio-repository/in-memory-audio-repository.js";
@@ -161,6 +162,9 @@ function buildTestHarness() {
   const authenticationService = new AuthenticationService({
     identityAdapter: adapter,
     authRepository: authRepo,
+    personalWorkspaceConvergenceService: new PersonalWorkspaceConvergenceService({
+      authRepository: authRepo,
+    }),
   });
   const stubPrisma = new Proxy({} as never, {
     get() {

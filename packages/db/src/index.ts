@@ -35,3 +35,25 @@ export {
   BG7_FIXTURE_STORAGE_REF,
   BG7_FIXTURE_LABEL,
 } from "./audio-sample-fixture.js";
+
+// M2 (#82 P2-001): the URL-only disposable-test-database guard lives
+// in `@soundhub/db` so packages/db/* scripts can apply the same
+// fail-closed check without reaching into apps/api (which would
+// create a `db → api → db` module cycle). The API module
+// (`apps/api/src/lib/test-database.ts`) re-exports these symbols
+// from `@soundhub/db` for every existing apps/api/* test caller.
+// Scope kept URL-only on purpose: Prisma client construction and the
+// QA-only validators (assertApprovedQaDatabase, readQaDatabaseUrl)
+// stay in apps/api because they depend on app-layer concerns.
+export {
+  APPROVED_TEST_DATABASE_HOSTS,
+  APPROVED_TEST_DATABASE_NAME,
+  APPROVED_TEST_DATABASE_PORT,
+  APPROVED_QA_DATABASE_NAME,
+  TestDatabaseGuardError,
+  assertDisposableTestDatabase,
+  assertNotQaDatabase,
+  readTestDatabaseUrl,
+  resolveApprovedTestDatabaseUrl,
+} from "./test-database-url.js";
+export type { ApprovedTestTarget } from "./test-database-url.js";

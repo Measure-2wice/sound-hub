@@ -1,7 +1,7 @@
 # SoundHub Product Specification
 
 - **Status:** MVP architecture baseline
-- **Current implementation target:** Milestone 1 — database-backed talent and offering search
+- **Current implementation target:** Milestone 2 (see §10)
 - **Domain language:** [`CONTEXT.md`](./CONTEXT.md)
 - **Architecture decisions:** [`docs/adr/`](./docs/adr/)
 
@@ -214,10 +214,10 @@ The repository is a pnpm TypeScript monorepo with:
 - Prisma/PostgreSQL package under `packages/db`
 - Docker Compose services for PostgreSQL and Redis
 
-The current search is an obsolete producer-only mock: it uses random scores, fake vectors,
-artificial delay, and fabricated AI explanations. The Prisma and shared-type models likewise use
-the older exclusive Artist/Producer role design. Milestone 1 intentionally replaces these
-pre-release contracts without compatibility layers or preservation of disposable mock fixtures.
+Milestone 1 / BG1–BG7 is the completed production foundation. Current repository behavior is
+defined by accepted ADRs in [`docs/adr/`](./docs/adr/), current specs in
+[`docs/specs/`](./docs/specs/), current migrations, executable contracts in
+[`docs/contracts/`](./docs/contracts/), and tests.
 
 ## 9. MVP scope
 
@@ -247,8 +247,10 @@ pre-release contracts without compatibility layers or preservation of disposable
 
 ## 10. Delivery sequence
 
-Only Milestone 1 is implementation-ready. The remaining sequence is provisional and must be grilled
-before implementation:
+M1 / BG1–BG7 is completed foundation. M2 is the current implementation-ready milestone, governed by
+the reconciled M2 functional and UX specifications and issues #82–#89. Later milestones are not
+implementation-ready until separately reconciled and approved. The remaining sequence below is
+provisional and must be grilled before any later-milestone implementation:
 
 1. Database-backed talent and offering search
 2. Authentication, Workspaces, memberships, and seller onboarding
@@ -258,5 +260,9 @@ before implementation:
 6. Private versioned delivery and acceptance
 7. Monitoring, disputes, audit integration, and MVP hardening
 
-Milestone 1's approved product and engineering specification is
-[`docs/specs/milestone-1-talent-search.md`](./docs/specs/milestone-1-talent-search.md).
+M1's approved product and engineering specification is
+[`docs/specs/milestone-1-talent-search.md`](./docs/specs/milestone-1-talent-search.md). M2's
+authoritative specifications are
+[`docs/specs/milestone-2-reconciled-personal-workspace-onboarding.md`](./docs/specs/milestone-2-reconciled-personal-workspace-onboarding.md)
+and [`docs/specs/milestone-2-reconciled-ux.md`](./docs/specs/milestone-2-reconciled-ux.md);
+implementation slices are issues #82–#89.

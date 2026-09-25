@@ -17,6 +17,7 @@
     "lint": "eslint .",
     "lint:fix": "eslint . --fix",
     "check": "pnpm type-check && pnpm lint && pnpm test && pnpm build",
+    "check:fast": "pnpm format:check && pnpm type-check && pnpm --filter @soundhub/api test && pnpm --filter @soundhub/web test && pnpm test:forbidden-deps && pnpm test:db-qa-env",
     "format": "prettier --write .",
     "format:check": "prettier --check .",
     "prisma:generate": "pnpm --filter @soundhub/db db:generate",
@@ -37,14 +38,26 @@
     "acceptance-gate": "node scripts/acceptance-gate.mjs",
     "clean": "rm -rf apps/web/.next apps/web/.next-dev packages/*/dist packages/*/tsconfig.tsbuildinfo packages/db/src/generated",
     "clean:build": "pnpm clean && pnpm prisma:generate && pnpm build"
+    "prepare": "husky"
+  },
+  "lint-staged": {
+    "*.{ts,tsx}": [
+      "prettier --write",
+      "eslint"
+    ],
+    "*.{json,md,yml,yaml,css,scss}": [
+      "prettier --write"
+    ]
   },
   "devDependencies": {
     "@eslint/js": "^9.39.5",
     "concurrently": "^9.2.4",
     "eslint": "^9.39.5",
     "eslint-config-prettier": "^9.1.2",
-    "prettier": "^3.9.8",
-    "typescript": "^5.9.3",
-    "typescript-eslint": "^8.70.0"
+    "prettier": "^3.3.3",
+    "husky": "^9.1.7",
+    "lint-staged": "^17.5.1",
+    "typescript": "^5.6.3",
+    "typescript-eslint": "^8.0.0"
   }
 }

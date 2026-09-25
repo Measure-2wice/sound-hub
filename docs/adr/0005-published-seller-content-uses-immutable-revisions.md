@@ -1,5 +1,6 @@
 ---
-status: accepted
+status: superseded
+superseded_by: docs/adr/0008-published-seller-content-uses-atomic-complete-state-updates.md
 ---
 
 # Published seller content uses immutable revisions
