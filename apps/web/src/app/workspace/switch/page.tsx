@@ -22,17 +22,18 @@
 //   - Cancel calls `cancelPendingTarget` and navigates to
 //     `/dashboard` — the committed value is NEVER touched by
 //     cancel.
-//   - The query-string `target` parameter is the user's CURRENT
-//     explicit intent. A stale in-memory `pendingTargetId` from a
-//     previous uncommitted switch (e.g., a browser-back away from
-//     the interstitial, or a dashboard deep-link clicked before the
-//     commit settled) MUST NOT shadow the URL's `target`. The
-//     promotion effect re-syncs `pendingTargetId` to the resolved
-//     candidate whenever they diverge, AND the `target` memo
-//     prefers a valid query-string candidate on first render so the
-//     page never flashes the wrong "Switch to:" card. The candidate
-//     is revalidated against `user.workspaces` (Active gate) before
-//     any action.
+//   - The query-string `target` parameter is AUTHORITATIVE when
+//     present. A valid candidate (in `user.workspaces` AND Active)
+//     becomes the target; an invalid candidate (inaccessible or
+//     Suspended) MUST clear any stale in-memory `pendingTargetId`
+//     and render the unavailable surface — the user can never
+//     commit a Workspace the URL did not actually request (Codex
+//     review, P1-001). The pending-state fallback is preserved
+//     only when no explicit query target is present (selector
+//     pre-set or hard-reload mid-transit). The candidate lookup
+//     is a shared memo consumed by both the sync effect and the
+//     target memo so the authorization gate cannot drift between
+//     the two call sites (Codex review, P2-001).
 
 import { Suspense, useEffect, useMemo, useRef, useState } from "react";
 import { useRouter, useSearchParams } from "next/navigation";
@@ -89,25 +90,55 @@ function WorkspaceSwitchPageInner() {
   // the wrong "Switch to:" card (visual-QA regression). The
   // selector flow (`handleSelect` pre-sets `pendingTarget` to the
   // same id before navigating) already has `pendingTargetId ===
-  // candidate.workspaceId` on mount, so this is a no-op there.
+  // queryCandidate.workspaceId` on mount, so this is a no-op there.
   // Once `pendingTarget` is set, the page's "Switch and continue"
   // commit operation must still explicitly switch — no silent
   // no-op path.
+  //
+  // Codex review (P1-001) tightened the contract further: when a
+  // `?target=` query is present, it is AUTHORITATIVE. An invalid
+  // (inaccessible / Suspended / random) query target MUST clear
+  // any stale `pendingTargetId` so the user cannot commit a
+  // Workspace the URL did not actually request. The pending-state
+  // fallback is preserved only when no explicit query target is
+  // present (i.e., the user landed on `/workspace/switch` via the
+  // selector's pre-set, which already encoded the intent into the
+  // URL).
+  const queryTargetId = searchParams.get("target");
+  // Shared Active-membership resolution: both the sync effect
+  // and the target memo MUST consult the same `user.workspaces`
+  // Active gate so the authorization rule cannot drift between
+  // the two call sites (Codex review, P2-001).
+  const queryCandidate = useMemo(() => {
+    if (!user || queryTargetId === null) return null;
+    return (
+      user.workspaces.find(
+        (w) => w.workspaceId === queryTargetId && w.workspaceStatus === "Active",
+      ) ?? null
+    );
+  }, [user, queryTargetId]);
+
   useEffect(() => {
     if (!user) return;
-    const queryTargetId = searchParams.get("target");
-    if (!queryTargetId) return;
-    const candidate = user.workspaces.find(
-      (w) => w.workspaceId === queryTargetId && w.workspaceStatus === "Active",
-    );
-    if (!candidate) return;
-    if (pendingTargetId !== candidate.workspaceId) {
-      setPendingTarget(candidate.workspaceId);
+    if (queryTargetId === null) return;
+    if (queryCandidate === null) {
+      // Explicit URL target is present but it does NOT resolve
+      // to an accessible Active Workspace. Clear any stale
+      // `pendingTargetId` so the user cannot commit a Workspace
+      // the URL did not actually request — and so subsequent
+      // navigations do not inherit the stale state. The target
+      // memo below returns null in this branch, which routes
+      // the page to the unavailable surface (P1-001).
+      if (pendingTargetId !== null) {
+        setPendingTarget(null);
+      }
+      return;
     }
-  }, [pendingTargetId, user, searchParams, setPendingTarget]);
+    if (pendingTargetId !== queryCandidate.workspaceId) {
+      setPendingTarget(queryCandidate.workspaceId);
+    }
+  }, [pendingTargetId, user, queryTargetId, queryCandidate, setPendingTarget]);
 
-  // provider before navigating here).
-  const queryTargetId = searchParams.get("target");
   // The cross-Workspace `?return=` query carries the destination
   // the customer was heading to before the acting Workspace
   // interstitial interrupted them. It is forwarded into the
@@ -124,25 +155,22 @@ function WorkspaceSwitchPageInner() {
   }, [searchParams]);
 
   const target = useMemo(() => {
-    // The query-string `target` is the user's current explicit
-    // intent (e.g., the dashboard "Switch to your Personal
-    // Workspace" link). When it resolves to a valid Active
-    // Workspace, it MUST win over any stale `pendingTargetId`
-    // from a previous uncommitted switch — otherwise the page
-    // would render the wrong "Switch to:" card for one render
-    // before the re-sync effect catches up. The selector flow
-    // pre-sets `pendingTarget` to the same id before navigating,
-    // so both branches resolve to the same Workspace there and
-    // there is no observable difference.
-    if (user && queryTargetId) {
-      const queryCandidate = user.workspaces.find(
-        (w) => w.workspaceId === queryTargetId && w.workspaceStatus === "Active",
-      );
-      if (queryCandidate) return queryCandidate;
-    }
+    // The query-string `target` is AUTHORITATIVE when present.
+    // A valid candidate becomes the target; an invalid candidate
+    // (not in `user.workspaces`, not Active) renders null so the
+    // page falls through to the unavailable surface — it MUST NOT
+    // fall back to a stale `pendingTarget` (Codex review, P1-001).
+    // The selector flow pre-sets `pendingTarget` to the same id
+    // it puts in the URL, so both branches resolve to the same
+    // Workspace there and there is no observable difference.
+    if (queryTargetId !== null) return queryCandidate;
+    // No explicit query target — preserve the pending-state
+    // fallback so a selector pre-set that navigated without an
+    // explicit `?target=` (or a hard-reload mid-transit) still
+    // drives the target.
     if (pendingTarget) return pendingTarget;
     return null;
-  }, [pendingTarget, queryTargetId, user]);
+  }, [pendingTarget, queryTargetId, queryCandidate]);
 
   const [submitting, setSubmitting] = useState(false);
   const [error, setError] = useState<string | null>(null);

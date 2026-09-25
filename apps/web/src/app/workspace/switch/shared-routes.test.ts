@@ -99,7 +99,7 @@ describe("post-command return routes shared across server + client (M2 #83 P2-00
 // so the superseded source-regex tests have been removed in favor
 // of the browser-seam coverage.
 
-describe("Workspace-switch page — query-string re-sync behavior (M2 #83 visual-QA regression)", () => {
+describe("Workspace-switch page — query-string re-sync behavior (M2 #83 visual-QA + Codex P1-001 regressions)", () => {
   // Visual QA caught a P1 regression: after a switch attempt that
   // left `pendingTargetId` set (selector click + browser-back, or
   // selector click + dashboard deep-link before commit settled), a
@@ -108,26 +108,27 @@ describe("Workspace-switch page — query-string re-sync behavior (M2 #83 visual
   // root cause was a `if (pendingTargetId !== null) return;` short-
   // circuit inside the promotion effect — the effect only re-synced
   // `pendingTargetId` from the URL when the in-memory value was
-  // empty. These source-pattern assertions pin the new behavior so
-  // the gate cannot silently revert to the null-only check.
+  // empty. Codex review (P1-001) tightened the contract further:
+  // an invalid explicit URL target MUST clear any stale
+  // `pendingTargetId` so the user can never commit a Workspace the
+  // URL did not actually request. Codex review (P2-001) asked for
+  // the duplicated Active lookup to be deduplicated.
   test("promotion effect does NOT short-circuit when pendingTargetId is non-null; it must compare against the resolved candidate", () => {
     // The original gate `if (pendingTargetId !== null) return;` is
-    // the precise cause of the regression. A regression that
-    // re-introduces it (or any equivalent like `if (pendingTarget)`
-    // — note `pendingTarget` is the resolved Workspace, not the id,
-    // so the gate would still be wrong) must fail this assertion.
+    // the precise cause of the visual-QA regression. A regression
+    // that re-introduces it must fail this assertion.
     assert.equal(
       /if\s*\(\s*pendingTargetId\s*!==\s*null\s*\)\s*return\s*;/.test(CLIENT_SWITCH_SOURCE),
       false,
-      "promotion effect MUST NOT short-circuit on pendingTargetId !== null; it must re-sync whenever pendingTargetId !== candidate.workspaceId",
+      "promotion effect MUST NOT short-circuit on pendingTargetId !== null; it must re-sync whenever pendingTargetId !== queryCandidate.workspaceId",
     );
     // The replacement gate MUST compare `pendingTargetId` against
-    // the resolved `candidate.workspaceId` so a stale id from a
+    // the shared `queryCandidate.workspaceId` so a stale id from a
     // previous uncommitted switch can be overwritten.
     assert.match(
       CLIENT_SWITCH_SOURCE,
-      /pendingTargetId\s*[!=]==\s*candidate\.workspaceId/,
-      "the promotion effect MUST compare pendingTargetId against the resolved candidate.workspaceId",
+      /pendingTargetId\s*[!=]==\s*queryCandidate\.workspaceId/,
+      "the promotion effect MUST compare pendingTargetId against the resolved queryCandidate.workspaceId",
     );
     // The Active gate MUST still be applied against `user.workspaces`
     // before any pendingTarget is set — a deep-link to a Suspended
@@ -140,34 +141,98 @@ describe("Workspace-switch page — query-string re-sync behavior (M2 #83 visual
     );
   });
 
-  test("target memo prefers the URL candidate over pendingTarget when the URL resolves to a valid Active Workspace", () => {
-    // The memo MUST consult the URL target first when it resolves
-    // to a valid Active Workspace, so the first render matches the
-    // URL even before the re-sync effect catches up. Otherwise the
-    // page flashes the wrong "Switch to:" card for one render.
-    // Pin by anchoring on the `target` useMemo body and asserting
-    // the URL-candidate lookup appears BEFORE the pendingTarget
-    // fallback.
+  test("promotion effect clears stale pendingTargetId when an explicit URL target is present but invalid (P1-001)", () => {
+    // When `?target=` is present but does NOT resolve to an
+    // accessible Active Workspace, the effect MUST clear any
+    // stale `pendingTargetId` via `setPendingTarget(null)` so the
+    // user cannot commit a Workspace the URL did not actually
+    // request. The previous short-circuit (`if (!candidate)
+    // return;`) left the stale value intact and let the target
+    // memo fall through to it.
+    assert.match(
+      CLIENT_SWITCH_SOURCE,
+      /setPendingTarget\(null\)/,
+      "the promotion effect MUST call setPendingTarget(null) when the explicit URL target does not resolve to an accessible Active Workspace",
+    );
+    // The clear MUST be guarded by `queryCandidate === null` (the
+    // resolved candidate is absent), not by a stale-state check
+    // alone. Pin the branch order so a refactor cannot move the
+    // clear out of the invalid-target branch.
+    const clearBranchMatch = CLIENT_SWITCH_SOURCE.match(
+      /if\s*\(\s*queryCandidate\s*===\s*null\s*\)\s*\{[\s\S]*?setPendingTarget\(null\)/,
+    );
+    assert.ok(
+      clearBranchMatch,
+      "setPendingTarget(null) MUST live inside the `queryCandidate === null` branch so it only fires for invalid explicit URL targets",
+    );
+  });
+
+  test("target memo is authoritative about the URL target — does NOT fall back to pendingTarget when `?target=` is present", () => {
+    // When `?target=` is present, the memo MUST consult the
+    // resolved candidate and MUST NOT fall back to a stale
+    // `pendingTarget` — even if the candidate is invalid (which
+    // would route to the unavailable surface). The fallback is
+    // preserved only when no explicit query target is present
+    // (P1-001).
     const memoBodyMatch = CLIENT_SWITCH_SOURCE.match(
-      /const target = useMemo\(\(\) => \{[\s\S]*?return null;\s*\}, \[pendingTarget, queryTargetId, user\]\);/,
+      /const target = useMemo\(\(\) => \{[\s\S]*?return null;\s*\}, \[pendingTarget, queryTargetId, queryCandidate\]\);/,
     );
     assert.ok(memoBodyMatch, "the target useMemo block must be present in the switch page");
     const memoBody = memoBodyMatch[0];
-    const queryCandidateIndex = memoBody.search(/queryCandidate/);
-    const pendingTargetFallbackIndex = memoBody.search(
-      /if\s*\(\s*pendingTarget\s*\)\s*return pendingTarget/,
+    // The memo MUST short-circuit on a present query target and
+    // return the resolved candidate (which may be null for an
+    // invalid URL target).
+    assert.match(
+      memoBody,
+      /if\s*\(\s*queryTargetId\s*!==\s*null\s*\)\s*return\s+queryCandidate/,
+      "target memo MUST return queryCandidate when queryTargetId is present (P1-001 authoritative-query rule)",
     );
-    assert.ok(
-      queryCandidateIndex >= 0,
-      "target memo MUST consult the URL candidate (queryCandidate) when it resolves",
+    // The pendingTarget fallback MUST appear AFTER the
+    // queryTargetId short-circuit so it can only fire when no
+    // explicit query target is present.
+    const queryShortCircuitIndex = memoBody.search(/if\s*\(\s*queryTargetId\s*!==\s*null\s*\)/);
+    const pendingFallbackIndex = memoBody.search(
+      /if\s*\(\s*pendingTarget\s*\)\s*return\s+pendingTarget/,
     );
+    assert.ok(queryShortCircuitIndex >= 0, "the queryTargetId short-circuit must be present");
+    assert.ok(pendingFallbackIndex >= 0, "the pendingTarget fallback must still be present");
     assert.ok(
-      pendingTargetFallbackIndex >= 0,
-      "target memo MUST still fall back to pendingTarget when the URL has no valid candidate",
+      pendingFallbackIndex > queryShortCircuitIndex,
+      "the pendingTarget fallback MUST be guarded by the queryTargetId short-circuit so a stale pendingTarget cannot leak through when the URL carries an explicit target",
     );
-    assert.ok(
-      queryCandidateIndex < pendingTargetFallbackIndex,
-      "target memo MUST prefer the URL candidate over pendingTarget so the first render matches the URL",
+  });
+
+  test("Active query-target resolution is shared between the sync effect and the target memo (P2-001)", () => {
+    // Codex review (P2-001) flagged that the same Active-membership
+    // lookup was duplicated in the sync effect and target memo.
+    // The fix derives one memoized `queryCandidate` and consumes
+    // it from both. Pin by asserting there is exactly one
+    // `user.workspaces.find(...Active...)` lookup in the file
+    // AND that both the effect body and the memo body reference
+    // the shared `queryCandidate` variable.
+    const lookupCount = (
+      CLIENT_SWITCH_SOURCE.match(
+        /user\.workspaces\.find\([\s\S]*?workspaceStatus\s*===\s*["']Active["']/g,
+      ) ?? []
+    ).length;
+    assert.equal(
+      lookupCount,
+      1,
+      `the Active-membership lookup MUST be defined exactly once (was duplicated across the effect and the memo); found ${lookupCount}`,
+    );
+    // Both consumers MUST reference the shared `queryCandidate`
+    // variable rather than re-running the lookup inline.
+    assert.match(
+      CLIENT_SWITCH_SOURCE,
+      /const\s+queryCandidate\s*=\s*useMemo/,
+      "queryCandidate MUST be a shared useMemo so both consumers share the resolution",
+    );
+    // The effect body MUST also branch on `queryCandidate === null`
+    // to clear stale state on an invalid URL target.
+    assert.match(
+      CLIENT_SWITCH_SOURCE,
+      /queryCandidate\s*===\s*null/,
+      "the sync effect MUST branch on queryCandidate === null to clear stale pendingTargetId on an invalid URL target",
     );
   });
 });

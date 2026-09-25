@@ -344,9 +344,11 @@ describe("Switch interstitial — commit / cancel behaviour (§4 / P1-005)", () 
     const source = readFile("workspace/switch/page.tsx");
     assert.ok(/useSearchParams\(\)/.test(source), "page reads query string via useSearchParams");
     assert.ok(
-      /setPendingTarget\(\s*candidate\.workspaceId\s*\)/.test(source) ||
+      /setPendingTarget\(\s*queryCandidate\.workspaceId\s*\)/.test(source) ||
+        /setPendingTarget\(queryCandidate\.workspaceId\)/.test(source) ||
+        /setPendingTarget\(\s*candidate\.workspaceId\s*\)/.test(source) ||
         /setPendingTarget\(candidate\.workspaceId\)/.test(source),
-      "page promotes membership-validated query target into pending state",
+      "page promotes membership-validated query target into pending state (P2-001 shared queryCandidate variable)",
     );
     assert.ok(
       /workspaceStatus.*Active/.test(source) || /status === "Active"/.test(source),

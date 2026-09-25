@@ -49,6 +49,12 @@
 //   - Narrow viewport (mobile / small): no horizontal page
 //     scroll; the acting-Workspace control remains visible
 //     outside the menu.
+//   - Codex review (P1-001): when an explicit `?target=` query
+//     is present but does NOT resolve to an accessible Active
+//     Workspace AND the in-memory `pendingTargetId` is stale
+//     from a previous uncommitted switch, the page MUST render
+//     the unavailable surface — the user cannot commit a
+//     Workspace the URL did not actually request.
 //
 // The fixture is created via the existing
 // `apps/api/src/test-helpers/multi-workspace-user.ts` helper
@@ -793,6 +799,65 @@ test.describe("M2 #83: intent + Workspace switching (expected-state)", () => {
     await expect(page.getByTestId("switch-unavailable")).toBeVisible();
     await expect(page.getByTestId("workspace-switch-continue")).toHaveCount(0);
     await expect(page.getByTestId("workspace-switch-page")).toHaveCount(0);
+    await expect(page.getByTestId("switch-back-to-dashboard")).toBeVisible();
+  });
+
+  // Codex review (P1-001) verification: when the URL carries an
+  // explicit `?target=` that does NOT resolve to an accessible
+  // Active Workspace AND the in-memory `pendingTargetId` is stale
+  // from a previous uncommitted switch, the page MUST render the
+  // unavailable surface — never the stale Workspace. The previous
+  // short-circuit let the user commit the stale Workspace even
+  // though the URL explicitly requested an invalid one.
+  test("P1-001: invalid URL target cannot fall back to a stale pendingTargetId (clears stale state)", async ({
+    page,
+  }) => {
+    const email = `${FRESH_EMAIL_PREFIX}stale-pending-${Date.now()}@example.test`;
+    seedFreshUser(email);
+    await signInViaDevUrl(page, email);
+    await page.getByTestId("dashboard").waitFor();
+    await page.evaluate(() => window.localStorage.removeItem("soundhub.actingWorkspaceId"));
+
+    // Provision Buyer on Personal so the dashboard renders Buyer
+    // readiness and the selector dropdown is exposed (the selector
+    // needs two accessible Workspaces to render its dropdown).
+    await walkToIntentPage(page);
+    await page.getByTestId("intent-choice-hire-input").check();
+    await page.getByTestId("intent-submit").click();
+    await page.getByTestId("dashboard").waitFor();
+
+    // Establish a stale `pendingTargetId`: open the selector,
+    // pick the Organization, and land on the switch page WITHOUT
+    // committing or cancelling. Then navigate AWAY (browser back
+    // to the dashboard) so the switch page unmounts but the
+    // `pendingTargetId` state in the ActingWorkspaceProvider
+    // remains set — reproducing the visual-QA flow that left the
+    // selector's pre-set pending target behind.
+    await page.getByTestId("acting-workspace-selector").click();
+    await page
+      .getByTestId(/^acting-workspace-option-/)
+      .nth(1)
+      .click();
+    await page.getByTestId("workspace-switch-page").waitFor();
+    await expect(page.getByTestId("workspace-switch-target-name")).toHaveText(
+      "Multi-Workspace Test Organization",
+    );
+    await page.goBack();
+    await page.getByTestId("dashboard").waitFor();
+
+    // Navigate to the switch page with an INVALID URL target
+    // (random UUID that no Workspace row matches). The page MUST
+    // render the unavailable surface — the stale pendingTargetId
+    // MUST NOT leak through to either the commit button or a
+    // stale Workspace card.
+    const randomUuid = `ws-not-real-${Math.random().toString(36).slice(2, 10)}-${Date.now().toString(36)}`;
+    await page.goto(`/workspace/switch?target=${randomUuid}`);
+    await expect(page.getByTestId("switch-unavailable")).toBeVisible();
+    await expect(page.getByTestId("workspace-switch-continue")).toHaveCount(0);
+    await expect(page.getByTestId("workspace-switch-page")).toHaveCount(0);
+    // No stale Organization card.
+    await expect(page.getByTestId("workspace-switch-target-name")).toHaveCount(0);
+    // Recovery affordance present.
     await expect(page.getByTestId("switch-back-to-dashboard")).toBeVisible();
   });
 });
