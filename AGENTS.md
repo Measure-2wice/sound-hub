@@ -168,3 +168,101 @@ work must not be introduced without explicit authorization.
 
 When a ticket, spec, or test conflicts with current repository behavior or with an accepted ADR,
 stop and surface the conflict rather than silently inventing behavior.
+
+# Branch Review Commands
+
+Use these commands when running the `review-branch` skill in SoundHub.
+
+## Repository defaults
+
+Default branch:
+
+```bash
+main
+```
+
+Package manager:
+
+```bash
+pnpm
+```
+
+## Primary fast gate
+
+```bash
+pnpm check:fast
+```
+
+## Production build
+
+```bash
+pnpm build
+```
+
+## Package tests
+
+API:
+
+```bash
+pnpm --filter @soundhub/api test
+```
+
+Web:
+
+```bash
+pnpm --filter @soundhub/web test
+```
+
+## PostgreSQL repository suite
+
+```bash
+pnpm test:repository
+```
+
+Run `pnpm test:repository` only when the ticket changes:
+
+- persistence;
+- repository behavior;
+- transactions;
+- concurrency; or
+- a ticket explicitly requires repository-level verification.
+
+## Playwright
+
+Run only the Playwright spec or specs relevant to the current ticket unless the ticket is broad enough to justify the full browser suite.
+
+Do not run the full browser suite by default during branch review.
+
+## Read-only review constraints
+
+During review, never use:
+
+- formatting write flags;
+- lint auto-fix flags;
+- snapshot update flags;
+- migration-generation commands;
+- dependency installation or upgrade commands; or
+- any command intended to modify tracked repository files.
+
+Allowed examples:
+
+```bash
+git status --short
+git branch --show-current
+git rev-parse HEAD
+git diff origin/main...HEAD --stat
+git diff origin/main...HEAD --name-status
+git diff origin/main...HEAD
+pnpm check:fast
+pnpm build
+pnpm --filter @soundhub/api test
+pnpm --filter @soundhub/web test
+```
+
+Before and after verification, run:
+
+```bash
+git status --short
+```
+
+If a verification command modifies tracked files, stop and report the change rather than repairing it during review.
