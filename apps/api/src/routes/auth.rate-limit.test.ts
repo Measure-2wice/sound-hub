@@ -54,7 +54,8 @@ import { WorkspaceAuthorizationService } from "../services/workspace-authorizati
 import { PersonalWorkspaceConvergenceService } from "../services/personal-workspace-convergence.service.js";
 import { DeterministicIdentityAdapter } from "../identity/deterministic-identity-adapter.js";
 import { InMemoryAuthRepository } from "../auth-repository/in-memory-auth-repository.js";
-import { generateRequestId, writeSafeError, buildSafeError } from "../lib/errors.js";
+import { writeSafeError, buildSafeError } from "../lib/errors.js";
+import { getRequestId, storeRequestId, type RequestWithRequestId } from "../lib/request-id.js";
 
 function buildFreshApp(): {
   app: Application;
@@ -81,14 +82,17 @@ function buildFreshApp(): {
   // router-level `parseAuthRequestBody` middleware owns body parsing
   // for the auth surface and exercises the same code path the
   // deployed entry point uses.
+  //
+  // The canonical request-id writer/reader pair from
+  // `apps/api/src/lib/request-id.ts` is used here so the test app
+  // applies the same `SAFE_REQUEST_ID_PATTERN` allow-list as
+  // production. Reading `req.headers["x-request-id"]` directly with
+  // a length-only check would let an unsafe header reach the
+  // response header / envelope surfaces (the original CodeQL
+  // "externally-controlled format string" finding on this file).
   app.use((req: Request, res: Response, next: NextFunction) => {
-    const incoming = req.headers["x-request-id"];
-    const requestId =
-      typeof incoming === "string" && incoming.length > 0 && incoming.length <= 128
-        ? incoming
-        : generateRequestId();
+    const requestId = storeRequestId(req);
     res.setHeader("x-request-id", requestId);
-    (req as Request & { requestId?: string }).requestId = requestId;
     next();
   });
   // Catch-all error handler so any unexpected throw surfaces as the
@@ -96,7 +100,7 @@ function buildFreshApp(): {
   // `index.ts` is identical in shape).
   app.use((err: Error, req: Request, res: Response, _next: NextFunction) => {
     void _next;
-    const requestId = (req as Request & { requestId?: string }).requestId ?? generateRequestId();
+    const requestId = getRequestId(req as RequestWithRequestId);
     writeSafeError(
       res,
       buildSafeError("AUTH_FAILED", "An unexpected error occurred.", undefined, requestId),
