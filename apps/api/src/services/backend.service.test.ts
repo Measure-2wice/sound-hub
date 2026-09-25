@@ -1,3 +1,4 @@
+/* eslint-disable @typescript-eslint/no-unsafe-assignment */
 import assert from "node:assert/strict";
 import * as c from "./backend.service";
 

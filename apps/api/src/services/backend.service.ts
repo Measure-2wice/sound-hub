@@ -1,3 +1,9 @@
+/* eslint-disable @typescript-eslint/no-explicit-any */
+/* eslint-disable @typescript-eslint/no-unsafe-assignment */
+/* eslint-disable @typescript-eslint/no-unsafe-member-access */
+/* eslint-disable @typescript-eslint/no-unsafe-call */
+/* eslint-disable @typescript-eslint/no-unsafe-argument */
+/* eslint-disable @typescript-eslint/no-unsafe-return */
 import * as crypto from "crypto";
 
 import { ApiPromise, WsProvider } from "@polkadot/api";
@@ -11,11 +17,15 @@ import contractMetadataRaw from "./contract-metadata.json" assert { type: "json"
 
 let api: ApiPromise;
 let contractAddress: string;
-let arbitratorAddress: string;
-let contractMetadata: any = contractMetadataRaw;
+export let arbitratorAddress: string;
+const contractMetadata: any = contractMetadataRaw;
 let abi: Abi;
 let signer: KeyringPair;
 let signerAddress: string;
+
+export function getArbitratorAddress(): string {
+  return arbitratorAddress;
+}
 
 function requireEnv(name: string, fallbackValue: string): string {
   const value = process.env[name] || fallbackValue;
@@ -31,7 +41,7 @@ function formatDispatchError(dispatchError: any): string {
   return dispatchError.toString();
 }
 
-function isDispatchError(dispatchError: any, section: string, name: string): boolean {
+export function isDispatchError(dispatchError: any, section: string, name: string): boolean {
   if (!dispatchError.isModule) return false;
   const decoded = api.registry.findMetaError(dispatchError.asModule);
   return decoded.section === section && decoded.name === name;
@@ -112,14 +122,14 @@ export async function init(): Promise<void> {
 
   console.log(`Substrate Address: ${signer.address}`);
 
-  signerAddress = ((await (api.call as any).reviveApi.address(signer.address)) as any).toString();
+  signerAddress = (await (api.call as any).reviveApi.address(signer.address)).toString();
   console.log(`Signer Address: ${signerAddress}`);
   const originalAccount = await (api.query as any).revive.originalAccount(signerAddress);
 
-  if ((originalAccount as any).isNone) {
+  if (originalAccount.isNone) {
     console.log("Sending mapping transaction...");
     await signAndSend((api.tx as any).revive.mapAccount());
-    signerAddress = ((await (api.call as any).reviveApi.address(signer.address)) as any).toString();
+    signerAddress = (await (api.call as any).reviveApi.address(signer.address)).toString();
   }
 }
 
@@ -128,11 +138,7 @@ export function setContractAddress(address: string, arbitrator: string): void {
   arbitratorAddress = arbitrator;
 }
 
-export async function queryMessage(
-  methodName: string,
-  args: any[] = [],
-  options: any = {},
-): Promise<any> {
+export async function queryMessage(methodName: string, args: any[] = []): Promise<any> {
   const message = abi.messages.find((m: AbiMessage) => m.identifier === methodName);
   if (!message) throw new Error(`Unsupported method: ${methodName}`);
 
@@ -169,7 +175,9 @@ export async function queryMessage(
         const decoded = abi.registry.createTypeUnsafe(returnType as any, [rawData]);
         decodedErr = JSON.stringify(decoded.toHuman());
       }
-    } catch (e) {}
+    } catch {
+      // ignore
+    }
     throw new Error(`Contract Reverted in ${methodName}: ${decodedErr}`);
   }
 
@@ -180,12 +188,8 @@ export async function queryMessage(
   };
 }
 
-export async function sendMessage(
-  methodName: string,
-  args: any[] = [],
-  options: any = {},
-): Promise<any> {
-  const { gasRequired, storageDeposit } = await queryMessage(methodName, args, options);
+export async function sendMessage(methodName: string, args: any[] = []): Promise<any> {
+  const { gasRequired, storageDeposit } = await queryMessage(methodName, args);
   const message = abi.messages.find((m: AbiMessage) => m.identifier === methodName);
   if (!message) throw new Error(`Unsupported method: ${methodName}`);
 
@@ -284,6 +288,7 @@ export async function createEscrow(
   return { blockHash, contractAddress: newAddress };
 }
 
+// eslint-disable-next-line @typescript-eslint/require-await
 export async function getSignerAddress(): Promise<string> {
   return signerAddress;
 }
