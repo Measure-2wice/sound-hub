@@ -31,6 +31,7 @@ import type {
   UserIdentityMapping,
   WorkspaceMembershipView,
 } from "./auth-repository.js";
+import { IntentConflictError } from "./auth-repository.js";
 
 export interface InMemoryMembershipSeed {
   readonly workspaceId: string;
@@ -403,6 +404,118 @@ export class InMemoryAuthRepository implements AuthRepository {
     return Promise.resolve(this.workspacesById.get(workspaceId)?.slug ?? null);
   }
 
+  // ---------- M2 #83: Intent selection primitives ----------
+  //
+  // Per-Workspace serialization queue. The Prisma adapter uses
+  // `pg_advisory_xact_lock` to serialize intent transitions per
+  // Workspace; the in-memory adapter mirrors that contract with
+  // a chained Promise queue keyed by `workspaceId`. Each new
+  // intent transition awaits the previous transition's tail
+  // before running, so two concurrent disjoint first
+  // submissions serialize and the second observes the first's
+  // committed state.
+  private readonly intentTransitionLocks = new Map<string, Promise<unknown>>();
+
+  /**
+   * M2 #83: symmetric in-memory implementation of the Prisma
+   * expected-state intent primitive.
+   *
+   * Mirrors the Prisma adapter's contract:
+   *
+   *   - The command is additive only.
+   *   - A per-Workspace mutex queue serializes intent
+   *     transitions, equivalent to
+   *     `pg_advisory_xact_lock`.
+   *   - A snapshot/restore block enforces transaction-level
+   *     atomicity (a thrown step rolls capability writes back
+   *     to the pre-call state), equivalent to Prisma's
+   *     `$transaction` rollback.
+   *
+   * #83 re-revision: intent does NOT collect a generic Seller
+   * participation/terms acceptance at capability-provisioning
+   * time. Context-specific confirmations are owned by their
+   * later boundaries.
+   */
+  async provisionIntentAtomically(input: {
+    readonly workspaceId: string;
+    readonly userAccountId: string;
+    readonly capabilities: readonly MarketplaceCapabilityV1[];
+    readonly expectedCapabilities: readonly MarketplaceCapabilityV1[];
+  }): Promise<void> {
+    // Per-Workspace serialization: chain this call onto the
+    // previous transition's tail so concurrent callers observe
+    // a strict FIFO order. The Prisma adapter achieves the
+    // same ordering via `pg_advisory_xact_lock` inside the
+    // transaction.
+    const previous = this.intentTransitionLocks.get(input.workspaceId) ?? Promise.resolve();
+    const run = previous
+      .catch(() => undefined) // never propagate a predecessor's failure into the next caller
+      .then(() => this.runProvisionIntentAtomically(input));
+    // Park the tail so the NEXT caller chains onto this one.
+    // Use a defensive `.catch` so a future caller that awaits
+    // `this.intentTransitionLocks.get(...)` directly does not
+    // see an unhandled rejection.
+    this.intentTransitionLocks.set(
+      input.workspaceId,
+      run.catch(() => undefined),
+    );
+    await run;
+  }
+
+  private async runProvisionIntentAtomically(input: {
+    readonly workspaceId: string;
+    readonly userAccountId: string;
+    readonly capabilities: readonly MarketplaceCapabilityV1[];
+    readonly expectedCapabilities: readonly MarketplaceCapabilityV1[];
+  }): Promise<void> {
+    // Mirror the Prisma adapter's atomic shape: an `await` so
+    // the linter's require-await rule sees a real awaitable
+    // path. The snapshot/restore block below mirrors the
+    // Prisma `$transaction` rollback on failure.
+    await Promise.resolve();
+
+    const workspace = this.workspacesById.get(input.workspaceId);
+    if (!workspace) {
+      throw new Error(
+        `InMemoryAuthRepository.provisionIntentAtomically: unknown workspaceId=${input.workspaceId}`,
+      );
+    }
+    const beforeCapabilities = [...workspace.capabilities];
+
+    const existing: readonly MarketplaceCapabilityV1[] = [...workspace.capabilities];
+
+    const transition = deriveIntentTransition({
+      existing,
+      chosen: input.capabilities,
+      expected: input.expectedCapabilities,
+    });
+
+    if (transition.kind === "conflict") {
+      throw new IntentConflictError(
+        "Intent precondition mismatch: the persisted capability set does not match the state observed when this command was submitted.",
+        transition.existing,
+        transition.expected,
+        transition.existing,
+      );
+    }
+
+    if (transition.kind === "no-op") {
+      // Idempotent success — zero writes.
+      return;
+    }
+
+    try {
+      for (const capability of transition.addition) {
+        applyCapabilityUpsert(workspace, capability);
+      }
+    } catch (err) {
+      // Roll back capability changes so a mid-write failure
+      // cannot leave the Workspace with partial capability state.
+      workspace.capabilities = beforeCapabilities;
+      throw err;
+    }
+  }
+
   private toMembershipView(
     membership: InternalMembership,
     workspace: InternalWorkspace,
@@ -418,4 +531,92 @@ export class InMemoryAuthRepository implements AuthRepository {
       joinedAt: membership.createdAt,
     };
   }
+}
+
+/**
+ * Apply a single capability upsert to an in-memory workspace.
+ * Module-local helper — intentionally NOT exposed on the
+ * `InMemoryAuthRepository` class. Only the atomic
+ * `provisionIntentAtomically` primitive calls it. There is no
+ * public capability-primitive surface that could be called
+ * outside the atomic transaction.
+ */
+function applyCapabilityUpsert(
+  workspace: InternalWorkspace,
+  capability: MarketplaceCapabilityV1,
+): void {
+  if (!workspace.capabilities.includes(capability)) {
+    workspace.capabilities.push(capability);
+    workspace.capabilities.sort();
+  }
+}
+
+/**
+ * Derive the additive transition for an intent command. Mirrors
+ * the Prisma adapter's module-local helper so transition
+ * semantics are identical in unit tests and the real database.
+ *
+ * Returns one of three shapes:
+ *
+ *   - `{ kind: "no-op" }` when the chosen set is already a
+ *     subset of the persisted set (idempotent success).
+ *   - `{ kind: "write", addition }` when persisted `existing`
+ *     matches `expected` and the command writes `chosen −
+ *     existing` rows.
+ *   - `{ kind: "conflict", existing, expected, fresh }` when
+ *     persisted `existing` differs from `expected`; the
+ *     transaction rolls back.
+ */
+type IntentTransition =
+  | { readonly kind: "no-op" }
+  | {
+      readonly kind: "write";
+      readonly addition: readonly MarketplaceCapabilityV1[];
+    }
+  | {
+      readonly kind: "conflict";
+      readonly existing: readonly MarketplaceCapabilityV1[];
+      readonly expected: readonly MarketplaceCapabilityV1[];
+    };
+
+function deriveIntentTransition(input: {
+  readonly existing: readonly MarketplaceCapabilityV1[];
+  readonly chosen: readonly MarketplaceCapabilityV1[];
+  readonly expected: readonly MarketplaceCapabilityV1[];
+}): IntentTransition {
+  const existing = [...input.existing].sort();
+  const chosen = [...input.chosen].sort();
+  const expected = [...input.expected].sort();
+
+  if (isSubset(chosen, existing)) {
+    return { kind: "no-op" };
+  }
+
+  if (!arrayEqual(existing, expected)) {
+    return { kind: "conflict", existing, expected };
+  }
+
+  const addition = chosen.filter((capability) => !existing.includes(capability));
+  return { kind: "write", addition };
+}
+
+function isSubset(
+  candidate: readonly MarketplaceCapabilityV1[],
+  container: readonly MarketplaceCapabilityV1[],
+): boolean {
+  for (const value of candidate) {
+    if (!container.includes(value)) return false;
+  }
+  return true;
+}
+
+function arrayEqual(
+  a: readonly MarketplaceCapabilityV1[],
+  b: readonly MarketplaceCapabilityV1[],
+): boolean {
+  if (a.length !== b.length) return false;
+  for (let i = 0; i < a.length; i += 1) {
+    if (a[i] !== b[i]) return false;
+  }
+  return true;
 }

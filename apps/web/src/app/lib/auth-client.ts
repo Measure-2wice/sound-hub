@@ -24,9 +24,12 @@ import type {
   Bg1SessionInfoV1,
   Bg1VerifyTokenRequestV1,
   Bg1VerifyTokenResponseV1,
+  IntentRequestV1,
+  IntentResponseV1,
+  MarketplaceCapabilityV1,
 } from "@soundhub/types";
 
-export type { Bg1VerifyTokenResponseV1 };
+export type { Bg1VerifyTokenResponseV1, IntentResponseV1 };
 
 /**
  * M2 (#82): server-derived recovery state. The convergence service
@@ -45,6 +48,8 @@ import {
   bg1MagicLinkResponseV1Schema,
   bg1SessionInfoV1Schema,
   bg1VerifyTokenResponseV1Schema,
+  intentRequestV1Schema,
+  intentResponseV1Schema,
 } from "@soundhub/types";
 
 export interface AuthClientError {
@@ -52,6 +57,13 @@ export interface AuthClientError {
   readonly code: string;
   readonly message: string;
   readonly requestId: string | null;
+  /**
+   * INTENT_CONFLICT surfaces the FRESH persisted capability set
+   * on `error.freshCapabilities` so the UI can render an
+   * actionable recovery affordance. Absent on every other
+   * envelope.
+   */
+  readonly freshCapabilities: readonly MarketplaceCapabilityV1[] | null;
 }
 
 async function parseErrorResponse(response: Response): Promise<AuthClientError> {
@@ -68,6 +80,7 @@ async function parseErrorResponse(response: Response): Promise<AuthClientError> 
       code?: string;
       message?: string;
       requestId?: string;
+      freshCapabilities?: readonly MarketplaceCapabilityV1[];
     };
   } | null;
   return {
@@ -75,6 +88,7 @@ async function parseErrorResponse(response: Response): Promise<AuthClientError> 
     code: candidate?.error?.code ?? "AUTH_FAILED",
     message: candidate?.error?.message ?? "Authentication request failed.",
     requestId: candidate?.error?.requestId ?? null,
+    freshCapabilities: candidate?.error?.freshCapabilities ?? null,
   };
 }
 
@@ -165,14 +179,83 @@ export async function signOut(): Promise<void> {
   }
 }
 
-export async function selectActingWorkspace(input: { actingWorkspaceId: string }): Promise<void> {
+export async function selectActingWorkspace(input: {
+  actingWorkspaceId: string;
+  /**
+   * Optional raw cross-Workspace continuation captured by the
+   * switch interstitial. Forwarded verbatim into the request
+   * body; the server revalidates and resolves it under the
+   * post-commit acting Workspace context
+   * (`resolvePostCommandReturnDestination`). `null` / omitted
+   * leaves the server's `safeReturnTo` at `null` and the
+   * browser falls back to `/dashboard`.
+   */
+  returnTo?: string | null;
+}): Promise<{ readonly safeReturnTo: string | null }> {
+  const body: { actingWorkspaceId: string; returnTo?: string } = {
+    actingWorkspaceId: input.actingWorkspaceId,
+  };
+  if (input.returnTo !== null && input.returnTo !== undefined) {
+    body.returnTo = input.returnTo;
+  }
   const response = await fetch("/api/auth/acting-workspace", {
     method: "POST",
     headers: { "Content-Type": "application/json" },
     credentials: "include",
-    body: JSON.stringify(input),
+    body: JSON.stringify(body),
   });
   if (!response.ok) {
     throw ensureError(null, await parseErrorResponse(response));
   }
+  const raw: unknown = await response.json();
+  // The server-resolved `safeReturnTo` represents CONTEXTUAL
+  // authorization — the destination is reachable from the FRESH
+  // post-commit acting Workspace. The browser consumes ONLY
+  // this value; the raw `?return=` query parameter is never
+  // honored client-side after a successful commit.
+  const responseBody = raw as { safeReturnTo?: unknown };
+  return {
+    safeReturnTo:
+      typeof responseBody.safeReturnTo === "string" && responseBody.safeReturnTo.length > 0
+        ? responseBody.safeReturnTo
+        : null,
+  };
+}
+
+/**
+ * M2 (#83): submit the user's intent choice (`Hire talent`,
+ * `Offer services`, `Both`) to the server. The server validates
+ * the request body, revalidates current membership on the acting
+ * Workspace, and provisions the requested capability set. The
+ * server's response carries the updated public user payload and
+ * the validated `returnTo` (or `null`).
+ *
+ * The browser never reads raw query parameters to recover a return
+ * destination — the response's `returnTo` is the only authoritative
+ * value, validated by the existing internal-return validation rules.
+ *
+ * The intent surface carries no `sellerAcceptance` field — #83
+ * does NOT collect a generic Seller participation/terms acceptance
+ * at capability-provisioning time.
+ */
+export async function submitIntent(input: {
+  workspaceId: string;
+  intent: IntentRequestV1;
+}): Promise<IntentResponseV1> {
+  // The route layer validates the body against `intentRequestV1Schema`
+  // before the service runs; the client re-validates so a stale UI
+  // cannot produce a request that the server would reject. The
+  // schema is the executable contract on both sides.
+  const validated = intentRequestV1Schema.parse(input.intent);
+  const response = await fetch(`/api/workspaces/${encodeURIComponent(input.workspaceId)}/intent`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    credentials: "include",
+    body: JSON.stringify(validated),
+  });
+  if (!response.ok) {
+    throw ensureError(null, await parseErrorResponse(response));
+  }
+  const raw: unknown = await response.json();
+  return intentResponseV1Schema.parse(raw);
 }

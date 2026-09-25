@@ -483,6 +483,9 @@ describe("BG1 auth routes (in-memory, deterministic adapter)", () => {
     assert.equal(response.body.ok, true);
     assert.equal(response.body.actingWorkspace.workspaceId, BUYER_WORKSPACE_ID);
     assert.equal(response.body.membership.role, "Owner");
+    // P1-001: no `returnTo` carried → `safeReturnTo` is `null`
+    // and the browser falls back to `/dashboard`.
+    assert.equal(response.body.safeReturnTo, null);
   });
 
   test("POST /api/auth/acting-workspace rejects a non-member with NOT_A_MEMBER (GS 4 / GS 5)", async () => {
@@ -503,6 +506,109 @@ describe("BG1 auth routes (in-memory, deterministic adapter)", () => {
       .set("Content-Type", "application/json");
     assert.equal(response.status, 401);
     assert.equal(response.body.error.code, "SESSION_INVALID");
+  });
+
+  // ---------- P1-001 — `returnTo` continuation through /api/auth/acting-workspace ----------
+  //
+  // The switch interstitial forwards the validated `?return=`
+  // query into the acting-workspace request body; the route
+  // revalidates it against the FRESH post-commit user via
+  // `resolvePostCommandReturnDestination` and emits the bounded
+  // `safeReturnTo`. The browser consumes ONLY this value.
+
+  test("P1-001: POST /api/auth/acting-workspace with `returnTo: '/talent'` resolves safeReturnTo to '/talent' under Buyer-capable actor", async () => {
+    const cookie = await signIn(app, adapter, "buyer-route@example.com");
+    const response = await request(app)
+      .post("/api/auth/acting-workspace")
+      .send({ actingWorkspaceId: BUYER_WORKSPACE_ID, returnTo: "/talent" })
+      .set("Cookie", cookie)
+      .set("Content-Type", "application/json");
+    assert.equal(response.status, 200);
+    assert.equal(response.body.safeReturnTo, "/talent");
+  });
+
+  test("P1-001: POST /api/auth/acting-workspace with capability-gated `/deals` keeps the destination (Buyer actor)", async () => {
+    const cookie = await signIn(app, adapter, "buyer-route@example.com");
+    const response = await request(app)
+      .post("/api/auth/acting-workspace")
+      .send({ actingWorkspaceId: BUYER_WORKSPACE_ID, returnTo: "/deals" })
+      .set("Cookie", cookie)
+      .set("Content-Type", "application/json");
+    assert.equal(response.status, 200);
+    assert.equal(response.body.safeReturnTo, "/deals");
+  });
+
+  // P1-001: Deals are a party destination for both Buyer and
+  // Seller Workspaces. A Seller-only actor returning to `/deals`
+  // must resume the valid continuation; the resolver MUST NOT
+  // silently drop the request to the dashboard fallback.
+  test("P1-001: POST /api/auth/acting-workspace with capability-gated `/deals` keeps the destination (Seller-only actor)", async () => {
+    const cookie = await signIn(app, adapter, "seller-route@example.com");
+    const response = await request(app)
+      .post("/api/auth/acting-workspace")
+      .send({ actingWorkspaceId: SELLER_WORKSPACE_ID, returnTo: "/deals" })
+      .set("Cookie", cookie)
+      .set("Content-Type", "application/json");
+    assert.equal(response.status, 200);
+    assert.equal(response.body.safeReturnTo, "/deals");
+  });
+
+  test("P1-001: POST /api/auth/acting-workspace with capability-gated `/seller-requests` falls back to null (Buyer-only actor)", async () => {
+    const cookie = await signIn(app, adapter, "buyer-route@example.com");
+    const response = await request(app)
+      .post("/api/auth/acting-workspace")
+      .send({ actingWorkspaceId: BUYER_WORKSPACE_ID, returnTo: "/seller-requests" })
+      .set("Cookie", cookie)
+      .set("Content-Type", "application/json");
+    assert.equal(response.status, 200);
+    // The route must NOT admit a destination the post-commit actor
+    // cannot reach; the browser falls back to `/dashboard`.
+    assert.equal(response.body.safeReturnTo, null);
+  });
+
+  test("P1-001: POST /api/auth/acting-workspace with malformed `returnTo` (external origin) returns safeReturnTo: null", async () => {
+    const cookie = await signIn(app, adapter, "buyer-route@example.com");
+    const response = await request(app)
+      .post("/api/auth/acting-workspace")
+      .send({ actingWorkspaceId: BUYER_WORKSPACE_ID, returnTo: "https://evil.example/x" })
+      .set("Cookie", cookie)
+      .set("Content-Type", "application/json");
+    assert.equal(response.status, 200);
+    assert.equal(response.body.safeReturnTo, null);
+  });
+
+  test("P1-001: POST /api/auth/acting-workspace with action-endpoint `returnTo` returns safeReturnTo: null", async () => {
+    const cookie = await signIn(app, adapter, "buyer-route@example.com");
+    const response = await request(app)
+      .post("/api/auth/acting-workspace")
+      .send({ actingWorkspaceId: BUYER_WORKSPACE_ID, returnTo: "/api/auth/sign-out" })
+      .set("Cookie", cookie)
+      .set("Content-Type", "application/json");
+    assert.equal(response.status, 200);
+    assert.equal(response.body.safeReturnTo, null);
+  });
+
+  test("P1-001: POST /api/auth/acting-workspace with unknown-route `returnTo` returns safeReturnTo: null", async () => {
+    const cookie = await signIn(app, adapter, "buyer-route@example.com");
+    const response = await request(app)
+      .post("/api/auth/acting-workspace")
+      .send({ actingWorkspaceId: BUYER_WORKSPACE_ID, returnTo: "/this/is/not/bounded" })
+      .set("Cookie", cookie)
+      .set("Content-Type", "application/json");
+    assert.equal(response.status, 200);
+    assert.equal(response.body.safeReturnTo, null);
+  });
+
+  test("P1-001: POST /api/auth/acting-workspace rejects oversized `returnTo` with INVALID_AUTH_REQUEST", async () => {
+    const cookie = await signIn(app, adapter, "buyer-route@example.com");
+    const oversizedReturnTo = "/" + "x".repeat(300);
+    const response = await request(app)
+      .post("/api/auth/acting-workspace")
+      .send({ actingWorkspaceId: BUYER_WORKSPACE_ID, returnTo: oversizedReturnTo })
+      .set("Cookie", cookie)
+      .set("Content-Type", "application/json");
+    assert.equal(response.status, 400);
+    assert.equal(response.body.error.code, "INVALID_AUTH_REQUEST");
   });
 
   test("POST /api/auth/sign-out revokes the session and clears the cookie", async () => {
@@ -685,6 +791,116 @@ describe("BG1 auth routes (in-memory, deterministic adapter)", () => {
     const stillAlive = await request(explodingApp).get("/api/auth/me");
     assert.equal(stillAlive.status, 500);
     assert.ok(stillAlive.body.error);
+  });
+
+  // ---------- Tenki PR #95 medium finding: request-id correlation invariants ----------
+  //
+  // The application-boundary middleware in `apps/api/src/index.ts`
+  // is the canonical writer of `req.requestId` (sanitized via
+  // the shared `[A-Za-z0-9._-]{1,128}` allow-list). The auth
+  // route handlers now consume that value via `getRequestId(req)`
+  // — they MUST NOT re-sanitize the raw `x-request-id` header
+  // against any local length-only policy (which would silently
+  // bypass the boundary sanitizer and let an attacker-supplied
+  // `%s` reach a `console.error` first argument).
+  //
+  // These three tests pin the correlation invariants across the
+  // auth route end-to-end.
+
+  test("Tenki medium: a normal request id remains correlated end-to-end on the success path", async () => {
+    // The boundary middleware accepts the UUID; the auth
+    // handler reads it from `req.requestId`; the response
+    // header carries the canonical inbound id.
+    //
+    // NOTE: on the magic-link SUCCESS path, the response body's
+    // `requestId` is intentionally distinct — it is the
+    // authentication service's correlation id for the dev
+    // verification URL, not the inbound HTTP request id (per
+    // P0-001 / P2-001 — see the existing test on line 115).
+    // The error-path correlation invariant is asserted in the
+    // dedicated test below.
+    const safe = "550e8400-e29b-41d4-a716-446655440000";
+    const response = await request(app)
+      .post("/api/auth/magic-link")
+      .send({ email: "buyer-route@example.com" })
+      .set("Content-Type", "application/json")
+      .set("x-request-id", safe);
+    assert.equal(response.status, 200);
+    assert.equal(
+      response.headers["x-request-id"],
+      safe,
+      "a UUID-shaped x-request-id MUST round-trip through the boundary sanitizer unchanged",
+    );
+  });
+
+  test("Tenki medium: an invalid/raw incoming request id cannot bypass the canonical sanitized value", async () => {
+    // The boundary middleware's allow-list rejects anything
+    // outside `[A-Za-z0-9._-]{1,128}`. The auth handler MUST
+    // consume the boundary-canonicalized value via
+    // `getRequestId(req)` — re-sanitizing the raw header
+    // against a length-only policy would let `%s` reach the
+    // `console.error` first argument as a format specifier
+    // (the CodeQL hardening round closed the same risk on
+    // `intent.ts`; auth had the same shape and must inherit
+    // the same defense).
+    //
+    // The success envelope's `requestId` is the auth-service
+    // correlation (see comment on the previous test), so the
+    // correlation invariant is asserted on the response HEADER
+    // only — the unsafe inbound value MUST NOT survive the
+    // boundary sanitizer into the response.
+    const malicious = "evil%s-injection";
+    const response = await request(app)
+      .post("/api/auth/magic-link")
+      .send({ email: "buyer-route@example.com" })
+      .set("Content-Type", "application/json")
+      .set("x-request-id", malicious);
+    assert.equal(response.status, 200);
+    const header = response.headers["x-request-id"];
+    assert.ok(typeof header === "string");
+    assert.notEqual(
+      header,
+      malicious,
+      "an x-request-id containing the util.format '%s' specifier MUST NOT pass through the boundary sanitizer",
+    );
+    assert.match(
+      header,
+      /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i,
+      "the canonicalized request id MUST be a freshly generated UUID when the inbound header is unsafe",
+    );
+  });
+
+  test("Tenki medium: response x-request-id and error-envelope requestId use the same canonical id on the error path", async () => {
+    // Force an error path: malformed JSON triggers
+    // INVALID_AUTH_REQUEST (a safe-error envelope). The
+    // canonical reader MUST emit the same id on the response
+    // header and on the envelope body so callers can correlate
+    // logs.
+    const unsafe = "evil o"; // whitespace — outside the allow-list
+    const response = await request(app)
+      .post("/api/auth/magic-link")
+      .set("Content-Type", "application/json")
+      .send("not-valid-json-at-all")
+      .set("x-request-id", unsafe);
+    assert.equal(response.status, 400);
+    assert.equal(
+      response.body.error?.code,
+      "INVALID_AUTH_REQUEST",
+      "the auth route MUST surface INVALID_AUTH_REQUEST for malformed JSON",
+    );
+    const header = response.headers["x-request-id"];
+    assert.ok(typeof header === "string");
+    assert.notEqual(
+      header,
+      unsafe,
+      "the boundary sanitizer MUST reject the unsafe x-request-id even on the error path",
+    );
+    assert.match(header, /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i);
+    assert.equal(
+      response.body.error?.requestId,
+      header,
+      "the error envelope's requestId MUST equal the response header (correlation invariant on the error path)",
+    );
   });
 });
 
@@ -1041,6 +1257,132 @@ describe("BG1 /api/auth/me is strictly read-only (Tenki PR #91, in-memory)", () 
     assert.equal(afterB.ownerPersonalMemberships.length, 1);
     assert.equal(afterA.coOwnedPersonalWorkspaceIds.has(CO_OWNED_WORKSPACE_ID), true);
     assert.equal(afterB.coOwnedPersonalWorkspaceIds.has(CO_OWNED_WORKSPACE_ID), true);
+  });
+});
+
+// ---------- P1-001 — cross-Workspace `returnTo` resolves through /workspace/switch ----------
+//
+// The bounded post-command destination resolver routes
+// cross-Workspace destinations through `/workspace/switch?target=<id>`
+// so a customer landing on a destination owned by a Workspace
+// they are no longer acting as must first pass the explicit
+// switch interstitial.
+describe("BG1 auth routes — cross-Workspace returnTo (P1-001)", () => {
+  const CROSS_USER_ID = "user-cross-ws";
+  const PERSONAL_ID = "ws-cross-personal";
+  const ORG_ID = "ws-cross-org";
+  const adapter = new DeterministicIdentityAdapter({ allowDevVerificationUrl: true });
+  const crossSubject = deterministicSubjectFor("cross-ws@example.com");
+  const authRepo = new InMemoryAuthRepository([
+    {
+      userAccountId: CROSS_USER_ID,
+      email: "cross-ws@example.com",
+      identityProvider: "deterministic",
+      identitySubject: crossSubject,
+      memberships: [
+        {
+          workspaceId: PERSONAL_ID,
+          slug: "cross-personal",
+          name: "Cross Personal",
+          workspaceType: "Personal",
+          workspaceStatus: "Active",
+          role: "Owner",
+          capabilities: ["Buyer"],
+        },
+        {
+          workspaceId: ORG_ID,
+          slug: "cross-org",
+          name: "Cross Org",
+          workspaceType: "Organization",
+          workspaceStatus: "Active",
+          role: "Member",
+          capabilities: ["Buyer"],
+        },
+      ],
+    },
+  ]);
+  const authenticationService = new AuthenticationService({
+    identityAdapter: adapter,
+    authRepository: authRepo,
+    personalWorkspaceConvergenceService: new PersonalWorkspaceConvergenceService({
+      authRepository: authRepo,
+    }),
+  });
+  const workspaceAuthorizationService = new WorkspaceAuthorizationService({
+    authRepository: authRepo,
+  });
+  const stubPrisma = new Proxy({} as never, {
+    get() {
+      throw new Error(
+        "Prisma client was invoked; the route tests must use the in-memory auth repository.",
+      );
+    },
+  });
+
+  let app: import("express").Application;
+  beforeEach(() => {
+    app = buildApp({
+      authenticationService,
+      workspaceAuthorizationService,
+      authRepository: authRepo,
+      identityAdapter: adapter,
+      prismaClient: stubPrisma,
+    }).app;
+  });
+
+  test("P1-001: switch from Personal→Org with returnTo '/talent?workspace=<other>' routes through /workspace/switch?target=<other> with the original returnTo preserved", async () => {
+    const cookie = await signIn(app, adapter, "cross-ws@example.com");
+    const response = await request(app)
+      .post("/api/auth/acting-workspace")
+      .send({
+        actingWorkspaceId: ORG_ID,
+        returnTo: `/talent?workspace=${PERSONAL_ID}`,
+      })
+      .set("Cookie", cookie)
+      .set("Content-Type", "application/json");
+    assert.equal(response.status, 200);
+    // The Workspace the customer just committed to (ORG_ID) is
+    // NOT the one named in `?workspace=<PERSONAL_ID>`; the
+    // resolver routes the destination through the switch
+    // interstitial so the explicit confirmation happens first.
+    // The ORIGINAL `returnTo` is URL-encoded into the switch
+    // path's `?return=` parameter so the post-switch server can
+    // re-resolve the continuation under the FRESH actor (now
+    // PERSONAL_ID). The resolver trips the cross-Workspace
+    // branch again because ORG_ID named PERSONAL_ID, but this
+    // time the actingWorkspaceId passed into the second pass is
+    // PERSONAL_ID — the continuation is now reachable under the
+    // committed actor.
+    const safePath: string = response.body.safeReturnTo;
+    assert.ok(
+      safePath.startsWith(`/workspace/switch?target=${encodeURIComponent(PERSONAL_ID)}&return=`),
+      `expected safeReturnTo to begin with the cross-Workspace switch path (got ${safePath})`,
+    );
+    // The encoded `return` value MUST round-trip back to the
+    // original `/talent?workspace=<PERSONAL_ID>` path.
+    const parsed = new URLSearchParams(safePath.slice(safePath.indexOf("?") + 1));
+    assert.equal(
+      decodeURIComponent(parsed.get("return") ?? ""),
+      `/talent?workspace=${PERSONAL_ID}`,
+    );
+  });
+
+  test("P1-001: switch from Personal→Org with same-Workspace `?workspace=` keeps the bounded destination", async () => {
+    const cookie = await signIn(app, adapter, "cross-ws@example.com");
+    const response = await request(app)
+      .post("/api/auth/acting-workspace")
+      .send({
+        actingWorkspaceId: ORG_ID,
+        returnTo: `/deals?workspace=${ORG_ID}`,
+      })
+      .set("Cookie", cookie)
+      .set("Content-Type", "application/json");
+    assert.equal(response.status, 200);
+    // Same-Workspace destinations are stripped of the workspaceId
+    // query (the bounded route is the only path the browser
+    // receives) and pass through the capability gate (Buyer present
+    // → `/deals` is reachable).
+    assert.equal(response.body.safeReturnTo, "/deals");
   });
 });
 

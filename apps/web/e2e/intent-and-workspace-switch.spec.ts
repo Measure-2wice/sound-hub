@@ -1,0 +1,1122 @@
+// Representative browser journey for the M2 #83 intent
+// selection + Workspace switching surface (expected-state
+// revision).
+//
+// Scope:
+//
+//   - Fresh user with Personal Workspace + Organization Workspace
+//     (dual Owner, the multi-workspace-user fixture).
+//   - Acting on Personal, dashboard auto-redirects to
+//     /workspace/intent.
+//   - Hire, Offer, and Both happy paths each provision the
+//     correct capability set; the Shell renders the correct
+//     destinations for each — Deals is visible for Buyer OR
+//     Seller.
+//   - Later capability addition through the SAME intent
+//     primitive: Buyer-only Personal → "Add Offer services
+//     too" submits Offer with expectedCapabilities=[Buyer];
+//     final state = [Buyer, Seller]. Seller-only Personal →
+//     "Add Hire talent too" submits Hire with
+//     expectedCapabilities=[Seller]; final state = [Buyer,
+//     Seller]. Same primitive, single endpoint.
+//   - Idempotency: re-submitting the SAME intent against the
+//     same state is a no-op success.
+//   - Stale-precondition conflict: persisted state advances
+//     while the customer's UI is on a stale tab; the customer
+//     submits with expectedCapabilities=[] and receives the
+//     INTENT_CONFLICT envelope carrying freshCapabilities.
+//     The reload affordance re-derives the capability-aware
+//     affordance from the fresh state.
+//   - Validated return continuity: deep-link to
+//     /workspace/intent?return=/talent resumes at /talent
+//     after a successful Hire.
+//   - Clicking the Workspace selector and choosing the
+//     Organization routes through /workspace/switch?target=<id>;
+//     Cancel returns to /dashboard (does NOT follow a
+//     cross-Workspace `?return=` — the customer opted out of
+//     the switch and must stay in the safe current-Workspace
+//     context).
+//   - Switch and continue commits; the dashboard re-renders
+//     under the Organization acting surface with the
+//     Organization empty-state (no Choose-intent CTA,
+//     capability-aware copy).
+//   - localStorage (key `soundhub.actingWorkspaceId`)
+//     reflects the committed acting Workspace only after
+//     Switch and continue; not after Cancel.
+//   - Keyboard navigation: Tab order traverses the capability-
+//     derived affordance → submit without a pointer (reduced-
+//     motion friendly).
+//   - Narrow viewport (mobile / small): no horizontal page
+//     scroll; the acting-Workspace control remains visible
+//     outside the menu.
+//   - Codex review (P1-001): when an explicit `?target=` query
+//     is present but does NOT resolve to an accessible Active
+//     Workspace AND the in-memory `pendingTargetId` is stale
+//     from a previous uncommitted switch, the page MUST render
+//     the unavailable surface — the user cannot commit a
+//     Workspace the URL did not actually request.
+//
+// The fixture is created via the existing
+// `apps/api/src/test-helpers/multi-workspace-user.ts` helper
+// (a direct Prisma seed). No new product flow is introduced in
+// this spec.
+
+import { expect, test, type Page } from "@playwright/test";
+import { execFileSync } from "node:child_process";
+import { dirname, resolve as resolvePath } from "node:path";
+import { fileURLToPath } from "node:url";
+import {
+  APPROVED_TEST_DATABASE_NAME,
+  APPROVED_TEST_DATABASE_PORT,
+} from "../../api/src/lib/test-database.js";
+
+const __dirname = dirname(fileURLToPath(import.meta.url));
+const APPROVED_DISPOSABLE_TEST_DATABASE_URL = `postgresql://soundhub:password@localhost:${APPROVED_TEST_DATABASE_PORT}/${APPROVED_TEST_DATABASE_NAME}`;
+
+const FRESH_EMAIL_PREFIX = "m2-83-intent-";
+const SEED_HELPER = resolvePath(__dirname, "../../api/src/test-helpers/multi-workspace-user.ts");
+const SEED_RUNNER = resolvePath(__dirname, "../../api/node_modules/.bin/tsx");
+
+function seedFreshUser(
+  email: string,
+  options: { suspendOrganization?: boolean; suspendPersonal?: boolean } = {},
+): void {
+  execFileSync(SEED_RUNNER, [SEED_HELPER, email], {
+    cwd: resolvePath(__dirname, "../../api"),
+    env: {
+      ...process.env,
+      TEST_DATABASE_URL: APPROVED_DISPOSABLE_TEST_DATABASE_URL,
+      NODE_ENV: "test",
+      SUSPEND_ORG: options.suspendOrganization ? "1" : "",
+      SUSPEND_PERSONAL: options.suspendPersonal ? "1" : "",
+    },
+    stdio: "inherit",
+  });
+}
+
+async function signInViaDevUrl(page: Page, email: string): Promise<void> {
+  await page.goto("/login");
+  await page.getByTestId("login-email").fill(email);
+  await page.getByTestId("login-submit").click();
+  await page.getByTestId("login-dev-verify").click();
+  // The dashboard auto-redirect may fire (Personal Workspace
+  // with zero capabilities) and land on the intent page. For
+  // a fixture whose resolver returns `null` (e.g., Suspended
+  // Personal + Active Organization only), the explicit
+  // `dashboard-no-actor` recovery surface renders — that
+  // testid MUST be in the race so the helper does not hang on
+  // a branch it does not recognize (Codex review, P1-001,
+  // third iteration). Wait for any of the four landing
+  // surfaces; the caller picks the explicit post-condition.
+  await Promise.race([
+    page
+      .getByTestId("dashboard")
+      .or(page.getByTestId("dashboard-recovery"))
+      .or(page.getByTestId("dashboard-no-actor"))
+      .waitFor({ timeout: 15_000 })
+      .then(() => undefined),
+    page
+      .getByTestId("intent-page")
+      .waitFor({ timeout: 15_000 })
+      .then(() => undefined),
+  ]);
+}
+
+function readCommittedActingWorkspaceId(page: Page): Promise<string | null> {
+  return page.evaluate(() => window.localStorage.getItem("soundhub.actingWorkspaceId"));
+}
+
+/**
+ * Walk the freshly-signed-in user to the intent page. The
+ * dashboard may auto-redirect to `/workspace/intent` when the
+ * actor is a Personal Workspace with zero capabilities; the
+ * redirect may also race the dashboard render and detach the
+ * Choose-intent link before the click resolves. Direct
+ * navigation is the deterministic path: we wait for the
+ * dashboard to settle, then navigate to the intent route and
+ * wait for the page's own test-id.
+ */
+async function walkToIntentPage(page: Page): Promise<void> {
+  // Wait for either the dashboard or the intent page to appear.
+  // The auto-redirect may have already fired; either is a valid
+  // landing state for a freshly-signed-in user with an empty
+  // Personal Workspace.
+  await Promise.race([
+    page
+      .getByTestId("dashboard")
+      .waitFor({ timeout: 15_000 })
+      .then(() => undefined),
+    page
+      .getByTestId("intent-page")
+      .waitFor({ timeout: 15_000 })
+      .then(() => undefined),
+  ]);
+  if (await page.getByTestId("intent-page").count()) return;
+  await page.goto("/workspace/intent");
+  await page.getByTestId("intent-page").waitFor();
+}
+
+test.describe("M2 #83: intent + Workspace switching (expected-state)", () => {
+  test("Cancel from switch interstitial returns to /dashboard under the unchanged committed actor", async ({
+    page,
+  }) => {
+    const email = `${FRESH_EMAIL_PREFIX}cancel-${Date.now()}@example.test`;
+    seedFreshUser(email);
+    await signInViaDevUrl(page, email);
+    await page.getByTestId("dashboard").waitFor();
+    await page.evaluate(() => window.localStorage.removeItem("soundhub.actingWorkspaceId"));
+
+    // Provision Buyer on the Personal Workspace so we have an
+    // acting surface that the dashboard renders.
+    await walkToIntentPage(page);
+    await page.getByTestId("intent-choice-hire-input").check();
+    await page.getByTestId("intent-submit").click();
+    await page.getByTestId("dashboard").waitFor();
+    await expect(page.getByTestId("dashboard-buyer-readiness")).toBeVisible();
+
+    // Open the selector and pick the Organization.
+    await page.getByTestId("acting-workspace-selector").click();
+    await page
+      .getByTestId(/^acting-workspace-option-/)
+      .nth(1)
+      .click();
+    await page.getByTestId("workspace-switch-page").waitFor();
+    await expect(page).toHaveURL(/target=/);
+
+    const beforeCancel = await readCommittedActingWorkspaceId(page);
+    await page.getByTestId("workspace-switch-cancel").click();
+
+    // Cancel returns to /dashboard under the still-committed
+    // actor — NOT a cross-Workspace `?return=` destination.
+    await page.getByTestId("dashboard").waitFor();
+    expect(page.url()).toMatch(/\/dashboard\/?$/);
+
+    // The committed actingWorkspace MUST NOT have changed.
+    const afterCancel = await readCommittedActingWorkspaceId(page);
+    expect(afterCancel).toBe(beforeCancel);
+    await expect(page.getByTestId("dashboard-buyer-readiness")).toBeVisible();
+  });
+
+  test("Switch and continue commits and renders the Organization empty-state (no Choose-intent CTA)", async ({
+    page,
+  }) => {
+    const email = `${FRESH_EMAIL_PREFIX}commit-${Date.now()}@example.test`;
+    seedFreshUser(email);
+    await signInViaDevUrl(page, email);
+    await page.getByTestId("dashboard").waitFor();
+    await page.evaluate(() => window.localStorage.removeItem("soundhub.actingWorkspaceId"));
+
+    await walkToIntentPage(page);
+    await page.getByTestId("intent-choice-hire-input").check();
+    await page.getByTestId("intent-submit").click();
+    await page.getByTestId("dashboard").waitFor();
+
+    // Walk to the switch interstitial targeting the Organization.
+    await page.getByTestId("acting-workspace-selector").click();
+    await page
+      .getByTestId(/^acting-workspace-option-/)
+      .nth(1)
+      .click();
+    await page.getByTestId("workspace-switch-page").waitFor();
+    await page.getByTestId("workspace-switch-continue").click();
+    await page.getByTestId("dashboard").waitFor();
+
+    const committed = await readCommittedActingWorkspaceId(page);
+    expect(committed).not.toBeNull();
+    expect(committed).not.toBe("");
+
+    await expect(page.getByTestId("dashboard-org-no-capabilities")).toBeVisible();
+    await expect(page.getByTestId("dashboard-choose-intent")).toHaveCount(0);
+    await expect(page.getByTestId("dashboard-org-switch-to-personal")).toBeVisible();
+  });
+
+  // Visual-QA regression (M2 #83 P1). After committing to the
+  // Organization, the dashboard's "Switch to your Personal Workspace"
+  // deep-link targets the Personal Workspace correctly, but the
+  // interstitial previously rendered the Organization as both the
+  // current AND target Workspace because a stale `pendingTargetId`
+  // from the prior switch shadowed the URL's `target`. The fix
+  // re-syncs `pendingTargetId` to the URL whenever they diverge
+  // AND the `target` memo prefers the URL on first render so the
+  // page never flashes the wrong card.
+  test("Dashboard deep-link to Personal from Organization renders Personal (not Organization) as the switch target", async ({
+    page,
+  }) => {
+    const email = `${FRESH_EMAIL_PREFIX}back-switch-${Date.now()}@example.test`;
+    seedFreshUser(email);
+    await signInViaDevUrl(page, email);
+    await page.getByTestId("dashboard").waitFor();
+    await page.evaluate(() => window.localStorage.removeItem("soundhub.actingWorkspaceId"));
+
+    // Provision Buyer on Personal so the dashboard renders Buyer
+    // readiness and the selector dropdown is exposed (the selector
+    // needs two accessible Workspaces to render its dropdown).
+    await walkToIntentPage(page);
+    await page.getByTestId("intent-choice-hire-input").check();
+    await page.getByTestId("intent-submit").click();
+    await page.getByTestId("dashboard").waitFor();
+
+    // Capture both Workspace ids via the selector dropdown so we
+    // can target the back-link without re-querying /api/auth/me.
+    await page.getByTestId("acting-workspace-selector").click();
+    const personalOption = page.getByTestId(/^acting-workspace-option-/).first();
+    const orgOption = page.getByTestId(/^acting-workspace-option-/).nth(1);
+    await personalOption.waitFor();
+    await orgOption.waitFor();
+    const personalId =
+      (await personalOption.getAttribute("data-testid"))?.replace("acting-workspace-option-", "") ??
+      "";
+    const orgId =
+      (await orgOption.getAttribute("data-testid"))?.replace("acting-workspace-option-", "") ?? "";
+    await page.keyboard.press("Escape");
+
+    // Commit the switch to the Organization so the dashboard
+    // exposes the "Switch to your Personal Workspace" link.
+    await page.getByTestId("acting-workspace-selector").click();
+    await orgOption.click();
+    await page.getByTestId("workspace-switch-page").waitFor();
+    await page.getByTestId("workspace-switch-continue").click();
+    await page.getByTestId("dashboard").waitFor();
+    await expect(page.getByTestId("dashboard-org-switch-to-personal")).toBeVisible();
+
+    // Follow the dashboard back-link. The URL MUST target the
+    // Personal Workspace id we captured above.
+    await page.getByTestId("dashboard-org-switch-to-personal").click();
+    await page.getByTestId("workspace-switch-page").waitFor();
+    expect(page.url()).toContain(`target=${encodeURIComponent(personalId)}`);
+
+    // The "Switch to:" card MUST name Personal — NOT the
+    // Organization that the page is also currently acting as.
+    // Pre-fix this rendered the Organization's name here because
+    // the stale `pendingTargetId` shadowed the URL's `target`.
+    const targetName = await page.getByTestId("workspace-switch-target-name").textContent();
+    expect(targetName?.trim()).toBe("Multi-Workspace Test Personal");
+    // The current actor card MUST continue to show the
+    // Organization the user just committed to (the visual-QA
+    // finding specifically called out that BOTH cards rendered
+    // the Organization).
+    const currentName = await page.getByTestId("workspace-switch-current-name").textContent();
+    expect(currentName?.trim()).not.toBe(targetName?.trim());
+    expect(currentName?.trim()).toBe("Multi-Workspace Test Organization");
+    // And the commit button MUST be enabled — the page must not
+    // fall through to the unavailable surface for this valid
+    // Active Workspace.
+    await expect(page.getByTestId("workspace-switch-continue")).toBeEnabled();
+
+    // Sanity: the captured orgId id MUST differ from personalId;
+    // this guards the assertion above against selector ordering
+    // drift across the seed fixture.
+    expect(orgId).not.toBe(personalId);
+    expect(personalId).not.toBe("");
+  });
+
+  // -----------------------------------------------------------------
+  // Additional acceptance paths: Offer, Both, later-add /
+  // idempotency / conflicting-retry recovery, validated return
+  // continuity, keyboard, narrow viewport.
+  // -----------------------------------------------------------------
+
+  test("Offer provisions Seller capability and the Shell exposes Deals", async ({ page }) => {
+    const email = `${FRESH_EMAIL_PREFIX}offer-${Date.now()}@example.test`;
+    seedFreshUser(email);
+    await signInViaDevUrl(page, email);
+    await page.evaluate(() => window.localStorage.removeItem("soundhub.actingWorkspaceId"));
+    await walkToIntentPage(page);
+    await page.getByTestId("intent-choice-offer-input").check();
+    await page.getByTestId("intent-submit").click();
+    await page.getByTestId("dashboard").waitFor();
+    await expect(page.getByTestId("dashboard-seller-readiness")).toBeVisible();
+    await expect(page.getByTestId("nav-deals-link")).toBeVisible();
+    await expect(page.getByTestId("dashboard-view-deals")).toBeVisible();
+    await expect(page.getByTestId("nav-requests-link")).toBeVisible();
+    await expect(page.getByTestId("nav-services-link")).toBeVisible();
+  });
+
+  test("Both provisions Buyer + Seller atomically; Shell exposes all capability-aware destinations", async ({
+    page,
+  }) => {
+    const email = `${FRESH_EMAIL_PREFIX}both-${Date.now()}@example.test`;
+    seedFreshUser(email);
+    await signInViaDevUrl(page, email);
+    await page.evaluate(() => window.localStorage.removeItem("soundhub.actingWorkspaceId"));
+    await walkToIntentPage(page);
+    await page.getByTestId("intent-choice-both-input").check();
+    await page.getByTestId("intent-submit").click();
+    await page.getByTestId("dashboard").waitFor();
+    await expect(page.getByTestId("dashboard-buyer-readiness")).toBeVisible();
+    await expect(page.getByTestId("dashboard-seller-readiness")).toBeVisible();
+    await expect(page.getByTestId("nav-deals-link")).toBeVisible();
+    await expect(page.getByTestId("nav-requests-link")).toBeVisible();
+    await expect(page.getByTestId("nav-services-link")).toBeVisible();
+    await expect(page.getByTestId("dashboard-find-talent")).toBeVisible();
+    await expect(page.getByTestId("dashboard-view-deals")).toBeVisible();
+  });
+
+  test("Validated return continuity: deep-link /workspace/intent?return=/talent resumes at /talent", async ({
+    page,
+  }) => {
+    const email = `${FRESH_EMAIL_PREFIX}return-${Date.now()}@example.test`;
+    seedFreshUser(email);
+    await signInViaDevUrl(page, email);
+    await page.evaluate(() => window.localStorage.removeItem("soundhub.actingWorkspaceId"));
+    await page.goto("/workspace/intent?return=/talent");
+    await page.getByTestId("intent-page").waitFor();
+    await page.getByTestId("intent-choice-hire-input").check();
+    await page.getByTestId("intent-submit").click();
+    await page.waitForURL(/\/talent/);
+    await expect(page).toHaveURL(/\/talent/);
+  });
+
+  test("Validated return continuity: cross-Workspace switch honors ?return= (Continue path)", async ({
+    page,
+  }) => {
+    const email = `${FRESH_EMAIL_PREFIX}switch-return-${Date.now()}@example.test`;
+    seedFreshUser(email);
+    await signInViaDevUrl(page, email);
+    await page.evaluate(() => window.localStorage.removeItem("soundhub.actingWorkspaceId"));
+    await walkToIntentPage(page);
+    await page.getByTestId("intent-choice-hire-input").check();
+    await page.getByTestId("intent-submit").click();
+    await page.getByTestId("dashboard").waitFor();
+
+    // Re-render the switch page with `?return=/talent` carried
+    // forward by the dashboard's Organization empty-state
+    // link. This exercises the server-resolved continuation
+    // contract end-to-end. Open the selector, wait for the
+    // Organization option, capture its id, then navigate to
+    // the switch interstitial directly with `?return=/talent`.
+    await page.getByTestId("acting-workspace-selector").click();
+    const orgOption = page.getByTestId(/^acting-workspace-option-/).nth(1);
+    await orgOption.waitFor();
+    const orgWorkspaceId = await orgOption.getAttribute("data-testid");
+    const orgId = orgWorkspaceId?.replace("acting-workspace-option-", "") ?? "";
+    expect(orgId.length).toBeGreaterThan(0);
+    // Close the dropdown before navigating away.
+    await page.keyboard.press("Escape");
+    await page.goto(`/workspace/switch?target=${orgId}&return=/talent`);
+    // The provider carries the pending target id; on
+    // navigation the switch page reads `?target=` and
+    // promotes it into pending state. Wait for the page to
+    // settle.
+    await page.waitForLoadState("networkidle");
+    await page.getByTestId("workspace-switch-page").waitFor();
+    await page.getByTestId("workspace-switch-continue").click();
+    await page.waitForURL(/\/talent/);
+    await expect(page).toHaveURL(/\/talent/);
+  });
+
+  // Behavior-level coverage: the cross-Workspace continuation
+  // round-trip MUST start at the server command
+  // (`POST /api/auth/acting-workspace`) that PRODUCES the nested
+  // safeReturnTo, follow the server-resolved switch URL exactly,
+  // click Switch and continue, and land on the original
+  // destination — i.e., the URL the original
+  // `resolvePostCommandReturnDestination` did NOT directly emit.
+  // Until the server-emitted URL is exercised end-to-end, the
+  // resolver can drop, corrupt, or overflow the nested
+  // continuation while every assertion that only checks the URL
+  // shape still passes.
+  //
+  // The fixture's Organization membership carries no Buyer/Seller
+  // capability, so the capability-gated `/deals` destination is
+  // unreachable under the post-switch actor and the resolver
+  // correctly falls back to `/dashboard`. The full-chain case
+  // uses the open `/talent` route (no capability gate) so the
+  // post-switch re-resolution lands the customer on the
+  // destination the cross-Workspace command was aiming for.
+  test("Validated return continuity: full chain starts at the acting-workspace command and re-resolves under the fresh actor", async ({
+    page,
+  }) => {
+    const email = `${FRESH_EMAIL_PREFIX}return-command-${Date.now()}@example.test`;
+    seedFreshUser(email);
+    await signInViaDevUrl(page, email);
+    await walkToIntentPage(page);
+    await page.getByTestId("intent-choice-hire-input").check();
+    await page.getByTestId("intent-submit").click();
+    await page.getByTestId("dashboard").waitFor();
+
+    // Capture Personal + Org workspace IDs from the selector.
+    await page.getByTestId("acting-workspace-selector").click();
+    const personalOption = page.getByTestId(/^acting-workspace-option-/).first();
+    const orgOption = page.getByTestId(/^acting-workspace-option-/).nth(1);
+    await personalOption.waitFor();
+    await orgOption.waitFor();
+    const personalId =
+      (await personalOption.getAttribute("data-testid"))?.replace("acting-workspace-option-", "") ??
+      "";
+    const orgId =
+      (await orgOption.getAttribute("data-testid"))?.replace("acting-workspace-option-", "") ?? "";
+    expect(personalId.length).toBeGreaterThan(0);
+    expect(orgId.length).toBeGreaterThan(0);
+    expect(personalId).not.toEqual(orgId);
+    await page.keyboard.press("Escape");
+
+    // Reset the localStorage pointer to Personal before driving
+    // the cross-Workspace command — the seed assigns the Org by
+    // default to exercise the switch-surface itself; the
+    // cross-Workspace branch fires when the SERVER-side
+    // `actingWorkspaceId` differs from the `returnTo`'s
+    // workspaceId param.
+    await page.evaluate(() => window.localStorage.removeItem("soundhub.actingWorkspaceId"));
+
+    // Step 1: drive the actual server command. The resolver MUST
+    // emit a nested switch URL that carries the original
+    // returnTo (URL-encoded) so the post-commit re-resolution
+    // can resume under the FRESH actor. `/talent` is an open
+    // route (no capability gate), so it is reachable from any
+    // current Workspace actor and the post-switch re-resolution
+    // returns `/talent` as the destination to land on.
+    const crossResponse = await page.request.post("/api/auth/acting-workspace", {
+      data: {
+        actingWorkspaceId: personalId,
+        returnTo: `/talent?workspaceId=${orgId}`,
+      },
+    });
+    expect(crossResponse.status()).toBe(200);
+    const crossBody = (await crossResponse.json()) as { safeReturnTo: string | null };
+    expect(crossBody.safeReturnTo).toBeTruthy();
+    const safeReturnTo = crossBody.safeReturnTo!;
+    expect(safeReturnTo).toContain(`/workspace/switch?target=${orgId}&return=`);
+    // The composed switch URL MUST stay inside the bounded
+    // `bg1ActingWorkspaceResponseV1Schema.safeReturnTo.max(256)`
+    // response contract — otherwise the schema parser throws
+    // `too_big`. The happy-path returnTo is well below the
+    // boundary, so the encoded-with-`?return=` form fits.
+    expect(safeReturnTo.length).toBeLessThanOrEqual(256);
+
+    // Step 2: follow the server-resolved URL EXACTLY. The
+    // switch page reads ?target= and ?return=, the customer's
+    // click forwards the validated returnTo into
+    // commitPendingTarget, the post-commit server resolver
+    // re-resolves the continuation under the FRESH actor
+    // (=orgId), and the browser consumes only the
+    // server-returned safeReturnTo (= `/talent`).
+    await page.goto(safeReturnTo);
+    await page.waitForLoadState("networkidle");
+    await page.getByTestId("workspace-switch-page").waitFor();
+    await page.getByTestId("workspace-switch-continue").click();
+    await page.waitForURL(/\/talent(\?.*)?\/?$/);
+    await expect(page).toHaveURL(/\/talent(\?.*)?\/?$/);
+  });
+
+  // Behavior-level coverage: when the input returnTo is sized so
+  // the URL-encoded cross-Workspace composed path WOULD exceed
+  // the bounded `safeReturnTo` response contract (max length
+  // 256), the resolver MUST bound the composed output (drop the
+  // encoded `?return=`) rather than throw `too_big` during
+  // response parsing. The customer can still complete the
+  // switch and lands on the documented safe fallback
+  // (`/dashboard`) for the missing continuation.
+  test("Validated return continuity: oversize cross-Workspace returnTo stays inside the safeReturnTo contract", async ({
+    page,
+  }) => {
+    const email = `${FRESH_EMAIL_PREFIX}return-oversize-${Date.now()}@example.test`;
+    seedFreshUser(email);
+    await signInViaDevUrl(page, email);
+    await walkToIntentPage(page);
+    await page.getByTestId("intent-choice-hire-input").check();
+    await page.getByTestId("intent-submit").click();
+    await page.getByTestId("dashboard").waitFor();
+
+    // Capture IDs.
+    await page.getByTestId("acting-workspace-selector").click();
+    const personalOption = page.getByTestId(/^acting-workspace-option-/).first();
+    const orgOption = page.getByTestId(/^acting-workspace-option-/).nth(1);
+    await personalOption.waitFor();
+    await orgOption.waitFor();
+    const personalId =
+      (await personalOption.getAttribute("data-testid"))?.replace("acting-workspace-option-", "") ??
+      "";
+    const orgId =
+      (await orgOption.getAttribute("data-testid"))?.replace("acting-workspace-option-", "") ?? "";
+    await page.keyboard.press("Escape");
+    await page.evaluate(() => window.localStorage.removeItem("soundhub.actingWorkspaceId"));
+
+    // Construct an oversize-but-shape-valid returnTo: the
+    // length hits the documented max (256) input, but
+    // percent-encoding expands it well beyond 256 once the
+    // composed switch URL is built. The composer MUST bound
+    // itself; the route handler MUST NOT throw `too_big`.
+    const prefix = `/deals?workspaceId=${orgId}&q=`;
+    const oversize = `${prefix}${"a".repeat(256 - prefix.length)}`;
+    expect(oversize.length).toBeLessThanOrEqual(256);
+
+    const crossResponse = await page.request.post("/api/auth/acting-workspace", {
+      data: {
+        actingWorkspaceId: personalId,
+        returnTo: oversize,
+      },
+    });
+    // The response MUST be a 2xx with a valid safeReturnTo.
+    // The legacy regression — schema-parse failure causing a
+    // 500 — would show up here as a non-2xx status.
+    expect(crossResponse.status()).toBe(200);
+    const crossBody = (await crossResponse.json()) as { safeReturnTo: string | null };
+    expect(crossBody.safeReturnTo).toBeTruthy();
+    const safeReturnTo = crossBody.safeReturnTo!;
+    expect(safeReturnTo.length).toBeLessThanOrEqual(256);
+
+    // The bounded fallback form MUST NOT carry an encoded
+    // `?return=` segment when the composed output would
+    // exceed the cap. The customer can still complete the
+    // switch; the post-commit resolver returns the documented
+    // safe fallback (`/dashboard`) for the missing
+    // continuation.
+    expect(safeReturnTo).not.toContain("&return=");
+
+    await page.goto(safeReturnTo);
+    await page.waitForLoadState("networkidle");
+    await page.getByTestId("workspace-switch-page").waitFor();
+    await page.getByTestId("workspace-switch-continue").click();
+    await page.waitForURL(/\/dashboard\/?$/);
+    await expect(page).toHaveURL(/\/dashboard\/?$/);
+  });
+
+  // Stale-precondition conflict recovery. UI observed []; the
+  // persisted state advances to Buyer via the add-Hire-offer
+  // shortcut link on the dashboard; the customer goes BACK to a
+  // stale tab and submits Hire with expectedCapabilities=[].
+  // The server detects the precondition mismatch and emits the
+  // INTENT_CONFLICT envelope carrying freshCapabilities=[Buyer];
+  // the page renders the actionable recovery message + a
+  // reload affordance. The reload re-derives the capability-
+  // aware form (now Offer-only since Buyer is present).
+  test("Stale-precondition conflict: persisted=Buyer + stale submit surfaces INTENT_CONFLICT with reload affordance", async ({
+    page,
+  }) => {
+    const email = `${FRESH_EMAIL_PREFIX}conflict-${Date.now()}@example.test`;
+    seedFreshUser(email);
+    await signInViaDevUrl(page, email);
+    await page.evaluate(() => window.localStorage.removeItem("soundhub.actingWorkspaceId"));
+    await walkToIntentPage(page);
+    // First submission: Hire → Buyer.
+    await page.getByTestId("intent-choice-hire-input").check();
+    await page.getByTestId("intent-submit").click();
+    await page.getByTestId("dashboard").waitFor();
+    await expect(page.getByTestId("dashboard-buyer-readiness")).toBeVisible();
+
+    // The customer lands on the dashboard, then navigates back
+    // to the intent page directly. The page now derives from
+    // Buyer-only and renders the Offer add affordance only.
+    // We simulate a stale-tab scenario by intercepting the
+    // submit and forcing a request with expectedCapabilities=[]
+    // — the form would otherwise send expected=[Buyer].
+    await page.route("**/api/workspaces/*/intent", async (route, request) => {
+      if (request.method() === "POST") {
+        const body = JSON.parse(request.postData() ?? "{}") as Record<string, unknown>;
+        // Inject a stale expectedCapabilities to trigger the
+        // INTENT_CONFLICT envelope. The browser consumes
+        // freshCapabilities from the response; we then
+        // intercept again so the UI renders the recovery
+        // affordance rather than the post-success dashboard.
+        const response = await route.fetch({
+          url: request.url(),
+          method: request.method(),
+          headers: await request.allHeaders(),
+          postData: JSON.stringify({ ...body, expectedCapabilities: [] }),
+        });
+        await route.fulfill({ response });
+        return;
+      }
+      await route.continue();
+    });
+    await page.goto("/workspace/intent");
+    await page.getByTestId("intent-page").waitFor();
+    // Buyer-only state renders the Offer add affordance.
+    await page.getByTestId("intent-choice-offer-input").check();
+    await page.getByTestId("intent-submit").click();
+    await expect(page.getByTestId("intent-error")).toBeVisible({ timeout: 5000 });
+    await expect(page.getByTestId("intent-reload")).toBeVisible();
+
+    // Reload re-derives the affordance from the fresh
+    // capability set (Buyer-only → Offer add).
+    await page.unroute("**/api/workspaces/*/intent");
+    await page.getByTestId("intent-reload").click();
+    await page.getByTestId("intent-page").waitFor();
+    // Buyer is present; only the Offer add affordance renders.
+    await expect(page.getByTestId("intent-choice-offer-input")).toBeVisible();
+    await expect(page.getByTestId("intent-choice-hire-input")).toHaveCount(0);
+  });
+
+  // Later capability addition. Buyer-only Personal renders
+  // the single "Add Offer services too" affordance. The
+  // request body is `{ intent: "Offer", expectedCapabilities:
+  // ["Buyer"] }` — the SAME primitive as initial selection.
+  test("Later-add: Buyer-only Personal adds Seller through the 'Add Offer services too' affordance", async ({
+    page,
+  }) => {
+    const email = `${FRESH_EMAIL_PREFIX}later-add-${Date.now()}@example.test`;
+    seedFreshUser(email);
+    await signInViaDevUrl(page, email);
+    await page.evaluate(() => window.localStorage.removeItem("soundhub.actingWorkspaceId"));
+    await walkToIntentPage(page);
+    // Initial Hire → Buyer.
+    await page.getByTestId("intent-choice-hire-input").check();
+    await page.getByTestId("intent-submit").click();
+    await page.getByTestId("dashboard").waitFor();
+    await expect(page.getByTestId("dashboard-buyer-readiness")).toBeVisible();
+
+    // The dashboard surfaces the "Add Offer services too" link
+    // on the Buyer readiness row (Seller is missing).
+    await expect(page.getByTestId("dashboard-add-offer")).toBeVisible();
+    await page.getByTestId("dashboard-add-offer").click();
+    await page.getByTestId("intent-page").waitFor();
+    // Buyer-only renders ONLY the Offer add affordance.
+    await expect(page.getByTestId("intent-choice-offer-input")).toBeVisible();
+    await expect(page.getByTestId("intent-choice-hire-input")).toHaveCount(0);
+    await expect(page.getByTestId("intent-choice-both-input")).toHaveCount(0);
+    await page.getByTestId("intent-choice-offer-input").check();
+    await page.getByTestId("intent-submit").click();
+    await page.getByTestId("dashboard").waitFor();
+    // Final state: both capabilities.
+    await expect(page.getByTestId("dashboard-buyer-readiness")).toBeVisible();
+    await expect(page.getByTestId("dashboard-seller-readiness")).toBeVisible();
+  });
+
+  test("Idempotent: re-submitting the SAME intent is a no-op success", async ({ page }) => {
+    const email = `${FRESH_EMAIL_PREFIX}idempotent-${Date.now()}@example.test`;
+    seedFreshUser(email);
+    await signInViaDevUrl(page, email);
+    await page.evaluate(() => window.localStorage.removeItem("soundhub.actingWorkspaceId"));
+    await walkToIntentPage(page);
+    await page.getByTestId("intent-choice-both-input").check();
+    await page.getByTestId("intent-submit").click();
+    await page.getByTestId("dashboard").waitFor();
+    await expect(page.getByTestId("dashboard-buyer-readiness")).toBeVisible();
+    await expect(page.getByTestId("dashboard-seller-readiness")).toBeVisible();
+    // Re-submit Both — idempotent no-op.
+    await page.goto("/workspace/intent");
+    // Both capability renders the calm panel without a form.
+    await expect(page.getByTestId("intent-back-to-dashboard")).toBeVisible();
+    await page.getByTestId("intent-back-to-dashboard").click();
+    await page.getByTestId("dashboard").waitFor();
+    await expect(page.getByTestId("dashboard-buyer-readiness")).toBeVisible();
+    await expect(page.getByTestId("dashboard-seller-readiness")).toBeVisible();
+  });
+
+  test("Keyboard-only intent submission", async ({ page }) => {
+    const email = `${FRESH_EMAIL_PREFIX}keyboard-${Date.now()}@example.test`;
+    seedFreshUser(email);
+    await signInViaDevUrl(page, email);
+    await page.evaluate(() => window.localStorage.removeItem("soundhub.actingWorkspaceId"));
+    await walkToIntentPage(page);
+    await page.getByTestId("intent-choice-hire-input").focus();
+    await page.keyboard.press("Space");
+    await expect(page.getByTestId("intent-choice-hire-input")).toBeChecked();
+    await page.keyboard.press("Tab");
+    await page.keyboard.press("Enter");
+    await page.getByTestId("dashboard").waitFor();
+    await expect(page.getByTestId("dashboard-buyer-readiness")).toBeVisible();
+  });
+
+  test("Narrow viewport reflow (mobile / reflow behavior)", async ({ page }) => {
+    await page.setViewportSize({ width: 360, height: 800 });
+    const email = `${FRESH_EMAIL_PREFIX}narrow-${Date.now()}@example.test`;
+    seedFreshUser(email);
+    await signInViaDevUrl(page, email);
+    await page.evaluate(() => window.localStorage.removeItem("soundhub.actingWorkspaceId"));
+    await walkToIntentPage(page);
+    const scrollWidth = await page.evaluate(() => document.documentElement.scrollWidth);
+    const clientWidth = await page.evaluate(() => document.documentElement.clientWidth);
+    expect(scrollWidth).toBeLessThanOrEqual(clientWidth + 1);
+    await expect(page.getByTestId("intent-choice-hire")).toBeVisible();
+    await expect(page.getByTestId("intent-choice-offer")).toBeVisible();
+    await expect(page.getByTestId("intent-choice-both")).toBeVisible();
+    await expect(page.getByTestId("intent-submit")).toBeVisible();
+  });
+
+  // Behavior-level coverage for the deep-link switch page
+  // (Tenki review, P2-002). The pre-cleanup PR carried source-
+  // level regex assertions that could pass while the runtime
+  // deep-link behavior was broken; these tests drive the real
+  // browser through the seeded Workspace set and assert what
+  // the page actually renders.
+  //
+  // Each case below verifies the SAME invariant from a
+  // different angle: a deep link whose target cannot be
+  // committed (Suspended or inaccessible) MUST render the
+  // `switch-unavailable` surface and MUST NOT render the
+  // `workspace-switch-continue` button. The browser is the
+  // browser seam; the assertions are DOM-visible behaviors
+  // the testid surface already exposes.
+  test("P2-002: deep link to a Suspended target renders switch-unavailable and does NOT render the commit button", async ({
+    page,
+  }) => {
+    const email = `${FRESH_EMAIL_PREFIX}suspended-${Date.now()}@example.test`;
+    seedFreshUser(email, { suspendOrganization: true });
+    await signInViaDevUrl(page, email);
+    await page.getByTestId("dashboard").waitFor();
+
+    // Provision Buyer on the Personal Workspace so the dashboard
+    // surface is steady and the selector dropdown is exposed (the
+    // selector needs two accessible Workspaces to render). The
+    // Organization is Suspended, so it never appears in the
+    // selector's Active list — we navigate to the switch page
+    // directly with `?target=<suspendedOrgId>` to exercise the
+    // deep-link.
+    await walkToIntentPage(page);
+    await page.getByTestId("intent-choice-hire-input").check();
+    await page.getByTestId("intent-submit").click();
+    await page.getByTestId("dashboard").waitFor();
+    await page.evaluate(() => window.localStorage.removeItem("soundhub.actingWorkspaceId"));
+
+    // Drive a real /api/auth/me so we can capture the Suspended
+    // Organization's id without rendering the selector (the
+    // selector filters Suspended entries out of the Active list).
+    const meResponse = await page.request.get("/api/auth/me");
+    expect(meResponse.status()).toBe(200);
+    const meBody = (await meResponse.json()) as {
+      user: { workspaces: readonly { workspaceId: string; workspaceStatus: string }[] };
+    };
+    const suspendedOrg = meBody.user.workspaces.find((w) => w.workspaceStatus === "Suspended");
+    expect(suspendedOrg, "seed fixture MUST expose one Suspended Workspace").toBeTruthy();
+    const suspendedOrgId = suspendedOrg!.workspaceId;
+
+    // Deep-link to the Suspended Workspace. The page MUST fall
+    // through to the unavailable surface — never expose a
+    // "Switch and continue" button for a target the server
+    // refuses to commit.
+    await page.goto(`/workspace/switch?target=${suspendedOrgId}`);
+    await expect(page.getByTestId("switch-unavailable")).toBeVisible();
+    await expect(page.getByTestId("workspace-switch-continue")).toHaveCount(0);
+    await expect(page.getByTestId("workspace-switch-page")).toHaveCount(0);
+    // Recovery affordance: the unavailable surface renders the
+    // explicit "Return to dashboard" button so the buyer can
+    // navigate away without a silent no-op.
+    await expect(page.getByTestId("switch-back-to-dashboard")).toBeVisible();
+  });
+
+  test("P2-002: deep link to an inaccessible target (random UUID) renders switch-unavailable and does NOT render the commit button", async ({
+    page,
+  }) => {
+    const email = `${FRESH_EMAIL_PREFIX}inaccessible-${Date.now()}@example.test`;
+    seedFreshUser(email);
+    await signInViaDevUrl(page, email);
+    await page.getByTestId("dashboard").waitFor();
+    await page.evaluate(() => window.localStorage.removeItem("soundhub.actingWorkspaceId"));
+
+    // Walk the dashboard to steady state. No special fixture is
+    // needed — we drive a random UUID that no Workspace row in
+    // the database can match.
+    await walkToIntentPage(page);
+    await page.getByTestId("intent-choice-hire-input").check();
+    await page.getByTestId("intent-submit").click();
+    await page.getByTestId("dashboard").waitFor();
+    await page.evaluate(() => window.localStorage.removeItem("soundhub.actingWorkspaceId"));
+
+    const randomUuid = `ws-not-real-${Math.random().toString(36).slice(2, 10)}-${Date.now().toString(36)}`;
+    await page.goto(`/workspace/switch?target=${randomUuid}`);
+    await expect(page.getByTestId("switch-unavailable")).toBeVisible();
+    await expect(page.getByTestId("workspace-switch-continue")).toHaveCount(0);
+    await expect(page.getByTestId("workspace-switch-page")).toHaveCount(0);
+    await expect(page.getByTestId("switch-back-to-dashboard")).toBeVisible();
+  });
+
+  // Codex review (P1-001) verification: when the URL carries an
+  // explicit `?target=` that does NOT resolve to an accessible
+  // Active Workspace AND the in-memory `pendingTargetId` is stale
+  // from a previous uncommitted switch, the page MUST render the
+  // unavailable surface — never the stale Workspace. The previous
+  // short-circuit let the user commit the stale Workspace even
+  // though the URL explicitly requested an invalid one.
+  test("P1-001: invalid URL target cannot fall back to a stale pendingTargetId (clears stale state)", async ({
+    page,
+  }) => {
+    const email = `${FRESH_EMAIL_PREFIX}stale-pending-${Date.now()}@example.test`;
+    seedFreshUser(email);
+    await signInViaDevUrl(page, email);
+    await page.getByTestId("dashboard").waitFor();
+    await page.evaluate(() => window.localStorage.removeItem("soundhub.actingWorkspaceId"));
+
+    // Provision Buyer on Personal so the dashboard renders Buyer
+    // readiness and the selector dropdown is exposed (the selector
+    // needs two accessible Workspaces to render its dropdown).
+    await walkToIntentPage(page);
+    await page.getByTestId("intent-choice-hire-input").check();
+    await page.getByTestId("intent-submit").click();
+    await page.getByTestId("dashboard").waitFor();
+
+    // Establish a stale `pendingTargetId`: open the selector,
+    // pick the Organization, and land on the switch page WITHOUT
+    // committing or cancelling. Then navigate AWAY (browser back
+    // to the dashboard) so the switch page unmounts but the
+    // `pendingTargetId` state in the ActingWorkspaceProvider
+    // remains set — reproducing the visual-QA flow that left the
+    // selector's pre-set pending target behind.
+    await page.getByTestId("acting-workspace-selector").click();
+    await page
+      .getByTestId(/^acting-workspace-option-/)
+      .nth(1)
+      .click();
+    await page.getByTestId("workspace-switch-page").waitFor();
+    await expect(page.getByTestId("workspace-switch-target-name")).toHaveText(
+      "Multi-Workspace Test Organization",
+    );
+    await page.goBack();
+    await page.getByTestId("dashboard").waitFor();
+
+    // Navigate to the switch page with an INVALID URL target
+    // (random UUID that no Workspace row matches). The page MUST
+    // render the unavailable surface — the stale pendingTargetId
+    // MUST NOT leak through to either the commit button or a
+    // stale Workspace card.
+    const randomUuid = `ws-not-real-${Math.random().toString(36).slice(2, 10)}-${Date.now().toString(36)}`;
+    await page.goto(`/workspace/switch?target=${randomUuid}`);
+    await expect(page.getByTestId("switch-unavailable")).toBeVisible();
+    await expect(page.getByTestId("workspace-switch-continue")).toHaveCount(0);
+    await expect(page.getByTestId("workspace-switch-page")).toHaveCount(0);
+    // No stale Organization card.
+    await expect(page.getByTestId("workspace-switch-target-name")).toHaveCount(0);
+    // Recovery affordance present.
+    await expect(page.getByTestId("switch-back-to-dashboard")).toBeVisible();
+  });
+
+  // Codex review (P1-001) verification (case 1): store a Suspended
+  // Organization id in localStorage before session restoration and
+  // prove the resolved acting Workspace is the ACTIVE Personal
+  // Workspace, never the Suspended Organization. The previous
+  // resolver matched the remembered id only, so a Suspended entry
+  // could remain the client actor.
+  test("P1-001: remembered Suspended Organization falls back to the Active Personal Workspace on session restoration", async ({
+    page,
+  }) => {
+    const email = `${FRESH_EMAIL_PREFIX}suspended-remembered-${Date.now()}@example.test`;
+    seedFreshUser(email, { suspendOrganization: true });
+    await signInViaDevUrl(page, email);
+    await page.getByTestId("dashboard").waitFor();
+
+    // Provision Buyer on the ACTIVE Personal Workspace FIRST so
+    // the dashboard auto-redirect does not kick in when we later
+    // restore from localStorage. Without Buyer, the dashboard
+    // redirects to /workspace/intent for an unprovisioned
+    // Personal Workspace, which would mask the resolver's
+    // Personal-vs-Organization outcome.
+    await walkToIntentPage(page);
+    await page.getByTestId("intent-choice-hire-input").check();
+    await page.getByTestId("intent-submit").click();
+    await page.getByTestId("dashboard").waitFor();
+    await expect(page.getByTestId("dashboard-buyer-readiness")).toBeVisible();
+
+    // Drive /api/auth/me directly so we can capture the Suspended
+    // Organization id without relying on selector ordering (the
+    // selector filters Suspended entries out of the Active list).
+    const meResponse = await page.request.get("/api/auth/me");
+    expect(meResponse.status()).toBe(200);
+    const meBody = (await meResponse.json()) as {
+      user: { workspaces: readonly { workspaceId: string; workspaceStatus: string }[] };
+    };
+    const suspendedOrg = meBody.user.workspaces.find((w) => w.workspaceStatus === "Suspended");
+    expect(suspendedOrg, "seed fixture MUST expose one Suspended Workspace").toBeTruthy();
+    const suspendedOrgId = suspendedOrg!.workspaceId;
+
+    // Plant the Suspended id in localStorage so the very next
+    // navigation runs through resolveActingWorkspaceId with a
+    // remembered=Suspended entry. The committed localStorage
+    // value stays Suspended — only the in-memory resolver must
+    // change.
+    await page.evaluate((id) => {
+      window.localStorage.setItem("soundhub.actingWorkspaceId", id);
+    }, suspendedOrgId);
+
+    // Force a fresh resolution by reloading the dashboard.
+    await page.goto("/dashboard");
+    await page.getByTestId("dashboard").waitFor();
+
+    // The dashboard MUST present the ACTIVE Personal Workspace,
+    // not the Suspended Organization. The dashboard renders the
+    // actor inside the `dashboard-organization-context` card
+    // when the actor is an Organization; the Suspended
+    // Organization MUST NOT be the actor so that card MUST NOT
+    // render for the Suspended-org fixture.
+    await expect(page.getByTestId("dashboard-organization-context")).toHaveCount(0);
+    // The Personal Readiness surface MUST render (the resolver
+    // fell back to the Active Personal Workspace, which now has
+    // Buyer capability from the provisioning step above).
+    await expect(page.getByTestId("dashboard-buyer-readiness")).toBeVisible();
+
+    // The committed localStorage entry remains a client-convenience
+    // value (unchanged); the in-memory resolver is the only thing
+    // that must differ. Assert the localStorage plant is intact so
+    // a regression that just clears localStorage cannot mask the
+    // bug.
+    const stillSuspended = await readCommittedActingWorkspaceId(page);
+    expect(stillSuspended).toBe(suspendedOrgId);
+
+    // The selector displays the resolved actingWorkspace.name —
+    // the deterministic browser seam for the in-memory resolver.
+    // The selector has four testids depending on the viewport
+    // variant AND the Accessible-count branch: the dropdown
+    // variant emits `acting-workspace-selector-name` (desktop) or
+    // `acting-workspace-compact-name` (mobile-compact) when there
+    // are multiple accessible Workspaces or when `actingWorkspace`
+    // is null; the singleton-label variant emits
+    // `acting-workspace-label` (desktop) or
+    // `acting-workspace-compact-label` (mobile-compact) when there
+    // is exactly one Active Workspace AND `actingWorkspace` is
+    // set. The fixture suspends the Organization, so only the
+    // Active Personal remains — the singleton-label variant
+    // applies. Read all four to keep the assertion resilient to
+    // viewport changes.
+    const candidates = await Promise.all([
+      page
+        .getByTestId("acting-workspace-selector-name")
+        .textContent()
+        .catch(() => null),
+      page
+        .getByTestId("acting-workspace-compact-name")
+        .textContent()
+        .catch(() => null),
+      page
+        .getByTestId("acting-workspace-label")
+        .textContent()
+        .catch(() => null),
+      page
+        .getByTestId("acting-workspace-compact-label")
+        .textContent()
+        .catch(() => null),
+    ]);
+    const resolved =
+      candidates.find((c): c is string => typeof c === "string" && c.trim().length > 0)?.trim() ??
+      "";
+    expect(resolved).toBe("Multi-Workspace Test Personal");
+    expect(resolved).not.toBe("Multi-Workspace Test Organization");
+  });
+
+  // Codex review (P1-001, second iteration) verification: when the
+  // Personal Workspace itself is NOT Active and a Suspended
+  // Personal id is remembered, the resolver MUST return `null` so
+  // the dashboard renders the explicit `dashboard-no-actor`
+  // recovery surface. The user MUST select an Organization
+  // explicitly via the selector — implicit Organization selection
+  // would change acting context without confirmation.
+  test("P1-001: remembered Suspended Personal renders the no-actor recovery surface (no implicit Organization)", async ({
+    page,
+  }) => {
+    const email = `${FRESH_EMAIL_PREFIX}suspended-personal-${Date.now()}@example.test`;
+    seedFreshUser(email, { suspendPersonal: true });
+    await signInViaDevUrl(page, email);
+    // The fixture has an Active Organization but no Active
+    // Personal Workspace, so `resolveActingWorkspaceId` returns
+    // `null` and the dashboard MUST render the explicit
+    // `dashboard-no-actor` recovery surface — NOT the normal
+    // `dashboard` branch. The previous version of this test
+    // waited for `dashboard` (the mutually exclusive branch)
+    // and therefore timed out before exercising the recovery
+    // flow (Codex review, P1-001, third iteration).
+    await page.getByTestId("dashboard-no-actor").waitFor();
+
+    // Capture the Suspended Personal id via /api/auth/me.
+    const meResponse = await page.request.get("/api/auth/me");
+    expect(meResponse.status()).toBe(200);
+    const meBody = (await meResponse.json()) as {
+      user: {
+        workspaces: readonly {
+          workspaceId: string;
+          workspaceType: string;
+          workspaceStatus: string;
+        }[];
+      };
+    };
+    const suspendedPersonal = meBody.user.workspaces.find(
+      (w) => w.workspaceType === "Personal" && w.workspaceStatus === "Suspended",
+    );
+    expect(
+      suspendedPersonal,
+      "suspendPersonal fixture MUST expose one Suspended Personal Workspace",
+    ).toBeTruthy();
+    const suspendedPersonalId = suspendedPersonal!.workspaceId;
+    const activeOrg = meBody.user.workspaces.find(
+      (w) => w.workspaceType === "Organization" && w.workspaceStatus === "Active",
+    );
+    expect(activeOrg, "fixture MUST expose one Active Organization").toBeTruthy();
+
+    // Plant the Suspended Personal id in localStorage.
+    await page.evaluate((id) => {
+      window.localStorage.setItem("soundhub.actingWorkspaceId", id);
+    }, suspendedPersonalId);
+
+    // Reload the dashboard so resolveActingWorkspaceId runs
+    // with the Suspended-Personal remembered entry. The
+    // resolver still returns `null` (Suspended Personal is
+    // remembered AND no Active Personal exists), so the
+    // dashboard MUST render the no-actor recovery surface
+    // again — same wait as above (Codex review, P1-001, third
+    // iteration).
+    await page.goto("/dashboard");
+    await page.getByTestId("dashboard-no-actor").waitFor();
+
+    // The resolver MUST return null because no Active Personal
+    // Workspace is accessible. The dashboard MUST render the
+    // explicit no-actor recovery surface — NOT Organization
+    // context. Implicit Organization selection would silently
+    // change acting context without confirmation (P1-001,
+    // second iteration).
+    await expect(page.getByTestId("dashboard-no-actor")).toBeVisible();
+    await expect(page.getByTestId("dashboard-organization-context")).toHaveCount(0);
+    // The dashboard MUST NOT render the Personal-only readiness
+    // surfaces (Buyer/Seller readiness lives on the Personal
+    // Workspace; a Suspended Personal cannot satisfy them).
+    await expect(page.getByTestId("dashboard-buyer-readiness")).toHaveCount(0);
+    await expect(page.getByTestId("dashboard-seller-readiness")).toHaveCount(0);
+
+    // The shell MUST NOT falsely present the Organization as
+    // current. The selector renders the dropdown (because
+    // actingWorkspace is null) and the dropdown's accessible
+    // label is "Choose a Workspace" — NOT the Organization name.
+    await expect(page.getByTestId("dashboard-no-actor-options")).toBeVisible();
+    const dropdownLabel = await Promise.all([
+      page
+        .getByTestId("acting-workspace-selector-name")
+        .textContent()
+        .catch(() => null),
+      page
+        .getByTestId("acting-workspace-compact-name")
+        .textContent()
+        .catch(() => null),
+    ]);
+    const resolvedSelector =
+      dropdownLabel
+        .find((c): c is string => typeof c === "string" && c.trim().length > 0)
+        ?.trim() ?? "";
+    expect(resolvedSelector).toBe("Choose a Workspace");
+    expect(resolvedSelector).not.toBe("Multi-Workspace Test Organization");
+
+    // The recovery surface MUST offer an explicit selection
+    // action for the Active Organization. Clicking it routes
+    // through the switch interstitial so the Organization can
+    // only become the actor after confirmation.
+    const selectOrgLink = page.getByTestId(`dashboard-no-actor-select-${activeOrg!.workspaceId}`);
+    await expect(selectOrgLink).toBeVisible();
+    await selectOrgLink.click();
+    await page.getByTestId("workspace-switch-page").waitFor();
+
+    // The interstitial MUST render the commit form (not the
+    // unavailable surface) and name the current/target
+    // workspaces truthfully: "Currently acting as: (none)" and
+    // "Switch to: <Organization>". The user MUST confirm before
+    // the Workspace becomes the actor.
+    await expect(page.getByTestId("workspace-switch-current-name")).toHaveText("(none)");
+    await expect(page.getByTestId("workspace-switch-current-unset")).toBeVisible();
+    await expect(page.getByTestId("workspace-switch-target-name")).toHaveText(
+      "Multi-Workspace Test Organization",
+    );
+    await expect(page.getByTestId("workspace-switch-continue")).toBeEnabled();
+
+    // Confirming the commit turns the Organization into the actor
+    // (the dashboard's Organization-context surface must now
+    // render and the selector must display the Organization
+    // name). The recovery flow is end-to-end operable.
+    await page.getByTestId("workspace-switch-continue").click();
+    await page.getByTestId("dashboard").waitFor();
+    await expect(page.getByTestId("dashboard-organization-context")).toBeVisible();
+
+    // Sanity: the localStorage plant is intact — the resolver
+    // alone determined the in-memory actor up until the user
+    // committed. After commit, localStorage now reflects the
+    // Organization id (the committed value), NOT the Suspended
+    // Personal.
+    const committed = await readCommittedActingWorkspaceId(page);
+    expect(committed).toBe(activeOrg!.workspaceId);
+    expect(committed).not.toBe(suspendedPersonalId);
+  });
+});

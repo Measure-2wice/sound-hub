@@ -57,7 +57,7 @@ import {
 } from "@playwright/test";
 
 async function loadHome(page: Page) {
-  await page.goto("/");
+  await page.goto("/talent");
   await expect(page.getByRole("heading", { name: "Find Caribbean talent" })).toBeVisible();
 }
 

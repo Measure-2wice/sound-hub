@@ -30,7 +30,7 @@ const KEISHA_AVATAR_URL = `${FIXTURE_ORIGIN}/fixtures/sellers/keisha-williams/av
 // belongs to issues #7 and #8.
 
 test("renders real sellers and Active offerings for the M1.1 happy path", async ({ page }) => {
-  await page.goto("/");
+  await page.goto("/talent");
 
   await expect(page.getByRole("heading", { name: "Find Caribbean talent" })).toBeVisible();
 
@@ -111,7 +111,7 @@ test("renders real sellers and Active offerings for the M1.1 happy path", async 
 test("presents every pricing presentation as non-binding, including offerings with no advertised price", async ({
   page,
 }) => {
-  await page.goto("/");
+  await page.goto("/talent");
 
   // The seeded mastering fixture advertises no pricing at all. The absent case
   // is a distinct presentation and must still carry the non-binding framing
@@ -141,7 +141,7 @@ test("presents every pricing presentation as non-binding, including offerings wi
 });
 
 test("presents Fixed pricing and the approved optional seller avatar", async ({ page }) => {
-  await page.goto("/");
+  await page.goto("/talent");
 
   // The seeded topline fixture is the canonical Fixed-pricing offering and
   // the canonical non-null `avatarUrl` seller.
@@ -188,7 +188,7 @@ test("presents Fixed pricing and the approved optional seller avatar", async ({ 
 });
 
 test("presents ContactForQuote pricing as non-binding", async ({ page }) => {
-  await page.goto("/");
+  await page.goto("/talent");
 
   // The seeded bachata fixture advertises ContactForQuote rather than an
   // amount. It must read as an invitation to discuss, never as a quote.

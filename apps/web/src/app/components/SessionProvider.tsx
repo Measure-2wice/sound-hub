@@ -15,8 +15,8 @@
 // because client-side route changes never re-run mount-time fetches.
 //
 // `SessionProvider` is the single seam every auth-aware client
-// component reads from. It owns the user state, fetches it from
-// the authoritative endpoint on mount, and exposes a `refresh()` that
+// component reads from. It owns the user state, fetches it from the
+// authoritative endpoint on mount, and exposes a `refresh()` that
 // any caller can invoke after a state-changing auth action. The
 // helper methods (`verifyAndRefresh`, `signOutAndRefresh`) wrap the
 // auth-client calls so the refresh can never drift from the action:
@@ -29,6 +29,34 @@
 // token response (including the server-derived `setupState` and the
 // validated `returnTo`) so callers can navigate appropriately
 // without an additional round-trip.
+//
+// M2 (#83) — Acting-Workspace context model:
+//
+//   The browser remembers one acting-Workspace id in localStorage
+//   ("soundhub.actingWorkspaceId"). The provider splits that into:
+//
+//     - `actingWorkspaceId`: the COMMITTED value (localStorage-
+//       backed). All consumers (Shell, switch page, dashboard) read
+//       this value.
+//     - `pendingTargetId`: a CANDIDATE the selector chose but the
+//       user has not yet confirmed. No localStorage write.
+//
+//   Three update methods cover the surface:
+//
+//     - `setPendingTarget(id)`: selector → in-memory only. The
+//       switch page reads this as its pending candidate.
+//     - `commitPendingTarget()`: switch page → call the existing
+//       `selectActingWorkspace` API; on success, write localStorage
+//       and clear pending. On failure, leave both untouched so
+//       Cancel-or-error leaves the committed state unchanged.
+//     - `cancelPendingTarget()`: switch page Cancel → clears
+//       pending without touching committed state.
+//     - `clearActingWorkspace()`: sign-out → clears committed.
+//
+//   The `useActingWorkspace()` consumer hook returns the four
+//   surfaces Shell / switch page / dashboard read from: committed
+//   + pending (or null each). Cancel must never touch the
+//   committed state.
 
 import {
   createContext,
@@ -36,6 +64,7 @@ import {
   useContext,
   useEffect,
   useMemo,
+  useRef,
   useState,
   type ReactNode,
 } from "react";
@@ -44,7 +73,17 @@ import type {
   Bg1VerifyTokenRequestV1,
   Bg1VerifyTokenResponseV1,
 } from "@soundhub/types";
-import { fetchSessionInfo, signOut as signOutRequest, verifyToken } from "../lib/auth-client";
+import {
+  fetchSessionInfo,
+  signOut as signOutRequest,
+  verifyToken,
+  selectActingWorkspace as selectActingWorkspaceRequest,
+} from "../lib/auth-client";
+import {
+  clearRememberedActingWorkspaceId,
+  readRememberedActingWorkspaceId,
+  writeRememberedActingWorkspaceId,
+} from "../lib/remembered-acting-workspace";
 
 export interface SessionContextValue {
   readonly user: Bg1PublicUserV1 | null;
@@ -65,15 +104,228 @@ export interface SessionContextValue {
 
 const SessionContext = createContext<SessionContextValue | null>(null);
 
+/**
+ * Resolve the committed acting-Workspace id from the user's
+ * accessible workspaces plus a remembered localStorage value.
+ *
+ * Status gate (Codex review, P1-001, two iterations): every
+ * branch — the remembered match and the Personal-Workspace
+ * fallback — MUST consult `workspaceStatus === "Active"`. A
+ * remembered Suspended Organization or a Suspended Personal
+ * Workspace MUST NOT become the client actor. When no Active
+ * Personal Workspace is accessible the function returns
+ * `null` so the consumer (the dashboard's `dashboard-no-actor`
+ * surface, the shell, etc.) renders the explicit recovery
+ * affordance — the user MUST select an Organization explicitly
+ * via the selector; implicit Organization selection would
+ * change acting context without confirmation.
+ */
+function resolveActingWorkspaceId(
+  user: Bg1PublicUserV1 | null,
+  remembered: string | null,
+): string | null {
+  if (!user) return null;
+  if (user.workspaces.length === 0) return null;
+  // The remembered value is convenience only — revalidate against
+  // the user's current ACCESSIBLE ACTIVE workspaces. A Suspended
+  // remembered Workspace falls through to the safe-default chain
+  // below (P1-001).
+  if (remembered) {
+    const match = user.workspaces.find(
+      (w) => w.workspaceId === remembered && w.workspaceStatus === "Active",
+    );
+    if (match) return match.workspaceId;
+  }
+  // Default to the user's ACTIVE Personal Workspace. The Personal
+  // Workspace is the production-shaped first Workspace; Organization
+  // memberships never become the implicit default (P1-001). A
+  // Suspended Personal Workspace falls through to `null` — the
+  // consumer renders the explicit `dashboard-no-actor` recovery
+  // surface and the user MUST pick an Organization through the
+  // selector. Implicit Organization selection is not safe.
+  const personal = user.workspaces.find(
+    (w) => w.workspaceType === "Personal" && w.workspaceStatus === "Active",
+  );
+  return personal ? personal.workspaceId : null;
+}
+
+export interface ActingWorkspaceContextValue {
+  readonly actingWorkspaceId: string | null;
+  readonly actingWorkspace: Bg1PublicUserV1["workspaces"][number] | null;
+  readonly pendingTargetId: string | null;
+  readonly pendingTarget: Bg1PublicUserV1["workspaces"][number] | null;
+}
+
+const ActingWorkspaceContext = createContext<ActingWorkspaceContextValue>({
+  actingWorkspaceId: null,
+  actingWorkspace: null,
+  pendingTargetId: null,
+  pendingTarget: null,
+});
+
+export interface ActingWorkspaceUpdateContextValue {
+  /** Selector → set the in-memory candidate; no localStorage write. */
+  readonly setPendingTarget: (workspaceId: string | null) => void;
+  /**
+   * Switch page "Switch and continue". Calls the
+   * `selectActingWorkspace` API; on success, writes localStorage
+   * and clears pending, and returns the server-resolved
+   * `safeReturnTo` (the destination the browser should navigate
+   * to under the post-commit acting Workspace context). The
+   * browser consumes ONLY this value — the raw `?return=` query
+   * parameter is never honored client-side after a successful
+   * commit. On failure, throws and leaves both committed +
+   * pending untouched.
+   *
+   * `returnTo` is forwarded into the request body when the
+   * caller (the switch interstitial) captured a validated
+   * cross-Workspace continuation; the server re-resolves it
+   * against the post-commit acting Workspace. When `null` /
+   * omitted, the server returns `safeReturnTo: null` and the
+   * caller falls back to `/dashboard`.
+   */
+  readonly commitPendingTarget: (returnTo?: string | null) => Promise<string | null>;
+  /** Switch page "Cancel". Clears pending without touching committed. */
+  readonly cancelPendingTarget: () => void;
+  /** Sign-out + edge cases. Clears the committed localStorage value. */
+  readonly clearActingWorkspace: () => void;
+}
+
+const ActingWorkspaceUpdateContext = createContext<ActingWorkspaceUpdateContextValue>({
+  setPendingTarget: () => undefined,
+  commitPendingTarget: () => Promise.resolve<string | null>(null),
+  cancelPendingTarget: () => undefined,
+  clearActingWorkspace: () => undefined,
+});
+
+export function ActingWorkspaceProvider({ children }: { readonly children: ReactNode }) {
+  const { user } = useSession();
+  const [remembered, setRemembered] = useState<string | null>(null);
+  const [pendingTargetId, setPendingTargetId] = useState<string | null>(null);
+
+  // Read localStorage on mount. Server-rendered HTML cannot
+  // access localStorage; the value is `null` on the first render
+  // and re-derives on the client.
+  useEffect(() => {
+    setRemembered(readRememberedActingWorkspaceId());
+  }, []);
+
+  const actingWorkspaceId = useMemo(
+    () => resolveActingWorkspaceId(user, remembered),
+    [user, remembered],
+  );
+
+  const actingWorkspace = useMemo(() => {
+    if (!user || !actingWorkspaceId) return null;
+    return user.workspaces.find((w) => w.workspaceId === actingWorkspaceId) ?? null;
+  }, [user, actingWorkspaceId]);
+
+  const pendingTarget = useMemo(() => {
+    if (!user || !pendingTargetId) return null;
+    return user.workspaces.find((w) => w.workspaceId === pendingTargetId) ?? null;
+  }, [user, pendingTargetId]);
+
+  const setPendingTarget = useCallback((workspaceId: string | null) => {
+    setPendingTargetId(workspaceId);
+  }, []);
+
+  const commitPendingTarget = useCallback(
+    async (returnTo: string | null = null): Promise<string | null> => {
+      if (!pendingTargetId) return null;
+      // Validate the candidate is still a current member of the
+      // user's accessible Workspaces BEFORE calling the network.
+      if (!user || !user.workspaces.some((w) => w.workspaceId === pendingTargetId)) {
+        throw new Error("Pending target is no longer a current Workspace; refusing to commit.");
+      }
+      // Server-side revalidation via the #82 acting-workspace route
+      // (membership-not-Owner-only). The server resolves the
+      // continuation under the POST-COMMIT acting Workspace
+      // context and returns the `safeReturnTo` value the browser
+      // should consume. On failure, leave both untouched.
+      const response = await selectActingWorkspaceRequest({
+        actingWorkspaceId: pendingTargetId,
+        returnTo,
+      });
+      writeRememberedActingWorkspaceId(pendingTargetId);
+      setRemembered(pendingTargetId);
+      setPendingTargetId(null);
+      return response.safeReturnTo ?? null;
+    },
+    [pendingTargetId, user],
+  );
+
+  const cancelPendingTarget = useCallback(() => {
+    setPendingTargetId(null);
+  }, []);
+
+  const clearActingWorkspace = useCallback(() => {
+    clearRememberedActingWorkspaceId();
+    setRemembered(null);
+    setPendingTargetId(null);
+  }, []);
+
+  const value = useMemo<ActingWorkspaceContextValue>(
+    () => ({ actingWorkspaceId, actingWorkspace, pendingTargetId, pendingTarget }),
+    [actingWorkspaceId, actingWorkspace, pendingTargetId, pendingTarget],
+  );
+
+  const updateValue = useMemo<ActingWorkspaceUpdateContextValue>(
+    () => ({
+      setPendingTarget,
+      commitPendingTarget,
+      cancelPendingTarget,
+      clearActingWorkspace,
+    }),
+    [setPendingTarget, commitPendingTarget, cancelPendingTarget, clearActingWorkspace],
+  );
+
+  return (
+    <ActingWorkspaceContext.Provider value={value}>
+      <ActingWorkspaceUpdateContext.Provider value={updateValue}>
+        {children}
+      </ActingWorkspaceUpdateContext.Provider>
+    </ActingWorkspaceContext.Provider>
+  );
+}
+
+export function useActingWorkspace(): ActingWorkspaceContextValue {
+  return useContext(ActingWorkspaceContext);
+}
+
+export function useSetActingWorkspace(): ActingWorkspaceUpdateContextValue {
+  return useContext(ActingWorkspaceUpdateContext);
+}
+
 export function SessionProvider({ children }: { readonly children: ReactNode }) {
   const [user, setUser] = useState<Bg1PublicUserV1 | null>(null);
   const [loading, setLoading] = useState(true);
 
+  // Operation-generation guard (Codex review P1-001, race fix).
+  //
+  // Background: `refresh()` and the mount-time initial fetch both
+  // call `fetchSessionInfo()`. If a user-initiated sign-out (or any
+  // newer auth action) supersedes an older in-flight refresh, the
+  // older fetch could resolve AFTER the newer state was applied —
+  // calling `setUser(oldUser)` would resurrect a signed-out user in
+  // the navigation / dashboard. The same hazard applies to two
+  // overlapping refreshes: the slower response must not overwrite
+  // the fresher one.
+  //
+  // Mechanism: every operation that may eventually call `setUser`
+  // bumps `sessionOperationGeneration.current` BEFORE awaiting, and
+  // only commits the result if its bumped value is still current.
+  // `signOutAndRefresh` and `verifyAndRefresh` route through
+  // `refresh()`, so they share the same guard automatically.
+  const sessionOperationGeneration = useRef(0);
+
   const refresh = useCallback(async (): Promise<void> => {
+    const myGen = ++sessionOperationGeneration.current;
     try {
       const info = await fetchSessionInfo();
+      if (myGen !== sessionOperationGeneration.current) return;
       setUser(info.user);
     } catch {
+      if (myGen !== sessionOperationGeneration.current) return;
       setUser(null);
     }
   }, []);
@@ -83,15 +335,24 @@ export function SessionProvider({ children }: { readonly children: ReactNode }) 
   // from the first render. Subsequent auth actions call `refresh`
   // (directly or via the helpers) instead of duplicating the
   // request.
+  //
+  // The mount-time fetch bumps the same operation-generation
+  // counter as `refresh()` so a stale mount-time response cannot
+  // overwrite newer state either. `setLoading(false)` is NOT
+  // generation-gated because `loading` is initial-render-only — a
+  // stale mount resolution that flips `loading: false` is a no-op
+  // for any subsequent render.
   useEffect(() => {
     let cancelled = false;
+    const myGen = ++sessionOperationGeneration.current;
     void (async () => {
       try {
         const info = await fetchSessionInfo();
-        if (cancelled) return;
+        if (cancelled || myGen !== sessionOperationGeneration.current) return;
         setUser(info.user);
       } catch {
-        if (!cancelled) setUser(null);
+        if (cancelled || myGen !== sessionOperationGeneration.current) return;
+        setUser(null);
       } finally {
         if (!cancelled) setLoading(false);
       }
@@ -117,6 +378,7 @@ export function SessionProvider({ children }: { readonly children: ReactNode }) 
 
   const signOutAndRefresh = useCallback(async (): Promise<void> => {
     await signOutRequest();
+    clearRememberedActingWorkspaceId();
     // After sign-out the server no longer recognises the session
     // cookie, so `/api/auth/me` returns null. Re-pull to clear every
     // consumer consistently.
@@ -128,7 +390,11 @@ export function SessionProvider({ children }: { readonly children: ReactNode }) 
     [user, loading, refresh, verifyAndRefresh, signOutAndRefresh],
   );
 
-  return <SessionContext.Provider value={value}>{children}</SessionContext.Provider>;
+  return (
+    <SessionContext.Provider value={value}>
+      <ActingWorkspaceProvider>{children}</ActingWorkspaceProvider>
+    </SessionContext.Provider>
+  );
 }
 
 export function useSession(): SessionContextValue {

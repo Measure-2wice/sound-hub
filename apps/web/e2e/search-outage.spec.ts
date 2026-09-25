@@ -14,7 +14,7 @@ const TEST_DB_HOST = "localhost";
 const TEST_DB_PORT = 5433;
 
 async function loadHome(page: Page) {
-  await page.goto("/");
+  await page.goto("/talent");
   await expect(page.getByRole("heading", { name: "Find Caribbean talent" })).toBeVisible();
 }
 

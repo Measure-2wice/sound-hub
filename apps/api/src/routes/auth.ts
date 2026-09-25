@@ -42,7 +42,11 @@
 //     and a current WorkspaceMembership. Proves the GS 4 / GS 5 /
 //     GS 6 contracts: the route revalidates current membership on
 //     every request and rejects a user without it, regardless of any
-//     legacy ownerUserId match.
+//     legacy ownerUserId match. Returns the server-resolved
+//     `safeReturnTo` against the fresh post-switch user payload;
+//     `Cancel` does NOT call this route — it is a safe in-page
+//     exit to `/dashboard` under the still-committed current
+//     Workspace.
 
 import { createHash } from "node:crypto";
 import { Router, type NextFunction, type Request, type Response } from "express";
@@ -60,6 +64,7 @@ import {
 } from "@soundhub/types";
 import { ZodError } from "zod";
 import type { AuthenticationService } from "../services/authentication.service.js";
+import type { AuthRepository } from "../auth-repository/auth-repository.js";
 import {
   AuthorizationError,
   type WorkspaceAuthorizationService,
@@ -67,10 +72,10 @@ import {
 import {
   buildFieldErrors,
   buildSafeError,
-  generateRequestId,
   writeSafeError,
   type SafeErrorResponse,
 } from "../lib/errors.js";
+import { getRequestId, type RequestWithRequestId } from "../lib/request-id.js";
 import { SESSION_COOKIE, setSessionCookie, clearSessionCookie } from "../lib/session-cookie.js";
 import {
   clearReturnContextCookie,
@@ -78,7 +83,10 @@ import {
   resolveAllowedOrigin,
   setReturnContextCookie,
 } from "../lib/return-context.js";
-import type { AuthRepository } from "../auth-repository/auth-repository.js";
+import {
+  SafeReturnToFallback,
+  resolvePostCommandReturnDestination,
+} from "../lib/post-command-return-destination.js";
 import { toPublicUser } from "../dto/public-mappers.js";
 
 export interface AuthRouteDeps {
@@ -219,7 +227,14 @@ function forwardUnhandledRejection(
     // middleware — it would attempt to set headers / write JSON on a
     // sent response. Log so the failure is auditable and let the
     // request close so the process stays responsive.
-    console.error(`[auth] requestId=${resolveRequestId(req)} handler-rejection-after-write:`, err);
+    // The literal `%s` format string keeps the dynamic requestId out
+    // of the format-string position so `console.error` (which passes
+    // its first arg through `util.format`) cannot interpret attacker-
+    // supplied characters as format specifiers — see the canonical
+    // request-id reader at apps/api/src/lib/request-id.ts and the
+    // equivalent hardening in apps/api/src/routes/intent.ts.
+    const requestId = getRequestId(req as RequestWithRequestId);
+    console.error("[auth] requestId=%s handler-rejection-after-write:", requestId, err);
     return;
   }
   next(err);
@@ -232,7 +247,7 @@ async function handleMagicLink(
   res: Response,
   deps: AuthRouteDeps & { readonly allowedReturnOrigin: string },
 ): Promise<void> {
-  const requestId = resolveRequestId(req);
+  const requestId = getRequestId(req as RequestWithRequestId);
   res.setHeader("x-request-id", requestId);
 
   const rawBody = await readJsonBodyOrRespond(req, res, requestId);
@@ -282,7 +297,7 @@ async function handleVerifyToken(
   res: Response,
   deps: AuthRouteDeps & { readonly allowedReturnOrigin: string },
 ): Promise<void> {
-  const requestId = resolveRequestId(req);
+  const requestId = getRequestId(req as RequestWithRequestId);
   res.setHeader("x-request-id", requestId);
 
   const rawBody = await readJsonBodyOrRespond(req, res, requestId);
@@ -348,7 +363,7 @@ async function handleVerifyToken(
 // ---------- GET /api/auth/me ----------
 
 async function handleMe(req: Request, res: Response, deps: AuthRouteDeps): Promise<void> {
-  const requestId = resolveRequestId(req);
+  const requestId = getRequestId(req as RequestWithRequestId);
   res.setHeader("x-request-id", requestId);
   const sessionId = readSessionCookie(req);
   // M2 (#82): surface `setupState` on the public user so the
@@ -364,7 +379,7 @@ async function handleMe(req: Request, res: Response, deps: AuthRouteDeps): Promi
 // ---------- POST /api/auth/sign-out ----------
 
 async function handleSignOut(req: Request, res: Response, deps: AuthRouteDeps): Promise<void> {
-  const requestId = resolveRequestId(req);
+  const requestId = getRequestId(req as RequestWithRequestId);
   res.setHeader("x-request-id", requestId);
   const sessionId = readSessionCookie(req);
   await deps.authenticationService.signOut(sessionId);
@@ -380,12 +395,12 @@ async function handleActingWorkspace(
   res: Response,
   deps: AuthRouteDeps,
 ): Promise<void> {
-  const requestId = resolveRequestId(req);
+  const requestId = getRequestId(req as RequestWithRequestId);
   res.setHeader("x-request-id", requestId);
 
   const sessionId = readSessionCookie(req);
-  const view = await deps.authenticationService.resolveSession(sessionId);
-  if (!view) {
+  const resolved = await deps.authenticationService.resolveSessionWithSetupState(sessionId);
+  if (!resolved) {
     writeSafeError(
       res,
       buildSafeError(
@@ -397,6 +412,7 @@ async function handleActingWorkspace(
     );
     return;
   }
+  const view = resolved;
 
   const rawBody = await readJsonBodyOrRespond(req, res, requestId);
   if (rawBody === undefined) return;
@@ -422,9 +438,37 @@ async function handleActingWorkspace(
 
   try {
     const membership = await deps.workspaceAuthorizationService.requireActingMembership({
-      userAccountId: view.userAccountId,
+      userAccountId: view.user.userAccountId,
       workspaceId: parsed.actingWorkspaceId,
     });
+    // Resolve `safeReturnTo` against the FRESH post-commit user
+    // payload (via the bounded #83 post-command destination
+    // resolver). The browser consumes ONLY this value; the raw
+    // `?return=` query parameter is never honored client-side
+    // after a successful commit, so a cross-Workspace destination
+    // cannot reach the browser before the Workspace the customer
+    // just committed to is the actor. A `null` request value, or
+    // a value that fails the bounded revalidation, leaves
+    // `safeReturnTo` at `null` and the browser falls back to
+    // `/dashboard`.
+    const publicUser = toPublicUser(view.user, view.setupState);
+    let safeReturnTo: string | null = null;
+    try {
+      const resolvedDestination = resolvePostCommandReturnDestination({
+        returnTo: parsed.returnTo ?? null,
+        freshUser: publicUser,
+        actingWorkspaceId: membership.workspace.workspaceId,
+        allowedOrigin:
+          deps.allowedReturnOrigin ?? process.env.FRONTEND_URL ?? "http://localhost:3000",
+      });
+      safeReturnTo = resolvedDestination?.path ?? null;
+    } catch (err) {
+      if (err instanceof SafeReturnToFallback) {
+        safeReturnTo = null;
+      } else {
+        throw err;
+      }
+    }
     const body = bg1ActingWorkspaceResponseV1Schema.parse({
       ok: true,
       actingWorkspace: membership.workspace,
@@ -432,6 +476,7 @@ async function handleActingWorkspace(
         role: membership.role,
         joinedAt: membership.joinedAt.toISOString(),
       },
+      safeReturnTo,
     });
     res.status(200).json(body);
   } catch (err) {
@@ -445,14 +490,6 @@ async function handleActingWorkspace(
 }
 
 // ---------- Helpers ----------
-
-function resolveRequestId(req: Request): string {
-  const incoming = req.headers["x-request-id"];
-  if (typeof incoming === "string" && incoming.length > 0 && incoming.length <= 128) {
-    return incoming;
-  }
-  return generateRequestId();
-}
 
 function readSessionCookie(req: Request): string | undefined {
   const header = req.headers.cookie;
@@ -587,11 +624,11 @@ function writeAuthError(res: Response, err: unknown, requestId: string, route: s
     const authErr = err as Error & { code?: ApiErrorCodeV1 };
     const code = authErr.code ?? "AUTH_FAILED";
     const safe: SafeErrorResponse = buildSafeError(code, err.message, undefined, requestId);
-    console.error(`[auth:${route}] requestId=${requestId} code=${code}:`, err);
+    console.error("[auth:%s] requestId=%s code=%s:", route, requestId, code, err);
     writeSafeError(res, safe);
     return;
   }
-  console.error(`[auth:${route}] requestId=${requestId} unhandled:`, err);
+  console.error("[auth:%s] requestId=%s unhandled:", route, requestId, err);
   writeSafeError(
     res,
     buildSafeError(
@@ -630,7 +667,7 @@ function parseAuthRequestBody(req: Request, res: Response, next: NextFunction): 
     return;
   }
 
-  const requestId = resolveRequestId(req);
+  const requestId = getRequestId(req as RequestWithRequestId);
   const chunks: Buffer[] = [];
   let total = 0;
 
@@ -702,9 +739,9 @@ function rateLimitHandler(req: Request, res: Response): void {
   // to write the safe-error envelope so the public 429 contract
   // matches the rest of the auth surface. Only `POST /verify-token`
   // mounts a limiter, so the route tag is fixed.
-  const requestId = resolveRequestId(req);
+  const requestId = getRequestId(req as RequestWithRequestId);
   res.setHeader("x-request-id", requestId);
-  console.error(`[auth:verify-token] requestId=${requestId} code=AUTH_RATE_LIMITED`);
+  console.error("[auth:verify-token] requestId=%s code=AUTH_RATE_LIMITED", requestId);
   writeSafeError(
     res,
     buildSafeError("AUTH_RATE_LIMITED", "Too many requests.", undefined, requestId),

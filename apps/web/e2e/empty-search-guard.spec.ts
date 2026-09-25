@@ -33,7 +33,7 @@
 import { test, expect, type Page } from "@playwright/test";
 
 async function loadHome(page: Page): Promise<void> {
-  await page.goto("/");
+  await page.goto("/talent");
   await expect(page.getByRole("heading", { name: "Find Caribbean talent" })).toBeVisible();
 }
 

@@ -534,6 +534,21 @@ export const apiErrorCodeV1Schema = z.enum([
   // compare-and-set + retry budget. Defensive code; the safe envelope
   // covers it if it occurs.
   "PERSONAL_WORKSPACE_CONVERGENCE_CONFLICT",
+  // M2 (#83): Intent selection surface.
+  // 400 — the intent request body failed runtime validation.
+  "INTENT_INVALID",
+  // 403 — the acting human is not a current member of the target
+  // Personal Workspace, the Workspace is not eligible, or some
+  // other authorization rejection collapsed by the safe envelope.
+  "INTENT_FORBIDDEN",
+  // 409 — the request's `expectedCapabilities` did not match the
+  // persisted capability set inside the locked transition. The
+  // transaction has been rolled back; the response carries the
+  // fresh capability set so the customer can re-submit with the
+  // up-to-date precondition. Distinct from INTENT_FORBIDDEN
+  // (authorization failure) so the UI can render an actionable
+  // recovery rather than a false "not a current member" message.
+  "INTENT_CONFLICT",
 ]);
 export type ApiErrorCodeV1 = z.infer<typeof apiErrorCodeV1Schema>;
 
@@ -853,6 +868,15 @@ export type Bg1SignOutResponseV1 = z.infer<typeof bg1SignOutResponseV1Schema>;
 export const bg1ActingWorkspaceRequestV1Schema = z
   .object({
     actingWorkspaceId: z.string().min(1).max(128),
+    // M2 #83 continuation: the switch interstitial forwards the
+    // raw `?return=` query into the request body when present.
+    // The route revalidates and resolves it under the
+    // post-commit acting Workspace context via
+    // `resolvePostCommandReturnDestination`; the response only
+    // carries the bounded `safeReturnTo`. Invalid / missing
+    // values drop to `safeReturnTo: null` and the browser falls
+    // back to `/dashboard`.
+    returnTo: z.string().min(1).max(256).optional(),
   })
   .strict();
 export type Bg1ActingWorkspaceRequestV1 = z.infer<typeof bg1ActingWorkspaceRequestV1Schema>;
@@ -867,6 +891,14 @@ export const bg1ActingWorkspaceResponseV1Schema = z
         joinedAt: z.string().datetime(),
       })
       .strict(),
+    // M2 #83 remediation (§5): server-resolved safe return
+    // destination. Bounded by
+    // `apps/api/src/lib/post-command-return-destination.ts` to the
+    // explicit #83 route shapes. The browser consumes only this
+    // value; it does NOT read raw query parameters or pattern-match
+    // paths. `null` when no returnTo was supplied or none passes
+    // the bounded revalidation.
+    safeReturnTo: z.string().min(1).max(256).nullable(),
   })
   .strict();
 export type Bg1ActingWorkspaceResponseV1 = z.infer<typeof bg1ActingWorkspaceResponseV1Schema>;
@@ -898,6 +930,164 @@ export type Sha256HexFn = (input: string) => string;
 export function deriveDeterministicSubject(email: string, sha256Hex: Sha256HexFn): string {
   return sha256Hex(`deterministic|${email.trim().toLowerCase()}`);
 }
+
+// ===========================================================================
+// M2 (#83) shared runtime contracts.
+//
+// Intent selection is the Personal-Workspace-scoped command that lets
+// a freshly-converged human choose `Hire talent`, `Offer services`, or
+// `Both`. The command is capability-creating only; it never grants
+// `DealApprover` and never publishes seller content. The acting
+// Workspace id is required so the route can revalidate current Owner
+// membership (any Owner/Admin/Member role passes
+// `requireActingMembership` — the route is not Owner-only per ticket
+// #82). Neither Buyer nor Seller capability collects a generic
+// participation/terms acceptance at capability-provisioning time —
+// context-specific confirmations are owned by their later boundaries
+// (SellerProfile publication, media use, ServiceOffering activation,
+// Deal approval authority / approval).
+//
+// The `returnTo` field on the request is validated by the route via
+// the existing internal-return validation rules
+// (`apps/api/src/lib/return-context.ts`). Invalid values are silently
+// dropped; the route proceeds with `returnTo: null`. The successful
+// response echoes only the validated `returnTo`. The intent contract
+// does not carry `setupState` — recovery is already surfaced via the
+// existing `bg1PublicUserV1Schema.setupState` field on the user
+// payload and the dashboard renders it.
+// ===========================================================================
+
+// ---------- Closed intent values ----------
+
+export const intentKindV1Values = ["Hire", "Offer", "Both"] as const;
+export type IntentKindV1 = (typeof intentKindV1Values)[number];
+
+// ---------- Bounded post-command return routes (M2 #83) ----------
+//
+// The closed set of internal return routes the post-command destination
+// resolver may emit. This list is the SHARED definition consumed by both
+// the server-side authority boundary
+// (`apps/api/src/lib/post-command-return-destination.ts`) AND the typed
+// client narrowing helper on the Workspace-switch interstitial
+// (`apps/web/src/app/workspace/switch/page.tsx`). Adding a route in the
+// resolver MUST extend this list in lock-step so a server-returnable
+// value can never be silently rejected by the client narrowing helper.
+//
+// The set is intentionally closed (#83 review §5): unknown routes fall
+// back to `/dashboard` rather than being pattern-matched. The resolver
+// does not build a general route-manifest authorization engine; the
+// list of authorized destinations is the closed enum declared here.
+export const postCommandRouteValuesV1 = [
+  "/dashboard",
+  "/workspace/intent",
+  "/workspace/switch",
+  "/talent",
+  "/deals",
+  "/seller-requests",
+  "/dashboard/audio",
+] as const;
+export type PostCommandRouteV1 = (typeof postCommandRouteValuesV1)[number];
+
+// ---------- Intent request ----------
+
+// The intent request body.
+//
+// `intent` selects the capability set to ADD. The command is
+// additive: `Hire` adds Buyer, `Offer` adds Seller, `Both` adds
+// Buyer + Seller. Removing or narrowing a capability is not
+// exposed by this command.
+//
+// `expectedCapabilities` is the capability set the human
+// observed when they clicked Submit. The route compares the
+// persisted set to this value inside the transaction's
+// Workspace-scoped lock and rejects mismatches with the
+// `INTENT_CONFLICT` envelope so the customer can recover with
+// the fresh state. Idempotency only requires the chosen set to
+// be fully covered by the persisted set; a stale
+// `expectedCapabilities` does NOT produce a conflict when the
+// chosen set is already present.
+//
+// `expectedCapabilities` is a SET, not an array: the closed
+// domain contains only Buyer and Seller so the maximum unique
+// size is two, and duplicate entries (`['Buyer', 'Buyer']`) must
+// be rejected so the comparison against the persisted set never
+// produces a false conflict.
+//
+// `returnTo` is optional; the route revalidates it via the
+// existing internal-return validation rules. No `sellerAcceptance`
+// field is carried: the M2 #83 slice does not collect a generic
+// Seller participation/terms acceptance at capability-provisioning
+// time.
+export const intentRequestV1Schema = z
+  .object({
+    intent: z.enum(intentKindV1Values),
+    expectedCapabilities: z
+      .array(z.enum(marketplaceCapabilityValuesV1))
+      .max(2, {
+        message:
+          "expectedCapabilities may contain at most the two closed-enum capabilities (Buyer, Seller).",
+      })
+      .refine(
+        (arr) => new Set(arr).size === arr.length,
+        "expectedCapabilities must contain unique entries (duplicate capabilities are not allowed).",
+      ),
+    returnTo: z.string().min(1).max(256).optional(),
+  })
+  .strict();
+export type IntentRequestV1 = z.infer<typeof intentRequestV1Schema>;
+
+// ---------- Intent response ----------
+
+// The successful intent response. Carries the updated public user
+// payload, the validated `returnTo` (or `null` when none was
+// supplied / validation dropped it), and the server-resolved
+// `safeReturnTo`. `safeReturnTo` represents CONTEXTUAL
+// authorization against the fresh post-provision user — it is the
+// destination the browser should consume (route + capability +
+// Workspace all revalidated). The contract does NOT carry
+// `setupState` — recovery is already surfaced via the user
+// payload's existing `setupState` field; intent is capability-only.
+export const intentResponseV1Schema = z
+  .object({
+    ok: z.literal(true),
+    user: bg1PublicUserV1Schema,
+    returnTo: z.string().min(1).max(256).nullable(),
+    safeReturnTo: z.string().min(1).max(256).nullable(),
+  })
+  .strict();
+export type IntentResponseV1 = z.infer<typeof intentResponseV1Schema>;
+
+// ---------- Intent conflict response ----------
+//
+// Surface returned when the request's `expectedCapabilities`
+// does not match the persisted capability set inside the
+// locked transition. Carries the FRESH persisted capability set
+// so the customer can re-submit with the up-to-date
+// precondition. Distinct from the standard error envelope so
+// the UI can render an actionable recovery rather than the
+// false "not a current member" copy.
+//
+// The shape is only emitted by the intent route; the standard
+// safe error envelope covers every other rejection surface.
+export const intentConflictResponseV1Schema = z
+  .object({
+    error: z
+      .object({
+        code: z.literal("INTENT_CONFLICT"),
+        message: z.string().min(1).max(500),
+        // Server-emitted fresh persisted capability set. Mirrors
+        // the request-side cap: at most the two closed-enum
+        // values, unique only.
+        freshCapabilities: z
+          .array(z.enum(marketplaceCapabilityValuesV1))
+          .max(2)
+          .refine((arr) => new Set(arr).size === arr.length, "freshCapabilities must be unique"),
+        requestId: z.string().min(1).max(128),
+      })
+      .strict(),
+  })
+  .strict();
+export type IntentConflictResponseV1 = z.infer<typeof intentConflictResponseV1Schema>;
 
 // ===========================================================================
 // Matchmaker shared runtime contracts (introduced by ticket #60

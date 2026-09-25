@@ -115,8 +115,8 @@ Precedence is:
    compact navigation does not hide consequential context.
 7. As a buyer-and-seller Workspace, I want buyer and seller readiness presented independently without
    persona modes, so that I can use both capabilities from one Workspace.
-8. As a new participant, I want intent choices to explain their practical consequences and required
-   Seller participation acceptance, so that I can make one explicit choice confidently.
+8. As a new participant, I want intent choices to explain their practical consequences, so that I
+   can make one explicit choice confidently.
 9. As a seller, I want Professional Profile editing to feel private until publication, so that saving
    work is never confused with making it public.
 10. As a seller, I want publication presented as a separate marketplace-progression action, so that I
@@ -540,7 +540,10 @@ source for authorization, validation, persistence, lifecycle, and transition sem
 - Present Hire talent, Offer services, and Both as mutually exclusive choices within the acting
   Personal Workspace.
 - Keep the acting Workspace visible and explain that the other capability may be added later.
-- Show Seller participation acceptance only when the selected intent requires it.
+- Do not collect a generic Seller participation/terms acceptance at capability-provisioning time;
+  no legal text, no acceptance checkbox, and no terms version/hash appear on the intent
+  surface. Context-specific confirmations remain owned by their later boundaries (SellerProfile
+  publication, media use, ServiceOffering activation, Deal approval authority / approval).
 - Explain that capability does not grant permission to approve terms without exposing internal
   implementation vocabulary.
 - Use one explicit submit action with retry-safe feedback; do not imply that selecting a card has

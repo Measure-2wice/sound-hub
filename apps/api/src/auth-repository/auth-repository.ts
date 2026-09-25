@@ -244,4 +244,89 @@ export interface AuthRepository {
    * winner's slug. Returns null when the Workspace is unknown.
    */
   findWorkspaceSlugById(workspaceId: string): Promise<string | null>;
+
+  // ---------- M2 #83: Intent selection primitives ----------
+  //
+  // Per #83 implementation decision: the standalone capability
+  // primitive is a PRIVATE implementation helper in each adapter.
+  // The public AuthRepository surface exposes ONLY
+  // `provisionIntentAtomically`, which composes the capability
+  // writes inside a single transaction. Production consumers cannot
+  // bypass the atomic invariant.
+
+  /**
+   * M2 #83: atomic, expected-state intent provisioning.
+   *
+   * The command is **additive only**: it adds the chosen
+   * capability set to whatever is already present on the
+   * Personal Workspace. `Hire` adds Buyer, `Offer` adds
+   * Seller, `Both` adds Buyer + Seller. The same primitive
+   * covers initial selection and explicit later-add: a Buyer
+   * Personal choosing `Offer` with `expectedCapabilities:
+   * ["Buyer"]` adds Seller and the final state is Buyer+Seller.
+   *
+   * `expectedCapabilities` is the capability set the human
+   * observed when they clicked Submit. The transaction locks
+   * the canonical Personal Workspace via `pg_advisory_xact_lock`
+   * (the Prisma adapter) or a per-Workspace mutex queue (the
+   * in-memory adapter), reads the persisted capability set,
+   * and rejects mismatches with `IntentConflictError`. The
+   * transaction rolls back; no rows are written.
+   *
+   * Idempotency: the command succeeds with zero writes when
+   * the chosen set is already a subset of the persisted set,
+   * regardless of `expectedCapabilities` staleness. The lock
+   * ensures concurrent disjoint first submissions cannot
+   * silently union into Both — exactly one wins, the other
+   * observes the winner's row and conflicts.
+   *
+   * The natural unique `(workspaceId, capability)` index is the
+   * single source of row-level idempotency inside the lock;
+   * `INSERT ... ON CONFLICT DO NOTHING` absorbs duplicate
+   * rows when an idempotent retry races a concurrent commit.
+   *
+   * #83 re-revision: intent does NOT collect a generic Seller
+   * participation/terms acceptance at capability-provisioning
+   * time. Context-specific confirmations are owned by their
+   * later boundaries.
+   */
+  provisionIntentAtomically(input: {
+    readonly workspaceId: string;
+    readonly userAccountId: string;
+    readonly capabilities: readonly MarketplaceCapabilityV1[];
+    readonly expectedCapabilities: readonly MarketplaceCapabilityV1[];
+  }): Promise<void>;
+}
+
+/**
+ * Transition-precondition mismatch signal. Thrown by the atomic
+ * intent primitive when the persisted capability set does not
+ * match the request's `expectedCapabilities` after the
+ * Workspace-scoped lock is acquired. The transaction has been
+ * rolled back; no rows were written.
+ *
+ * Surfaced to the customer as the `INTENT_CONFLICT` envelope
+ * (HTTP 409) with the FRESH persisted capability set so the
+ * customer can re-submit with an up-to-date precondition. The
+ * `existing` and `fresh` fields both carry the FRESH persisted
+ * state — the row set at the moment the conflict was detected,
+ * which is what the customer needs to construct a correct
+ * retry. `fresh` mirrors `existing` to preserve the
+ * IntentConflictError field shape for callers that expect
+ * `existing` / `expected` / `fresh`.
+ *
+ * This signal is distinct from authorization failures; the
+ * customer IS a current member of the Personal Workspace. They
+ * simply acted on a stale view of its capability set.
+ */
+export class IntentConflictError extends Error {
+  constructor(
+    message: string,
+    public readonly existing: readonly MarketplaceCapabilityV1[],
+    public readonly expected: readonly MarketplaceCapabilityV1[],
+    public readonly fresh: readonly MarketplaceCapabilityV1[],
+  ) {
+    super(message);
+    this.name = "IntentConflictError";
+  }
 }

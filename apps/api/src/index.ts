@@ -10,6 +10,7 @@ import { createAuthRouter } from "./routes/auth.js";
 import { createAudioSamplesRouter } from "./routes/audio-samples.js";
 import { createOfferingCatalogRouter } from "./routes/offering-catalog.js";
 import { createMatchmakerRouter } from "./routes/matchmaker.js";
+import { createIntentRouter } from "./routes/intent.js";
 import { PrismaOfferingCatalogRepository } from "./repositories/prisma-offering-catalog.repository.js";
 import { createProjectRequestRouter } from "./routes/project-requests.js";
 import { createDealTermsRouter } from "./routes/deal-terms.js";
@@ -22,6 +23,7 @@ import { TalentSearchService } from "./services/talent-search.service.js";
 import { AuthenticationService } from "./services/authentication.service.js";
 import { WorkspaceAuthorizationService } from "./services/workspace-authorization.service.js";
 import { PersonalWorkspaceConvergenceService } from "./services/personal-workspace-convergence.service.js";
+import { IntentService } from "./services/intent.service.js";
 import { AudioSampleService } from "./services/audio-sample.service.js";
 import { MatchmakerService } from "./services/matchmaker.service.js";
 import { ProjectRequestService } from "./project-request/project-request.service.js";
@@ -57,7 +59,8 @@ import {
   type BuiltAiAdapters,
 } from "./matchmaker/ai-adapter-factory.js";
 import type { SmokeResult } from "./identity/managed-identity-adapter.js";
-import { buildSafeError, generateRequestId, writeSafeError } from "./lib/errors.js";
+import { buildSafeError, writeSafeError } from "./lib/errors.js";
+import { getRequestId, storeRequestId } from "./lib/request-id.js";
 
 export interface AppOptions {
   readonly service?: TalentSearchService;
@@ -163,6 +166,13 @@ export interface AppOptions {
    * (or the service with a stub repository).
    */
   readonly personalWorkspaceConvergenceService?: PersonalWorkspaceConvergenceService;
+  /**
+   * Override for the Intent selection service (ticket #83). When
+   * supplied, the composition root does NOT construct the service
+   * from the auth repository and authorization service; the
+   * override is served directly. Tests inject a stub service.
+   */
+  readonly intentService?: IntentService;
 }
 
 export interface BuiltApp {
@@ -186,6 +196,12 @@ export interface BuiltApp {
    * the composition root and injected into `AuthenticationService`.
    */
   readonly personalWorkspaceConvergenceService: PersonalWorkspaceConvergenceService;
+  /**
+   * M2 (#83): Intent selection service. Composed at the composition
+   * root from the auth repository and authorization service; injected
+   * into `createIntentRouter`.
+   */
+  readonly intentService: IntentService;
 }
 
 export function buildApp(options: AppOptions = {}): BuiltApp {
@@ -234,6 +250,16 @@ export function buildApp(options: AppOptions = {}): BuiltApp {
     });
   const workspaceAuthorizationService =
     options.workspaceAuthorizationService ?? new WorkspaceAuthorizationService({ authRepository });
+
+  // M2 (#83): Intent selection service. Wired from the auth
+  // repository and authorization service. Tests can inject a stub
+  // via `options.intentService` to bypass real repository work.
+  const intentService =
+    options.intentService ??
+    new IntentService({
+      authRepository,
+      workspaceAuthorizationService,
+    });
 
   // BG3 Matchmaker: build the AI adapter bundle (managed stub OR
   // deterministic fallback) and the project-brief repository, then
@@ -356,14 +382,29 @@ export function buildApp(options: AppOptions = {}): BuiltApp {
     }),
   );
 
+  // Global request-id sanitizer (M2 #83 CodeQL hardening).
+  //
+  // The untrusted `x-request-id` header is sanitized at the
+  // application boundary via `lib/request-id`. The resulting
+  // value is the ONLY one consumed by every downstream sink:
+  //   - the per-route handlers, which read it back via the
+  //     canonical accessor `getRequestId(req)` (NOT a fresh
+  //     re-sanitization of the raw header — that would
+  //     generate a second UUID for invalid inputs and break
+  //     the end-to-end correlation invariant);
+  //   - the 404 fallback below;
+  //   - the error middleware below, whose `console.error` used
+  //     to interpolate `${requestId}` into the format string
+  //     and was the second reachable format-string sink flagged
+  //     by CodeQL after the route-local sink in
+  //     `apps/api/src/routes/intent.ts` was fixed.
+  //
+  // Storing the sanitized value on the request and reading it
+  // back in the error middlewares eliminates the gap between
+  // the route-local sink and the global sink.
   app.use((req, res, next) => {
-    const incoming = req.headers["x-request-id"];
-    const requestId =
-      typeof incoming === "string" && incoming.length > 0 && incoming.length <= 128
-        ? incoming
-        : generateRequestId();
+    const requestId = storeRequestId(req as Request & { requestId?: string });
     res.setHeader("x-request-id", requestId);
-    (req as Request & { requestId?: string }).requestId = requestId;
     next();
   });
 
@@ -412,6 +453,20 @@ export function buildApp(options: AppOptions = {}): BuiltApp {
       dealListService,
     }),
   );
+  // M2 (#83): Intent selection route. Mounted at `/api/workspaces`
+  // so the URL path `/:workspaceId/intent` reads the acting
+  // Workspace id directly. The route revalidates current
+  // membership via `WorkspaceAuthorizationService.requireActingMembership`
+  // (membership-not-Owner-only per ticket #82).
+  app.use(
+    "/api/workspaces",
+    createIntentRouter({
+      authenticationService,
+      intentService,
+      personalWorkspaceConvergenceService,
+      allowedReturnOrigin: process.env.FRONTEND_URL ?? "http://localhost:3000",
+    }),
+  );
   app.use(
     "/api/deals",
     createDealTermsRouter({
@@ -430,7 +485,12 @@ export function buildApp(options: AppOptions = {}): BuiltApp {
 
   // 404 fallback
   app.use((req: Request, res: Response) => {
-    const requestId = (req as Request & { requestId?: string }).requestId ?? generateRequestId();
+    // Read the boundary-stored correlation id (or resolve a
+    // fresh sanitized UUID if the boundary never ran). Using
+    // the same accessor as the route handlers guarantees the
+    // response header, the safe-error envelope, and any log
+    // line all carry the same correlation id.
+    const requestId = getRequestId(req as Request & { requestId?: string });
     const safe = buildSafeError(
       "INVALID_SEARCH_CRITERIA",
       "Route not found.",
@@ -443,8 +503,22 @@ export function buildApp(options: AppOptions = {}): BuiltApp {
   // Error middleware
   app.use((err: Error, req: Request, res: Response, _next: NextFunction) => {
     void _next;
-    const requestId = (req as Request & { requestId?: string }).requestId ?? generateRequestId();
-    console.error(`[talent-search] requestId=${requestId} unhandled:`, err);
+    // Read the boundary-stored correlation id (or resolve a
+    // fresh sanitized UUID if the boundary never ran). The same
+    // accessor is consumed by every other sink so the response
+    // header, the safe-error envelope, and this log line all
+    // carry the same correlation id.
+    const requestId = getRequestId(req as Request & { requestId?: string });
+    // The format string MUST be a literal constant — Node's
+    // `console.error` passes its first argument through
+    // `util.format`, which interprets `%s`, `%d`, `%o`, `%j`,
+    // etc. as format specifiers. Earlier passes interpolated
+    // `requestId` directly into the template literal; once an
+    // untrusted `x-request-id` reaches here, an attacker-
+    // supplied `%s` would steer util.format substitution. The
+    // value is also pre-sanitized by the boundary middleware
+    // (M2 #83 CodeQL hardening) as defense-in-depth.
+    console.error("[talent-search] requestId=%s unhandled:", requestId, err);
     const safe = buildSafeError(
       "SEARCH_FAILED",
       "An unexpected error occurred while processing the request.",
@@ -471,6 +545,7 @@ export function buildApp(options: AppOptions = {}): BuiltApp {
     dealTermsService,
     dealListService,
     personalWorkspaceConvergenceService,
+    intentService,
   };
 }
 

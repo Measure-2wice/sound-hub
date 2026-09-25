@@ -217,3 +217,83 @@ describe("BG1 failed verification cannot mark the user signed in", () => {
     );
   });
 });
+
+describe("Acting-Workspace status revalidation (M2 #83 Codex P1-001)", () => {
+  // Codex review (P1-001, two iterations) flagged that
+  // `resolveActingWorkspaceId` matched a remembered Workspace by
+  // id alone and that its Personal/last-resort fallbacks also
+  // ignored `workspaceStatus`. Because `/api/auth/me` can include
+  // Suspended memberships, a remembered Suspended Organization
+  // (or a Suspended fallback) could remain the client actor and
+  // be presented by the shell/dashboard as current. The second
+  // iteration tightened the contract further: when no Active
+  // Personal Workspace is accessible the resolver MUST return
+  // `null` so the consumer renders the explicit
+  // `dashboard-no-actor` recovery surface — Organizations MUST
+  // never be selected implicitly. These source-pattern assertions
+  // pin the Active gate and the no-implicit-Organization rule so
+  // a refactor cannot silently regress.
+  test("resolveActingWorkspaceId gates the remembered match on workspaceStatus === 'Active' (P1-001)", () => {
+    const source = readFile("components/SessionProvider.tsx");
+    // Pin the body of `resolveActingWorkspaceId` so the assertion
+    // cannot pass via a stray Active check elsewhere in the file.
+    const resolverBodyMatch = source.match(/function resolveActingWorkspaceId\([\s\S]*?\n\}\n/);
+    assert.ok(resolverBodyMatch, "resolveActingWorkspaceId MUST be present in SessionProvider.tsx");
+    const resolverBody = resolverBodyMatch[0];
+    assert.match(
+      resolverBody,
+      /user\.workspaces\.find\(\s*\(\s*w\s*\)\s*=>\s*w\.workspaceId\s*===\s*remembered\s*&&\s*w\.workspaceStatus\s*===\s*["']Active["']/,
+      "the remembered-match lookup MUST gate on workspaceStatus === 'Active' alongside workspaceId === remembered (P1-001)",
+    );
+  });
+
+  test("resolveActingWorkspaceId gates the Personal-Workspace fallback on workspaceStatus === 'Active' (P1-001)", () => {
+    const source = readFile("components/SessionProvider.tsx");
+    const resolverBodyMatch = source.match(/function resolveActingWorkspaceId\([\s\S]*?\n\}\n/);
+    assert.ok(resolverBodyMatch, "resolveActingWorkspaceId MUST be present");
+    const resolverBody = resolverBodyMatch[0];
+    assert.match(
+      resolverBody,
+      /w\.workspaceType\s*===\s*["']Personal["']\s*&&\s*w\.workspaceStatus\s*===\s*["']Active["']/,
+      "the Personal-Workspace fallback MUST gate on workspaceStatus === 'Active' so a Suspended Personal Workspace cannot become the actor (P1-001)",
+    );
+  });
+
+  test("resolveActingWorkspaceId does NOT implicitly select an Organization when no Active Personal exists (P1-001)", () => {
+    // Codex review (P1-001, second iteration) tightened the
+    // contract: when no Active Personal Workspace is accessible,
+    // the resolver MUST return `null` so the consumer renders the
+    // explicit `dashboard-no-actor` recovery surface. The user
+    // MUST select an Organization explicitly via the selector;
+    // implicit Organization selection would change acting context
+    // without confirmation. The previous `firstActive` fallback
+    // (which picked any Active Workspace, including an
+    // Organization) is exactly what the reviewer flagged.
+    const source = readFile("components/SessionProvider.tsx");
+    const resolverBodyMatch = source.match(/function resolveActingWorkspaceId\([\s\S]*?\n\}\n/);
+    assert.ok(resolverBodyMatch, "resolveActingWorkspaceId MUST be present");
+    const resolverBody = resolverBodyMatch[0];
+    // Pin the unguarded `user.workspaces[0]!.workspaceId` access
+    // is gone — the previous bug allowed a Suspended-only fixture
+    // to leak into the actor.
+    assert.equal(
+      /return\s+user\.workspaces\[0\]!/.test(resolverBody),
+      false,
+      "resolveActingWorkspaceId MUST NOT index user.workspaces[0]! directly (P1-001)",
+    );
+    // Pin that NO `firstActive`-style last-resort branch exists:
+    // the resolver MUST end with the Personal-Workspace branch,
+    // not with a `find(w => w.workspaceStatus === "Active")`
+    // Organization fallback. The Personal branch already gates on
+    // Active; the contract is that an Active-Organization-only
+    // user MUST explicitly select their Organization rather than
+    // be silently switched into it.
+    assert.equal(
+      /user\.workspaces\.find\(\s*\(\s*w\s*\)\s*=>\s*w\.workspaceStatus\s*===\s*["']Active["']\s*\)/.test(
+        resolverBody,
+      ),
+      false,
+      "resolveActingWorkspaceId MUST NOT have a last-resort `find any Active Workspace` fallback — Organizations MUST never be selected implicitly (P1-001, second iteration)",
+    );
+  });
+});

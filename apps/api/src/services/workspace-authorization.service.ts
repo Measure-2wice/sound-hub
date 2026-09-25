@@ -41,6 +41,20 @@ export class AuthorizationError extends Error {
   }
 }
 
+/**
+ * M2 #83 remediation (§2): Personal-Workspace boundary. A separate
+ * error class keeps the AuthorizationError code set aligned with the
+ * `ApiErrorCodeV1` schema (`INTENT_NOT_PERSONAL` is intentionally NOT
+ * in the public envelope — the IntentService translates it to
+ * `INTENT_FORBIDDEN`).
+ */
+export class PersonalActingMembershipError extends Error {
+  constructor(message = "Intent selection is available on the Personal Workspace only.") {
+    super(message);
+    this.name = "PersonalActingMembershipError";
+  }
+}
+
 export interface ActingMembership {
   readonly workspace: Bg1PublicWorkspaceV1;
   readonly role: WorkspaceMembershipRoleV1;
@@ -111,6 +125,32 @@ export class WorkspaceAuthorizationService {
         `This Workspace does not have the ${input.requiredCapability} capability.`,
         "MISSING_CAPABILITY",
       );
+    }
+    return membership;
+  }
+
+  /**
+   * M2 #83 remediation (Codex CHANGES_REQUESTED P0): Personal-Workspace
+   * boundary for intent self-service. A valid current Owner/Admin/Member
+   * membership on an Organization Workspace does NOT permit intent
+   * provisioning. Intent selection is the Personal-Workspace-scoped
+   * command that produces Buyer/Seller capability on the human's
+   * production Personal Workspace. Organization Workspaces never
+   * receive intent-driven capability.
+   *
+   * Throws `PersonalActingMembershipError` when the membership row
+   * exists but `workspaceType !== "Personal"`. The IntentService
+   * translates that error to the safe-envelope `INTENT_FORBIDDEN`
+   * so the route layer renders a single customer-facing copy for
+   * the inverse case.
+   */
+  async requirePersonalActingMembership(input: {
+    readonly userAccountId: string;
+    readonly workspaceId: string;
+  }): Promise<ActingMembership> {
+    const membership = await this.requireActingMembership(input);
+    if (membership.workspace.workspaceType !== "Personal") {
+      throw new PersonalActingMembershipError();
     }
     return membership;
   }
