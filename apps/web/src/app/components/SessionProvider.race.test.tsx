@@ -132,7 +132,7 @@ function mountSessionProvider(): {
   let providerRoot: Root | null = null;
 
   const originalFetch = globalThis.fetch;
-  globalThis.fetch = (async (input: RequestInfo | URL) => {
+  globalThis.fetch = async (input: RequestInfo | URL) => {
     const url = typeof input === "string" ? input : (input as Request).url;
     if (url.endsWith("/api/auth/sign-out")) {
       if (signOutDeferred) await signOutDeferred.promise;
@@ -147,7 +147,7 @@ function mountSessionProvider(): {
       return jsonResponse(makeSessionInfo(slot.user));
     }
     return new Response("{}", { status: 500 });
-  });
+  };
 
   return {
     async mount(mountFetch: Deferred<Bg1SessionInfoV1>) {
