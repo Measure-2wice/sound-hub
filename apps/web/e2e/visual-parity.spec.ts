@@ -13,7 +13,7 @@
 // the workspace selector's overflow behavior with a long Workspace
 // name, the landing CTA contrast ratio, and the rendered logo SVG.
 
-import { test, expect, type ViewportSize } from "@playwright/test";
+import { test, expect, type Page, type ViewportSize } from "@playwright/test";
 
 const VIEWPORTS: ReadonlyArray<{ readonly name: string; readonly size: ViewportSize }> = [
   { name: "mobile-390", size: { width: 390, height: 844 } },
@@ -21,6 +21,22 @@ const VIEWPORTS: ReadonlyArray<{ readonly name: string; readonly size: ViewportS
   { name: "between-1000", size: { width: 1000, height: 800 } },
   { name: "desktop-1440", size: { width: 1440, height: 900 } },
 ];
+
+const FRESH_EMAIL_PREFIX = "m2-83-visual-";
+
+// Sign in via the deterministic dev verification flow. The
+// login route creates a Personal Workspace for any fresh
+// email, so no explicit DB seed is required for these
+// authenticated visual-parity checks. Wait for the dashboard
+// OR the recovery surface so the helper covers the
+// multi-Personal-Workspace fixture used by other specs.
+async function signInFresh(page: Page, email: string): Promise<void> {
+  await page.goto("/login");
+  await page.getByTestId("login-email").fill(email);
+  await page.getByTestId("login-submit").click();
+  await page.getByTestId("login-dev-verify").click();
+  await page.getByTestId("dashboard").or(page.getByTestId("dashboard-recovery")).waitFor();
+}
 
 // ----- Landing page: reflow + coral contrast + logo at all four viewports -----
 
@@ -166,11 +182,23 @@ test("ActingWorkspaceSelector preserves full Workspace name in title + aria-labe
 
 // ----- Mobile menu behavior preserved -----
 
-test("mobile menu toggle opens the destination panel below 1024px", async ({ browser }) => {
+test("authenticated mobile menu exposes the session section (Sign out) below 1024px", async ({
+  browser,
+}) => {
+  // Authenticated visual-QA (Codex review, P1-001 second
+  // iteration): the menu panel must expose the Sign out action
+  // for an authenticated user. The previous version of this
+  // test ran with an anonymous browser context and expected
+  // `nav-sign-out` to be visible — but SessionStatus only
+  // renders the Sign out affordance for a signed-in user. The
+  // helper `signInFresh` goes through the deterministic dev
+  // verification flow so the seeded user lands on the
+  // dashboard with a Personal Workspace, and the bar/panel
+  // assertions can run against the actual authenticated DOM.
   const ctx = await browser.newContext({ viewport: { width: 390, height: 844 } });
   const page = await ctx.newPage();
   try {
-    await page.goto("/");
+    await signInFresh(page, `${FRESH_EMAIL_PREFIX}menu-${Date.now()}@example.test`);
     await expect(page.getByTestId("shell-mobile-toggle")).toBeVisible();
     await page.getByTestId("shell-mobile-toggle").click();
     await expect(page.getByTestId("shell-mobile-panel")).toBeVisible();
@@ -179,7 +207,14 @@ test("mobile menu toggle opens the destination panel below 1024px", async ({ bro
     // overlap at 390px). SessionStatus renders the Sign out
     // button inside this section.
     await expect(page.getByTestId("shell-mobile-session")).toBeVisible();
-    await expect(page.getByTestId("nav-sign-out")).toBeVisible();
+    // Scope the Sign out locator to the mobile session section:
+    // the desktop row also renders `nav-sign-out` (it's hidden
+    // by CSS at <1024px but still in the DOM), so an unscoped
+    // locator would match two nodes and the visibility assertion
+    // would be ambiguous.
+    await expect(
+      page.getByTestId("shell-mobile-session").getByTestId("nav-sign-out"),
+    ).toBeVisible();
   } finally {
     await ctx.close();
   }
@@ -187,26 +222,23 @@ test("mobile menu toggle opens the destination panel below 1024px", async ({ bro
 
 // ----- Mobile header overlap regression (visual-QA P1) -----
 
-test("mobile bar keeps the compact Workspace selector + menu toggle operable at 390px without overlap (P1)", async ({
+test("authenticated mobile bar keeps the compact Workspace selector + menu toggle operable at 390px without overlap (P1)", async ({
   browser,
 }) => {
   // Visual QA found a 26px overlap between the compact Workspace
   // selector and the Sign out button at 390px viewport. The fix
   // moves Sign out (and any other account action) into the
   // mobile menu panel so the cramped mobile bar holds only the
-  // selector + menu toggle. Assert at 390px: the bar contains
-  // exactly the selector + the toggle, and the bar's bounding
-  // box does not exceed the viewport.
+  // selector + menu toggle. Authenticated visual-QA (Codex
+  // review, P1-001 second iteration) confirms the fix works;
+  // the regression must be exercised with a signed-in browser
+  // so both the selector AND the menu-only Sign out are
+  // actually rendered.
   const ctx = await browser.newContext({ viewport: { width: 390, height: 844 } });
   const page = await ctx.newPage();
   try {
-    await page.goto("/");
+    await signInFresh(page, `${FRESH_EMAIL_PREFIX}bar-${Date.now()}@example.test`);
     await expect(page.getByTestId("shell-mobile-bar")).toBeVisible();
-    // SessionStatus MUST NOT be in the mobile bar at any viewport
-    // — it belongs to the desktop row + the mobile menu panel.
-    // Asserting `nav-sign-out` is absent from the bar (vs the
-    // whole page) requires scoping; we use locator filtering on
-    // the bar's bounding box.
     const barBox = await page.getByTestId("shell-mobile-bar").boundingBox();
     expect(barBox, "mobile bar bounding box MUST exist").not.toBeNull();
     if (!barBox) throw new Error("unreachable");
@@ -214,22 +246,45 @@ test("mobile bar keeps the compact Workspace selector + menu toggle operable at 
       barBox.x + barBox.width,
       "mobile bar MUST NOT horizontally overflow the viewport",
     ).toBeLessThanOrEqual(390);
-    const signOutBox = await page.getByTestId("nav-sign-out").boundingBox();
-    // The Sign out button is either absent (signed out) or lives
-    // outside the mobile bar's horizontal range. When present,
-    // its left edge MUST be at or after the bar's right edge (no
-    // overlap); when absent, the assertion is trivially true.
-    if (signOutBox) {
-      expect(
-        signOutBox.x >= barBox.x + barBox.width - 1,
-        `Sign out (left=${signOutBox.x}) MUST NOT overlap the mobile bar (right=${
-          barBox.x + barBox.width
-        })`,
-      ).toBe(true);
-    }
-    // The compact Workspace selector MUST be inside the bar.
+
+    // Scope the selector locator to the mobile bar — the
+    // desktop row also renders the selector (hidden at <1024px
+    // but still in the DOM) so an unscoped locator matches two
+    // nodes and the boundingBox assertion is ambiguous.
+    const selectorBox = await page
+      .getByTestId("shell-mobile-bar")
+      .getByTestId(/^(acting-workspace-compact-selector|acting-workspace-label)$/)
+      .boundingBox();
+    expect(
+      selectorBox,
+      "compact selector bounding box MUST exist in the mobile bar",
+    ).not.toBeNull();
+    if (!selectorBox) throw new Error("unreachable");
+
+    const toggleBox = await page
+      .getByTestId("shell-mobile-bar")
+      .getByTestId("shell-mobile-toggle")
+      .boundingBox();
+    expect(toggleBox, "menu toggle bounding box MUST exist in the mobile bar").not.toBeNull();
+    if (!toggleBox) throw new Error("unreachable");
+
+    // Selector and toggle MUST NOT overlap: the selector's right
+    // edge MUST be at or before the toggle's left edge.
+    expect(
+      selectorBox.x + selectorBox.width <= toggleBox.x + 1,
+      `selector (right=${
+        selectorBox.x + selectorBox.width
+      }) MUST NOT overlap toggle (left=${toggleBox.x})`,
+    ).toBe(true);
+
+    // Open the menu and verify the Sign out lives in the
+    // session section (NOT in the mobile bar). Scope the
+    // locator: the desktop row keeps a hidden `nav-sign-out`
+    // node that the unscoped locator would match.
+    await page.getByTestId("shell-mobile-toggle").click();
+    await expect(page.getByTestId("shell-mobile-panel")).toBeVisible();
     await expect(
-      page.getByTestId(/^(acting-workspace-compact-selector|acting-workspace-label)$/),
+      page.getByTestId("shell-mobile-session").getByTestId("nav-sign-out"),
     ).toBeVisible();
   } finally {
     await ctx.close();
