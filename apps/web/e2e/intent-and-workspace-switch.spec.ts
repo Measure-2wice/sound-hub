@@ -100,13 +100,19 @@ async function signInViaDevUrl(page: Page, email: string): Promise<void> {
   await page.getByTestId("login-submit").click();
   await page.getByTestId("login-dev-verify").click();
   // The dashboard auto-redirect may fire (Personal Workspace
-  // with zero capabilities) and land on the intent page. Wait
-  // for any of the three landing surfaces; the caller picks the
-  // explicit post-condition.
+  // with zero capabilities) and land on the intent page. For
+  // a fixture whose resolver returns `null` (e.g., Suspended
+  // Personal + Active Organization only), the explicit
+  // `dashboard-no-actor` recovery surface renders — that
+  // testid MUST be in the race so the helper does not hang on
+  // a branch it does not recognize (Codex review, P1-001,
+  // third iteration). Wait for any of the four landing
+  // surfaces; the caller picks the explicit post-condition.
   await Promise.race([
     page
       .getByTestId("dashboard")
       .or(page.getByTestId("dashboard-recovery"))
+      .or(page.getByTestId("dashboard-no-actor"))
       .waitFor({ timeout: 15_000 })
       .then(() => undefined),
     page
@@ -989,7 +995,15 @@ test.describe("M2 #83: intent + Workspace switching (expected-state)", () => {
     const email = `${FRESH_EMAIL_PREFIX}suspended-personal-${Date.now()}@example.test`;
     seedFreshUser(email, { suspendPersonal: true });
     await signInViaDevUrl(page, email);
-    await page.getByTestId("dashboard").waitFor();
+    // The fixture has an Active Organization but no Active
+    // Personal Workspace, so `resolveActingWorkspaceId` returns
+    // `null` and the dashboard MUST render the explicit
+    // `dashboard-no-actor` recovery surface — NOT the normal
+    // `dashboard` branch. The previous version of this test
+    // waited for `dashboard` (the mutually exclusive branch)
+    // and therefore timed out before exercising the recovery
+    // flow (Codex review, P1-001, third iteration).
+    await page.getByTestId("dashboard-no-actor").waitFor();
 
     // Capture the Suspended Personal id via /api/auth/me.
     const meResponse = await page.request.get("/api/auth/me");
@@ -1022,9 +1036,14 @@ test.describe("M2 #83: intent + Workspace switching (expected-state)", () => {
     }, suspendedPersonalId);
 
     // Reload the dashboard so resolveActingWorkspaceId runs
-    // with the Suspended-Personal remembered entry.
+    // with the Suspended-Personal remembered entry. The
+    // resolver still returns `null` (Suspended Personal is
+    // remembered AND no Active Personal exists), so the
+    // dashboard MUST render the no-actor recovery surface
+    // again — same wait as above (Codex review, P1-001, third
+    // iteration).
     await page.goto("/dashboard");
-    await page.getByTestId("dashboard").waitFor();
+    await page.getByTestId("dashboard-no-actor").waitFor();
 
     // The resolver MUST return null because no Active Personal
     // Workspace is accessible. The dashboard MUST render the
