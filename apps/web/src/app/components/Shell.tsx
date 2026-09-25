@@ -21,7 +21,10 @@
 // Mobile: menu-only destination navigation. No bottom navigation.
 // The ActingWorkspaceSelector renders OUTSIDE the menu on mobile,
 // so the Workspace context remains visible regardless of menu
-// state. Desktop: inline row of primary destinations with the
+// state. Sign-out / session actions render INSIDE the mobile menu
+// panel so the cramped mobile bar stays operable at the
+// 375-390px viewport (visual-QA P1: header controls overlap).
+// Desktop: inline row of primary destinations with the
 // ActingWorkspaceSelector + SessionStatus inline.
 //
 // Authorization rule (carried from the M2 spec):
@@ -132,7 +135,6 @@ export function Shell() {
             data-testid="shell-mobile-bar"
           >
             <ActingWorkspaceSelector variant="mobile-compact" />
-            <SessionStatus />
             {hasMobileDestination && <MobileMenuToggle open={open} onToggle={onToggle} />}
           </div>
         </div>
@@ -217,6 +219,15 @@ function MobileMenuPanel({
             {destination.label}
           </Link>
         ))}
+      </div>
+      {/* Session section: account actions render inside the
+          mobile menu so the cramped mobile bar (visible at every
+          viewport) stays operable at 375-390px — the Sign-out
+          button previously competed with the compact Workspace
+          selector for the same horizontal real estate
+          (visual-QA P1). */}
+      <div className="mt-2 pt-2 border-t border-borderWarm" data-testid="shell-mobile-session">
+        <SessionStatus />
       </div>
     </div>
   );

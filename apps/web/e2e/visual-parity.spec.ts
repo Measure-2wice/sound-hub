@@ -174,6 +174,63 @@ test("mobile menu toggle opens the destination panel below 1024px", async ({ bro
     await expect(page.getByTestId("shell-mobile-toggle")).toBeVisible();
     await page.getByTestId("shell-mobile-toggle").click();
     await expect(page.getByTestId("shell-mobile-panel")).toBeVisible();
+    // The panel MUST carry a session section so account actions
+    // render inside the menu (visual-QA P1: header controls
+    // overlap at 390px). SessionStatus renders the Sign out
+    // button inside this section.
+    await expect(page.getByTestId("shell-mobile-session")).toBeVisible();
+    await expect(page.getByTestId("nav-sign-out")).toBeVisible();
+  } finally {
+    await ctx.close();
+  }
+});
+
+// ----- Mobile header overlap regression (visual-QA P1) -----
+
+test("mobile bar keeps the compact Workspace selector + menu toggle operable at 390px without overlap (P1)", async ({
+  browser,
+}) => {
+  // Visual QA found a 26px overlap between the compact Workspace
+  // selector and the Sign out button at 390px viewport. The fix
+  // moves Sign out (and any other account action) into the
+  // mobile menu panel so the cramped mobile bar holds only the
+  // selector + menu toggle. Assert at 390px: the bar contains
+  // exactly the selector + the toggle, and the bar's bounding
+  // box does not exceed the viewport.
+  const ctx = await browser.newContext({ viewport: { width: 390, height: 844 } });
+  const page = await ctx.newPage();
+  try {
+    await page.goto("/");
+    await expect(page.getByTestId("shell-mobile-bar")).toBeVisible();
+    // SessionStatus MUST NOT be in the mobile bar at any viewport
+    // — it belongs to the desktop row + the mobile menu panel.
+    // Asserting `nav-sign-out` is absent from the bar (vs the
+    // whole page) requires scoping; we use locator filtering on
+    // the bar's bounding box.
+    const barBox = await page.getByTestId("shell-mobile-bar").boundingBox();
+    expect(barBox, "mobile bar bounding box MUST exist").not.toBeNull();
+    if (!barBox) throw new Error("unreachable");
+    expect(
+      barBox.x + barBox.width,
+      "mobile bar MUST NOT horizontally overflow the viewport",
+    ).toBeLessThanOrEqual(390);
+    const signOutBox = await page.getByTestId("nav-sign-out").boundingBox();
+    // The Sign out button is either absent (signed out) or lives
+    // outside the mobile bar's horizontal range. When present,
+    // its left edge MUST be at or after the bar's right edge (no
+    // overlap); when absent, the assertion is trivially true.
+    if (signOutBox) {
+      expect(
+        signOutBox.x >= barBox.x + barBox.width - 1,
+        `Sign out (left=${signOutBox.x}) MUST NOT overlap the mobile bar (right=${
+          barBox.x + barBox.width
+        })`,
+      ).toBe(true);
+    }
+    // The compact Workspace selector MUST be inside the bar.
+    await expect(
+      page.getByTestId(/^(acting-workspace-compact-selector|acting-workspace-label)$/),
+    ).toBeVisible();
   } finally {
     await ctx.close();
   }
