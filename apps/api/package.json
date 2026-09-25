@@ -17,19 +17,16 @@
   "dependencies": {
     "@soundhub/db": "workspace:*",
     "@soundhub/types": "workspace:*",
+    "@polkadot/api": "^16.5.6",
+    "@polkadot/api-contract": "^16.5.6",
+    "@polkadot/keyring": "^14.0.3",
     "content-type": "^1.0.5",
     "cors": "^2.8.5",
     "dotenv": "^16.4.0",
-    "zod": "^3.23.8",
-    "content-type": "^1.0.5",
-    "@soundhub/types": "workspace:*",
-    "@soundhub/db": "workspace:*",
-    "@polkadot/api": "^16.5.6",
-    "@polkadot/api-contract": "^16.5.6",
-    "@polkadot/keyring": "^14.0.3"
     "express": "^4.22.3",
     "express-rate-limit": "^8.7.0",
-    "helmet": "^7.1.0"
+    "helmet": "^7.1.0",
+    "zod": "^3.23.8"
   },
   "devDependencies": {
     "@types/content-type": "^1.1.5",

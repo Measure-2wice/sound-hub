@@ -37,7 +37,7 @@
     "check:forbidden-deps": "node scripts/check-forbidden-deps.mjs",
     "acceptance-gate": "node scripts/acceptance-gate.mjs",
     "clean": "rm -rf apps/web/.next apps/web/.next-dev packages/*/dist packages/*/tsconfig.tsbuildinfo packages/db/src/generated",
-    "clean:build": "pnpm clean && pnpm prisma:generate && pnpm build"
+    "clean:build": "pnpm clean && pnpm prisma:generate && pnpm build",
     "prepare": "husky"
   },
   "lint-staged": {
