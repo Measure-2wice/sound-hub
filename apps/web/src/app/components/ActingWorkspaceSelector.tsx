@@ -22,8 +22,17 @@
 //     which accepts any Owner/Admin/Member role (the route is
 //     NOT Owner-only per ticket #82).
 //   - An inaccessible remembered value falls back to the user's
-//     Personal Workspace (or the first accessible Workspace when
-//     no Personal Workspace is accessible).
+//     Active Personal Workspace (Codex review, P1-001). When no
+//     Active Personal Workspace is accessible, the resolver
+//     returns `null` and the consumer renders the explicit
+//     no-actor recovery surface — Organizations are NEVER selected
+//     implicitly; the user MUST pick one through the selector.
+//   - The shell MUST never fabricate an acting-Workspace context.
+//     When `actingWorkspace` is null but at least one Active
+//     Workspace is accessible, the selector MUST remain operable
+//     (dropdown, not a passive label) so the user can explicitly
+//     select a Workspace — including the singleton case (Codex
+//     review, P1-001, second iteration).
 //
 // Visual rules:
 //
@@ -35,6 +44,10 @@
 //     Workspace; selecting a Workspace navigates to the
 //     `/workspace/switch` interstitial when the target is
 //     different from the current acting Workspace.
+//   - When `actingWorkspace` is null and only one Active
+//     Workspace is accessible, the dropdown's accessible label is
+//     "Choose a Workspace" so the user understands the context is
+//     unselected (Codex review, P1-001, second iteration).
 
 import { useRouter, useSearchParams } from "next/navigation";
 import { Suspense, useEffect, useId, useMemo, useRef, useState } from "react";
@@ -124,9 +137,18 @@ function ActingWorkspaceSelectorInner({ variant }: ActingWorkspaceSelectorProps)
   const accessibleWorkspaces = user.workspaces.filter((w) => w.workspaceStatus === "Active");
   if (accessibleWorkspaces.length === 0) return null;
 
-  // Render a passive label when only one Workspace is accessible —
-  // there is nothing to switch to.
-  if (accessibleWorkspaces.length === 1) {
+  // The shell MUST never fabricate an acting-Workspace context.
+  // When `actingWorkspace` is null (e.g., the resolver returned
+  // null because no Active Personal Workspace is accessible), the
+  // selector MUST remain operable so the user can explicitly
+  // select a Workspace through the switch interstitial — even
+  // when only one Active Workspace is accessible. Rendering a
+  // passive label here would falsely present that Workspace as
+  // current and offer no recovery path (Codex review, P1-001).
+  // Conversely, when `actingWorkspace` is set AND only one Active
+  // Workspace is accessible, the selector renders a passive label
+  // because there is nothing to switch to.
+  if (actingWorkspace && accessibleWorkspaces.length === 1) {
     const only = accessibleWorkspaces[0]!;
     if (variant === "desktop") {
       return (

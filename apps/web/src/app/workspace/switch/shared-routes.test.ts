@@ -235,4 +235,40 @@ describe("Workspace-switch page — query-string re-sync behavior (M2 #83 visual
       "the sync effect MUST branch on queryCandidate === null to clear stale pendingTargetId on an invalid URL target",
     );
   });
+
+  test("switch page renders the commit form truthfully when target is valid even with actingWorkspace === null (P1-001 second iteration)", () => {
+    // The no-actor recovery flow (Codex review, P1-001, second
+    // iteration) routes the user through the switch interstitial
+    // with the target pre-set. The interstitial MUST render the
+    // commit form (not the unavailable surface) and name the
+    // current/target workspaces truthfully so the user can
+    // confirm before the Workspace becomes the actor.
+    // The unavailable surface MUST fire only when `target` is
+    // null — NOT when `actingWorkspace` is null.
+    const unavailableCheckMatch = CLIENT_SWITCH_SOURCE.match(
+      /if\s*\(\s*!target\s*\)\s*\{[\s\S]*?data-testid="switch-unavailable"/,
+    );
+    assert.ok(
+      unavailableCheckMatch,
+      "the unavailable surface MUST fire when target is null — NOT when actingWorkspace is null (P1-001 second iteration)",
+    );
+    assert.equal(
+      /if\s*\(\s*!actingWorkspace\s*\|\|\s*!target\s*\)/.test(CLIENT_SWITCH_SOURCE),
+      false,
+      "the unavailable check MUST NOT short-circuit on actingWorkspace === null (P1-001 second iteration)",
+    );
+    // The "Currently acting as" card MUST render a truthful
+    // "(none)" placeholder + a recovery-specific explanatory
+    // paragraph when actingWorkspace is null.
+    assert.match(
+      CLIENT_SWITCH_SOURCE,
+      /actingWorkspace\s*\?\s*actingWorkspace\.name\s*:\s*["']\(none\)["']/,
+      'the current-acting card MUST render "(none)" when actingWorkspace is null so the user sees truthful context',
+    );
+    assert.match(
+      CLIENT_SWITCH_SOURCE,
+      /workspace-switch-current-unset/,
+      "the no-actor case MUST surface an explanatory testid so the recovery is a11y-targetable",
+    );
+  });
 });

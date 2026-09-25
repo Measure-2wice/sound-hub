@@ -938,18 +938,40 @@ test.describe("M2 #83: intent + Workspace switching (expected-state)", () => {
 
     // The selector displays the resolved actingWorkspace.name —
     // the deterministic browser seam for the in-memory resolver.
-    // The selector exists in either `desktop` (selector-name) or
-    // `mobile-compact` (compact-name) variants depending on the
-    // viewport; both surface the same actingWorkspace.name.
-    const selectorName = await page
-      .getByTestId("acting-workspace-selector-name")
-      .textContent()
-      .catch(() => null);
-    const compactName = await page
-      .getByTestId("acting-workspace-compact-name")
-      .textContent()
-      .catch(() => null);
-    const resolved = (selectorName ?? compactName ?? "").trim();
+    // The selector has four testids depending on the viewport
+    // variant AND the Accessible-count branch: the dropdown
+    // variant emits `acting-workspace-selector-name` (desktop) or
+    // `acting-workspace-compact-name` (mobile-compact) when there
+    // are multiple accessible Workspaces or when `actingWorkspace`
+    // is null; the singleton-label variant emits
+    // `acting-workspace-label` (desktop) or
+    // `acting-workspace-compact-label` (mobile-compact) when there
+    // is exactly one Active Workspace AND `actingWorkspace` is
+    // set. The fixture suspends the Organization, so only the
+    // Active Personal remains — the singleton-label variant
+    // applies. Read all four to keep the assertion resilient to
+    // viewport changes.
+    const candidates = await Promise.all([
+      page
+        .getByTestId("acting-workspace-selector-name")
+        .textContent()
+        .catch(() => null),
+      page
+        .getByTestId("acting-workspace-compact-name")
+        .textContent()
+        .catch(() => null),
+      page
+        .getByTestId("acting-workspace-label")
+        .textContent()
+        .catch(() => null),
+      page
+        .getByTestId("acting-workspace-compact-label")
+        .textContent()
+        .catch(() => null),
+    ]);
+    const resolved =
+      candidates.find((c): c is string => typeof c === "string" && c.trim().length > 0)?.trim() ??
+      "";
     expect(resolved).toBe("Multi-Workspace Test Personal");
     expect(resolved).not.toBe("Multi-Workspace Test Organization");
   });
@@ -1018,9 +1040,64 @@ test.describe("M2 #83: intent + Workspace switching (expected-state)", () => {
     await expect(page.getByTestId("dashboard-buyer-readiness")).toHaveCount(0);
     await expect(page.getByTestId("dashboard-seller-readiness")).toHaveCount(0);
 
+    // The shell MUST NOT falsely present the Organization as
+    // current. The selector renders the dropdown (because
+    // actingWorkspace is null) and the dropdown's accessible
+    // label is "Choose a Workspace" — NOT the Organization name.
+    await expect(page.getByTestId("dashboard-no-actor-options")).toBeVisible();
+    const dropdownLabel = await Promise.all([
+      page
+        .getByTestId("acting-workspace-selector-name")
+        .textContent()
+        .catch(() => null),
+      page
+        .getByTestId("acting-workspace-compact-name")
+        .textContent()
+        .catch(() => null),
+    ]);
+    const resolvedSelector =
+      dropdownLabel
+        .find((c): c is string => typeof c === "string" && c.trim().length > 0)
+        ?.trim() ?? "";
+    expect(resolvedSelector).toBe("Choose a Workspace");
+    expect(resolvedSelector).not.toBe("Multi-Workspace Test Organization");
+
+    // The recovery surface MUST offer an explicit selection
+    // action for the Active Organization. Clicking it routes
+    // through the switch interstitial so the Organization can
+    // only become the actor after confirmation.
+    const selectOrgLink = page.getByTestId(`dashboard-no-actor-select-${activeOrg!.workspaceId}`);
+    await expect(selectOrgLink).toBeVisible();
+    await selectOrgLink.click();
+    await page.getByTestId("workspace-switch-page").waitFor();
+
+    // The interstitial MUST render the commit form (not the
+    // unavailable surface) and name the current/target
+    // workspaces truthfully: "Currently acting as: (none)" and
+    // "Switch to: <Organization>". The user MUST confirm before
+    // the Workspace becomes the actor.
+    await expect(page.getByTestId("workspace-switch-current-name")).toHaveText("(none)");
+    await expect(page.getByTestId("workspace-switch-current-unset")).toBeVisible();
+    await expect(page.getByTestId("workspace-switch-target-name")).toHaveText(
+      "Multi-Workspace Test Organization",
+    );
+    await expect(page.getByTestId("workspace-switch-continue")).toBeEnabled();
+
+    // Confirming the commit turns the Organization into the actor
+    // (the dashboard's Organization-context surface must now
+    // render and the selector must display the Organization
+    // name). The recovery flow is end-to-end operable.
+    await page.getByTestId("workspace-switch-continue").click();
+    await page.getByTestId("dashboard").waitFor();
+    await expect(page.getByTestId("dashboard-organization-context")).toBeVisible();
+
     // Sanity: the localStorage plant is intact — the resolver
-    // alone determines the in-memory actor.
-    const stillSuspended = await readCommittedActingWorkspaceId(page);
-    expect(stillSuspended).toBe(suspendedPersonalId);
+    // alone determined the in-memory actor up until the user
+    // committed. After commit, localStorage now reflects the
+    // Organization id (the committed value), NOT the Suspended
+    // Personal.
+    const committed = await readCommittedActingWorkspaceId(page);
+    expect(committed).toBe(activeOrg!.workspaceId);
+    expect(committed).not.toBe(suspendedPersonalId);
   });
 });

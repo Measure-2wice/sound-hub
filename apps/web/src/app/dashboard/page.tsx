@@ -32,6 +32,13 @@
 //
 //   - Recovery is rendered for `user.setupState === "recovery"`
 //     and is independent of the acting Workspace.
+//   - No-actor recovery (Codex review, P1-001, second iteration):
+//     when `resolveActingWorkspaceId` returns `null` the
+//     dashboard renders an explicit selection surface that lists
+//     every Active Workspace as a switch interstitial link — the
+//     user MUST pick an acting Workspace explicitly; refreshing
+//     cannot resolve the state and Organizations are never picked
+//     implicitly.
 
 import { useEffect, useState } from "react";
 import Link from "next/link";
@@ -107,17 +114,48 @@ export default function DashboardPage() {
   }
 
   if (!actingWorkspace) {
+    // No-actor recovery (Codex review, P1-001, second iteration):
+    // when `resolveActingWorkspaceId` returns `null` the user has
+    // an accessible Workspace set but no implicit Personal default
+    // to fall back to (e.g., Personal is Suspended but an Active
+    // Organization remains). The user MUST pick an acting
+    // Workspace explicitly through the switch interstitial — no
+    // implicit Organization selection, no misleading "refresh in
+    // a moment" copy. Each Active Workspace is offered as an
+    // explicit selection so the recovery is operable.
+    const activeWorkspaces = user.workspaces.filter((w) => w.workspaceStatus === "Active");
     return (
       <div className="min-h-screen bg-canvas">
         <div className="max-w-2xl mx-auto px-6 py-12" data-testid="dashboard-no-actor">
           <Card variant="parchment">
             <Card.Header>
-              <Card.Title>No acting Workspace</Card.Title>
+              <Card.Title>Choose an acting Workspace</Card.Title>
             </Card.Header>
             <Card.Content>
-              <p className="text-base text-muted">
-                Your acting Workspace is being prepared. Refresh in a moment.
+              <p className="text-base text-muted mb-4">
+                SoundHub could not pick an acting Workspace for you automatically. Pick the
+                Workspace you want to act as — the change is committed only after you confirm.
               </p>
+              <ul className="space-y-3" data-testid="dashboard-no-actor-options">
+                {activeWorkspaces.map((workspace) => (
+                  <li key={workspace.workspaceId}>
+                    <Link
+                      href={`/workspace/switch?target=${encodeURIComponent(workspace.workspaceId)}`}
+                      className="inline-flex items-center justify-center min-h-[44px] min-w-[44px] py-3 px-6 text-base font-medium text-white bg-aubergine hover:bg-aubergine-hover rounded focus:outline-none focus-visible:outline focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-aubergine"
+                      data-testid={`dashboard-no-actor-select-${workspace.workspaceId}`}
+                    >
+                      Act as {workspace.name}
+                      {workspace.workspaceType === "Organization" ? " (Organization)" : ""}
+                    </Link>
+                  </li>
+                ))}
+              </ul>
+              {activeWorkspaces.length === 0 && (
+                <Alert role="alert" variant="failure" title="No active Workspace">
+                  Every Workspace on your account is currently Suspended. Contact support to restore
+                  access.
+                </Alert>
+              )}
             </Card.Content>
           </Card>
         </div>

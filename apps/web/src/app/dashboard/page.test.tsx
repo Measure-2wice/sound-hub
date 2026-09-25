@@ -672,3 +672,68 @@ describe("dashboard cross-Workspace stale state (M2 #83 P1-001)", () => {
     );
   });
 });
+
+describe("Dashboard no-actor recovery surface (M2 #83 Codex P1-001 second iteration)", () => {
+  // Codex review (P1-001, second iteration) tightened the
+  // no-actor contract: when `resolveActingWorkspaceId` returns
+  // `null`, the dashboard MUST render an explicit selection
+  // surface that lists every Active Workspace as a switch
+  // interstitial link. Refreshing cannot resolve the state and
+  // Organizations are never picked implicitly. These assertions
+  // pin the dashboard source so a refactor cannot silently
+  // regress to the misleading "refresh in a moment" copy or
+  // drop the explicit selection action.
+  test("dashboard no-actor surface lists every Active Workspace as a switch interstitial link", () => {
+    // The no-actor surface MUST drive the user through the
+    // switch interstitial — the link href encodes the target
+    // Workspace id so the interstitial can revalidate and
+    // require explicit confirmation before the Workspace
+    // becomes the actor.
+    assert.match(
+      DASHBOARD_PAGE_SOURCE,
+      /\/workspace\/switch\?target=\$\{encodeURIComponent\(workspace\.workspaceId\)\}/,
+      "no-actor recovery MUST route each Active Workspace through /workspace/switch?target=<id> (P1-001 second iteration)",
+    );
+    assert.match(
+      DASHBOARD_PAGE_SOURCE,
+      /data-testid=\{`dashboard-no-actor-select-\$\{workspace\.workspaceId\}`\}/,
+      "no-actor recovery MUST expose a stable selection testid per Workspace so the recovery is operable and a11y-targetable",
+    );
+  });
+
+  test("dashboard no-actor copy is truthful: refreshing cannot resolve the state", () => {
+    // The previous copy ("Your acting Workspace is being
+    // prepared. Refresh in a moment.") falsely implied that
+    // refreshing resolves the no-actor state — but the resolver
+    // only re-runs when the user picks a Workspace. The new
+    // copy MUST describe the recovery truthfully and direct the
+    // user to pick a Workspace.
+    assert.equal(
+      /being prepared\.?\s*Refresh in a moment/i.test(DASHBOARD_PAGE_SOURCE),
+      false,
+      "no-actor copy MUST NOT claim 'being prepared, refresh in a moment' — refreshing cannot resolve the state (P1-001 second iteration)",
+    );
+    assert.match(
+      DASHBOARD_PAGE_SOURCE,
+      /Pick the\s+Workspace you want to act as/,
+      "no-actor copy MUST direct the user to pick a Workspace explicitly",
+    );
+  });
+
+  test("dashboard no-actor surface falls back to a contact-support Alert when no Active Workspace exists", () => {
+    // A user whose every Workspace is Suspended cannot pick
+    // one — the recovery surface MUST say so truthfully. Pin
+    // the bounded copy + the Alert primitive so screen readers
+    // announce the failure immediately.
+    assert.match(
+      DASHBOARD_PAGE_SOURCE,
+      /Every Workspace on your account is currently Suspended/,
+      "no-actor surface MUST surface the truth: a fully-Suspended account has no operable Workspace to pick",
+    );
+    assert.match(
+      DASHBOARD_PAGE_SOURCE,
+      /role="alert"[\s\S]*?No active Workspace/,
+      "no-actor fallback Alert MUST use role='alert' for screen-reader announcement",
+    );
+  });
+});

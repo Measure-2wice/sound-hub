@@ -34,6 +34,12 @@
 //     is a shared memo consumed by both the sync effect and the
 //     target memo so the authorization gate cannot drift between
 //     the two call sites (Codex review, P2-001).
+//   - No-actor recovery (Codex review, P1-001, second iteration):
+//     when `actingWorkspace` is null but `target` is valid, the
+//     commit form still renders with truthful "Currently acting
+//     as: (none)" copy — the user MUST confirm before the
+//     Workspace becomes the actor. The unavailable surface fires
+//     only when `target` is null.
 
 import { Suspense, useEffect, useMemo, useRef, useState } from "react";
 import { useRouter, useSearchParams } from "next/navigation";
@@ -217,7 +223,15 @@ function WorkspaceSwitchPageInner() {
     );
   }
 
-  if (!actingWorkspace || !target) {
+  // The no-actor recovery case (Codex review, P1-001, second
+  // iteration): `actingWorkspace` may be null when the user is
+  // picking an acting Workspace from the dashboard's no-actor
+  // surface. The commit form MUST still work as long as the
+  // `target` is valid; the "Currently acting as" card below
+  // handles the null case with truthful copy. A `null` target
+  // (no query, no in-memory pending) is the only condition that
+  // truly renders the switch unavailable.
+  if (!target) {
     return (
       <div className="min-h-screen bg-canvas">
         <div className="max-w-[1440px] mx-auto px-6 lg:px-12 py-12">
@@ -316,9 +330,15 @@ function WorkspaceSwitchPageInner() {
                 <div>
                   <dt className="inline font-medium text-muted">Currently acting as: </dt>
                   <dd className="inline text-ink" data-testid="workspace-switch-current-name">
-                    {actingWorkspace.name}
+                    {actingWorkspace ? actingWorkspace.name : "(none)"}
                   </dd>
                 </div>
+                {!actingWorkspace && (
+                  <p className="text-sm text-muted" data-testid="workspace-switch-current-unset">
+                    SoundHub will set this Workspace as your acting Workspace after you confirm
+                    below.
+                  </p>
+                )}
               </dl>
             </Card.Content>
           </Card>
