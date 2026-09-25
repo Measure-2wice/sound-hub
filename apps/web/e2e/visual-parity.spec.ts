@@ -289,7 +289,9 @@ test("authenticated mobile bar keeps the compact Workspace selector + menu toggl
     // nodes and the boundingBox assertion is ambiguous.
     const selectorBox = await page
       .getByTestId("shell-mobile-bar")
-      .getByTestId(/^(acting-workspace-compact-selector|acting-workspace-label)$/)
+      .getByTestId(
+        /^(acting-workspace-compact-selector|acting-workspace-compact-label|acting-workspace-label)$/,
+      )
       .boundingBox();
     expect(
       selectorBox,
