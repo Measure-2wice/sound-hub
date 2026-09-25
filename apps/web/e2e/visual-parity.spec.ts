@@ -27,15 +27,41 @@ const FRESH_EMAIL_PREFIX = "m2-83-visual-";
 // Sign in via the deterministic dev verification flow. The
 // login route creates a Personal Workspace for any fresh
 // email, so no explicit DB seed is required for these
-// authenticated visual-parity checks. Wait for the dashboard
-// OR the recovery surface so the helper covers the
-// multi-Personal-Workspace fixture used by other specs.
+// authenticated visual-parity checks.
+//
+// #83 auto-redirects a fresh user (zero-capability Personal
+// Workspace) to /workspace/intent so they can choose an
+// intent. This helper deterministically submits the Hire
+// intent (Buyer capability) and then settles on the dashboard
+// so the subsequent mobile-header assertions run against the
+// authenticated dashboard DOM — not a transient or
+// intermediate state. The recovery surface is also accepted
+// so the helper covers the multi-Personal-Workspace fixture
+// used by other specs (Codex review, P1-001 third iteration).
 async function signInFresh(page: Page, email: string): Promise<void> {
   await page.goto("/login");
   await page.getByTestId("login-email").fill(email);
   await page.getByTestId("login-submit").click();
   await page.getByTestId("login-dev-verify").click();
-  await page.getByTestId("dashboard").or(page.getByTestId("dashboard-recovery")).waitFor();
+  // Three post-sign-in landing surfaces are possible for a
+  // fresh user; wait for whichever appears first.
+  await Promise.race([
+    page
+      .getByTestId("dashboard")
+      .or(page.getByTestId("dashboard-recovery"))
+      .or(page.getByTestId("intent-page"))
+      .waitFor({ timeout: 15_000 })
+      .then(() => undefined),
+  ]);
+  // Fresh user landed on the intent page — submit Hire so
+  // the Personal Workspace has a Buyer capability and the
+  // dashboard auto-redirect does not race the subsequent
+  // Shell assertions.
+  if (await page.getByTestId("intent-page").count()) {
+    await page.getByTestId("intent-choice-hire-input").check();
+    await page.getByTestId("intent-submit").click();
+  }
+  await page.getByTestId("dashboard").waitFor({ timeout: 15_000 });
 }
 
 // ----- Landing page: reflow + coral contrast + logo at all four viewports -----
