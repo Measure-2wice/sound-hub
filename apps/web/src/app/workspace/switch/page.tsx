@@ -22,11 +22,17 @@
 //   - Cancel calls `cancelPendingTarget` and navigates to
 //     `/dashboard` — the committed value is NEVER touched by
 //     cancel.
-//   - The query-string `target` parameter is a recovery hint only.
-//     The acting-workspace context provider is the source of truth;
-//     the query is consulted only when context is stale (e.g., a
-//     hard reload mid-transit). The candidate is revalidated
-//     against `user.workspaces` before any action.
+//   - The query-string `target` parameter is the user's CURRENT
+//     explicit intent. A stale in-memory `pendingTargetId` from a
+//     previous uncommitted switch (e.g., a browser-back away from
+//     the interstitial, or a dashboard deep-link clicked before the
+//     commit settled) MUST NOT shadow the URL's `target`. The
+//     promotion effect re-syncs `pendingTargetId` to the resolved
+//     candidate whenever they diverge, AND the `target` memo
+//     prefers a valid query-string candidate on first render so the
+//     page never flashes the wrong "Switch to:" card. The candidate
+//     is revalidated against `user.workspaces` (Active gate) before
+//     any action.
 
 import { Suspense, useEffect, useMemo, useRef, useState } from "react";
 import { useRouter, useSearchParams } from "next/navigation";
@@ -74,15 +80,20 @@ function WorkspaceSwitchPageInner() {
   const { actingWorkspace, pendingTarget, pendingTargetId } = useActingWorkspace();
   const { commitPendingTarget, cancelPendingTarget, setPendingTarget } = useSetActingWorkspace();
 
-  // Query-string target is a recovery hint for deep-link / hard-reload
-  // cases (P1-002). When context is empty AND the URL carries a
-  // `target=` query parameter, validate the candidate against the
-  // user's accessible Workspaces and promote it to the in-memory
-  // pending state. Once pendingTarget is set, the page's "Switch
-  // and continue" commit operation must explicitly switch — no
-  // silent no-op path.
+  // Query-string target is the user's CURRENT explicit intent. The
+  // re-sync runs whenever `pendingTargetId` diverges from the
+  // resolved URL candidate — NOT only when `pendingTargetId` is
+  // null. The original null-only gate let a stale `pendingTargetId`
+  // from a previous uncommitted switch (selector → browser-back
+  // → dashboard deep-link) shadow the URL's `target` and render
+  // the wrong "Switch to:" card (visual-QA regression). The
+  // selector flow (`handleSelect` pre-sets `pendingTarget` to the
+  // same id before navigating) already has `pendingTargetId ===
+  // candidate.workspaceId` on mount, so this is a no-op there.
+  // Once `pendingTarget` is set, the page's "Switch and continue"
+  // commit operation must still explicitly switch — no silent
+  // no-op path.
   useEffect(() => {
-    if (pendingTargetId !== null) return;
     if (!user) return;
     const queryTargetId = searchParams.get("target");
     if (!queryTargetId) return;
@@ -90,7 +101,9 @@ function WorkspaceSwitchPageInner() {
       (w) => w.workspaceId === queryTargetId && w.workspaceStatus === "Active",
     );
     if (!candidate) return;
-    setPendingTarget(candidate.workspaceId);
+    if (pendingTargetId !== candidate.workspaceId) {
+      setPendingTarget(candidate.workspaceId);
+    }
   }, [pendingTargetId, user, searchParams, setPendingTarget]);
 
   // provider before navigating here).
@@ -111,21 +124,24 @@ function WorkspaceSwitchPageInner() {
   }, [searchParams]);
 
   const target = useMemo(() => {
-    if (pendingTarget) return pendingTarget;
-    if (!user || !queryTargetId) return null;
-    // Only Active Workspaces may render as a valid switch target.
-    // A deep link to a Suspended or non-Active Workspace must fall
-    // through to the unavailable surface — never present a
-    // "Switch and continue" button for a target that cannot
-    // actually be committed. The promotion effect above enforces
-    // the same Active gate before any pendingTarget is set; this
-    // lookup applies the same gate when the buyer lands directly
-    // on the switch page without an explicit selector click.
-    return (
-      user.workspaces.find(
+    // The query-string `target` is the user's current explicit
+    // intent (e.g., the dashboard "Switch to your Personal
+    // Workspace" link). When it resolves to a valid Active
+    // Workspace, it MUST win over any stale `pendingTargetId`
+    // from a previous uncommitted switch — otherwise the page
+    // would render the wrong "Switch to:" card for one render
+    // before the re-sync effect catches up. The selector flow
+    // pre-sets `pendingTarget` to the same id before navigating,
+    // so both branches resolve to the same Workspace there and
+    // there is no observable difference.
+    if (user && queryTargetId) {
+      const queryCandidate = user.workspaces.find(
         (w) => w.workspaceId === queryTargetId && w.workspaceStatus === "Active",
-      ) ?? null
-    );
+      );
+      if (queryCandidate) return queryCandidate;
+    }
+    if (pendingTarget) return pendingTarget;
+    return null;
   }, [pendingTarget, queryTargetId, user]);
 
   const [submitting, setSubmitting] = useState(false);

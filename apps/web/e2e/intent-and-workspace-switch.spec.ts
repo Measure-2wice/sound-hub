@@ -214,6 +214,86 @@ test.describe("M2 #83: intent + Workspace switching (expected-state)", () => {
     await expect(page.getByTestId("dashboard-org-switch-to-personal")).toBeVisible();
   });
 
+  // Visual-QA regression (M2 #83 P1). After committing to the
+  // Organization, the dashboard's "Switch to your Personal Workspace"
+  // deep-link targets the Personal Workspace correctly, but the
+  // interstitial previously rendered the Organization as both the
+  // current AND target Workspace because a stale `pendingTargetId`
+  // from the prior switch shadowed the URL's `target`. The fix
+  // re-syncs `pendingTargetId` to the URL whenever they diverge
+  // AND the `target` memo prefers the URL on first render so the
+  // page never flashes the wrong card.
+  test("Dashboard deep-link to Personal from Organization renders Personal (not Organization) as the switch target", async ({
+    page,
+  }) => {
+    const email = `${FRESH_EMAIL_PREFIX}back-switch-${Date.now()}@example.test`;
+    seedFreshUser(email);
+    await signInViaDevUrl(page, email);
+    await page.getByTestId("dashboard").waitFor();
+    await page.evaluate(() => window.localStorage.removeItem("soundhub.actingWorkspaceId"));
+
+    // Provision Buyer on Personal so the dashboard renders Buyer
+    // readiness and the selector dropdown is exposed (the selector
+    // needs two accessible Workspaces to render its dropdown).
+    await walkToIntentPage(page);
+    await page.getByTestId("intent-choice-hire-input").check();
+    await page.getByTestId("intent-submit").click();
+    await page.getByTestId("dashboard").waitFor();
+
+    // Capture both Workspace ids via the selector dropdown so we
+    // can target the back-link without re-querying /api/auth/me.
+    await page.getByTestId("acting-workspace-selector").click();
+    const personalOption = page.getByTestId(/^acting-workspace-option-/).first();
+    const orgOption = page.getByTestId(/^acting-workspace-option-/).nth(1);
+    await personalOption.waitFor();
+    await orgOption.waitFor();
+    const personalId =
+      (await personalOption.getAttribute("data-testid"))?.replace("acting-workspace-option-", "") ??
+      "";
+    const orgId =
+      (await orgOption.getAttribute("data-testid"))?.replace("acting-workspace-option-", "") ?? "";
+    await page.keyboard.press("Escape");
+
+    // Commit the switch to the Organization so the dashboard
+    // exposes the "Switch to your Personal Workspace" link.
+    await page.getByTestId("acting-workspace-selector").click();
+    await orgOption.click();
+    await page.getByTestId("workspace-switch-page").waitFor();
+    await page.getByTestId("workspace-switch-continue").click();
+    await page.getByTestId("dashboard").waitFor();
+    await expect(page.getByTestId("dashboard-org-switch-to-personal")).toBeVisible();
+
+    // Follow the dashboard back-link. The URL MUST target the
+    // Personal Workspace id we captured above.
+    await page.getByTestId("dashboard-org-switch-to-personal").click();
+    await page.getByTestId("workspace-switch-page").waitFor();
+    expect(page.url()).toContain(`target=${encodeURIComponent(personalId)}`);
+
+    // The "Switch to:" card MUST name Personal — NOT the
+    // Organization that the page is also currently acting as.
+    // Pre-fix this rendered the Organization's name here because
+    // the stale `pendingTargetId` shadowed the URL's `target`.
+    const targetName = await page.getByTestId("workspace-switch-target-name").textContent();
+    expect(targetName?.trim()).toBe("Multi-Workspace Test Personal");
+    // The current actor card MUST continue to show the
+    // Organization the user just committed to (the visual-QA
+    // finding specifically called out that BOTH cards rendered
+    // the Organization).
+    const currentName = await page.getByTestId("workspace-switch-current-name").textContent();
+    expect(currentName?.trim()).not.toBe(targetName?.trim());
+    expect(currentName?.trim()).toBe("Multi-Workspace Test Organization");
+    // And the commit button MUST be enabled — the page must not
+    // fall through to the unavailable surface for this valid
+    // Active Workspace.
+    await expect(page.getByTestId("workspace-switch-continue")).toBeEnabled();
+
+    // Sanity: the captured orgId id MUST differ from personalId;
+    // this guards the assertion above against selector ordering
+    // drift across the seed fixture.
+    expect(orgId).not.toBe(personalId);
+    expect(personalId).not.toBe("");
+  });
+
   // -----------------------------------------------------------------
   // Additional acceptance paths: Offer, Both, later-add /
   // idempotency / conflicting-retry recovery, validated return
