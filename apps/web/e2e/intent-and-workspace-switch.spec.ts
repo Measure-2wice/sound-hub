@@ -879,6 +879,18 @@ test.describe("M2 #83: intent + Workspace switching (expected-state)", () => {
     await signInViaDevUrl(page, email);
     await page.getByTestId("dashboard").waitFor();
 
+    // Provision Buyer on the ACTIVE Personal Workspace FIRST so
+    // the dashboard auto-redirect does not kick in when we later
+    // restore from localStorage. Without Buyer, the dashboard
+    // redirects to /workspace/intent for an unprovisioned
+    // Personal Workspace, which would mask the resolver's
+    // Personal-vs-Organization outcome.
+    await walkToIntentPage(page);
+    await page.getByTestId("intent-choice-hire-input").check();
+    await page.getByTestId("intent-submit").click();
+    await page.getByTestId("dashboard").waitFor();
+    await expect(page.getByTestId("dashboard-buyer-readiness")).toBeVisible();
+
     // Drive /api/auth/me directly so we can capture the Suspended
     // Organization id without relying on selector ordering (the
     // selector filters Suspended entries out of the Active list).
@@ -893,7 +905,9 @@ test.describe("M2 #83: intent + Workspace switching (expected-state)", () => {
 
     // Plant the Suspended id in localStorage so the very next
     // navigation runs through resolveActingWorkspaceId with a
-    // remembered=Suspended entry.
+    // remembered=Suspended entry. The committed localStorage
+    // value stays Suspended — only the in-memory resolver must
+    // change.
     await page.evaluate((id) => {
       window.localStorage.setItem("soundhub.actingWorkspaceId", id);
     }, suspendedOrgId);
@@ -909,8 +923,9 @@ test.describe("M2 #83: intent + Workspace switching (expected-state)", () => {
     // Organization MUST NOT be the actor so that card MUST NOT
     // render for the Suspended-org fixture.
     await expect(page.getByTestId("dashboard-organization-context")).toHaveCount(0);
-    // The Personal Readiness surface MUST render (the Personal
-    // actor satisfies the Personal-only readiness surfaces).
+    // The Personal Readiness surface MUST render (the resolver
+    // fell back to the Active Personal Workspace, which now has
+    // Buyer capability from the provisioning step above).
     await expect(page.getByTestId("dashboard-buyer-readiness")).toBeVisible();
 
     // The committed localStorage entry remains a client-convenience
@@ -939,12 +954,14 @@ test.describe("M2 #83: intent + Workspace switching (expected-state)", () => {
     expect(resolved).not.toBe("Multi-Workspace Test Organization");
   });
 
-  // Codex review (P1-001) verification (case 2): the fallback
-  // when the Personal Workspace itself is NOT Active. A
-  // remembered Personal id + a Suspended Personal Workspace must
-  // resolve to the first Active accessible Workspace (the
-  // Organization), never the Suspended Personal.
-  test("P1-001: remembered Suspended Personal falls back to the first Active accessible Workspace", async ({
+  // Codex review (P1-001, second iteration) verification: when the
+  // Personal Workspace itself is NOT Active and a Suspended
+  // Personal id is remembered, the resolver MUST return `null` so
+  // the dashboard renders the explicit `dashboard-no-actor`
+  // recovery surface. The user MUST select an Organization
+  // explicitly via the selector — implicit Organization selection
+  // would change acting context without confirmation.
+  test("P1-001: remembered Suspended Personal renders the no-actor recovery surface (no implicit Organization)", async ({
     page,
   }) => {
     const email = `${FRESH_EMAIL_PREFIX}suspended-personal-${Date.now()}@example.test`;
@@ -972,6 +989,10 @@ test.describe("M2 #83: intent + Workspace switching (expected-state)", () => {
       "suspendPersonal fixture MUST expose one Suspended Personal Workspace",
     ).toBeTruthy();
     const suspendedPersonalId = suspendedPersonal!.workspaceId;
+    const activeOrg = meBody.user.workspaces.find(
+      (w) => w.workspaceType === "Organization" && w.workspaceStatus === "Active",
+    );
+    expect(activeOrg, "fixture MUST expose one Active Organization").toBeTruthy();
 
     // Plant the Suspended Personal id in localStorage.
     await page.evaluate((id) => {
@@ -983,16 +1004,23 @@ test.describe("M2 #83: intent + Workspace switching (expected-state)", () => {
     await page.goto("/dashboard");
     await page.getByTestId("dashboard").waitFor();
 
-    // The Organization is Active and IS the first (only) Active
-    // accessible Workspace when the Personal is Suspended, so
-    // the resolver MUST fall back to it — NOT to the Suspended
-    // Personal.
-    await expect(page.getByTestId("dashboard-organization-context")).toBeVisible();
-    // And the dashboard MUST NOT render the Personal-only
-    // readiness surfaces (Buyer/Seller readiness lives on the
-    // Personal Workspace; a Suspended Personal cannot satisfy
-    // them).
+    // The resolver MUST return null because no Active Personal
+    // Workspace is accessible. The dashboard MUST render the
+    // explicit no-actor recovery surface — NOT Organization
+    // context. Implicit Organization selection would silently
+    // change acting context without confirmation (P1-001,
+    // second iteration).
+    await expect(page.getByTestId("dashboard-no-actor")).toBeVisible();
+    await expect(page.getByTestId("dashboard-organization-context")).toHaveCount(0);
+    // The dashboard MUST NOT render the Personal-only readiness
+    // surfaces (Buyer/Seller readiness lives on the Personal
+    // Workspace; a Suspended Personal cannot satisfy them).
     await expect(page.getByTestId("dashboard-buyer-readiness")).toHaveCount(0);
     await expect(page.getByTestId("dashboard-seller-readiness")).toHaveCount(0);
+
+    // Sanity: the localStorage plant is intact — the resolver
+    // alone determines the in-memory actor.
+    const stillSuspended = await readCommittedActingWorkspaceId(page);
+    expect(stillSuspended).toBe(suspendedPersonalId);
   });
 });

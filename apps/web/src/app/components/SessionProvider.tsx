@@ -107,16 +107,17 @@ const SessionContext = createContext<SessionContextValue | null>(null);
  * Resolve the committed acting-Workspace id from the user's
  * accessible workspaces plus a remembered localStorage value.
  *
- * Status gate (Codex review, P1-001): every branch — the
- * remembered match, the Personal-Workspace fallback, and the
- * first-workspace fallback — MUST consult `workspaceStatus ===
- * "Active"`. A remembered Suspended Organization, a Suspended
- * Personal Workspace, or any Suspended first-workspace entry
- * MUST NOT become the client actor. When no Active Workspace
- * is accessible the function returns `null` so the consumer
- * (the dashboard's `dashboard-no-actor` surface, the shell,
- * etc.) renders the explicit recovery affordance rather than
- * presenting a Suspended Workspace as current.
+ * Status gate (Codex review, P1-001, two iterations): every
+ * branch — the remembered match and the Personal-Workspace
+ * fallback — MUST consult `workspaceStatus === "Active"`. A
+ * remembered Suspended Organization or a Suspended Personal
+ * Workspace MUST NOT become the client actor. When no Active
+ * Personal Workspace is accessible the function returns
+ * `null` so the consumer (the dashboard's `dashboard-no-actor`
+ * surface, the shell, etc.) renders the explicit recovery
+ * affordance — the user MUST select an Organization explicitly
+ * via the selector; implicit Organization selection would
+ * change acting context without confirmation.
  */
 function resolveActingWorkspaceId(
   user: Bg1PublicUserV1 | null,
@@ -136,19 +137,15 @@ function resolveActingWorkspaceId(
   }
   // Default to the user's ACTIVE Personal Workspace. The Personal
   // Workspace is the production-shaped first Workspace; Organization
-  // memberships never become the default. A Suspended Personal
-  // Workspace falls through to the first Active accessible
-  // Workspace (P1-001).
+  // memberships never become the implicit default (P1-001). A
+  // Suspended Personal Workspace falls through to `null` — the
+  // consumer renders the explicit `dashboard-no-actor` recovery
+  // surface and the user MUST pick an Organization through the
+  // selector. Implicit Organization selection is not safe.
   const personal = user.workspaces.find(
     (w) => w.workspaceType === "Personal" && w.workspaceStatus === "Active",
   );
-  if (personal) return personal.workspaceId;
-  // Last resort: any Active accessible Workspace. Returning `null`
-  // (instead of `user.workspaces[0]!.workspaceId`) ensures a
-  // Suspended-only fixture never becomes the actor — the consumer
-  // renders `dashboard-no-actor` instead (P1-001).
-  const firstActive = user.workspaces.find((w) => w.workspaceStatus === "Active");
-  return firstActive ? firstActive.workspaceId : null;
+  return personal ? personal.workspaceId : null;
 }
 
 export interface ActingWorkspaceContextValue {

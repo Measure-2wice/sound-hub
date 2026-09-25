@@ -63,11 +63,14 @@ export interface SeedMultiWorkspaceUserOptions {
    * If `true`, create the Personal Workspace with `status =
    * "Suspended"`. The user still holds an Owner membership on
    * the row, so `user.workspaces[]` returns it; the resolver in
-   * the Acting-Workspace provider MUST fall back to the first
-   * Active accessible Workspace (the Organization) rather than
-   * presenting the Suspended Personal Workspace as current.
-   * This fixture exists for the Codex review (P1-001) verification
-   * of `resolveActingWorkspaceId`'s Personal-status gate.
+   * the Acting-Workspace provider MUST return `null` (rather
+   * than falling back to an implicit Active Organization) so
+   * the consumer renders the explicit `dashboard-no-actor`
+   * recovery surface. The user MUST pick an Organization through
+   * the selector — implicit Organization selection would
+   * silently change acting context. This fixture exists for
+   * the Codex review (P1-001, second iteration) verification of
+   * `resolveActingWorkspaceId`'s no-implicit-Organization rule.
    */
   readonly suspendPersonal?: boolean;
 }
