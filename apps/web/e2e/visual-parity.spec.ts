@@ -31,36 +31,46 @@ const FRESH_EMAIL_PREFIX = "m2-83-visual-";
 //
 // #83 auto-redirects a fresh user (zero-capability Personal
 // Workspace) to /workspace/intent so they can choose an
-// intent. This helper deterministically submits the Hire
-// intent (Buyer capability) and then settles on the dashboard
-// so the subsequent mobile-header assertions run against the
-// authenticated dashboard DOM — not a transient or
-// intermediate state. The recovery surface is also accepted
-// so the helper covers the multi-Personal-Workspace fixture
-// used by other specs (Codex review, P1-001 third iteration).
+// intent. That redirect fires via a `useEffect` on the
+// dashboard, so the dashboard briefly renders BEFORE the
+// redirect resolves — a real user never sees the dashboard
+// for a fresh user, but a `getByTestId("dashboard").waitFor()`
+// CAN resolve against that transient DOM and return before
+// the helper reaches the intent page. Treating the transient
+// dashboard as "done" was the source of the race the
+// previous helper introduced (Codex review, P1-001 fourth
+// iteration).
+//
+// Deterministic flow: wait only for the sign-in response to
+// settle (any of the three landing surfaces), explicitly
+// navigate to `/workspace/intent`, submit Hire (Buyer
+// capability), and only then wait for the post-provisioning
+// stable dashboard.
 async function signInFresh(page: Page, email: string): Promise<void> {
   await page.goto("/login");
   await page.getByTestId("login-email").fill(email);
   await page.getByTestId("login-submit").click();
   await page.getByTestId("login-dev-verify").click();
-  // Three post-sign-in landing surfaces are possible for a
-  // fresh user; wait for whichever appears first.
-  await Promise.race([
-    page
-      .getByTestId("dashboard")
-      .or(page.getByTestId("dashboard-recovery"))
-      .or(page.getByTestId("intent-page"))
-      .waitFor({ timeout: 15_000 })
-      .then(() => undefined),
-  ]);
-  // Fresh user landed on the intent page — submit Hire so
-  // the Personal Workspace has a Buyer capability and the
-  // dashboard auto-redirect does not race the subsequent
-  // Shell assertions.
-  if (await page.getByTestId("intent-page").count()) {
-    await page.getByTestId("intent-choice-hire-input").check();
-    await page.getByTestId("intent-submit").click();
-  }
+  // Wait for the sign-in response to settle on ANY of the
+  // three possible landing surfaces. We do NOT branch off the
+  // `dashboard` landing — a fresh user's dashboard is transient
+  // and the helper would return before intent provisioning.
+  await page
+    .getByTestId("dashboard")
+    .or(page.getByTestId("dashboard-recovery"))
+    .or(page.getByTestId("intent-page"))
+    .waitFor({ timeout: 15_000 });
+  // Deterministic landing: navigate to the intent page so we
+  // can submit the intent choice without racing the
+  // pre-redirect dashboard render.
+  await page.goto("/workspace/intent");
+  await page.getByTestId("intent-page").waitFor({ timeout: 15_000 });
+  // Provision Buyer so the Personal Workspace has a capability
+  // and the post-submit dashboard does not auto-redirect back
+  // to the intent page during the subsequent Shell assertions.
+  await page.getByTestId("intent-choice-hire-input").check();
+  await page.getByTestId("intent-submit").click();
+  // Wait for the post-provisioning STABLE dashboard.
   await page.getByTestId("dashboard").waitFor({ timeout: 15_000 });
 }
 
