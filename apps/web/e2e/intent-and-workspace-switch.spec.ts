@@ -77,7 +77,10 @@ const FRESH_EMAIL_PREFIX = "m2-83-intent-";
 const SEED_HELPER = resolvePath(__dirname, "../../api/src/test-helpers/multi-workspace-user.ts");
 const SEED_RUNNER = resolvePath(__dirname, "../../api/node_modules/.bin/tsx");
 
-function seedFreshUser(email: string, options: { suspendOrganization?: boolean } = {}): void {
+function seedFreshUser(
+  email: string,
+  options: { suspendOrganization?: boolean; suspendPersonal?: boolean } = {},
+): void {
   execFileSync(SEED_RUNNER, [SEED_HELPER, email], {
     cwd: resolvePath(__dirname, "../../api"),
     env: {
@@ -85,6 +88,7 @@ function seedFreshUser(email: string, options: { suspendOrganization?: boolean }
       TEST_DATABASE_URL: APPROVED_DISPOSABLE_TEST_DATABASE_URL,
       NODE_ENV: "test",
       SUSPEND_ORG: options.suspendOrganization ? "1" : "",
+      SUSPEND_PERSONAL: options.suspendPersonal ? "1" : "",
     },
     stdio: "inherit",
   });
@@ -859,5 +863,136 @@ test.describe("M2 #83: intent + Workspace switching (expected-state)", () => {
     await expect(page.getByTestId("workspace-switch-target-name")).toHaveCount(0);
     // Recovery affordance present.
     await expect(page.getByTestId("switch-back-to-dashboard")).toBeVisible();
+  });
+
+  // Codex review (P1-001) verification (case 1): store a Suspended
+  // Organization id in localStorage before session restoration and
+  // prove the resolved acting Workspace is the ACTIVE Personal
+  // Workspace, never the Suspended Organization. The previous
+  // resolver matched the remembered id only, so a Suspended entry
+  // could remain the client actor.
+  test("P1-001: remembered Suspended Organization falls back to the Active Personal Workspace on session restoration", async ({
+    page,
+  }) => {
+    const email = `${FRESH_EMAIL_PREFIX}suspended-remembered-${Date.now()}@example.test`;
+    seedFreshUser(email, { suspendOrganization: true });
+    await signInViaDevUrl(page, email);
+    await page.getByTestId("dashboard").waitFor();
+
+    // Drive /api/auth/me directly so we can capture the Suspended
+    // Organization id without relying on selector ordering (the
+    // selector filters Suspended entries out of the Active list).
+    const meResponse = await page.request.get("/api/auth/me");
+    expect(meResponse.status()).toBe(200);
+    const meBody = (await meResponse.json()) as {
+      user: { workspaces: readonly { workspaceId: string; workspaceStatus: string }[] };
+    };
+    const suspendedOrg = meBody.user.workspaces.find((w) => w.workspaceStatus === "Suspended");
+    expect(suspendedOrg, "seed fixture MUST expose one Suspended Workspace").toBeTruthy();
+    const suspendedOrgId = suspendedOrg!.workspaceId;
+
+    // Plant the Suspended id in localStorage so the very next
+    // navigation runs through resolveActingWorkspaceId with a
+    // remembered=Suspended entry.
+    await page.evaluate((id) => {
+      window.localStorage.setItem("soundhub.actingWorkspaceId", id);
+    }, suspendedOrgId);
+
+    // Force a fresh resolution by reloading the dashboard.
+    await page.goto("/dashboard");
+    await page.getByTestId("dashboard").waitFor();
+
+    // The dashboard MUST present the ACTIVE Personal Workspace,
+    // not the Suspended Organization. The dashboard renders the
+    // actor inside the `dashboard-organization-context` card
+    // when the actor is an Organization; the Suspended
+    // Organization MUST NOT be the actor so that card MUST NOT
+    // render for the Suspended-org fixture.
+    await expect(page.getByTestId("dashboard-organization-context")).toHaveCount(0);
+    // The Personal Readiness surface MUST render (the Personal
+    // actor satisfies the Personal-only readiness surfaces).
+    await expect(page.getByTestId("dashboard-buyer-readiness")).toBeVisible();
+
+    // The committed localStorage entry remains a client-convenience
+    // value (unchanged); the in-memory resolver is the only thing
+    // that must differ. Assert the localStorage plant is intact so
+    // a regression that just clears localStorage cannot mask the
+    // bug.
+    const stillSuspended = await readCommittedActingWorkspaceId(page);
+    expect(stillSuspended).toBe(suspendedOrgId);
+
+    // The selector displays the resolved actingWorkspace.name —
+    // the deterministic browser seam for the in-memory resolver.
+    // The selector exists in either `desktop` (selector-name) or
+    // `mobile-compact` (compact-name) variants depending on the
+    // viewport; both surface the same actingWorkspace.name.
+    const selectorName = await page
+      .getByTestId("acting-workspace-selector-name")
+      .textContent()
+      .catch(() => null);
+    const compactName = await page
+      .getByTestId("acting-workspace-compact-name")
+      .textContent()
+      .catch(() => null);
+    const resolved = (selectorName ?? compactName ?? "").trim();
+    expect(resolved).toBe("Multi-Workspace Test Personal");
+    expect(resolved).not.toBe("Multi-Workspace Test Organization");
+  });
+
+  // Codex review (P1-001) verification (case 2): the fallback
+  // when the Personal Workspace itself is NOT Active. A
+  // remembered Personal id + a Suspended Personal Workspace must
+  // resolve to the first Active accessible Workspace (the
+  // Organization), never the Suspended Personal.
+  test("P1-001: remembered Suspended Personal falls back to the first Active accessible Workspace", async ({
+    page,
+  }) => {
+    const email = `${FRESH_EMAIL_PREFIX}suspended-personal-${Date.now()}@example.test`;
+    seedFreshUser(email, { suspendPersonal: true });
+    await signInViaDevUrl(page, email);
+    await page.getByTestId("dashboard").waitFor();
+
+    // Capture the Suspended Personal id via /api/auth/me.
+    const meResponse = await page.request.get("/api/auth/me");
+    expect(meResponse.status()).toBe(200);
+    const meBody = (await meResponse.json()) as {
+      user: {
+        workspaces: readonly {
+          workspaceId: string;
+          workspaceType: string;
+          workspaceStatus: string;
+        }[];
+      };
+    };
+    const suspendedPersonal = meBody.user.workspaces.find(
+      (w) => w.workspaceType === "Personal" && w.workspaceStatus === "Suspended",
+    );
+    expect(
+      suspendedPersonal,
+      "suspendPersonal fixture MUST expose one Suspended Personal Workspace",
+    ).toBeTruthy();
+    const suspendedPersonalId = suspendedPersonal!.workspaceId;
+
+    // Plant the Suspended Personal id in localStorage.
+    await page.evaluate((id) => {
+      window.localStorage.setItem("soundhub.actingWorkspaceId", id);
+    }, suspendedPersonalId);
+
+    // Reload the dashboard so resolveActingWorkspaceId runs
+    // with the Suspended-Personal remembered entry.
+    await page.goto("/dashboard");
+    await page.getByTestId("dashboard").waitFor();
+
+    // The Organization is Active and IS the first (only) Active
+    // accessible Workspace when the Personal is Suspended, so
+    // the resolver MUST fall back to it — NOT to the Suspended
+    // Personal.
+    await expect(page.getByTestId("dashboard-organization-context")).toBeVisible();
+    // And the dashboard MUST NOT render the Personal-only
+    // readiness surfaces (Buyer/Seller readiness lives on the
+    // Personal Workspace; a Suspended Personal cannot satisfy
+    // them).
+    await expect(page.getByTestId("dashboard-buyer-readiness")).toHaveCount(0);
+    await expect(page.getByTestId("dashboard-seller-readiness")).toHaveCount(0);
   });
 });

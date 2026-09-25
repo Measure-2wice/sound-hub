@@ -217,3 +217,62 @@ describe("BG1 failed verification cannot mark the user signed in", () => {
     );
   });
 });
+
+describe("Acting-Workspace status revalidation (M2 #83 Codex P1-001)", () => {
+  // Codex review (P1-001) flagged that `resolveActingWorkspaceId`
+  // matched a remembered Workspace by id alone and that its
+  // Personal/first fallback also ignored `workspaceStatus`. Because
+  // `/api/auth/me` can include Suspended memberships, a remembered
+  // Suspended Organization (or a Suspended fallback) could remain
+  // the client actor and be presented by the shell/dashboard as
+  // current. These source-pattern assertions pin the Active gate
+  // on every branch of the resolver so a refactor cannot silently
+  // regress to id-only matching.
+  test("resolveActingWorkspaceId gates the remembered match on workspaceStatus === 'Active' (P1-001)", () => {
+    const source = readFile("components/SessionProvider.tsx");
+    // Pin the body of `resolveActingWorkspaceId` so the assertion
+    // cannot pass via a stray Active check elsewhere in the file.
+    const resolverBodyMatch = source.match(/function resolveActingWorkspaceId\([\s\S]*?\n\}\n/);
+    assert.ok(resolverBodyMatch, "resolveActingWorkspaceId MUST be present in SessionProvider.tsx");
+    const resolverBody = resolverBodyMatch[0];
+    assert.match(
+      resolverBody,
+      /user\.workspaces\.find\(\s*\(\s*w\s*\)\s*=>\s*w\.workspaceId\s*===\s*remembered\s*&&\s*w\.workspaceStatus\s*===\s*["']Active["']/,
+      "the remembered-match lookup MUST gate on workspaceStatus === 'Active' alongside workspaceId === remembered (P1-001)",
+    );
+  });
+
+  test("resolveActingWorkspaceId gates the Personal-Workspace fallback on workspaceStatus === 'Active' (P1-001)", () => {
+    const source = readFile("components/SessionProvider.tsx");
+    const resolverBodyMatch = source.match(/function resolveActingWorkspaceId\([\s\S]*?\n\}\n/);
+    assert.ok(resolverBodyMatch, "resolveActingWorkspaceId MUST be present");
+    const resolverBody = resolverBodyMatch[0];
+    assert.match(
+      resolverBody,
+      /w\.workspaceType\s*===\s*["']Personal["']\s*&&\s*w\.workspaceStatus\s*===\s*["']Active["']/,
+      "the Personal-Workspace fallback MUST gate on workspaceStatus === 'Active' so a Suspended Personal Workspace cannot become the actor (P1-001)",
+    );
+  });
+
+  test("resolveActingWorkspaceId returns null (NOT user.workspaces[0]) when no Active Workspace exists (P1-001)", () => {
+    const source = readFile("components/SessionProvider.tsx");
+    const resolverBodyMatch = source.match(/function resolveActingWorkspaceId\([\s\S]*?\n\}\n/);
+    assert.ok(resolverBodyMatch, "resolveActingWorkspaceId MUST be present");
+    const resolverBody = resolverBodyMatch[0];
+    // The unguarded `user.workspaces[0]!.workspaceId` access was
+    // the exact line that let a Suspended-only fixture become the
+    // actor. Pin by asserting it is gone from the code (a comment
+    // may still reference it for documentation) AND that the
+    // last-resort branch gates on Active.
+    assert.equal(
+      /return\s+user\.workspaces\[0\]!/.test(resolverBody),
+      false,
+      "resolveActingWorkspaceId MUST NOT return user.workspaces[0]! directly — a Suspended-only fixture must not become the actor (P1-001)",
+    );
+    assert.match(
+      resolverBody,
+      /workspaceStatus\s*===\s*["']Active["']/,
+      "the last-resort fallback MUST gate on workspaceStatus === 'Active' (P1-001)",
+    );
+  });
+});

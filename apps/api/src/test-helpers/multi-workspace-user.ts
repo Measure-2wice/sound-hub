@@ -59,6 +59,17 @@ export interface SeedMultiWorkspaceUserOptions {
    * continues to seed the canonical Active Organization fixture.
    */
   readonly suspendOrganization?: boolean;
+  /**
+   * If `true`, create the Personal Workspace with `status =
+   * "Suspended"`. The user still holds an Owner membership on
+   * the row, so `user.workspaces[]` returns it; the resolver in
+   * the Acting-Workspace provider MUST fall back to the first
+   * Active accessible Workspace (the Organization) rather than
+   * presenting the Suspended Personal Workspace as current.
+   * This fixture exists for the Codex review (P1-001) verification
+   * of `resolveActingWorkspaceId`'s Personal-status gate.
+   */
+  readonly suspendPersonal?: boolean;
 }
 
 /**
@@ -74,6 +85,7 @@ export async function seedMultiWorkspaceUser(
     throw new Error("seedMultiWorkspaceUser: email argument is required");
   }
   const suspendOrganization = options.suspendOrganization === true;
+  const suspendPersonal = options.suspendPersonal === true;
   const url = readTestDatabaseUrl();
   assertDisposableTestDatabase(url);
 
@@ -98,7 +110,7 @@ export async function seedMultiWorkspaceUser(
         slug: personalSlug,
         name: "Multi-Workspace Test Personal",
         type: "Personal",
-        status: "Active",
+        status: suspendPersonal ? "Suspended" : "Active",
         ownerUserId: user.id,
       },
     });
@@ -149,13 +161,22 @@ if (isMainModule) {
   }
   // The CLI is the e2e browser seam's primary entry point. Tests
   // that need a Suspended Organization Workspace opt in via
-  // SUSPEND_ORG=1 in the spawned env (without changing the CLI
-  // signature the existing Playwright fixtures already use).
+  // SUSPEND_ORG=1; tests that need a Suspended Personal Workspace
+  // opt in via SUSPEND_PERSONAL=1. Both flags are accepted in the
+  // spawned env without changing the CLI signature the existing
+  // Playwright fixtures already use.
   const suspendOrganization = process.env.SUSPEND_ORG === "1";
-  seedMultiWorkspaceUser(email, { suspendOrganization })
+  const suspendPersonal = process.env.SUSPEND_PERSONAL === "1";
+  seedMultiWorkspaceUser(email, { suspendOrganization, suspendPersonal })
     .then((result) => {
+      const tags = [
+        suspendOrganization ? "suspended-org" : null,
+        suspendPersonal ? "suspended-personal" : null,
+      ]
+        .filter((t): t is string => t !== null)
+        .join(" ");
       console.log(
-        `✓ seeded multi-workspace user: ${email} (userId=${result.userAccountId} personal=${result.personalWorkspaceId} org=${result.organizationWorkspaceId}${suspendOrganization ? " suspended" : ""})`,
+        `✓ seeded multi-workspace user: ${email} (userId=${result.userAccountId} personal=${result.personalWorkspaceId} org=${result.organizationWorkspaceId}${tags ? " " + tags : ""})`,
       );
     })
     .catch((err: unknown) => {
