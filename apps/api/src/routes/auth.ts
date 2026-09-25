@@ -72,10 +72,10 @@ import {
 import {
   buildFieldErrors,
   buildSafeError,
-  generateRequestId,
   writeSafeError,
   type SafeErrorResponse,
 } from "../lib/errors.js";
+import { getRequestId, type RequestWithRequestId } from "../lib/request-id.js";
 import { SESSION_COOKIE, setSessionCookie, clearSessionCookie } from "../lib/session-cookie.js";
 import {
   clearReturnContextCookie,
@@ -227,7 +227,10 @@ function forwardUnhandledRejection(
     // middleware — it would attempt to set headers / write JSON on a
     // sent response. Log so the failure is auditable and let the
     // request close so the process stays responsive.
-    console.error(`[auth] requestId=${resolveRequestId(req)} handler-rejection-after-write:`, err);
+    console.error(
+      `[auth] requestId=${getRequestId(req as RequestWithRequestId)} handler-rejection-after-write:`,
+      err,
+    );
     return;
   }
   next(err);
@@ -240,7 +243,7 @@ async function handleMagicLink(
   res: Response,
   deps: AuthRouteDeps & { readonly allowedReturnOrigin: string },
 ): Promise<void> {
-  const requestId = resolveRequestId(req);
+  const requestId = getRequestId(req as RequestWithRequestId);
   res.setHeader("x-request-id", requestId);
 
   const rawBody = await readJsonBodyOrRespond(req, res, requestId);
@@ -290,7 +293,7 @@ async function handleVerifyToken(
   res: Response,
   deps: AuthRouteDeps & { readonly allowedReturnOrigin: string },
 ): Promise<void> {
-  const requestId = resolveRequestId(req);
+  const requestId = getRequestId(req as RequestWithRequestId);
   res.setHeader("x-request-id", requestId);
 
   const rawBody = await readJsonBodyOrRespond(req, res, requestId);
@@ -356,7 +359,7 @@ async function handleVerifyToken(
 // ---------- GET /api/auth/me ----------
 
 async function handleMe(req: Request, res: Response, deps: AuthRouteDeps): Promise<void> {
-  const requestId = resolveRequestId(req);
+  const requestId = getRequestId(req as RequestWithRequestId);
   res.setHeader("x-request-id", requestId);
   const sessionId = readSessionCookie(req);
   // M2 (#82): surface `setupState` on the public user so the
@@ -372,7 +375,7 @@ async function handleMe(req: Request, res: Response, deps: AuthRouteDeps): Promi
 // ---------- POST /api/auth/sign-out ----------
 
 async function handleSignOut(req: Request, res: Response, deps: AuthRouteDeps): Promise<void> {
-  const requestId = resolveRequestId(req);
+  const requestId = getRequestId(req as RequestWithRequestId);
   res.setHeader("x-request-id", requestId);
   const sessionId = readSessionCookie(req);
   await deps.authenticationService.signOut(sessionId);
@@ -388,7 +391,7 @@ async function handleActingWorkspace(
   res: Response,
   deps: AuthRouteDeps,
 ): Promise<void> {
-  const requestId = resolveRequestId(req);
+  const requestId = getRequestId(req as RequestWithRequestId);
   res.setHeader("x-request-id", requestId);
 
   const sessionId = readSessionCookie(req);
@@ -483,14 +486,6 @@ async function handleActingWorkspace(
 }
 
 // ---------- Helpers ----------
-
-function resolveRequestId(req: Request): string {
-  const incoming = req.headers["x-request-id"];
-  if (typeof incoming === "string" && incoming.length > 0 && incoming.length <= 128) {
-    return incoming;
-  }
-  return generateRequestId();
-}
 
 function readSessionCookie(req: Request): string | undefined {
   const header = req.headers.cookie;
@@ -668,7 +663,7 @@ function parseAuthRequestBody(req: Request, res: Response, next: NextFunction): 
     return;
   }
 
-  const requestId = resolveRequestId(req);
+  const requestId = getRequestId(req as RequestWithRequestId);
   const chunks: Buffer[] = [];
   let total = 0;
 
@@ -740,7 +735,7 @@ function rateLimitHandler(req: Request, res: Response): void {
   // to write the safe-error envelope so the public 429 contract
   // matches the rest of the auth surface. Only `POST /verify-token`
   // mounts a limiter, so the route tag is fixed.
-  const requestId = resolveRequestId(req);
+  const requestId = getRequestId(req as RequestWithRequestId);
   res.setHeader("x-request-id", requestId);
   console.error(`[auth:verify-token] requestId=${requestId} code=AUTH_RATE_LIMITED`);
   writeSafeError(

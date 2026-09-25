@@ -792,6 +792,119 @@ describe("BG1 auth routes (in-memory, deterministic adapter)", () => {
     assert.equal(stillAlive.status, 500);
     assert.ok(stillAlive.body.error);
   });
+
+  // ---------- Tenki PR #95 medium finding: request-id correlation invariants ----------
+  //
+  // The application-boundary middleware in `apps/api/src/index.ts`
+  // is the canonical writer of `req.requestId` (sanitized via
+  // the shared `[A-Za-z0-9._-]{1,128}` allow-list). The auth
+  // route handlers now consume that value via `getRequestId(req)`
+  // — they MUST NOT re-sanitize the raw `x-request-id` header
+  // against any local length-only policy (which would silently
+  // bypass the boundary sanitizer and let an attacker-supplied
+  // `%s` reach a `console.error` first argument).
+  //
+  // These three tests pin the correlation invariants across the
+  // auth route end-to-end.
+
+  test("Tenki medium: a normal request id remains correlated end-to-end on the success path", async () => {
+    // The boundary middleware accepts the UUID; the auth
+    // handler reads it from `req.requestId`; the response
+    // header carries the canonical inbound id.
+    //
+    // NOTE: on the magic-link SUCCESS path, the response body's
+    // `requestId` is intentionally distinct — it is the
+    // authentication service's correlation id for the dev
+    // verification URL, not the inbound HTTP request id (per
+    // P0-001 / P2-001 — see the existing test on line 115).
+    // The error-path correlation invariant is asserted in the
+    // dedicated test below.
+    const safe = "550e8400-e29b-41d4-a716-446655440000";
+    const response = await request(app)
+      .post("/api/auth/magic-link")
+      .send({ email: "buyer-route@example.com" })
+      .set("Content-Type", "application/json")
+      .set("x-request-id", safe);
+    assert.equal(response.status, 200);
+    assert.equal(
+      response.headers["x-request-id"],
+      safe,
+      "a UUID-shaped x-request-id MUST round-trip through the boundary sanitizer unchanged",
+    );
+  });
+
+  test("Tenki medium: an invalid/raw incoming request id cannot bypass the canonical sanitized value", async () => {
+    // The boundary middleware's allow-list rejects anything
+    // outside `[A-Za-z0-9._-]{1,128}`. The auth handler MUST
+    // consume the boundary-canonicalized value via
+    // `getRequestId(req)` — re-sanitizing the raw header
+    // against a length-only policy would let `%s` reach the
+    // `console.error` first argument as a format specifier
+    // (the CodeQL hardening round closed the same risk on
+    // `intent.ts`; auth had the same shape and must inherit
+    // the same defense).
+    //
+    // The success envelope's `requestId` is the auth-service
+    // correlation (see comment on the previous test), so the
+    // correlation invariant is asserted on the response HEADER
+    // only — the unsafe inbound value MUST NOT survive the
+    // boundary sanitizer into the response.
+    const malicious = "evil%s-injection";
+    const response = await request(app)
+      .post("/api/auth/magic-link")
+      .send({ email: "buyer-route@example.com" })
+      .set("Content-Type", "application/json")
+      .set("x-request-id", malicious);
+    assert.equal(response.status, 200);
+    const header = response.headers["x-request-id"];
+    assert.ok(typeof header === "string");
+    assert.notEqual(
+      header,
+      malicious,
+      "an x-request-id containing the util.format '%s' specifier MUST NOT pass through the boundary sanitizer",
+    );
+    assert.match(
+      header,
+      /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i,
+      "the canonicalized request id MUST be a freshly generated UUID when the inbound header is unsafe",
+    );
+  });
+
+  test("Tenki medium: response x-request-id and error-envelope requestId use the same canonical id on the error path", async () => {
+    // Force an error path: malformed JSON triggers
+    // INVALID_AUTH_REQUEST (a safe-error envelope). The
+    // canonical reader MUST emit the same id on the response
+    // header and on the envelope body so callers can correlate
+    // logs.
+    const unsafe = "evil o"; // whitespace — outside the allow-list
+    const response = await request(app)
+      .post("/api/auth/magic-link")
+      .set("Content-Type", "application/json")
+      .send("not-valid-json-at-all")
+      .set("x-request-id", unsafe);
+    assert.equal(response.status, 400);
+    assert.equal(
+      response.body.error?.code,
+      "INVALID_AUTH_REQUEST",
+      "the auth route MUST surface INVALID_AUTH_REQUEST for malformed JSON",
+    );
+    const header = response.headers["x-request-id"];
+    assert.ok(typeof header === "string");
+    assert.notEqual(
+      header,
+      unsafe,
+      "the boundary sanitizer MUST reject the unsafe x-request-id even on the error path",
+    );
+    assert.match(
+      header,
+      /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i,
+    );
+    assert.equal(
+      response.body.error?.requestId,
+      header,
+      "the error envelope's requestId MUST equal the response header (correlation invariant on the error path)",
+    );
+  });
 });
 
 // ---------- Tenki PR #91: /api/auth/me is strictly read-only ----------
