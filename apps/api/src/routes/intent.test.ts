@@ -1009,10 +1009,10 @@ describe("Global error middleware — pre-inner-try rejection (M2 #83 CodeQL har
   const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
   const adapter = new DeterministicIdentityAdapter({ allowDevVerificationUrl: true });
 
-  function buildAppWithFailOnNextConvergence(): Promise<{
+  function buildAppWithFailOnNextConvergence(): {
     app: import("express").Application;
     enableNextFailure: () => void;
-  }> {
+  } {
     const stubAuthRepo = new InMemoryAuthRepository([
       {
         userAccountId: USER_ID,
@@ -1108,7 +1108,7 @@ describe("Global error middleware — pre-inner-try rejection (M2 #83 CodeQL har
   }
 
   test("pre-inner-try rejection with x-request-id='evil%s' falls back to a sanitized UUID", async () => {
-    const { app: stubApp, enableNextFailure } = await buildAppWithFailOnNextConvergence();
+    const { app: stubApp, enableNextFailure } = buildAppWithFailOnNextConvergence();
     const cookie = await signInTo(stubApp);
     enableNextFailure();
     const malicious = "evil%s-injection";
@@ -1149,13 +1149,26 @@ describe("Global error middleware — pre-inner-try rejection (M2 #83 CodeQL har
       UUID_RE,
       "the response x-request-id MUST be a freshly generated UUID (defense-in-depth fallback)",
     );
+    // Correlation invariant: the response header, the safe-
+    // error envelope's `requestId`, and the global error log
+    // line MUST all carry the same correlation id. Without
+    // the canonical accessor in `lib/request-id.ts` the route
+    // handler's `resolveRequestId(req)` would generate a
+    // DIFFERENT UUID than the boundary middleware (which had
+    // already sanitized and stored the same one on
+    // `req.requestId`).
+    assert.equal(
+      response.body.error?.requestId,
+      correlationId,
+      "the safe-error envelope's requestId MUST equal the response header (correlation invariant)",
+    );
   });
 
   test("pre-inner-try rejection with a safe ULID-shaped header round-trips the correlation id", async () => {
     // End-to-end correlation invariant: a legitimate client
     // can correlate the response with its request even when
     // the request fails AFTER auth but BEFORE the inner try.
-    const { app: stubApp, enableNextFailure } = await buildAppWithFailOnNextConvergence();
+    const { app: stubApp, enableNextFailure } = buildAppWithFailOnNextConvergence();
     const cookie = await signInTo(stubApp);
     enableNextFailure();
     const safe = "01ARZ3NDEKTSV4RRFFQ69G5FAV";
@@ -1171,10 +1184,15 @@ describe("Global error middleware — pre-inner-try rejection (M2 #83 CodeQL har
       safe,
       "a safe ULID-shaped x-request-id MUST round-trip through the global error middleware unchanged",
     );
+    assert.equal(
+      response.body.error?.requestId,
+      safe,
+      "the safe-error envelope's requestId MUST equal the response header (correlation invariant)",
+    );
   });
 
   test("pre-inner-try rejection without an x-request-id produces a generated UUID", async () => {
-    const { app: stubApp, enableNextFailure } = await buildAppWithFailOnNextConvergence();
+    const { app: stubApp, enableNextFailure } = buildAppWithFailOnNextConvergence();
     const cookie = await signInTo(stubApp);
     enableNextFailure();
     const response = await request(stubApp)
@@ -1183,10 +1201,21 @@ describe("Global error middleware — pre-inner-try rejection (M2 #83 CodeQL har
       .set("Content-Type", "application/json")
       .set("Cookie", cookie);
     assert.equal(response.status, 500);
+    const generated = response.headers["x-request-id"] as string;
     assert.match(
-      response.headers["x-request-id"] as string,
+      generated,
       UUID_RE,
       "a missing x-request-id MUST fall back to a generated UUID even on global-middleware failures",
+    );
+    // Correlation invariant: the response header and the safe-
+    // error envelope MUST carry the SAME generated UUID. Pre-
+    // round-7, the route's `resolveRequestId(req)` would
+    // generate a SECOND UUID here because the boundary
+    // middleware had already generated and stored the first.
+    assert.equal(
+      response.body.error?.requestId,
+      generated,
+      "the safe-error envelope's requestId MUST equal the response header when the inbound header is missing (correlation invariant)",
     );
   });
 });

@@ -59,8 +59,8 @@ import {
   type BuiltAiAdapters,
 } from "./matchmaker/ai-adapter-factory.js";
 import type { SmokeResult } from "./identity/managed-identity-adapter.js";
-import { buildSafeError, generateRequestId, writeSafeError } from "./lib/errors.js";
-import { resolveRequestId } from "./lib/request-id.js";
+import { buildSafeError, writeSafeError } from "./lib/errors.js";
+import { getRequestId, storeRequestId } from "./lib/request-id.js";
 
 export interface AppOptions {
   readonly service?: TalentSearchService;
@@ -387,8 +387,11 @@ export function buildApp(options: AppOptions = {}): BuiltApp {
   // The untrusted `x-request-id` header is sanitized at the
   // application boundary via `lib/request-id`. The resulting
   // value is the ONLY one consumed by every downstream sink:
-  //   - the per-route handlers (which call this same helper
-  //     again — idempotent);
+  //   - the per-route handlers, which read it back via the
+  //     canonical accessor `getRequestId(req)` (NOT a fresh
+  //     re-sanitization of the raw header — that would
+  //     generate a second UUID for invalid inputs and break
+  //     the end-to-end correlation invariant);
   //   - the 404 fallback below;
   //   - the error middleware below, whose `console.error` used
   //     to interpolate `${requestId}` into the format string
@@ -400,9 +403,8 @@ export function buildApp(options: AppOptions = {}): BuiltApp {
   // back in the error middlewares eliminates the gap between
   // the route-local sink and the global sink.
   app.use((req, res, next) => {
-    const requestId = resolveRequestId(req);
+    const requestId = storeRequestId(req as Request & { requestId?: string });
     res.setHeader("x-request-id", requestId);
-    (req as Request & { requestId?: string }).requestId = requestId;
     next();
   });
 
@@ -483,7 +485,12 @@ export function buildApp(options: AppOptions = {}): BuiltApp {
 
   // 404 fallback
   app.use((req: Request, res: Response) => {
-    const requestId = (req as Request & { requestId?: string }).requestId ?? generateRequestId();
+    // Read the boundary-stored correlation id (or resolve a
+    // fresh sanitized UUID if the boundary never ran). Using
+    // the same accessor as the route handlers guarantees the
+    // response header, the safe-error envelope, and any log
+    // line all carry the same correlation id.
+    const requestId = getRequestId(req as Request & { requestId?: string });
     const safe = buildSafeError(
       "INVALID_SEARCH_CRITERIA",
       "Route not found.",
@@ -496,11 +503,12 @@ export function buildApp(options: AppOptions = {}): BuiltApp {
   // Error middleware
   app.use((err: Error, req: Request, res: Response, _next: NextFunction) => {
     void _next;
-    // The sanitized request id is stored on `req.requestId`
-    // by the boundary middleware above; if that middleware did
-    // not run for some reason, fall back to a freshly generated
-    // UUID — never echo the raw header value here.
-    const requestId = (req as Request & { requestId?: string }).requestId ?? resolveRequestId(req);
+    // Read the boundary-stored correlation id (or resolve a
+    // fresh sanitized UUID if the boundary never ran). The same
+    // accessor is consumed by every other sink so the response
+    // header, the safe-error envelope, and this log line all
+    // carry the same correlation id.
+    const requestId = getRequestId(req as Request & { requestId?: string });
     // The format string MUST be a literal constant — Node's
     // `console.error` passes its first argument through
     // `util.format`, which interprets `%s`, `%d`, `%o`, `%j`,

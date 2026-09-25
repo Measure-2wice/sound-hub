@@ -70,7 +70,7 @@ import type { AuthenticationService } from "../services/authentication.service.j
 import type { IntentService, IntentServiceError } from "../services/intent.service.js";
 import type { PersonalWorkspaceConvergenceService } from "../services/personal-workspace-convergence.service.js";
 import { buildFieldErrors, buildSafeError, writeSafeError } from "../lib/errors.js";
-import { resolveRequestId } from "../lib/request-id.js";
+import { getRequestId, type RequestWithRequestId } from "../lib/request-id.js";
 import { SESSION_COOKIE } from "../lib/session-cookie.js";
 import { isValidReturnPath } from "../lib/return-context.js";
 import {
@@ -109,7 +109,12 @@ export function createIntentRouter(deps: IntentRouteDeps): Router {
 // ---------- POST /api/workspaces/:workspaceId/intent ----------
 
 async function handleIntent(req: Request, res: Response, deps: IntentRouteDeps): Promise<void> {
-  const requestId = resolveRequestId(req);
+  // Read the canonical boundary-stored correlation id rather
+  // than re-sanitizing the raw `x-request-id` header — re-
+  // sanitizing would generate a fresh UUID for invalid inputs
+  // and break the end-to-end correlation invariant (response
+  // header, error envelope, log line all share one id).
+  const requestId = getRequestId(req as RequestWithRequestId);
   res.setHeader("x-request-id", requestId);
 
   const workspaceId = req.params.workspaceId;
@@ -294,7 +299,7 @@ function parseIntentRequestBody(req: Request, res: Response, next: (err?: unknow
     next();
     return;
   }
-  const requestId = resolveRequestId(req);
+  const requestId = getRequestId(req as RequestWithRequestId);
   const chunks: Buffer[] = [];
   let total = 0;
 
