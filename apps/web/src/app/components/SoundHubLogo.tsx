@@ -112,7 +112,13 @@ export function SoundHubLogo({
         <text
           x="42"
           y="27"
-          fontFamily="'var(--font-playfair)', Georgia, serif"
+          // CSS variable references must NOT be wrapped in quotes —
+          // the quotes make the SVG font resolver treat the entire
+          // `var(...)` expression as a literal font name and the
+          // variable never resolves (Codex review). The plain
+          // `var(--font-playfair)` form lets the browser fall back to
+          // Georgia / serif when the variable is unset.
+          fontFamily="var(--font-playfair), Georgia, serif"
           fontSize="22"
           fontWeight={700}
           fill={mono ? "currentColor" : "#19151D"}
@@ -121,7 +127,7 @@ export function SoundHubLogo({
           Sound
           <tspan
             fill={mono ? "currentColor" : "#3B1E3E"}
-            fontFamily="'var(--font-jakarta)', system-ui, -apple-system, sans-serif"
+            fontFamily="var(--font-jakarta), system-ui, -apple-system, sans-serif"
             fontWeight={600}
             fontSize="20"
           >

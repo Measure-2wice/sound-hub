@@ -64,6 +64,7 @@ import {
   useContext,
   useEffect,
   useMemo,
+  useRef,
   useState,
   type ReactNode,
 } from "react";
@@ -299,11 +300,32 @@ export function SessionProvider({ children }: { readonly children: ReactNode }) 
   const [user, setUser] = useState<Bg1PublicUserV1 | null>(null);
   const [loading, setLoading] = useState(true);
 
+  // Operation-generation guard (Codex review P1-001, race fix).
+  //
+  // Background: `refresh()` and the mount-time initial fetch both
+  // call `fetchSessionInfo()`. If a user-initiated sign-out (or any
+  // newer auth action) supersedes an older in-flight refresh, the
+  // older fetch could resolve AFTER the newer state was applied —
+  // calling `setUser(oldUser)` would resurrect a signed-out user in
+  // the navigation / dashboard. The same hazard applies to two
+  // overlapping refreshes: the slower response must not overwrite
+  // the fresher one.
+  //
+  // Mechanism: every operation that may eventually call `setUser`
+  // bumps `sessionOperationGeneration.current` BEFORE awaiting, and
+  // only commits the result if its bumped value is still current.
+  // `signOutAndRefresh` and `verifyAndRefresh` route through
+  // `refresh()`, so they share the same guard automatically.
+  const sessionOperationGeneration = useRef(0);
+
   const refresh = useCallback(async (): Promise<void> => {
+    const myGen = ++sessionOperationGeneration.current;
     try {
       const info = await fetchSessionInfo();
+      if (myGen !== sessionOperationGeneration.current) return;
       setUser(info.user);
     } catch {
+      if (myGen !== sessionOperationGeneration.current) return;
       setUser(null);
     }
   }, []);
@@ -313,15 +335,24 @@ export function SessionProvider({ children }: { readonly children: ReactNode }) 
   // from the first render. Subsequent auth actions call `refresh`
   // (directly or via the helpers) instead of duplicating the
   // request.
+  //
+  // The mount-time fetch bumps the same operation-generation
+  // counter as `refresh()` so a stale mount-time response cannot
+  // overwrite newer state either. `setLoading(false)` is NOT
+  // generation-gated because `loading` is initial-render-only — a
+  // stale mount resolution that flips `loading: false` is a no-op
+  // for any subsequent render.
   useEffect(() => {
     let cancelled = false;
+    const myGen = ++sessionOperationGeneration.current;
     void (async () => {
       try {
         const info = await fetchSessionInfo();
-        if (cancelled) return;
+        if (cancelled || myGen !== sessionOperationGeneration.current) return;
         setUser(info.user);
       } catch {
-        if (!cancelled) setUser(null);
+        if (cancelled || myGen !== sessionOperationGeneration.current) return;
+        setUser(null);
       } finally {
         if (!cancelled) setLoading(false);
       }
