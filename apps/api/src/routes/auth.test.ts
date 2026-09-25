@@ -895,10 +895,7 @@ describe("BG1 auth routes (in-memory, deterministic adapter)", () => {
       unsafe,
       "the boundary sanitizer MUST reject the unsafe x-request-id even on the error path",
     );
-    assert.match(
-      header,
-      /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i,
-    );
+    assert.match(header, /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i);
     assert.equal(
       response.body.error?.requestId,
       header,

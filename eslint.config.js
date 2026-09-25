@@ -14,6 +14,11 @@ export default [
       "**/node_modules/**",
       "packages/db/src/generated/**",
       "apps/web/next-env.d.ts",
+      // Claude Code local skill tooling (Node.js scripts, not application
+      // source). The repo's ESLint flat config targets TypeScript with a
+      // type-aware parser and rejects CommonJS `process`/`console` use.
+      "**/.claude/**",
+      "**/.agents/**",
       "**/*.js",
       "**/*.mjs",
     ],

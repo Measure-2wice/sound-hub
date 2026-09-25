@@ -227,10 +227,14 @@ function forwardUnhandledRejection(
     // middleware — it would attempt to set headers / write JSON on a
     // sent response. Log so the failure is auditable and let the
     // request close so the process stays responsive.
-    console.error(
-      `[auth] requestId=${getRequestId(req as RequestWithRequestId)} handler-rejection-after-write:`,
-      err,
-    );
+    // The literal `%s` format string keeps the dynamic requestId out
+    // of the format-string position so `console.error` (which passes
+    // its first arg through `util.format`) cannot interpret attacker-
+    // supplied characters as format specifiers — see the canonical
+    // request-id reader at apps/api/src/lib/request-id.ts and the
+    // equivalent hardening in apps/api/src/routes/intent.ts.
+    const requestId = getRequestId(req as RequestWithRequestId);
+    console.error("[auth] requestId=%s handler-rejection-after-write:", requestId, err);
     return;
   }
   next(err);
@@ -620,11 +624,11 @@ function writeAuthError(res: Response, err: unknown, requestId: string, route: s
     const authErr = err as Error & { code?: ApiErrorCodeV1 };
     const code = authErr.code ?? "AUTH_FAILED";
     const safe: SafeErrorResponse = buildSafeError(code, err.message, undefined, requestId);
-    console.error(`[auth:${route}] requestId=${requestId} code=${code}:`, err);
+    console.error("[auth:%s] requestId=%s code=%s:", route, requestId, code, err);
     writeSafeError(res, safe);
     return;
   }
-  console.error(`[auth:${route}] requestId=${requestId} unhandled:`, err);
+  console.error("[auth:%s] requestId=%s unhandled:", route, requestId, err);
   writeSafeError(
     res,
     buildSafeError(
@@ -737,7 +741,7 @@ function rateLimitHandler(req: Request, res: Response): void {
   // mounts a limiter, so the route tag is fixed.
   const requestId = getRequestId(req as RequestWithRequestId);
   res.setHeader("x-request-id", requestId);
-  console.error(`[auth:verify-token] requestId=${requestId} code=AUTH_RATE_LIMITED`);
+  console.error("[auth:verify-token] requestId=%s code=AUTH_RATE_LIMITED", requestId);
   writeSafeError(
     res,
     buildSafeError("AUTH_RATE_LIMITED", "Too many requests.", undefined, requestId),
