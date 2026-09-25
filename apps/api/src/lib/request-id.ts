@@ -87,12 +87,28 @@ export function resolveRequestId(req: Request): string {
 /**
  * Canonical reader for the boundary-stored correlation id.
  * Returns the stored value if the boundary middleware has run
- * (the common case); otherwise resolves and falls back.
+ * (the common case); otherwise resolves a fresh sanitized id,
+ * MEMOIZES it on `req.requestId`, and returns it.
+ *
+ * Memoization matters: a directly mounted router (e.g., a
+ * route-only test application where the boundary middleware
+ * has not run) can call `getRequestId` from multiple sinks —
+ * e.g., a body parser and a handler — and without memoization
+ * each call would generate a fresh UUID, recreating the
+ * correlation divergence the canonical reader is supposed to
+ * prevent. Storing the fallback on `req.requestId` makes
+ * subsequent calls return the SAME id.
+ *
  * Downstream sinks MUST consume this — never `resolveRequestId`
  * — to preserve the end-to-end correlation invariant.
  */
 export function getRequestId(req: RequestWithRequestId): string {
-  return req.requestId ?? resolveRequestId(req);
+  if (req.requestId !== undefined) {
+    return req.requestId;
+  }
+  const generated = resolveRequestId(req);
+  req.requestId = generated;
+  return generated;
 }
 
 /**
