@@ -1,12 +1,18 @@
-// Public metadata seam for the M1 buyer UI.
+// Public metadata seam.
 //
-// The browser NEVER holds a second, independently deployable list of
-// category keys. It calls `GET /api/metadata/categories` on mount and
-// uses the returned list to populate the `RequiredFilters` selects.
-// PostgreSQL is the only source of truth; this route reads the
-// canonical ServiceCategory records through the shared `MetadataRepository`
-// and maps them through an allow-listed DTO that the browser parses
-// with the shared `categoryMetadataResponseV1Schema` from `@soundhub/types`.
+// The M1.4 metadata route returns the canonical category catalog so the
+// browser can populate its required-filter selects without holding a
+// second, independently deployable list. PostgreSQL is the source of
+// truth; this route reads the canonical ServiceCategory records through
+// the shared `MetadataRepository` (the same application-layer seam the
+// TalentSearchService uses) and maps them through the shared
+// `categoryMetadataResponseV1Schema` from `@soundhub/types`.
+//
+// M2 (#84) extends the same seam with `GET /api/metadata/seller-profile-taxonomy`
+// which returns the canonical Specialty catalog (read from the Specialty
+// table) and the closed Caribbean affiliation code list with display
+// names (closed const in `@soundhub/types`). One round trip on editor
+// mount; no second, independently deployable list lives in the browser.
 //
 // The route is read-only, public, and never exposes private fields,
 // controlled internal flags, or storage details. It depends only on the
@@ -18,7 +24,10 @@
 // `buildApp` instances.
 
 import { Router, type Request, type Response } from "express";
-import { categoryMetadataResponseV1Schema } from "@soundhub/types";
+import {
+  categoryMetadataResponseV1Schema,
+  sellerProfileTaxonomyResponseV1Schema,
+} from "@soundhub/types";
 import { buildSafeError, generateRequestId, writeSafeError } from "../lib/errors.js";
 import type { MetadataRepository } from "../repositories/metadata.repository.js";
 
@@ -30,6 +39,12 @@ export function createMetadataRouter(deps: MetadataRouteDeps): Router {
   const router = Router();
   router.get("/categories", (_req: Request, res: Response) => {
     void handleCategories(_req, res, deps);
+  });
+  // M2 (#84): Professional Profile editor / publication review
+  // controlled-values catalog. Read-only, public (no auth), no acting
+  // Workspace — the same shape as the existing `/categories` route.
+  router.get("/seller-profile-taxonomy", (_req: Request, res: Response) => {
+    void handleSellerProfileTaxonomy(_req, res, deps);
   });
   return router;
 }
@@ -55,6 +70,37 @@ async function handleCategories(
     const safe = buildSafeError(
       "SEARCH_FAILED",
       "An unexpected error occurred while loading the category catalog.",
+      undefined,
+      requestId,
+    );
+    writeSafeError(res, safe);
+  }
+}
+
+async function handleSellerProfileTaxonomy(
+  _req: Request,
+  res: Response,
+  deps: MetadataRouteDeps,
+): Promise<void> {
+  const requestId = generateRequestId();
+  res.setHeader("x-request-id", requestId);
+
+  try {
+    const [specialties, caribbeanAffiliationCodes] = await Promise.all([
+      deps.repository.getCanonicalSpecialties(),
+      deps.repository.getCanonicalCaribbeanAffiliationCodes(),
+    ]);
+    const payload = {
+      specialties: [...specialties],
+      caribbeanAffiliationCodes: [...caribbeanAffiliationCodes],
+    };
+    const validated = sellerProfileTaxonomyResponseV1Schema.parse(payload);
+    res.status(200).json(validated);
+  } catch (err) {
+    console.error(`[metadata] requestId=${requestId} unhandled:`, err);
+    const safe = buildSafeError(
+      "SEARCH_FAILED",
+      "An unexpected error occurred while loading the seller profile taxonomy.",
       undefined,
       requestId,
     );

@@ -222,6 +222,14 @@ model UserAccount {
   // the funding call (recorded for audit; the Buyer capability +
   // WorkspaceMembership are the authorization sources).
   createdPaymentIntents      PaymentIntent[]     @relation("PaymentIntentCreatedBy")
+  // M2 (#84): SellerProfile publication attribution. Recorded for
+  // audit; NOT an authorization source. Two relations cover the
+  // current-state pointer (`SellerProfile.publishedByUserId`, SET
+  // NULL on delete) and the durable evidence row
+  // (`SellerProfilePublication.publishedByUserId`, RESTRICT on
+  // delete).
+  publishedSellerProfiles          SellerProfile[]         @relation("SellerProfilePublishedBy")
+  publishedSellerProfilePublications SellerProfilePublication[] @relation("SellerProfilePublicationPublishedBy")
 
   @@map("user_accounts")
 }
@@ -326,6 +334,10 @@ model Workspace {
   // Workspace. Always the buyer Workspace; the activation invariant
   // rejects seller-side intents at the service layer.
   paymentIntents        PaymentIntent[]
+  // M2 (#84): narrow append-only publication evidence. The reverse
+  // relation on the SellerProfilePublication table; ON DELETE
+  // RESTRICT on the FK preserves the durable evidence row.
+  sellerProfilePublications SellerProfilePublication[]
 
   @@map("workspaces")
 }
@@ -367,15 +379,61 @@ model SellerProfile {
   basedInRegion      String?
   basedInCountryCode String
   avatarUrl          String?
+  // M2 (#84): convenience current-state columns that cache the
+  // latest publication metadata for fast reads. NOT the durable
+  // evidence — see SellerProfilePublication for the append-only
+  // audit trail. ON DELETE SET NULL on publishedByUserId so a
+  // hard-deleted UserAccount does not cascade-erase the publication
+  // timestamp on a profile that still belongs to an active Workspace.
+  publishedAt        DateTime?
+  publishedByUserId  String?
   createdAt          DateTime            @default(now())
   updatedAt          DateTime            @updatedAt
 
-  workspace             Workspace                @relation(fields: [workspaceId], references: [id], onDelete: Cascade)
+  workspace             Workspace                  @relation(fields: [workspaceId], references: [id], onDelete: Cascade)
+  publishedByUser       UserAccount?               @relation("SellerProfilePublishedBy", fields: [publishedByUserId], references: [id], onDelete: SetNull)
   specialties           SellerProfileSpecialty[]
   caribbeanAffiliations CaribbeanAffiliation[]
   offerings             ServiceOffering[]
+  publications          SellerProfilePublication[]
 
+  @@index([status, updatedAt], map: "seller_profiles_status_updatedAt_idx")
   @@map("seller_profiles")
+}
+
+// M2 (#84): narrow append-only publication evidence. Mirrors the
+// DealApproval pattern at packages/db/prisma/schema.prisma around
+// line 1013. Each successful Publish / Update creates ONE row; the
+// (workspaceId, idempotencyKey) unique constraint is the second
+// defense against transport-retry duplicates (the first defense is
+// the application-layer pre-transaction check in SellerProfileService).
+// ON DELETE RESTRICT on every FK preserves the durable evidence row
+// even if the source UserAccount, Workspace, or SellerProfile is
+// ever hard-deleted.
+model SellerProfilePublication {
+  id                  String   @id @default(cuid())
+  publishedByUserId   String
+  workspaceId         String
+  sellerProfileId     String
+  confirmationVersion String
+  publishedAt         DateTime @default(now())
+  // Client-supplied UUID generated when a new publication attempt
+  // begins. Retained across uncertain transport outcomes and explicit
+  // Retry actions; cleared only on definitive success or user-initiated
+  // payload change. See SellerProfileService for retry semantics.
+  idempotencyKey      String
+  // The sanitized HTTP request correlation id from the boundary
+  // middleware (apps/api/src/lib/request-id.ts). Mirrors DealApproval's
+  // narrow audit attribution.
+  requestId           String
+
+  publishedBy   UserAccount    @relation("SellerProfilePublicationPublishedBy", fields: [publishedByUserId], references: [id], onDelete: Restrict)
+  workspace     Workspace      @relation(fields: [workspaceId], references: [id], onDelete: Restrict)
+  sellerProfile SellerProfile  @relation(fields: [sellerProfileId], references: [id], onDelete: Restrict)
+
+  @@unique([workspaceId, idempotencyKey], map: "seller_profile_publications_workspace_idem_unique_idx")
+  @@index([sellerProfileId, publishedAt(sort: Desc)], map: "seller_profile_publications_profile_publishedAt_idx")
+  @@map("seller_profile_publications")
 }
 
 model Specialty {

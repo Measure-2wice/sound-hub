@@ -25,15 +25,23 @@ import assert from "node:assert/strict";
 import { describe, test } from "node:test";
 import request from "supertest";
 import express from "express";
-import { categoryMetadataResponseV1Schema, type CategoryMetadataResponseV1 } from "@soundhub/types";
+import {
+  categoryMetadataResponseV1Schema,
+  sellerProfileTaxonomyResponseV1Schema,
+  type CategoryMetadataResponseV1,
+} from "@soundhub/types";
 import { createMetadataRouter } from "./metadata.js";
 import type {
   MetadataRepository,
+  RepositoryCaribbeanAffiliationMetadata,
   RepositoryCategoryMetadata,
+  RepositorySpecialtyMetadata,
 } from "../repositories/metadata.repository.js";
 
 class StubMetadataRepository implements MetadataRepository {
   private currentRows: readonly RepositoryCategoryMetadata[];
+  private currentSpecialtyRows: readonly RepositorySpecialtyMetadata[] = [];
+  private currentCaribbeanRows: readonly RepositoryCaribbeanAffiliationMetadata[] = [];
   callCount = 0;
   constructor(initial: readonly RepositoryCategoryMetadata[]) {
     this.currentRows = initial;
@@ -42,8 +50,24 @@ class StubMetadataRepository implements MetadataRepository {
     this.callCount += 1;
     return Promise.resolve(this.currentRows);
   }
+  getCanonicalSpecialties(): Promise<readonly RepositorySpecialtyMetadata[]> {
+    this.callCount += 1;
+    return Promise.resolve(this.currentSpecialtyRows);
+  }
+  getCanonicalCaribbeanAffiliationCodes(): Promise<
+    readonly RepositoryCaribbeanAffiliationMetadata[]
+  > {
+    this.callCount += 1;
+    return Promise.resolve(this.currentCaribbeanRows);
+  }
   setRows(next: readonly RepositoryCategoryMetadata[]): void {
     this.currentRows = next;
+  }
+  setSpecialtyRows(next: readonly RepositorySpecialtyMetadata[]): void {
+    this.currentSpecialtyRows = next;
+  }
+  setCaribbeanRows(next: readonly RepositoryCaribbeanAffiliationMetadata[]): void {
+    this.currentCaribbeanRows = next;
   }
 }
 
@@ -193,6 +217,78 @@ describe("categoryMetadataResponseV1Schema (shared contract)", () => {
   test("rejects a non-array categories value", () => {
     const result = categoryMetadataResponseV1Schema.safeParse({
       categories: { key: "music-production", name: "Music Production" },
+    });
+    assert.equal(result.success, false);
+  });
+});
+
+// M2 (#84): the seller-profile taxonomy endpoint returns the
+// canonical Specialty catalog AND the closed Caribbean affiliation
+// code list with display names. The endpoint is read-only/public
+// like `/categories` — no auth, no acting Workspace.
+describe("GET /api/metadata/seller-profile-taxonomy", () => {
+  test("returns the canonical Specialties and Caribbean codes", async () => {
+    const repository = new StubMetadataRepository([]);
+    repository.setSpecialtyRows([
+      { key: "Producer", name: "Producer" },
+      { key: "SoundEngineer", name: "Sound Engineer" },
+    ]);
+    repository.setCaribbeanRows([
+      { code: "HT", name: "Haiti" },
+      { code: "JM", name: "Jamaica" },
+    ]);
+    const app = express();
+    app.use("/api/metadata", createMetadataRouter({ repository }));
+
+    const response = await request(app).get("/api/metadata/seller-profile-taxonomy");
+    assert.equal(response.status, 200);
+    assert.equal(response.body.specialties.length, 2);
+    assert.equal(response.body.specialties[0].key, "Producer");
+    assert.equal(response.body.caribbeanAffiliationCodes.length, 2);
+    assert.equal(response.body.caribbeanAffiliationCodes[0].code, "HT");
+    assert.equal(response.body.caribbeanAffiliationCodes[0].name, "Haiti");
+  });
+
+  test("the public response shape matches the shared Zod schema", async () => {
+    const repository = new StubMetadataRepository([]);
+    repository.setSpecialtyRows([{ key: "Producer", name: "Producer" }]);
+    repository.setCaribbeanRows([{ code: "JM", name: "Jamaica" }]);
+    const app = express();
+    app.use("/api/metadata", createMetadataRouter({ repository }));
+
+    const response = await request(app).get("/api/metadata/seller-profile-taxonomy");
+    assert.equal(response.status, 200);
+    const parsed = sellerProfileTaxonomyResponseV1Schema.safeParse(response.body);
+    assert.equal(parsed.success, true, `schema rejected: ${JSON.stringify(parsed)}`);
+  });
+
+  test("returns empty arrays when no records exist", async () => {
+    const repository = new StubMetadataRepository([]);
+    const app = express();
+    app.use("/api/metadata", createMetadataRouter({ repository }));
+    const response = await request(app).get("/api/metadata/seller-profile-taxonomy");
+    assert.equal(response.status, 200);
+    assert.deepEqual(response.body, {
+      specialties: [],
+      caribbeanAffiliationCodes: [],
+    });
+  });
+});
+
+describe("sellerProfileTaxonomyResponseV1Schema (shared contract)", () => {
+  test("rejects an empty specialty key", () => {
+    const result = sellerProfileTaxonomyResponseV1Schema.safeParse({
+      specialties: [{ key: "", name: "Producer" }],
+      caribbeanAffiliationCodes: [{ code: "HT", name: "Haiti" }],
+    });
+    assert.equal(result.success, false);
+  });
+
+  test("rejects unknown top-level field", () => {
+    const result = sellerProfileTaxonomyResponseV1Schema.safeParse({
+      specialties: [{ key: "Producer", name: "Producer" }],
+      caribbeanAffiliationCodes: [{ code: "HT", name: "Haiti" }],
+      extra: "field",
     });
     assert.equal(result.success, false);
   });

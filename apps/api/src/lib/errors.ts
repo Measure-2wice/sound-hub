@@ -267,6 +267,32 @@ function mapStatus(code: ApiErrorCodeV1): number {
       return 403;
     case "INTENT_CONFLICT":
       return 409;
+    // M2 (#84): SellerProfile creation / resume / publish / update
+    // status mapping. Mirrors the intent pattern: 400 for malformed
+    // bodies (including missing/invalid `idempotencyKey`), 403 for
+    // authorization rejections (Personal-Workspace-only AND
+    // Seller-capable — Organization actor, Buyer-only Personal, or
+    // non-current member are all collapsed by the safe envelope),
+    // 404 for missing draft rows on read, 409 for
+    // duplicate-on-first-save / not-Draft-on-publish /
+    // not-Published-on-update, 422 for incomplete Publish payload
+    // (semantic-but-well-formed rejection; the safe envelope carries
+    // `fields` for the multi-error summary), 500 for unexpected
+    // internal failures.
+    case "SELLER_PROFILE_INVALID":
+      return 400;
+    case "SELLER_PROFILE_FORBIDDEN":
+      return 403;
+    case "SELLER_PROFILE_NOT_FOUND":
+      return 404;
+    case "SELLER_PROFILE_DUPLICATE":
+    case "SELLER_PROFILE_NOT_DRAFT":
+    case "SELLER_PROFILE_NOT_PUBLISHED":
+      return 409;
+    case "SELLER_PROFILE_INCOMPLETE":
+      return 422;
+    case "SELLER_PROFILE_INTERNAL_FAILED":
+      return 500;
   }
 }
 
