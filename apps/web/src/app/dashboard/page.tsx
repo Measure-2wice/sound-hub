@@ -472,6 +472,74 @@ function SellerReadinessRow({ hasBuyer }: { readonly hasBuyer: boolean }) {
   // for receiving ProjectRequests,
   // not the consequence of a first Deal. Replace with the
   // forward journey.
+  //
+  // M2 Professional Profile slice: the row surfaces the truthful
+  // Professional Profile state by reading the GET
+  // /api/workspaces/:id/seller-profile response on mount. The CTA
+  // copy adapts:
+  //   - No row yet   → "Create your Professional Profile"
+  //   - Draft row    → "Continue your private draft"
+  //   - Published    → "Edit your Professional Profile"
+  //   - Suspended    → the same "Create your Professional Profile"
+  //     CTA, plus a recovery hint.
+  const [profileState, setProfileState] = useState<
+    "loading" | "none" | "draft" | "published" | "suspended"
+  >("loading");
+  const { actingWorkspace } = useActingWorkspace();
+  useEffect(() => {
+    if (!actingWorkspace) return;
+    let cancelled = false;
+    void (async () => {
+      try {
+        const res = await fetch(
+          `/api/workspaces/${encodeURIComponent(actingWorkspace.workspaceId)}/seller-profile`,
+          {
+            method: "GET",
+            credentials: "include",
+            headers: { Accept: "application/json" },
+          },
+        );
+        if (cancelled) return;
+        if (!res.ok) {
+          setProfileState("none");
+          return;
+        }
+        const body = (await res.json()) as {
+          profile: { status: "Draft" | "Published" | "Suspended" } | null;
+        };
+        if (!body.profile) {
+          setProfileState("none");
+        } else if (body.profile.status === "Draft") {
+          setProfileState("draft");
+        } else if (body.profile.status === "Published") {
+          setProfileState("published");
+        } else {
+          setProfileState("suspended");
+        }
+      } catch {
+        if (!cancelled) setProfileState("none");
+      }
+    })();
+    return () => {
+      cancelled = true;
+    };
+  }, [actingWorkspace]);
+
+  const ctaCopy = (() => {
+    switch (profileState) {
+      case "draft":
+        return "Continue your private draft";
+      case "published":
+        return "Edit your Professional Profile";
+      case "loading":
+        return "Loading…";
+      case "suspended":
+      case "none":
+      default:
+        return "Create your Professional Profile";
+    }
+  })();
+
   return (
     <Card variant="parchment" data-testid="dashboard-seller-readiness">
       <Card.Header>
@@ -485,15 +553,25 @@ function SellerReadinessRow({ hasBuyer }: { readonly hasBuyer: boolean }) {
         <p className="mt-2 text-sm text-muted" data-testid="dashboard-seller-hint">
           You can save private drafts as you go — publication is a separate explicit step.
         </p>
-        {!hasBuyer && (
+        <div className="mt-3 flex flex-col sm:flex-row gap-2">
           <Link
-            href="/workspace/intent"
-            className="mt-3 inline-flex items-center justify-center min-h-[44px] min-w-[44px] py-2 px-4 text-base font-medium text-aubergine hover:text-aubergine-hover border border-aubergine rounded focus:outline-none focus-visible:outline focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-aubergine"
-            data-testid="dashboard-add-hire"
+            href="/seller/profile/edit"
+            className="inline-flex items-center justify-center min-h-[44px] min-w-[44px] py-2 px-4 text-base font-medium text-white bg-coral hover:bg-coral-hover rounded focus:outline-none focus-visible:outline focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-coral"
+            data-testid="dashboard-seller-edit-profile"
+            data-profile-state={profileState}
           >
-            Add Hire talent too
+            {ctaCopy}
           </Link>
-        )}
+          {!hasBuyer && (
+            <Link
+              href="/workspace/intent"
+              className="inline-flex items-center justify-center min-h-[44px] min-w-[44px] py-2 px-4 text-base font-medium text-aubergine hover:text-aubergine-hover border border-aubergine rounded focus:outline-none focus-visible:outline focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-aubergine"
+              data-testid="dashboard-add-hire"
+            >
+              Add Hire talent too
+            </Link>
+          )}
+        </div>
       </Card.Content>
     </Card>
   );

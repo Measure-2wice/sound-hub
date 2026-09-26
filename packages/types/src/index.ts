@@ -549,6 +549,26 @@ export const apiErrorCodeV1Schema = z.enum([
   // (authorization failure) so the UI can render an actionable
   // recovery rather than a false "not a current member" message.
   "INTENT_CONFLICT",
+  // M2 (#84): SellerProfile creation / resume / publish / update
+  // surface. Mirrors the intent pattern: 400 for malformed bodies
+  // (including missing/invalid `idempotencyKey`), 403 for
+  // authorization rejections (Personal-Workspace-only AND
+  // Seller-capable — Organization actor, Buyer-only Personal, or
+  // non-current member are all collapsed by the safe envelope),
+  // 404 for missing draft rows on read, 409 for
+  // duplicate-on-first-save / not-Draft-on-publish /
+  // not-Published-on-update, 422 for incomplete Publish payload
+  // (semantic-but-well-formed rejection; the safe envelope carries
+  // `fields` for the multi-error summary), 500 for unexpected
+  // internal failures.
+  "SELLER_PROFILE_INVALID",
+  "SELLER_PROFILE_FORBIDDEN",
+  "SELLER_PROFILE_NOT_FOUND",
+  "SELLER_PROFILE_DUPLICATE",
+  "SELLER_PROFILE_INCOMPLETE",
+  "SELLER_PROFILE_NOT_DRAFT",
+  "SELLER_PROFILE_NOT_PUBLISHED",
+  "SELLER_PROFILE_INTERNAL_FAILED",
 ]);
 export type ApiErrorCodeV1 = z.infer<typeof apiErrorCodeV1Schema>;
 
@@ -606,6 +626,34 @@ export function isSupportedCaribbeanAffiliationCode(
   return (SUPPORTED_CARIBBEAN_AFFILIATION_CODES as readonly string[]).includes(code);
 }
 
+// M2 (#84): canonical display names for the closed Caribbean
+// affiliation code list. Mirrors SUPPORTED_CARIBBEAN_AFFILIATION_CODES
+// index-by-index. Used by the seller-profile taxonomy endpoint to
+// render friendly names in the editor and publication review. This
+// const is a TYPE-ONLY allow-list; the codes themselves are
+// closed by SUPPORTED_CARIBBEAN_AFFILIATION_CODES above and the
+// runtime guard `isSupportedCaribbeanAffiliationCode`.
+export const SUPPORTED_CARIBBEAN_AFFILIATION_NAMES: ReadonlyArray<{
+  readonly code: SupportedCaribbeanAffiliationCode;
+  readonly name: string;
+}> = [
+  { code: "AG", name: "Antigua and Barbuda" },
+  { code: "BB", name: "Barbados" },
+  { code: "BS", name: "Bahamas" },
+  { code: "BZ", name: "Belize" },
+  { code: "DM", name: "Dominica" },
+  { code: "DO", name: "Dominican Republic" },
+  { code: "GD", name: "Grenada" },
+  { code: "GY", name: "Guyana" },
+  { code: "HT", name: "Haiti" },
+  { code: "JM", name: "Jamaica" },
+  { code: "KN", name: "Saint Kitts and Nevis" },
+  { code: "LC", name: "Saint Lucia" },
+  { code: "SR", name: "Suriname" },
+  { code: "TT", name: "Trinidad and Tobago" },
+  { code: "VC", name: "Saint Vincent and the Grenadines" },
+];
+
 // ---------- Stable controlled keys exposed for runtime validation ----------
 //
 // The canonical service categories, specialties, and pricing units
@@ -648,6 +696,252 @@ export type ProjectRequestStatusV1 = (typeof projectRequestStatusValuesV1)[numbe
 
 export const dealStatusValuesV1 = ["Negotiating", "Active"] as const;
 export type DealStatusV1 = (typeof dealStatusValuesV1)[number];
+
+// ===========================================================================
+// Milestone 2 (#84): Professional Profile (SellerProfile) shared runtime
+// contracts.
+//
+// The schemas below cover the seller-profile draft / publish / update /
+// read surface. The browser NEVER holds a second, independently deployable
+// list of controlled Specialties or Caribbean affiliation codes — the
+// metadata seam (see sellerProfileTaxonomyResponseV1Schema below and the
+// GET /api/metadata/seller-profile-taxonomy route) is the only source of
+// truth.
+//
+// Body validation follows the same patterns as the v1 search contract and
+// the BG1 runtime contracts: shared Zod is the executable contract;
+// TypeScript types are inferred from it; the same schema is consumed by
+// the Express route validator and the browser response parser. `.strict()`
+// rejects unknown fields. No Prisma model or raw provider subject ever
+// crosses a public DTO.
+
+// ---------- Taxonomy endpoint (controlled-values catalog) ----------
+//
+// One round trip on editor mount. The Specialty list comes from the
+// existing `Specialty` table seeded by packages/db/prisma/seed.ts; the
+// Caribbean affiliation code list comes from the closed
+// SUPPORTED_CARIBBEAN_AFFILIATION_CODES const above. The HTTP layer is
+// the only consumer — the browser never reads these consts directly.
+
+export const sellerProfileTaxonomyItemSpecialtyV1Schema = z
+  .object({
+    key: z.string().min(1).max(64),
+    name: z.string().min(1).max(200),
+  })
+  .strict();
+export type SellerProfileTaxonomyItemSpecialtyV1 = z.infer<
+  typeof sellerProfileTaxonomyItemSpecialtyV1Schema
+>;
+
+export const sellerProfileTaxonomyItemCountryV1Schema = z
+  .object({
+    code: countryCodeSchema,
+    name: z.string().min(1).max(120),
+  })
+  .strict();
+export type SellerProfileTaxonomyItemCountryV1 = z.infer<
+  typeof sellerProfileTaxonomyItemCountryV1Schema
+>;
+
+export const sellerProfileTaxonomyResponseV1Schema = z
+  .object({
+    specialties: z.array(sellerProfileTaxonomyItemSpecialtyV1Schema).max(50),
+    caribbeanAffiliationCodes: z.array(sellerProfileTaxonomyItemCountryV1Schema).max(50),
+  })
+  .strict();
+export type SellerProfileTaxonomyResponseV1 = z.infer<typeof sellerProfileTaxonomyResponseV1Schema>;
+
+// ---------- Shared payload fragments ----------
+//
+// Reused across draft / publish / update request schemas. NOT exposed
+// publicly — these are request-side building blocks.
+
+const sellerProfileBasedInV1Schema = z
+  .object({
+    countryCode: countryCodeSchema,
+    region: z.string().min(1).max(120).optional(),
+    city: z.string().min(1).max(120).optional(),
+  })
+  .strict();
+export type SellerProfileBasedInV1 = z.infer<typeof sellerProfileBasedInV1Schema>;
+
+const sellerProfileIdentityV1Schema = z
+  .object({
+    professionalName: z.string().min(1).max(200),
+    // Preserve the canonical PublicSellerSummaryV1.bio bound (2000
+    // characters). The Stitch editor's "248 / 600" counter is
+    // presentation-only; the UI normalizes to the canonical domain
+    // limit. The #84 brief does not authorize a tighter bound.
+    bio: z.string().min(1).max(2000),
+    avatarUrl: z.string().url().max(500).optional(),
+  })
+  .strict();
+export type SellerProfileIdentityV1 = z.infer<typeof sellerProfileIdentityV1Schema>;
+
+const sellerProfileDisciplineV1Schema = z
+  .object({
+    specialtyKeys: z.array(z.string().min(1).max(64)).min(0).max(20),
+    caribbeanAffiliationCodes: z.array(countryCodeSchema).min(0).max(20),
+  })
+  .strict();
+export type SellerProfileDisciplineV1 = z.infer<typeof sellerProfileDisciplineV1Schema>;
+
+// ---------- Draft request (lazy first-save / resume / update) ----------
+//
+// Save draft is explicit and idempotent w.r.t. the same payload. The
+// existing `seller_profiles.workspaceId @unique` constraint plus the
+// INSERT ... ON CONFLICT DO NOTHING primitive at provisionIntentAtomically
+// (apps/api/src/auth-repository/prisma-auth-repository.ts:498) provide
+// retry convergence without an explicit idempotencyKey on this surface.
+// Draft saves are pure upsert — no separate evidence row.
+
+export const sellerProfileDraftRequestV1Schema = z
+  .object({
+    identity: sellerProfileIdentityV1Schema,
+    basedIn: sellerProfileBasedInV1Schema,
+    disciplines: sellerProfileDisciplineV1Schema,
+    // Optional return target — schema-validated + server-resolved
+    // safeReturnTo. Mirrors the #83 intent return-target pattern.
+    returnTo: z.string().min(1).max(256).optional(),
+  })
+  .strict();
+export type SellerProfileDraftRequestV1 = z.infer<typeof sellerProfileDraftRequestV1Schema>;
+
+// ---------- Draft response ----------
+//
+// Returns the OwnerView shape so the editor re-renders with the
+// persisted values without a second GET round trip.
+
+const sellerProfileOwnerViewV1Schema = z
+  .object({
+    sellerProfileId: z.string().min(1),
+    workspaceId: z.string().min(1),
+    status: z.enum(["Draft", "Published", "Suspended"]),
+    identity: sellerProfileIdentityV1Schema,
+    basedIn: sellerProfileBasedInV1Schema,
+    disciplines: sellerProfileDisciplineV1Schema,
+    publishedAt: z.string().datetime().optional(),
+    publishedByDisplayName: z.string().min(1).max(200).optional(),
+  })
+  .strict();
+export type SellerProfileOwnerViewV1 = z.infer<typeof sellerProfileOwnerViewV1Schema>;
+
+export const sellerProfileDraftResponseV1Schema = z
+  .object({
+    ok: z.literal(true),
+    profile: sellerProfileOwnerViewV1Schema,
+    returnTo: z.string().min(1).max(256).nullable(),
+    safeReturnTo: z.string().min(1).max(256).nullable(),
+  })
+  .strict();
+export type SellerProfileDraftResponseV1 = z.infer<typeof sellerProfileDraftResponseV1Schema>;
+
+// ---------- Publish / Update request ----------
+//
+// Publish and post-publication update both require:
+//   - complete public field set (same as draft payload)
+//   - client-supplied idempotencyKey (UUID)
+//   - server-known confirmationVersion (the immutable document
+//     identifier). The constant `m2-profile-publication-v1` is the
+//     closed enum for the M2 slice. A future document revision
+//     increments the version suffix.
+//
+// `idempotencyKey` is generated by the client when a new
+// publication/update attempt begins and is RETAINED across any
+// uncertain transport outcome and explicit Retry action. Only a
+// definitive successful response, a payload change, or explicit
+// abandonment clears the key. The DB unique constraint
+// (workspaceId, idempotencyKey) is the second defense against
+// transport-retry duplicates.
+
+export const SELLER_PROFILE_PUBLICATION_CONFIRMATION_VERSIONS = [
+  "m2-profile-publication-v1",
+] as const;
+export type SellerProfilePublicationConfirmationVersionV1 =
+  (typeof SELLER_PROFILE_PUBLICATION_CONFIRMATION_VERSIONS)[number];
+
+const sellerProfilePublishUpdateCoreV1Schema = z
+  .object({
+    identity: sellerProfileIdentityV1Schema,
+    basedIn: sellerProfileBasedInV1Schema,
+    disciplines: sellerProfileDisciplineV1Schema,
+    // Immutable confirmation/document version. The application
+    // layer resolves the canonical document text/version from this
+    // key; the document itself is NOT duplicated in the request
+    // body. Mirrors DealApproval.termsVersionId.
+    confirmationVersion: z.enum(SELLER_PROFILE_PUBLICATION_CONFIRMATION_VERSIONS),
+    // Client-supplied UUID generated when a new publication/update
+    // attempt begins. Format: 8-4-4-4-12 hex with dashes. The DB
+    // unique constraint (workspaceId, idempotencyKey) is the second
+    // defense against transport-retry duplicates.
+    idempotencyKey: z.string().uuid().min(36).max(64),
+    returnTo: z.string().min(1).max(256).optional(),
+  })
+  .strict();
+
+// ---------- Publish request ----------
+//
+// Publish is the FIRST transition from Draft → Published. The schema
+// accepts the same shape as the draft (min(0) on both discipline
+// arrays) so a publish-failing payload reaches the service layer
+// rather than being rejected as INVALID. The service
+// (`SellerProfileService.publishProfile`) re-validates completeness
+// via `assertPublishCompleteness` and throws `SELLER_PROFILE_INCOMPLETE`
+// — which maps to HTTP 422 with field-level details — for empty
+// `specialtyKeys` or empty `caribbeanAffiliationCodes`. The route
+// never reports a 400 for "publish payload is missing required
+// controlled values"; that semantic is owned by the service.
+
+export const sellerProfilePublishRequestV1Schema = sellerProfilePublishUpdateCoreV1Schema;
+export type SellerProfilePublishRequestV1 = z.infer<typeof sellerProfilePublishRequestV1Schema>;
+
+// ---------- Update request ----------
+//
+// Post-publication update (atomic full field set replacement). Same
+// shape as publish; the service's `assertUpdateCompleteness` is the
+// single source of truth for `SELLER_PROFILE_INCOMPLETE`.
+
+export const sellerProfileUpdateRequestV1Schema = sellerProfilePublishUpdateCoreV1Schema;
+export type SellerProfileUpdateRequestV1 = z.infer<typeof sellerProfileUpdateRequestV1Schema>;
+
+// ---------- Publish / Update response ----------
+//
+// Returns the OwnerView plus the immutable evidence row's identity
+// so the UI can render "Published at <publishedAt> by <displayName>"
+// without a second GET round trip.
+
+export const sellerProfilePublicationResponseV1Schema = z
+  .object({
+    ok: z.literal(true),
+    profile: sellerProfileOwnerViewV1Schema,
+    evidence: z
+      .object({
+        publishedAt: z.string().datetime(),
+        confirmationVersion: z.enum(SELLER_PROFILE_PUBLICATION_CONFIRMATION_VERSIONS),
+        idempotencyKey: z.string().uuid(),
+      })
+      .strict(),
+    returnTo: z.string().min(1).max(256).nullable(),
+    safeReturnTo: z.string().min(1).max(256).nullable(),
+  })
+  .strict();
+export type SellerProfilePublicationResponseV1 = z.infer<
+  typeof sellerProfilePublicationResponseV1Schema
+>;
+
+// ---------- Get response ----------
+//
+// Editor / review on-mount read. Distinct from the public
+// PublicSellerSummaryV1 because the OwnerView returns Draft rows to
+// their owner; the public summary is Published-only.
+
+export const sellerProfileGetResponseV1Schema = z
+  .object({
+    ok: z.literal(true),
+    profile: sellerProfileOwnerViewV1Schema.nullable(),
+  })
+  .strict();
+export type SellerProfileGetResponseV1 = z.infer<typeof sellerProfileGetResponseV1Schema>;
 
 // ===========================================================================
 // Buildathon Golden Slice 1 (BG1) shared runtime contracts.
@@ -985,6 +1279,14 @@ export const postCommandRouteValuesV1 = [
   "/deals",
   "/seller-requests",
   "/dashboard/audio",
+  // M2 (#84): Professional Profile editor + publication review. The
+  // SellerProfile slice is Personal-Workspace-only and Seller-capable;
+  // the gate map in apps/api/src/lib/post-command-return-destination.ts
+  // adds a `Seller` capability requirement on these two routes so a
+  // Buyer-only Workspace returning from a non-#84 command cannot
+  // resume the editor under a stale Buyer actor.
+  "/seller/profile/edit",
+  "/seller/profile/review",
 ] as const;
 export type PostCommandRouteV1 = (typeof postCommandRouteValuesV1)[number];
 
