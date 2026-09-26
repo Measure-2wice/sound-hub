@@ -47,8 +47,7 @@ export const APPROVED_DISPOSABLE_TEST_DB: ApprovedDisposableTestDbConfig = Objec
 });
 
 export type ApprovedDisposableTestDbCheck =
-  | { readonly approved: true }
-  | { readonly approved: false; readonly reason: string };
+  { readonly approved: true } | { readonly approved: false; readonly reason: string };
 
 export class ApprovedDisposableTestDbError extends Error {
   constructor(message: string) {

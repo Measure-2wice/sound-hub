@@ -56,8 +56,7 @@ export function shouldSeedDeterministicAudioFixture(
  * without leaking credentials.
  */
 export type DeterministicAudioFixtureInsertionDecision =
-  | { readonly approved: true }
-  | { readonly approved: false; readonly reason: string };
+  { readonly approved: true } | { readonly approved: false; readonly reason: string };
 
 export function shouldSeedDeterministicAudioFixtureForDatabase(
   env: Readonly<Record<string, string | undefined>>,

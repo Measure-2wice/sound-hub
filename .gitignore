@@ -14,6 +14,7 @@ dist/
 *.tsbuildinfo
 .turbo/
 packages/db/src/generated/
+target/
 
 # Test output
 coverage/
