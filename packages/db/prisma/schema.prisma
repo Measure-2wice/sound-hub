@@ -230,6 +230,10 @@ model UserAccount {
   // delete).
   publishedSellerProfiles          SellerProfile[]         @relation("SellerProfilePublishedBy")
   publishedSellerProfilePublications SellerProfilePublication[] @relation("SellerProfilePublicationPublishedBy")
+  // M2 (#85): ServiceOffering activation attribution. Recorded
+  // for audit; authorization is decided by WorkspaceMembership +
+  // Seller capability, NOT by this relation.
+  activatedServiceOfferings        ServiceOfferingActivation[] @relation("ServiceOfferingActivationActivatedBy")
 
   @@map("user_accounts")
 }
@@ -338,6 +342,10 @@ model Workspace {
   // relation on the SellerProfilePublication table; ON DELETE
   // RESTRICT on the FK preserves the durable evidence row.
   sellerProfilePublications SellerProfilePublication[]
+  // M2 (#85): narrow append-only activation evidence. The reverse
+  // relation on the ServiceOfferingActivation table; ON DELETE
+  // RESTRICT on the FK preserves the durable evidence row.
+  serviceOfferingActivations ServiceOfferingActivation[]
 
   @@map("workspaces")
 }
@@ -400,6 +408,10 @@ model SellerProfile {
   caribbeanAffiliations CaribbeanAffiliation[]
   offerings             ServiceOffering[]
   publications          SellerProfilePublication[]
+  // M2 (#85): reverse relation on the ServiceOfferingActivation
+  // evidence table; ON DELETE RESTRICT on the FK preserves the
+  // durable evidence row.
+  offeringActivations   ServiceOfferingActivation[]
 
   @@index([status, updatedAt], map: "seller_profiles_status_updatedAt_idx")
   @@map("seller_profiles")
@@ -512,19 +524,34 @@ model ServiceOffering {
   title             String
   description       String
   status            ServiceOfferingStatus @default(Draft)
-  serviceMode       ServiceMode
-  primaryCategoryId String
+  // M2 (#85): serviceMode and primaryCategoryId are nullable on
+  // Draft so the seller can save a partial draft without silently
+  // fabricating a mode or category they never chose. Activation
+  // requires both at the trusted boundary; the search filter
+  // already requires non-null on Active rows because the existing
+  // eligibility predicate (`status = Active`) excludes Draft.
+  serviceMode       ServiceMode?
+  primaryCategoryId String?
   genreTags         String[]
   createdAt         DateTime              @default(now())
   updatedAt         DateTime              @updatedAt
 
   sellerProfile        SellerProfile                @relation(fields: [sellerProfileId], references: [id], onDelete: Cascade)
-  primaryCategory      ServiceCategory              @relation("PrimaryCategory", fields: [primaryCategoryId], references: [id], onDelete: Restrict)
+  primaryCategory      ServiceCategory?             @relation("PrimaryCategory", fields: [primaryCategoryId], references: [id], onDelete: Restrict)
   includedServices     IncludedService[]
   serviceAreas         ServiceOfferingServiceArea[]
   pricing              ServiceOfferingPricing?
   audioSamples         ServiceOfferingAudioSample[]
   orphanedAudioStorage AudioSampleOrphanedStorage[]
+  // M2 (#85): narrow append-only activation evidence. Mirrors the
+  // SellerProfilePublication pattern; one row per successful
+  // activation. The (offeringId, idempotencyKey) unique constraint
+  // is the second defense against transport-retry duplicates (the
+  // first defense is the application-layer pre-check in
+  // ServiceOfferingService.activate). ON DELETE RESTRICT on every
+  // FK preserves the durable evidence even if the source records
+  // are hard-deleted.
+  activations          ServiceOfferingActivation[]
   // BG4 references: a ServiceOffering can be selected by many
   // ProjectRequests over time and become the basis for many Deals.
   // RESTRICT on delete prevents an offering from being removed
@@ -536,6 +563,40 @@ model ServiceOffering {
   @@index([primaryCategoryId])
   @@index([status])
   @@map("service_offerings")
+}
+
+// M2 (#85): narrow append-only ServiceOffering activation evidence.
+// Each successful activation creates ONE row; same-attempt retry
+// transport duplicates are rejected by the (offeringId, idempotencyKey)
+// unique constraint. The service does the pre-check too so the DB
+// constraint is the second defense, not the first.
+model ServiceOfferingActivation {
+  id                  String   @id @default(cuid())
+  offeringId          String
+  workspaceId         String
+  sellerProfileId     String
+  // The acting human who clicked "Activate". Recorded for audit;
+  // authorization is decided by WorkspaceMembership + Seller
+  // capability, NOT by this column.
+  activatedByUserId   String
+  confirmationVersion String
+  activatedAt         DateTime @default(now())
+  // Client-supplied UUID generated when a new activation attempt
+  // begins. Retained across uncertain transport outcomes and Retry
+  // actions; cleared only on definitive success or user-initiated
+  // payload change.
+  idempotencyKey      String
+  requestId           String
+
+  offering      ServiceOffering @relation(fields: [offeringId], references: [id], onDelete: Restrict)
+  workspace     Workspace      @relation(fields: [workspaceId], references: [id], onDelete: Restrict)
+  sellerProfile SellerProfile  @relation(fields: [sellerProfileId], references: [id], onDelete: Restrict)
+  activatedBy   UserAccount    @relation("ServiceOfferingActivationActivatedBy", fields: [activatedByUserId], references: [id], onDelete: Restrict)
+
+  @@unique([offeringId, idempotencyKey], map: "service_offering_activations_offering_idem_unique_idx")
+  @@index([offeringId, activatedAt(sort: Desc)], map: "service_offering_activations_offering_activatedAt_idx")
+  @@index([workspaceId], map: "service_offering_activations_workspace_idx")
+  @@map("service_offering_activations")
 }
 
 model IncludedService {

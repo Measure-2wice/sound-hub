@@ -12,7 +12,10 @@ import { createOfferingCatalogRouter } from "./routes/offering-catalog.js";
 import { createMatchmakerRouter } from "./routes/matchmaker.js";
 import { createIntentRouter } from "./routes/intent.js";
 import { createSellerProfileRouter } from "./routes/seller-profile.js";
+import { createServiceOfferingRouter } from "./routes/service-offering.js";
 import { PrismaOfferingCatalogRepository } from "./repositories/prisma-offering-catalog.repository.js";
+import { PrismaServiceOfferingRepository } from "./repositories/prisma-service-offering.repository.js";
+import type { ServiceOfferingRepository } from "./repositories/service-offering.repository.js";
 import { createProjectRequestRouter } from "./routes/project-requests.js";
 import { createDealTermsRouter } from "./routes/deal-terms.js";
 import { createDealListRouter } from "./routes/deal-list.js";
@@ -26,6 +29,7 @@ import { WorkspaceAuthorizationService } from "./services/workspace-authorizatio
 import { PersonalWorkspaceConvergenceService } from "./services/personal-workspace-convergence.service.js";
 import { IntentService } from "./services/intent.service.js";
 import { SellerProfileService } from "./services/seller-profile.service.js";
+import { ServiceOfferingService } from "./services/service-offering.service.js";
 import { AudioSampleService } from "./services/audio-sample.service.js";
 import { MatchmakerService } from "./services/matchmaker.service.js";
 import { ProjectRequestService } from "./project-request/project-request.service.js";
@@ -177,6 +181,16 @@ export interface AppOptions {
    */
   readonly sellerProfileRepository?: SellerProfileRepository;
   /**
+   * M2 (#85): override for the ServiceOffering service. Tests inject
+   * a stub service backed by the in-memory repository.
+   */
+  readonly serviceOfferingService?: ServiceOfferingService;
+  /**
+   * M2 (#85): override for the ServiceOffering repository. Tests
+   * inject the in-memory adapter.
+   */
+  readonly serviceOfferingRepository?: ServiceOfferingRepository;
+  /**
    * Override for the Personal Workspace convergence service
    * (ticket #82). When supplied, the composition root does NOT
    * construct the service from the auth repository; the override
@@ -227,6 +241,13 @@ export interface BuiltApp {
    */
   readonly sellerProfileService: SellerProfileService;
   readonly sellerProfileRepository: SellerProfileRepository;
+  /**
+   * M2 (#85): ServiceOffering service composed at the composition
+   * root from the ServiceOffering repository and the workspace
+   * authorization service.
+   */
+  readonly serviceOfferingService: ServiceOfferingService;
+  readonly serviceOfferingRepository: ServiceOfferingRepository;
 }
 
 export function buildApp(options: AppOptions = {}): BuiltApp {
@@ -412,6 +433,35 @@ export function buildApp(options: AppOptions = {}): BuiltApp {
       workspaceAuthorizationService,
     });
 
+  // M2 (#85): ServiceOffering service. Composed from the
+  // ServiceOffering repository (Prisma adapter by default; tests
+  // inject the in-memory adapter) and the workspace authorization
+  // service. The ServiceOffering repository is the only place that
+  // reads or writes `service_offerings`,
+  // `service_offering_service_areas`, `offering_pricing`,
+  // `included_services`, and `service_offering_activations` for
+  // the seller-offering slice.
+  const sellerProfileStatusReader = async (input: { readonly workspaceId: string }) => {
+    const row = await prisma.sellerProfile.findUnique({
+      where: { workspaceId: input.workspaceId },
+      select: { status: true },
+    });
+    return row?.status ?? null;
+  };
+  const playbackBaseUrl = process.env.PUBLIC_API_BASE_URL ?? "http://localhost:4000";
+  const playbackUrlFor = (input: { offeringId: string; sampleId: string }) =>
+    `${playbackBaseUrl.replace(/\/+$/, "")}/api/services/${encodeURIComponent(input.offeringId)}/audio-samples/${encodeURIComponent(input.sampleId)}/play`;
+  const serviceOfferingRepository =
+    options.serviceOfferingRepository ?? new PrismaServiceOfferingRepository(prisma);
+  const serviceOfferingService =
+    options.serviceOfferingService ??
+    new ServiceOfferingService({
+      repository: serviceOfferingRepository,
+      workspaceAuthorizationService,
+      getSellerProfileStatus: sellerProfileStatusReader,
+      playbackUrlFor,
+    });
+
   const app: Application = express();
   app.disable("x-powered-by");
   app.use(helmet());
@@ -521,6 +571,20 @@ export function buildApp(options: AppOptions = {}): BuiltApp {
       allowedReturnOrigin: process.env.FRONTEND_URL ?? "http://localhost:3000",
     }),
   );
+  // M2 (#85): ServiceOffering route family. Mounted at
+  // `/api/workspaces` so the URL path
+  // `/:workspaceId/service-offerings/...` reads the acting Workspace
+  // id directly. The service revalidates current membership +
+  // Seller capability + Personal-Workspace identity via
+  // `WorkspaceAuthorizationService`.
+  app.use(
+    "/api/workspaces",
+    createServiceOfferingRouter({
+      service: serviceOfferingService,
+      authenticationService,
+      allowedReturnOrigin: process.env.FRONTEND_URL ?? "http://localhost:3000",
+    }),
+  );
   app.use(
     "/api/deals",
     createDealTermsRouter({
@@ -602,6 +666,8 @@ export function buildApp(options: AppOptions = {}): BuiltApp {
     intentService,
     sellerProfileService,
     sellerProfileRepository,
+    serviceOfferingService,
+    serviceOfferingRepository,
   };
 }
 

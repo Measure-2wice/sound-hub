@@ -51,4 +51,21 @@ export interface MetadataRepository {
   getCanonicalCaribbeanAffiliationCodes(): Promise<
     readonly RepositoryCaribbeanAffiliationMetadata[]
   >;
+
+  // M2 (#85): return the canonical PricingUnit catalog ordered by
+  // `key` (NOT by `id`). Drives the offering editor's pricing
+  // picker; the route maps the records through the shared metadata
+  // response schema before serializing.
+  getCanonicalPricingUnits(): Promise<readonly RepositoryPricingUnitMetadata[]>;
+
+  // M2 (#85): return the keys of every ServiceCategory whose
+  // `bundleOnly` flag is true. Drives the offering editor's
+  // `includedServiceCategoryKeys` picker (the only kind the
+  // canonical IncludedService surface accepts).
+  getCanonicalBundleOnlyCategoryKeys(): Promise<readonly string[]>;
+}
+
+export interface RepositoryPricingUnitMetadata {
+  readonly key: string;
+  readonly name: string;
 }

@@ -293,6 +293,30 @@ function mapStatus(code: ApiErrorCodeV1): number {
       return 422;
     case "SELLER_PROFILE_INTERNAL_FAILED":
       return 500;
+    // M2 (#85): ServiceOffering creation / draft / activate surface.
+    // Mirrors the SellerProfile mapping: 400 / 403 / 404 / 409 / 422
+    // / 500. The "not-Draft" / "already-Active" cases map to 409 so a
+    // retry on a stale status surfaces as a recoverable conflict
+    // rather than as a generic 500.
+    case "SERVICE_OFFERING_INVALID":
+      return 400;
+    case "SERVICE_OFFERING_FORBIDDEN":
+      return 403;
+    case "SERVICE_OFFERING_NOT_FOUND":
+      return 404;
+    case "SERVICE_OFFERING_NOT_DRAFT":
+    case "SERVICE_OFFERING_ALREADY_ACTIVE":
+      return 409;
+    case "SERVICE_OFFERING_INCOMPLETE":
+    case "SERVICE_OFFERING_SELLER_PROFILE_NOT_PUBLISHED":
+      // Semantic-but-well-formed rejection: the activation payload
+      // is valid but the offering does not satisfy the full current
+      // contract (missing field, missing audio, or unpublished
+      // SellerProfile). The safe envelope carries `fields` for the
+      // multi-error summary where applicable.
+      return 422;
+    case "SERVICE_OFFERING_INTERNAL_FAILED":
+      return 500;
   }
 }
 

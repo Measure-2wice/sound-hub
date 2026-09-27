@@ -358,7 +358,22 @@ export class AudioSampleService {
         "AUDIO_OFFERING_INELIGIBLE",
       );
     }
-    if (context.offeringStatus !== "Active" || context.sellerProfileStatus !== "Published") {
+    // M2 (#85): allow seller-side uploads on Draft and Paused
+    // offerings owned by the acting Workspace. Archived offerings
+    // remain rejected so a deletion cannot be bypassed by a stale
+    // seller session. The buyer-side listSamplesForBuyer and the
+    // play route still require Active + Published + Active
+    // Workspace + Seller capability; the gate below is the
+    // seller-side authorization boundary only. A Suspended
+    // SellerProfile remains rejected — a suspended seller cannot
+    // add media to any offering until the profile is restored.
+    if (context.offeringStatus === "Archived") {
+      throw new AudioSampleError(
+        "ServiceOffering is archived and cannot carry discovery samples.",
+        "AUDIO_OFFERING_INELIGIBLE",
+      );
+    }
+    if (context.sellerProfileStatus === "Suspended") {
       throw new AudioSampleError(
         "ServiceOffering is not eligible to carry discovery samples.",
         "AUDIO_OFFERING_INELIGIBLE",
@@ -553,6 +568,19 @@ export class AudioSampleService {
         "AUDIO_OFFERING_INELIGIBLE",
       );
     }
+    // M2 (#85): the seller-side list surfaces Draft samples too so
+    // the offering editor can render the bounded owner-side preview
+    // while the offering is still in the Draft lifecycle. The
+    // buyer-side listSamplesForBuyer (below) is unchanged and still
+    // requires Active + Published + Active Workspace + Seller
+    // capability; a Draft offering's samples never cross the
+    // public DTO or playback route.
+    if (context.offeringStatus === "Archived") {
+      throw new AudioSampleError(
+        "ServiceOffering is archived and cannot carry discovery samples.",
+        "AUDIO_OFFERING_INELIGIBLE",
+      );
+    }
     // Best-effort retry on every seller list so a previous
     // upload that flipped samples to PendingCleanup can be
     // completed without a separate scheduler.
@@ -638,6 +666,17 @@ export class AudioSampleService {
     if (context.sellerWorkspaceId !== input.actingWorkspaceId) {
       throw new AudioSampleError(
         "Acting Workspace is not the owner of this ServiceOffering.",
+        "AUDIO_OFFERING_INELIGIBLE",
+      );
+    }
+    // M2 (#85): the seller-side remove surfaces Draft samples too
+    // so the offering editor can manage audio before activation.
+    // The buyer-side listSamplesForBuyer and play route remain
+    // gated on Active + Published; a Draft offering's audio
+    // never crosses the public DTO or playback route.
+    if (context.offeringStatus === "Archived") {
+      throw new AudioSampleError(
+        "ServiceOffering is archived and cannot carry discovery samples.",
         "AUDIO_OFFERING_INELIGIBLE",
       );
     }

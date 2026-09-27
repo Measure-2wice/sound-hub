@@ -15,6 +15,7 @@ import type {
   MetadataRepository,
   RepositoryCaribbeanAffiliationMetadata,
   RepositoryCategoryMetadata,
+  RepositoryPricingUnitMetadata,
   RepositorySpecialtyMetadata,
 } from "./metadata.repository.js";
 
@@ -52,5 +53,29 @@ export class PrismaMetadataRepository implements MetadataRepository {
         name: namesByCode.get(code) ?? code,
       })),
     );
+  }
+
+  async getCanonicalPricingUnits(): Promise<readonly RepositoryPricingUnitMetadata[]> {
+    // M2 (#85): the offering editor's pricing-unit picker. Same
+    // canonical-source-of-truth pattern as `getCanonicalSpecialties`
+    // — the PricingUnit table is seeded once; the repository is the
+    // application-layer boundary.
+    const rows = await this.prisma.pricingUnit.findMany({
+      orderBy: [{ key: "asc" }],
+      select: { key: true, name: true },
+    });
+    return rows.map((row) => ({ key: row.key, name: row.name }));
+  }
+
+  async getCanonicalBundleOnlyCategoryKeys(): Promise<readonly string[]> {
+    // M2 (#85): bundle-only categories drive the offering editor's
+    // `includedServiceCategoryKeys` picker. Bounded by the seeded
+    // ServiceCategory set; no second list lives in the browser.
+    const rows = await this.prisma.serviceCategory.findMany({
+      where: { bundleOnly: true },
+      orderBy: [{ key: "asc" }],
+      select: { key: true },
+    });
+    return rows.map((row) => row.key);
   }
 }
