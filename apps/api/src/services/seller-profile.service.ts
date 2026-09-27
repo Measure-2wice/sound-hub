@@ -36,18 +36,19 @@
 //     mutex chain. A failure mid-write rolls back atomically.
 
 import {
+  type ApiFieldErrorV1,
   type SellerProfileDraftRequestV1,
   type SellerProfileDraftResponseV1,
   type SellerProfileGetResponseV1,
   type SellerProfilePublicationResponseV1,
   type SellerProfilePublishRequestV1,
   type SellerProfileUpdateRequestV1,
+  SUPPORTED_CARIBBEAN_AFFILIATION_CODES,
 } from "@soundhub/types";
-import type {
-  SellerProfileRepository} from "../repositories/seller-profile.repository.js";
+import type { SellerProfileRepository } from "../repositories/seller-profile.repository.js";
 import {
   type SellerProfileOwnerViewRecord,
-  type SellerProfilePublicationResult
+  type SellerProfilePublicationResult,
 } from "../repositories/seller-profile.repository.js";
 import { SellerProfileNotDraftError } from "../repositories/seller-profile.repository.js";
 import { SellerProfileNotPublishedError } from "../repositories/seller-profile.repository.js";
@@ -65,6 +66,7 @@ export class SellerProfileServiceError extends Error {
       | "SELLER_PROFILE_NOT_DRAFT"
       | "SELLER_PROFILE_NOT_PUBLISHED"
       | "SELLER_PROFILE_INTERNAL_FAILED",
+    public readonly fieldErrors: readonly ApiFieldErrorV1[] = [],
   ) {
     super(message);
     this.name = "SellerProfileServiceError";
@@ -106,6 +108,13 @@ export class SellerProfileService {
 
   async saveDraft(input: SellerProfileSaveDraftInput): Promise<SellerProfileDraftResponseV1> {
     this.assertCompleteDraftFields(input.request);
+    // The Caribbean affiliation list is closed. Validate it on every
+    // save path so a direct API client cannot smuggle unsupported
+    // codes (e.g. `US`, `ZZ`) into the persisted row, regardless of
+    // whether the rest of the draft is complete.
+    this.assertCaribbeanAffiliationsAreSupported(
+      input.request.disciplines.caribbeanAffiliationCodes,
+    );
     await this.assertPersonalSellerCapability(input.userAccountId, input.workspaceId);
     try {
       const profile = await this.deps.repository.saveDraft({
@@ -130,6 +139,9 @@ export class SellerProfileService {
     input: SellerProfilePublishInput,
   ): Promise<SellerProfilePublicationResponseV1> {
     await this.assertPersonalSellerCapability(input.userAccountId, input.workspaceId);
+    this.assertCaribbeanAffiliationsAreSupported(
+      input.request.disciplines.caribbeanAffiliationCodes,
+    );
     this.assertPublishCompleteness(input.request);
     try {
       const result = await this.deps.repository.publishProfile({
@@ -153,6 +165,9 @@ export class SellerProfileService {
     input: SellerProfileUpdateInput,
   ): Promise<SellerProfilePublicationResponseV1> {
     await this.assertPersonalSellerCapability(input.userAccountId, input.workspaceId);
+    this.assertCaribbeanAffiliationsAreSupported(
+      input.request.disciplines.caribbeanAffiliationCodes,
+    );
     this.assertUpdateCompleteness(input.request);
     try {
       const result = await this.deps.repository.updatePublishedProfile({
@@ -249,46 +264,90 @@ export class SellerProfileService {
   }
 
   private assertCompleteDraftFields(request: SellerProfileDraftRequestV1): void {
-    if (!request.identity.professionalName.trim()) {
-      throw new SellerProfileServiceError("professionalName is required", "SELLER_PROFILE_INVALID");
-    }
-    if (!request.identity.bio.trim()) {
-      throw new SellerProfileServiceError("bio is required", "SELLER_PROFILE_INVALID");
-    }
-    if (!request.basedIn.countryCode) {
-      throw new SellerProfileServiceError(
-        "basedIn.countryCode is required",
-        "SELLER_PROFILE_INVALID",
-      );
-    }
+    // Drafts may be incomplete. Per M2 #84 acceptance criteria,
+    // "Incomplete pre-publication Drafts remain private, resumable,
+    // absent from public DTOs, and presented as Private draft." The
+    // schema already permits empty strings / missing fields for
+    // drafts; we only normalize whitespace on save here. The Publish
+    // and Update paths enforce completeness separately.
+    void request;
+  }
+
+  /**
+   * Validate that every submitted Caribbean affiliation code is in
+   * the canonical closed list `SUPPORTED_CARIBBEAN_AFFILIATION_CODES`.
+   * Per M2 #84 acceptance criteria, the Caribbean connection is a
+   * closed self-declared surface; a direct API client must NOT be
+   * able to publish `US` or `ZZ` as an affiliation.
+   *
+   * Throws `SELLER_PROFILE_INVALID` carrying a `fieldErrors` array
+   * listing every invalid code (one field entry per offending code)
+   * so the editor recovery flow can highlight each invalid chip.
+   */
+  private assertCaribbeanAffiliationsAreSupported(codes: readonly string[]): void {
+    const allowed = SUPPORTED_CARIBBEAN_AFFILIATION_CODES as readonly string[];
+    const invalid = codes.filter((c) => !allowed.includes(c));
+    if (invalid.length === 0) return;
+    throw new SellerProfileServiceError(
+      `Caribbean affiliation codes must come from the canonical closed list`,
+      "SELLER_PROFILE_INVALID",
+      invalid.map((code) => ({
+        path: "disciplines.caribbeanAffiliationCodes",
+        code: "unsupported_affiliation_code",
+        message: `Unsupported Caribbean affiliation code: ${code}`,
+      })),
+    );
   }
 
   private assertPublishCompleteness(request: SellerProfilePublishRequestV1): void {
+    // Collect every missing-field error at once so the review
+    // recovery flow can render a focusable linked summary instead of
+    // a single-message error that hides the rest of the form.
+    const fields: ApiFieldErrorV1[] = [];
     if (request.disciplines.specialtyKeys.length < 1) {
-      throw new SellerProfileServiceError(
-        "At least one controlled specialty is required to publish.",
-        "SELLER_PROFILE_INCOMPLETE",
-      );
+      fields.push({
+        path: "disciplines.specialtyKeys",
+        code: "specialty_required",
+        message: "At least one controlled specialty is required to publish.",
+      });
     }
     if (request.disciplines.caribbeanAffiliationCodes.length < 1) {
+      fields.push({
+        path: "disciplines.caribbeanAffiliationCodes",
+        code: "caribbean_affiliation_required",
+        message: "At least one Caribbean affiliation is required to publish.",
+      });
+    }
+    if (fields.length > 0) {
       throw new SellerProfileServiceError(
-        "At least one Caribbean affiliation is required to publish.",
+        "Publication requires at least one controlled specialty and at least one Caribbean affiliation.",
         "SELLER_PROFILE_INCOMPLETE",
+        fields,
       );
     }
   }
 
   private assertUpdateCompleteness(request: SellerProfileUpdateRequestV1): void {
+    const fields: ApiFieldErrorV1[] = [];
     if (request.disciplines.specialtyKeys.length < 1) {
-      throw new SellerProfileServiceError(
-        "At least one controlled specialty is required.",
-        "SELLER_PROFILE_INCOMPLETE",
-      );
+      fields.push({
+        path: "disciplines.specialtyKeys",
+        code: "specialty_required",
+        message: "At least one controlled specialty is required to update.",
+      });
     }
     if (request.disciplines.caribbeanAffiliationCodes.length < 1) {
+      fields.push({
+        path: "disciplines.caribbeanAffiliationCodes",
+        code: "caribbean_affiliation_required",
+        message: "At least one Caribbean affiliation is required to update.",
+      });
+    }
+    if (fields.length > 0) {
       throw new SellerProfileServiceError(
-        "At least one Caribbean affiliation is required.",
+        "Update requires at least one controlled specialty and at least one Caribbean affiliation.",
         "SELLER_PROFILE_INCOMPLETE",
+        fields,
       );
     }
   }
@@ -314,9 +373,16 @@ export class SellerProfileService {
 export function toResponseProfile(
   profile: SellerProfileOwnerViewRecord,
 ): SellerProfilePublicationResponseV1["profile"] {
-  const basedIn: { countryCode: string; region?: string; city?: string } = {
-    countryCode: profile.basedIn.countryCode,
-  };
+  // A Draft OwnerView may carry `countryCode: undefined`. Omit the
+  // key instead of emitting an empty string so the response's Zod
+  // validation (which requires an ISO alpha-2) stays accurate and
+  // clients can distinguish "not chosen yet" from "chose ''".
+  // Published profiles always carry a real code (publish/update
+  // STRICT).
+  const basedIn: { countryCode?: string; region?: string; city?: string } = {};
+  if (profile.basedIn.countryCode !== undefined) {
+    basedIn.countryCode = profile.basedIn.countryCode;
+  }
   if (profile.basedIn.region !== undefined) basedIn.region = profile.basedIn.region;
   if (profile.basedIn.city !== undefined) basedIn.city = profile.basedIn.city;
   const identity: { professionalName: string; bio: string; avatarUrl?: string } = {

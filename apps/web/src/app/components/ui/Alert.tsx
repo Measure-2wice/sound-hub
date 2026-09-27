@@ -103,7 +103,18 @@ export function Alert({
       >
         {title}
       </h2>
-      <p className="mt-2 text-base text-muted">{children}</p>
+      {/*
+        The body slot is a `<div>` rather than `<p>` so callers can
+        pass structured ReactNode children (paragraphs, lists, inline
+        alerts) without producing invalid HTML such as a `<p>` nested
+        inside another `<p>`, which would otherwise trigger a
+        hydration error in React/Next.js. Visual styling is unchanged
+        from the prior `<p className="mt-2 text-base text-muted">` —
+        text utility classes apply to inline children the same way
+        they would apply to text inside a `<p>`. Existing single-
+        string callers render identically.
+      */}
+      <div className="mt-2 text-base text-muted">{children}</div>
       {action && (
         <div className="mt-3">
           <button

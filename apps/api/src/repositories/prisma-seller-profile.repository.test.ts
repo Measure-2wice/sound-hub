@@ -378,6 +378,52 @@ test("updatePublishedProfile: rejected with SellerProfileNotPublishedError on a 
 });
 
 // ---------------------------------------------------------------------------
+// Published-by attribution cache column
+// ---------------------------------------------------------------------------
+
+test("publishProfile: persists publishedByUserId on the seller_profiles cache column", async () => {
+  const fx = await loadFixture();
+  await repo.saveDraft(draftInput(fx.workspaceId));
+  await repo.publishProfile(publicationInput(fx.workspaceId, "key-cache-publish"));
+
+  // The cache column on the seller_profiles row must mirror the
+  // publisher recorded on the append-only evidence row, otherwise the
+  // owner view returns `publishedByUserId: null` even though the
+  // publication actually happened.
+  const stored = await prisma.sellerProfile.findUnique({
+    where: { workspaceId: fx.workspaceId },
+  });
+  assert.ok(stored);
+  assert.equal(stored?.publishedByUserId, fx.userId);
+});
+
+test("updatePublishedProfile: overwrites publishedByUserId on the seller_profiles cache column", async () => {
+  const fx = await loadFixture();
+  await repo.saveDraft(draftInput(fx.workspaceId));
+  await repo.publishProfile(publicationInput(fx.workspaceId, "key-cache-update-pub"));
+  await repo.updatePublishedProfile(publicationInput(fx.workspaceId, "key-cache-update"));
+
+  // After an update, the cache column must point at the latest
+  // publisher, matching the newest evidence row.
+  const stored = await prisma.sellerProfile.findUnique({
+    where: { workspaceId: fx.workspaceId },
+  });
+  assert.ok(stored);
+  assert.equal(stored?.publishedByUserId, fx.userId);
+
+  // The append-only evidence trail still has BOTH rows, in order.
+  const evidence = await prisma.sellerProfilePublication.findMany({
+    where: { workspaceId: fx.workspaceId },
+    orderBy: { publishedAt: "asc" },
+  });
+  assert.equal(evidence.length, 2);
+  assert.deepEqual(
+    evidence.map((e) => e.idempotencyKey),
+    ["key-cache-update-pub", "key-cache-update"],
+  );
+});
+
+// ---------------------------------------------------------------------------
 // Find current profile
 // ---------------------------------------------------------------------------
 

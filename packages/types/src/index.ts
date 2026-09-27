@@ -756,6 +756,9 @@ export type SellerProfileTaxonomyResponseV1 = z.infer<typeof sellerProfileTaxono
 // Reused across draft / publish / update request schemas. NOT exposed
 // publicly — these are request-side building blocks.
 
+// STRICT basedIn. Used by publish / update REQUEST schemas and
+// by the OwnerView of a Published profile (the persisted country
+// code is required by the closed Caribbean-orientation surface).
 const sellerProfileBasedInV1Schema = z
   .object({
     countryCode: countryCodeSchema,
@@ -765,18 +768,63 @@ const sellerProfileBasedInV1Schema = z
   .strict();
 export type SellerProfileBasedInV1 = z.infer<typeof sellerProfileBasedInV1Schema>;
 
+// RELAXED basedIn. Used by the draft request and by a Draft
+// OwnerView. `countryCode` may be omitted because a partial
+// first-save must not silently fabricate a country the seller
+// never selected — per M2 #84 "Incomplete pre-publication Drafts
+// remain private, resumable, absent from public DTOs, and
+// presented as Private draft". Publish / update completeness is
+// enforced separately via the STRICT sub-schema above.
+const sellerProfileDraftBasedInV1Schema = z
+  .object({
+    countryCode: countryCodeSchema.optional(),
+    region: z.string().min(1).max(120).optional(),
+    city: z.string().min(1).max(120).optional(),
+  })
+  .strict();
+export type SellerProfileDraftBasedInV1 = z.infer<typeof sellerProfileDraftBasedInV1Schema>;
+
+// RELAXED identity. Used by draft requests (which may be partial
+// per M2 #84: "Incomplete pre-publication Drafts remain private,
+// resumable, absent from public DTOs, and presented as Private
+// draft") and by the OwnerView response (which may carry a partial
+// draft). Publication-time completeness is enforced separately via
+// the STRICT sub-schema below.
 const sellerProfileIdentityV1Schema = z
   .object({
-    professionalName: z.string().min(1).max(200),
+    professionalName: z.string().max(200),
     // Preserve the canonical PublicSellerSummaryV1.bio bound (2000
     // characters). The Stitch editor's "248 / 600" counter is
     // presentation-only; the UI normalizes to the canonical domain
     // limit. The #84 brief does not authorize a tighter bound.
-    bio: z.string().min(1).max(2000),
+    bio: z.string().max(2000),
     avatarUrl: z.string().url().max(500).optional(),
   })
   .strict();
 export type SellerProfileIdentityV1 = z.infer<typeof sellerProfileIdentityV1Schema>;
+
+// STRICT identity. Used by publish / update REQUEST schemas. The
+// publish-time completeness invariant ("Publication requires the
+// functional specification's professional name, biography, ...")
+// is enforced at the trusted Zod boundary so a direct API client
+// cannot smuggle an empty identity through.
+//
+// Both required fields use `trimmedNonEmptyString` (declared at
+// the top of this module) so a whitespace-only payload — `.min(1)`
+// alone would accept `"   "` because it counts characters before
+// trimming — is rejected with the same field-anchor shape as the
+// other required-field paths. The relaxed draft schema below
+// still permits drafts to persist with whitespace-only strings
+// (the seller may edit the field later); the trimmed validation
+// applies only to publish / update, per ticket #84's "missing
+// fields on draft must remain private, resumable" rule.
+const sellerProfilePublishUpdateIdentityV1Schema = z
+  .object({
+    professionalName: trimmedNonEmptyString(1, 200, "professionalName"),
+    bio: trimmedNonEmptyString(1, 2000, "bio"),
+    avatarUrl: z.string().url().max(500).optional(),
+  })
+  .strict();
 
 const sellerProfileDisciplineV1Schema = z
   .object({
@@ -798,7 +846,7 @@ export type SellerProfileDisciplineV1 = z.infer<typeof sellerProfileDisciplineV1
 export const sellerProfileDraftRequestV1Schema = z
   .object({
     identity: sellerProfileIdentityV1Schema,
-    basedIn: sellerProfileBasedInV1Schema,
+    basedIn: sellerProfileDraftBasedInV1Schema,
     disciplines: sellerProfileDisciplineV1Schema,
     // Optional return target — schema-validated + server-resolved
     // safeReturnTo. Mirrors the #83 intent return-target pattern.
@@ -818,7 +866,13 @@ const sellerProfileOwnerViewV1Schema = z
     workspaceId: z.string().min(1),
     status: z.enum(["Draft", "Published", "Suspended"]),
     identity: sellerProfileIdentityV1Schema,
-    basedIn: sellerProfileBasedInV1Schema,
+    // Drafts may carry a partial basedIn (countryCode omitted).
+    // Published profiles always have countryCode set (the
+    // publish/update STRICT schema enforces it). Either way, the
+    // OwnerView shares the RELAXED shape; consumers that need the
+    // STRICT invariant (i.e. anything reading a Published profile)
+    // revalidate at the trust boundary.
+    basedIn: sellerProfileDraftBasedInV1Schema,
     disciplines: sellerProfileDisciplineV1Schema,
     publishedAt: z.string().datetime().optional(),
     publishedByDisplayName: z.string().min(1).max(200).optional(),
@@ -862,7 +916,7 @@ export type SellerProfilePublicationConfirmationVersionV1 =
 
 const sellerProfilePublishUpdateCoreV1Schema = z
   .object({
-    identity: sellerProfileIdentityV1Schema,
+    identity: sellerProfilePublishUpdateIdentityV1Schema,
     basedIn: sellerProfileBasedInV1Schema,
     disciplines: sellerProfileDisciplineV1Schema,
     // Immutable confirmation/document version. The application

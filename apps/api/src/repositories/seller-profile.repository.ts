@@ -41,7 +41,11 @@ export interface SellerProfileDraftInput {
   readonly workspaceId: string;
   readonly identity: SellerProfileIdentityV1;
   readonly basedIn: {
-    readonly countryCode: string;
+    // Draft may save without a countryCode (a partial first-save
+    // must not silently fabricate the value). Publish-time
+    // completeness is enforced by the publish/update schema +
+    // service-layer guards.
+    readonly countryCode?: string;
     readonly region?: string;
     readonly city?: string;
   };
@@ -53,6 +57,8 @@ export interface SellerProfilePublicationInput {
   readonly workspaceId: string;
   readonly identity: SellerProfileIdentityV1;
   readonly basedIn: {
+    // Publish / update always carries a country (the Zod STRICT
+    // schema rejects a missing one at the trusted boundary).
     readonly countryCode: string;
     readonly region?: string;
     readonly city?: string;
@@ -71,7 +77,11 @@ export interface SellerProfileOwnerViewRecord {
   readonly status: "Draft" | "Published" | "Suspended";
   readonly identity: SellerProfileIdentityV1;
   readonly basedIn: {
-    readonly countryCode: string;
+    // A Draft OwnerView may carry `countryCode: undefined` (the
+    // seller has not chosen a country). A Published OwnerView
+    // always carries a countryCode because the publish/update
+    // STRICT schema enforces it.
+    readonly countryCode?: string;
     readonly region?: string;
     readonly city?: string;
   };

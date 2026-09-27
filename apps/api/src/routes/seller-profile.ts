@@ -63,11 +63,8 @@ import {
   SafeReturnToFallback,
 } from "../lib/post-command-return-destination.js";
 import { getRequestId } from "../lib/request-id.js";
-import type {
-  SellerProfileService} from "../services/seller-profile.service.js";
-import {
-  SellerProfileServiceError,
-} from "../services/seller-profile.service.js";
+import type { SellerProfileService } from "../services/seller-profile.service.js";
+import { SellerProfileServiceError } from "../services/seller-profile.service.js";
 
 const SELLER_PROFILE_REQUEST_BODY_LIMIT = 16 * 1024;
 
@@ -199,7 +196,7 @@ async function handleDraft(
     rawBody = await readBody(req);
   } catch (err) {
     if (err instanceof SellerProfileServiceError) {
-      writeTranslatedError(res, err.code, err.message, requestId);
+      writeTranslatedError(res, err.code, err.message, err.fieldErrors, requestId);
       return;
     }
     writeSafeError(
@@ -260,7 +257,7 @@ async function handlePublish(
     rawBody = await readBody(req);
   } catch (err) {
     if (err instanceof SellerProfileServiceError) {
-      writeTranslatedError(res, err.code, err.message, requestId);
+      writeTranslatedError(res, err.code, err.message, err.fieldErrors, requestId);
       return;
     }
     writeSafeError(
@@ -322,7 +319,7 @@ async function handleUpdate(
     rawBody = await readBody(req);
   } catch (err) {
     if (err instanceof SellerProfileServiceError) {
-      writeTranslatedError(res, err.code, err.message, requestId);
+      writeTranslatedError(res, err.code, err.message, err.fieldErrors, requestId);
       return;
     }
     writeSafeError(
@@ -415,7 +412,7 @@ function writeJson(res: Response, status: number, body: unknown): void {
 
 function writeServiceError(res: Response, err: unknown, requestId: string): void {
   if (err instanceof SellerProfileServiceError) {
-    writeTranslatedError(res, err.code, err.message, requestId);
+    writeTranslatedError(res, err.code, err.message, err.fieldErrors, requestId);
     return;
   }
   console.error(`[seller-profile] requestId=${requestId} unhandled:`, err);
@@ -434,7 +431,15 @@ function writeTranslatedError(
   res: Response,
   code: SellerProfileServiceError["code"],
   message: string,
+  fieldErrors: SellerProfileServiceError["fieldErrors"],
   requestId: string,
 ): void {
-  writeSafeError(res, buildSafeError(code, message, undefined, requestId));
+  // Surface per-field validation failures (incomplete publish /
+  // update payloads, unsupported Caribbean codes, etc.) through the
+  // safe envelope so the browser recovery flow can render a focusable
+  // linked error summary against the editor controls. An empty
+  // `fieldErrors` array collapses to `undefined` to preserve the
+  // existing single-message error contract.
+  const fields = fieldErrors.length > 0 ? fieldErrors : undefined;
+  writeSafeError(res, buildSafeError(code, message, fields, requestId));
 }

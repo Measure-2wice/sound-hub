@@ -111,7 +111,9 @@ export class PrismaSellerProfileRepository implements SellerProfileRepository {
               : existing.avatarUrl !== null
                 ? { avatarUrl: existing.avatarUrl }
                 : {}),
-            basedInCountryCode: input.basedIn.countryCode,
+            // Partial-draft countryCode may be undefined; persist as
+            // NULL until the seller chooses one.
+            basedInCountryCode: input.basedIn.countryCode ?? null,
             basedInRegion: input.basedIn.region ?? null,
             basedInCity: input.basedIn.city ?? null,
             specialties: {
@@ -143,7 +145,7 @@ export class PrismaSellerProfileRepository implements SellerProfileRepository {
           ...(input.identity.avatarUrl !== undefined
             ? { avatarUrl: input.identity.avatarUrl }
             : {}),
-          basedInCountryCode: input.basedIn.countryCode,
+          basedInCountryCode: input.basedIn.countryCode ?? null,
           basedInRegion: input.basedIn.region ?? null,
           basedInCity: input.basedIn.city ?? null,
           specialties: {
@@ -256,6 +258,13 @@ export class PrismaSellerProfileRepository implements SellerProfileRepository {
             basedInRegion: input.basedIn.region ?? null,
             basedInCity: input.basedIn.city ?? null,
             publishedAt: input.now,
+            // Cache the publisher on the seller_profiles row so the
+            // owner view reflects the actual publisher without an
+            // extra join to the append-only evidence row. The
+            // in-memory adapter already does this; Prisma must match
+            // for production parity. The append-only SellerProfilePublication
+            // row remains the immutable audit record.
+            publishedByUserId: input.publishedByUserId,
             specialties: {
               deleteMany: {},
               create: specialtyCreates,
@@ -346,9 +355,14 @@ export class PrismaSellerProfileRepository implements SellerProfileRepository {
 }
 
 function toOwnerView(row: ProfileRow): SellerProfileOwnerViewRecord {
-  const basedIn: { countryCode: string; region?: string; city?: string } = {
-    countryCode: row.basedInCountryCode,
-  };
+  // A Draft may carry a null basedInCountryCode. Map it to
+  // `undefined` on the OwnerView so callers can distinguish
+  // "not set" from a real code. Published profiles always carry
+  // a real code (the publish/update STRICT schema enforces it).
+  const basedIn: { countryCode?: string; region?: string; city?: string } = {};
+  if (row.basedInCountryCode !== null) {
+    basedIn.countryCode = row.basedInCountryCode;
+  }
   if (row.basedInRegion !== null) basedIn.region = row.basedInRegion;
   if (row.basedInCity !== null) basedIn.city = row.basedInCity;
   const disciplines: SellerProfileDisciplineV1 = {

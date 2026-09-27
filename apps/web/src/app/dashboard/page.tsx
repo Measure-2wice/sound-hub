@@ -540,19 +540,58 @@ function SellerReadinessRow({ hasBuyer }: { readonly hasBuyer: boolean }) {
     }
   })();
 
+  // Body + hint copy is branch-specific. The pre-publication copy
+  // ("Publish your professional profile and activate at least one
+  // service…") is no longer truthful once the profile has been
+  // published — the publish surface's truthful post-publication
+  // state asserts no ServiceOffering was created or activated, and
+  // the next step is creating/activating the first service. We
+  // surface that state here without implementing the service
+  // authoring slice: the CTA continues to advertise "Edit your
+  // Professional Profile" (the row the customer just acted on);
+  // the next-product-step is described as a destination the seller
+  // already knows about.
+  const bodyCopy = (() => {
+    switch (profileState) {
+      case "published":
+        return "Your Professional Profile is published. You are not yet available to buyers through search until you create and activate your first service.";
+      case "loading":
+        return "";
+      case "draft":
+      case "suspended":
+      case "none":
+      default:
+        return "Publish your professional profile and activate at least one service to appear in search results and receive project requests.";
+    }
+  })();
+  const hintCopy = (() => {
+    switch (profileState) {
+      case "published":
+        return "Your next step is to create and activate your first service.";
+      case "loading":
+        return "";
+      case "draft":
+      case "suspended":
+      case "none":
+      default:
+        return "You can save private drafts as you go — publication is a separate explicit step.";
+    }
+  })();
+
   return (
     <Card variant="parchment" data-testid="dashboard-seller-readiness">
       <Card.Header>
         <Card.Title>Offering services</Card.Title>
       </Card.Header>
       <Card.Content>
-        <p className="text-base text-muted">
-          Publish your professional profile and activate at least one service to appear in search
-          results and receive project requests.
+        <p className="text-base text-muted" data-testid="dashboard-seller-body">
+          {bodyCopy}
         </p>
-        <p className="mt-2 text-sm text-muted" data-testid="dashboard-seller-hint">
-          You can save private drafts as you go — publication is a separate explicit step.
-        </p>
+        {hintCopy && (
+          <p className="mt-2 text-sm text-muted" data-testid="dashboard-seller-hint">
+            {hintCopy}
+          </p>
+        )}
         <div className="mt-3 flex flex-col sm:flex-row gap-2">
           <Link
             href="/seller/profile/edit"

@@ -28,6 +28,19 @@ export interface SpecialtyChipsProps {
   readonly onToggle: (key: string) => void;
   readonly disabled?: boolean;
   readonly ariaLabel?: string;
+  // Accessibility hooks for the editor's per-field error
+  // association. The parent passes `aria-invalid` when a
+  // server-/client-side rejection has marked this field group
+  // invalid; `aria-describedby` points at the adjacent error
+  // element so assistive tech can announce the rejection when
+  // the group receives focus.
+  readonly ariaInvalid?: boolean | "true" | "false" | "grammar" | "spelling";
+  readonly ariaDescribedBy?: string;
+  // Stable id so the page-level ErrorSummary can land its link
+  // on this group. `tabIndex={-1}` (always set when an id is
+  // present) makes the container programmatically focusable
+  // but keeps it out of the natural tab order.
+  readonly id?: string;
 }
 
 export function SpecialtyChips({
@@ -36,6 +49,9 @@ export function SpecialtyChips({
   onToggle,
   disabled = false,
   ariaLabel = "Specialties",
+  ariaInvalid,
+  ariaDescribedBy,
+  id,
 }: SpecialtyChipsProps) {
   if (specialties.length === 0) {
     return null;
@@ -44,7 +60,11 @@ export function SpecialtyChips({
   return (
     <div
       role="group"
+      id={id}
+      tabIndex={id !== undefined ? -1 : undefined}
       aria-label={ariaLabel}
+      aria-invalid={ariaInvalid}
+      aria-describedby={ariaDescribedBy}
       className="flex flex-wrap gap-2"
       data-testid="specialty-chips"
     >

@@ -40,7 +40,9 @@ interface StoredProfile {
   readonly workspaceId: string;
   readonly status: "Draft" | "Published" | "Suspended";
   readonly identity: SellerProfileIdentityV1;
-  readonly basedInCountryCode: string;
+  // Nullable: a partial Draft may persist with no countryCode
+  // until the seller chooses one. Publish/update always sets it.
+  readonly basedInCountryCode: string | null;
   readonly basedInRegion: string | null;
   readonly basedInCity: string | null;
   readonly specialtyKeys: readonly string[];
@@ -97,9 +99,14 @@ export class InMemorySellerProfileRepository implements SellerProfileRepository 
   }
 
   private toOwnerView(profile: StoredProfile): SellerProfileOwnerViewRecord {
-    const basedIn: { countryCode: string; region?: string; city?: string } = {
-      countryCode: profile.basedInCountryCode,
-    };
+    // A Draft may carry a null basedInCountryCode. Map it to
+    // `undefined` on the OwnerView so callers can distinguish
+    // "not set" from a real code. Published profiles always carry
+    // a real code (publish/update STRICT).
+    const basedIn: { countryCode?: string; region?: string; city?: string } = {};
+    if (profile.basedInCountryCode !== null) {
+      basedIn.countryCode = profile.basedInCountryCode;
+    }
     if (profile.basedInRegion !== null) basedIn.region = profile.basedInRegion;
     if (profile.basedInCity !== null) basedIn.city = profile.basedInCity;
     const disciplines: SellerProfileDisciplineV1 = {
@@ -144,7 +151,9 @@ export class InMemorySellerProfileRepository implements SellerProfileRepository 
         const updated: StoredProfile = {
           ...existing,
           identity: this.normalizedIdentity(input.identity, existing.identity.avatarUrl ?? null),
-          basedInCountryCode: input.basedIn.countryCode,
+          // Allow partial drafts: a missing countryCode is stored
+          // as null until the seller chooses one.
+          basedInCountryCode: input.basedIn.countryCode ?? null,
           basedInRegion: input.basedIn.region ?? null,
           basedInCity: input.basedIn.city ?? null,
           specialtyKeys: [...input.disciplines.specialtyKeys],
@@ -158,7 +167,7 @@ export class InMemorySellerProfileRepository implements SellerProfileRepository 
         workspaceId: input.workspaceId,
         status: "Draft",
         identity: this.normalizedIdentity(input.identity, input.identity.avatarUrl ?? null),
-        basedInCountryCode: input.basedIn.countryCode,
+        basedInCountryCode: input.basedIn.countryCode ?? null,
         basedInRegion: input.basedIn.region ?? null,
         basedInCity: input.basedIn.city ?? null,
         specialtyKeys: [...input.disciplines.specialtyKeys],

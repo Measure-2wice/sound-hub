@@ -377,7 +377,11 @@ model SellerProfile {
   status             SellerProfileStatus @default(Draft)
   basedInCity        String?
   basedInRegion      String?
-  basedInCountryCode String
+  // M2 #84 acceptance: "Incomplete pre-publication Drafts remain
+  // private, resumable, absent from public DTOs, and presented as
+  // Private draft." The draft may persist without a
+  // `basedInCountryCode`; publish/update completeness enforces it.
+  basedInCountryCode String?
   avatarUrl          String?
   // M2 (#84): convenience current-state columns that cache the
   // latest publication metadata for fast reads. NOT the durable

@@ -36,7 +36,6 @@ import {
   updatePublishedSellerProfile,
   asSellerProfileClientError,
 } from "../../../lib/seller-profile-client";
-import { navigateAfterPublish } from "../../../lib/navigate-after-publish";
 import { SaveDraftActions, type SaveDraftActionState } from "../../../components/SaveDraftActions";
 import { ErrorSummary, type ErrorSummaryItem } from "../../../components/ErrorSummary";
 import type {
@@ -45,6 +44,12 @@ import type {
   SellerProfileTaxonomyResponseV1,
 } from "@soundhub/types";
 import { isLocallyValidReturnPath } from "../../../lib/return-path-shape";
+import {
+  clearPendingSellerProfileEdits,
+  clearSellerProfileRejection,
+  readPendingSellerProfileEdits,
+  writeSellerProfileRejection,
+} from "../../../lib/seller-profile-pending-edits";
 
 const CONFIRMATION_VERSION = "m2-profile-publication-v1" as const;
 
@@ -71,7 +76,7 @@ function ReviewLoading() {
 }
 
 function ProfileReviewInner() {
-  const { user, loading } = useSession();
+  const { loading } = useSession();
   const { actingWorkspace } = useActingWorkspace();
   const router = useRouter();
   const searchParams = useSearchParams();
@@ -85,6 +90,14 @@ function ProfileReviewInner() {
   const [profile, setProfile] = useState<SellerProfileOwnerViewV1 | null>(null);
   const [bootstrapError, setBootstrapError] = useState<string | null>(null);
   const [confirmed, setConfirmed] = useState(false);
+
+  // Pending post-publication edits forwarded from the editor via
+  // sessionStorage. On a Published profile these override the
+  // server's current values for BOTH the preview and the submit
+  // payload. On a Draft profile they are ignored (the editor
+  // always saves drafts through the API first).
+  const [pendingEdits, setPendingEdits] =
+    useState<ReturnType<typeof readPendingSellerProfileEdits>>(null);
 
   // Submit state machine
   const [submitState, setSubmitState] = useState<SaveDraftActionState>("idle");
@@ -107,6 +120,10 @@ function ProfileReviewInner() {
     if (!actingWorkspace) return;
     const workspaceId = actingWorkspace.workspaceId;
     let cancelled = false;
+    // Read the post-publication edit handoff synchronously so the
+    // first render of the preview reflects the user's edits even if
+    // the server fetch is still in flight.
+    setPendingEdits(readPendingSellerProfileEdits(workspaceId));
     void (async () => {
       try {
         const [taxonomyResult, profileResult] = await Promise.all([
@@ -182,20 +199,74 @@ function ProfileReviewInner() {
   const isPublished = profile.status === "Published";
   const isUpdate = isPublished;
 
+  // On a Published profile the editor forwards the user's pending
+  // edits through sessionStorage; we overlay them on the server's
+  // current values for both the preview and the submit payload. A
+  // stale handoff for a Draft profile is ignored — the editor
+  // always saves drafts through the API before review.
+  const effectiveIdentity = isUpdate && pendingEdits ? pendingEdits.identity : profile.identity;
+  const effectiveBasedIn = isUpdate && pendingEdits ? pendingEdits.basedIn : profile.basedIn;
+  const effectiveDisciplines =
+    isUpdate && pendingEdits ? pendingEdits.disciplines : profile.disciplines;
+
+  // Used by performPublish to bail without sending the (already
+  // malformed) request body when the user clicks Publish on an
+  // empty country — the server-side SELLER_PROFILE_INCOMPLETE
+  // (and others) are surfaced through the same ErrorSummary path
+  // regardless of which boundary rejected it.
+
+  // Map every field-level error to the "Back to edit" anchor so
+  // the linked summary focuses that link instead of a non-existent
+  // control. The review surface is read-only; the recovery path is
+  // "Back to edit", and the editor renders the actual field
+  // controls (with their own per-field ErrorSummary on the editor
+  // page once the user lands back there with the persisted draft).
   const summaryItems: ErrorSummaryItem[] = fieldErrors.map((err) => ({
-    id: err.path.replace(/\./g, "-"),
+    id: "profile-review-back-edit",
     path: err.path,
-    message: err.message,
+    message: `${err.message} (${err.path})`,
   }));
 
   const performPublish = async (key: string) => {
     setSubmitState("saving");
     setSubmitErrorMessage(null);
     setFieldErrors([]);
+    // Client-side guard: the STRICT publish/update schema requires
+    // a country. If the user (or a partial-draft rejection) left
+    // the country unset, surface the same field-error annotation
+    // shape the server would, scoped to the editor's
+    // "basedIn.countryCode" anchor. Returning early avoids building
+    // a payload that the server would reject as SELLER_PROFILE_INVALID.
+    // The error is also persisted into the rejection handoff so the
+    // editor's correction flow retains the field-level guidance when
+    // the user returns via "Back to edit".
+    if (!effectiveBasedIn.countryCode) {
+      const countryFieldError = {
+        path: "basedIn.countryCode",
+        code: "country_required",
+        message: "Select a country before publishing your Professional Profile.",
+      };
+      setSubmitErrorMessage("Country is required to publish.");
+      setFieldErrors([countryFieldError]);
+      setSubmitState("error");
+      try {
+        writeSellerProfileRejection(actingWorkspace.workspaceId, {
+          fieldErrors: [countryFieldError],
+        });
+      } catch {
+        // Same throw-on-failure discipline as the editor's
+        // writePendingSellerProfileEdits: a silent swallow would
+        // let the editor drop the user into a clean form with no
+        // indication of what was rejected. The visible ErrorSummary
+        // already guides the user even if the persisted copy
+        // cannot be saved.
+      }
+      return;
+    }
     const payload = {
-      identity: profile.identity,
-      basedIn: profile.basedIn,
-      disciplines: profile.disciplines,
+      identity: effectiveIdentity,
+      basedIn: effectiveBasedIn as { countryCode: string; city?: string; region?: string },
+      disciplines: effectiveDisciplines,
       confirmationVersion: CONFIRMATION_VERSION,
       idempotencyKey: key,
     };
@@ -210,23 +281,52 @@ function ProfileReviewInner() {
             publish: payload,
           });
       setPublishedSnapshot(response.profile);
+      // Definitive success: the post-publication edit handoff has
+      // been committed; clear it so a subsequent edit starts fresh.
+      // The retained rejection (if any) is also cleared — the next
+      // Publish / Update will either succeed or surface a fresh
+      // rejection through this same path.
+      clearPendingSellerProfileEdits(actingWorkspace.workspaceId);
+      clearSellerProfileRejection(actingWorkspace.workspaceId);
+      setPendingEdits(null);
       // On definitive success, the user has reached the success
       // surface. The next attempt (if any) is a genuinely new
       // command — clear the retained key so the next Publish
       // generates a fresh one.
       idempotencyKeyRef.current = null;
       setSubmitState("saved");
-      navigateAfterPublish({ router, response });
+      // Intentionally NO auto-navigation. The SuccessSurface (rendered
+      // when `publishedSnapshot` is set) must remain mounted until the
+      // user dismisses via the Continue button or follows the
+      // "Create your first service" CTA, per M2 #84 acceptance
+      // criteria. Navigating here would unmount the success surface
+      // before the user could read the truthful post-publication copy.
     } catch (err) {
       const cls = asSellerProfileClientError(err);
+      let displayMessage: string;
+      let displayFieldErrors: readonly ApiFieldErrorV1[] = [];
       if (cls) {
-        setSubmitErrorMessage(cls.message);
-        setFieldErrors(cls.fieldErrors);
+        displayMessage = cls.message;
+        displayFieldErrors = cls.fieldErrors;
       } else {
-        setSubmitErrorMessage("Couldn't publish. Please try again.");
+        displayMessage = "Couldn't publish. Please try again.";
       }
+      setSubmitErrorMessage(displayMessage);
+      setFieldErrors(displayFieldErrors);
       setSubmitState("error");
       void key; // keep the same idempotencyKey for Retry
+      // Persist the rejection so the editor can resume the rejected
+      // payload + retained field errors when the user returns. The
+      // `pendingEdits` handoff is intentionally NOT cleared here:
+      // its purpose is to hold the values the user just submitted,
+      // and the editor's hydration reads them on mount. Clearing
+      // would force the user to re-enter every field they just
+      // typed. sessionStorage is bounded but the field-error
+      // payload is at most 50 entries (per apiFieldErrorV1Schema)
+      // so write cannot exceed any reasonable quota.
+      writeSellerProfileRejection(actingWorkspace.workspaceId, {
+        fieldErrors: displayFieldErrors,
+      });
     }
   };
 
@@ -245,10 +345,33 @@ function ProfileReviewInner() {
     void performPublish(idempotencyKeyRef.current);
   };
 
-  const handleAbandon = () => {
-    // User-initiated abandonment. Clear the retained key so the
-    // next attempt (if any) starts a fresh publication session.
+  const handleDiscardUpdates = () => {
+    // Explicit discard (NOT the default "Back to edit" path). The
+    // user is asked for confirmation because pendingEdits + the
+    // rejection state are permanently cleared — the editor will
+    // reload from the server's Published state on mount. After
+    // confirmation: clear the retained idempotencyKey, both
+    // handoffs, and navigate.
+    const confirmed =
+      typeof window === "undefined" ||
+      window.confirm(
+        "Discard your pending update? The editor will reload your current published values and you'll have to re-enter the changes.",
+      );
+    if (!confirmed) return;
     idempotencyKeyRef.current = null;
+    clearPendingSellerProfileEdits(actingWorkspace.workspaceId);
+    clearSellerProfileRejection(actingWorkspace.workspaceId);
+    setPendingEdits(null);
+    router.replace((validatedReturnTo ?? "/seller/profile/edit") as Route);
+  };
+
+  // "Back to edit" preserves the handoff. The editor hydrates from
+  // the pending edits (and the retained rejection, if any) on
+  // mount, so the user can correct and resubmit without re-entering
+  // values. The action-row button is the explicit
+  // "Discard updates" path with a bounded confirmation; the
+  // card-footer link is the implicit, always-safe escape.
+  const handleBackToEdit = () => {
     router.replace((validatedReturnTo ?? "/seller/profile/edit") as Route);
   };
 
@@ -269,8 +392,8 @@ function ProfileReviewInner() {
                   {isUpdate ? "Update Professional Profile" : "Review Professional Profile"}
                 </h1>
                 <p className="text-base text-muted mt-1">
-                  Verify your marketplace identity before making it visible. Publishing establishes
-                  your authenticated seller identity across SoundHub.
+                  Review your Professional Profile before publication. Publishing makes your profile
+                  visible to buyers on SoundHub.
                 </p>
               </div>
               <span
@@ -297,16 +420,16 @@ function ProfileReviewInner() {
                     Public Professional Identity
                   </span>
                   <h2 className="text-2xl font-serif text-ink">
-                    {profile.identity.professionalName}
+                    {effectiveIdentity.professionalName}
                   </h2>
                   <div className="flex items-center gap-2 text-muted">
                     <span aria-hidden="true">📍</span>
                     <span className="text-base text-ink">
-                      {profile.basedIn.city ?? ""}
-                      {profile.basedIn.city ? ", " : ""}
-                      {profile.basedIn.region ?? ""}
-                      {profile.basedIn.city || profile.basedIn.region ? ", " : ""}
-                      {profile.basedIn.countryCode}
+                      {effectiveBasedIn.city ?? ""}
+                      {effectiveBasedIn.city ? ", " : ""}
+                      {effectiveBasedIn.region ?? ""}
+                      {effectiveBasedIn.city || effectiveBasedIn.region ? ", " : ""}
+                      {effectiveBasedIn.countryCode}
                     </span>
                   </div>
                   <span className="text-xs text-muted">Marketplace operational location only</span>
@@ -316,14 +439,14 @@ function ProfileReviewInner() {
                 <span className="font-label-sm uppercase tracking-wider text-muted">
                   Professional Biography
                 </span>
-                <p className="text-base text-ink leading-relaxed mt-1">{profile.identity.bio}</p>
+                <p className="text-base text-ink leading-relaxed mt-1">{effectiveIdentity.bio}</p>
               </div>
               <div>
                 <span className="font-label-sm uppercase tracking-wider text-muted">
                   Controlled Specialties
                 </span>
                 <div className="flex flex-wrap gap-2 mt-2" data-testid="profile-review-specialties">
-                  {profile.disciplines.specialtyKeys.map((key) => (
+                  {effectiveDisciplines.specialtyKeys.map((key) => (
                     <span
                       key={key}
                       className="inline-flex items-center gap-1 px-3 py-1 rounded-md bg-surface-container text-primary text-sm"
@@ -339,7 +462,7 @@ function ProfileReviewInner() {
                   Caribbean Connection (self-declared)
                 </span>
                 <div className="flex flex-wrap gap-2 mt-2" data-testid="profile-review-caribbean">
-                  {profile.disciplines.caribbeanAffiliationCodes.map((code) => (
+                  {effectiveDisciplines.caribbeanAffiliationCodes.map((code) => (
                     <span
                       key={code}
                       className="inline-flex items-center gap-1 px-3 py-1 rounded-md bg-surface-container text-primary text-sm"
@@ -383,9 +506,16 @@ function ProfileReviewInner() {
                     testIdPrefix="profile-review-publish"
                   />
                   <div className="flex items-center gap-2">
+                    {/* Prominent Back-to-edit PRESERVES the handoff:
+                       the editor's mount hydrates from the pending
+                       edits + retained field errors, so the user
+                       can correct without re-entering values. The
+                       destructive path is the small Discard pending
+                       changes link below (with bounded
+                       confirmation). */}
                     <button
                       type="button"
-                      onClick={handleAbandon}
+                      onClick={handleBackToEdit}
                       className="inline-flex items-center justify-center min-h-[44px] min-w-[44px] py-3 px-4 text-base font-medium text-ink hover:text-aubergine bg-surface hover:bg-surface-container rounded focus:outline-none focus-visible:outline focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-aubergine"
                       data-testid="profile-review-back"
                     >
@@ -402,15 +532,26 @@ function ProfileReviewInner() {
                     </button>
                   </div>
                 </div>
+                {isUpdate && pendingEdits && (
+                  <button
+                    type="button"
+                    onClick={handleDiscardUpdates}
+                    className="text-xs text-muted hover:text-aubergine underline-offset-2 hover:underline focus:outline-none focus-visible:outline focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-aubergine"
+                    data-testid="profile-review-discard-updates"
+                  >
+                    Discard pending changes
+                  </button>
+                )}
               </Card.Content>
             </Card>
 
             <Link
               href={
-                (validatedReturnTo
+                validatedReturnTo
                   ? (`/seller/profile/edit?return=${encodeURIComponent(validatedReturnTo)}` as Route)
-                  : "/seller/profile/edit")
+                  : "/seller/profile/edit"
               }
+              id="profile-review-back-edit"
               className="text-aubergine hover:text-aubergine-hover font-medium"
               data-testid="profile-review-back-edit"
             >

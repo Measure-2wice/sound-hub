@@ -272,6 +272,37 @@ describe("SellerProfile route (in-memory)", () => {
     assert.equal(response.body.error.code, "SELLER_PROFILE_INVALID");
   });
 
+  test("POST /seller-profile/publish with whitespace-only biography is rejected with SELLER_PROFILE_INVALID", async () => {
+    // Per M2 #84: publication requires a meaningful biography.
+    // The STRICT publish schema trims and rejects whitespace-only
+    // identity fields at the trusted Zod boundary; the relaxed
+    // draft schema still accepts the same payload so a Draft
+    // can persist with whitespace-only strings (the seller can
+    // edit the field before publishing).
+    const cookie = await signIn(SELLER_EMAIL);
+    await request(app)
+      .put(`/api/workspaces/${PERSONAL_WS}/seller-profile/draft`)
+      .send(draftBody)
+      .set("Cookie", cookie)
+      .set("Content-Type", "application/json");
+    const whitespacePayload = {
+      ...publishBody,
+      identity: { ...publishBody.identity, bio: "   " },
+    };
+    const response = await request(app)
+      .post(`/api/workspaces/${PERSONAL_WS}/seller-profile/publish`)
+      .send(whitespacePayload)
+      .set("Cookie", cookie)
+      .set("Content-Type", "application/json");
+    assert.equal(response.status, 400);
+    assert.equal(response.body.error.code, "SELLER_PROFILE_INVALID");
+    const paths = (response.body.error.fields ?? []).map((f: { path: string }) => f.path);
+    assert.ok(
+      paths.includes("identity.bio"),
+      `expected identity.bio in field errors; got ${JSON.stringify(paths)}`,
+    );
+  });
+
   test("POST /seller-profile/publish returns SELLER_PROFILE_INCOMPLETE for empty Specialty list", async () => {
     const cookie = await signIn(SELLER_EMAIL);
     await request(app)

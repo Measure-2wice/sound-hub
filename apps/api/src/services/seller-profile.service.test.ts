@@ -22,8 +22,7 @@
 
 import assert from "node:assert/strict";
 import { describe, test } from "node:test";
-import type {
-  WorkspaceAuthorizationService} from "./workspace-authorization.service.js";
+import type { WorkspaceAuthorizationService } from "./workspace-authorization.service.js";
 import {
   AuthorizationError,
   PersonalActingMembershipError,
@@ -162,9 +161,21 @@ const draftPayload: SellerProfileDraftRequestV1 = {
   },
 };
 
+// Strict variant of `draftPayload` for publish/update paths. The
+// draft schema allows `countryCode` to be omitted; the
+// publish/update schema does not. Tests that exercise
+// publish/update re-assert the country so the strict type is
+// satisfied and any drift between the two schemas surfaces at
+// compile time.
+const strictBasedIn: { countryCode: string; region?: string; city?: string } = {
+  countryCode: draftPayload.basedIn.countryCode ?? "US",
+  region: draftPayload.basedIn.region,
+  city: draftPayload.basedIn.city,
+};
+
 const publishPayload: SellerProfilePublishRequestV1 = {
   identity: draftPayload.identity,
-  basedIn: draftPayload.basedIn,
+  basedIn: strictBasedIn,
   disciplines: draftPayload.disciplines,
   confirmationVersion: "m2-profile-publication-v1",
   idempotencyKey: "11111111-2222-3333-4444-555555555555",
@@ -182,6 +193,115 @@ describe("SellerProfileService.saveDraft", () => {
     assert.equal(result.profile.identity.professionalName, "Creole Beats Brooklyn");
     assert.deepEqual(result.profile.disciplines.specialtyKeys, ["Producer", "SoundEngineer"]);
     assert.deepEqual(result.profile.disciplines.caribbeanAffiliationCodes, ["HT"]);
+  });
+
+  test("partial draft with empty professional name + bio is allowed (resume on later save)", async () => {
+    // Per M2 #84 acceptance criteria: "Incomplete pre-publication
+    // Drafts remain private, resumable, absent from public DTOs,
+    // and presented as Private draft." The first-save payload may
+    // omit the publication-required identity values.
+    const { service, repo } = buildService();
+    const partial: SellerProfileDraftRequestV1 = {
+      identity: { professionalName: "", bio: "" },
+      basedIn: { countryCode: "US" },
+      disciplines: { specialtyKeys: [], caribbeanAffiliationCodes: [] },
+    };
+    const result = await service.saveDraft({
+      userAccountId: ACTING_USER,
+      workspaceId: PERSONAL_WS_ID,
+      request: partial,
+    });
+    assert.equal(result.profile.status, "Draft");
+    assert.equal(result.profile.identity.professionalName, "");
+    assert.equal(result.profile.identity.bio, "");
+    assert.deepEqual(result.profile.disciplines.specialtyKeys, []);
+    assert.deepEqual(result.profile.disciplines.caribbeanAffiliationCodes, []);
+    // The Draft row exists and is private — the public owner view
+    // for the same Workspace carries the partial state.
+    const stored = repo._peekProfile(PERSONAL_WS_ID);
+    assert.ok(stored);
+    assert.equal(stored.status, "Draft");
+  });
+
+  test("a partial draft can be resumed: subsequent save fills the missing fields", async () => {
+    const { service } = buildService();
+    const partial: SellerProfileDraftRequestV1 = {
+      identity: { professionalName: "", bio: "" },
+      basedIn: { countryCode: "US" },
+      disciplines: { specialtyKeys: [], caribbeanAffiliationCodes: [] },
+    };
+    await service.saveDraft({
+      userAccountId: ACTING_USER,
+      workspaceId: PERSONAL_WS_ID,
+      request: partial,
+    });
+    const resumed = await service.saveDraft({
+      userAccountId: ACTING_USER,
+      workspaceId: PERSONAL_WS_ID,
+      request: draftPayload,
+    });
+    assert.equal(resumed.profile.identity.professionalName, "Creole Beats Brooklyn");
+    assert.equal(resumed.profile.identity.bio, "Brooklyn-based production studio.");
+    assert.deepEqual(resumed.profile.disciplines.specialtyKeys, ["Producer", "SoundEngineer"]);
+  });
+
+  test("partial draft with no countryCode is allowed (resume on later save)", async () => {
+    // Per M2 #84 acceptance: the editor must not silently
+    // fabricate a country the seller never selected. A first-save
+    // payload may omit basedIn.countryCode entirely; the row
+    // stores NULL; publish/update completeness still require a
+    // country at the trusted Zod boundary.
+    const { service, repo } = buildService();
+    const partial: SellerProfileDraftRequestV1 = {
+      identity: { professionalName: "", bio: "" },
+      basedIn: {},
+      disciplines: { specialtyKeys: [], caribbeanAffiliationCodes: [] },
+    };
+    const result = await service.saveDraft({
+      userAccountId: ACTING_USER,
+      workspaceId: PERSONAL_WS_ID,
+      request: partial,
+    });
+    assert.equal(result.profile.status, "Draft");
+    assert.equal(result.profile.basedIn.countryCode, undefined);
+    const stored = repo._peekProfile(PERSONAL_WS_ID);
+    assert.ok(stored);
+    assert.equal(stored.basedInCountryCode, null);
+  });
+
+  test("unsupported Caribbean affiliation code is rejected at draft save with SELLER_PROFILE_INVALID + field errors", async () => {
+    // Per M2 #84: Caribbean connection is a closed self-declared
+    // surface. A direct API client must NOT be able to persist
+    // `US` or `ZZ` as an affiliation. Validate at the trusted
+    // service boundary, even on the draft save path.
+    const { service } = buildService();
+    const smuggled: SellerProfileDraftRequestV1 = {
+      ...draftPayload,
+      disciplines: {
+        ...draftPayload.disciplines,
+        caribbeanAffiliationCodes: ["HT", "US", "ZZ"],
+      },
+    };
+    await assert.rejects(
+      () =>
+        service.saveDraft({
+          userAccountId: ACTING_USER,
+          workspaceId: PERSONAL_WS_ID,
+          request: smuggled,
+        }),
+      (err: unknown) => {
+        if (!(err instanceof SellerProfileServiceError)) return false;
+        if (err.code !== "SELLER_PROFILE_INVALID") return false;
+        // One field error per offending code so the editor can
+        // highlight each invalid chip.
+        const paths = err.fieldErrors.map((f) => f.path);
+        assert.deepEqual(paths, [
+          "disciplines.caribbeanAffiliationCodes",
+          "disciplines.caribbeanAffiliationCodes",
+        ]);
+        return true;
+      },
+    );
   });
 
   test("a second save converges on the same row (no duplicate insert)", async () => {
@@ -382,6 +502,77 @@ describe("SellerProfileService.publishProfile", () => {
       },
     );
   });
+
+  test("publish with both specialties and Caribbean missing returns SELLER_PROFILE_INCOMPLETE with BOTH field errors", async () => {
+    // The review recovery flow renders a focusable linked error
+    // summary; it must list every missing-discipline field in one
+    // response so the user sees the full picture without submitting
+    // a corrected partial payload just to discover the next gap.
+    const { service } = buildService();
+    await service.saveDraft({
+      userAccountId: ACTING_USER,
+      workspaceId: PERSONAL_WS_ID,
+      request: draftPayload,
+    });
+    const incomplete: SellerProfilePublishRequestV1 = {
+      ...publishPayload,
+      disciplines: {
+        specialtyKeys: [],
+        caribbeanAffiliationCodes: [],
+      },
+    };
+    await assert.rejects(
+      () =>
+        service.publishProfile({
+          userAccountId: ACTING_USER,
+          workspaceId: PERSONAL_WS_ID,
+          request: incomplete,
+          requestId: "req_incomplete_both",
+        }),
+      (err: unknown) => {
+        if (!(err instanceof SellerProfileServiceError)) return false;
+        if (err.code !== "SELLER_PROFILE_INCOMPLETE") return false;
+        const paths = err.fieldErrors.map((f) => f.path);
+        assert.deepEqual(paths, [
+          "disciplines.specialtyKeys",
+          "disciplines.caribbeanAffiliationCodes",
+        ]);
+        return true;
+      },
+    );
+  });
+
+  test("publish with unsupported Caribbean affiliation returns SELLER_PROFILE_INVALID with field errors", async () => {
+    const { service } = buildService();
+    await service.saveDraft({
+      userAccountId: ACTING_USER,
+      workspaceId: PERSONAL_WS_ID,
+      request: draftPayload,
+    });
+    const smuggled: SellerProfilePublishRequestV1 = {
+      ...publishPayload,
+      disciplines: {
+        ...publishPayload.disciplines,
+        caribbeanAffiliationCodes: ["ZZ"],
+      },
+    };
+    await assert.rejects(
+      () =>
+        service.publishProfile({
+          userAccountId: ACTING_USER,
+          workspaceId: PERSONAL_WS_ID,
+          request: smuggled,
+          requestId: "req_publish_smuggled",
+        }),
+      (err: unknown) => {
+        if (!(err instanceof SellerProfileServiceError)) return false;
+        if (err.code !== "SELLER_PROFILE_INVALID") return false;
+        assert.equal(err.fieldErrors.length, 1);
+        assert.equal(err.fieldErrors[0]?.path, "disciplines.caribbeanAffiliationCodes");
+        return true;
+      },
+    );
+  });
 });
 
 describe("SellerProfileService.updatePublishedProfile", () => {
@@ -403,7 +594,7 @@ describe("SellerProfileService.updatePublishedProfile", () => {
         professionalName: "Creole Beats Brooklyn — Updated",
         bio: "Updated bio post-publication.",
       },
-      basedIn: draftPayload.basedIn,
+      basedIn: strictBasedIn,
       disciplines: draftPayload.disciplines,
       confirmationVersion: "m2-profile-publication-v1",
       idempotencyKey: "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee",
@@ -433,7 +624,7 @@ describe("SellerProfileService.updatePublishedProfile", () => {
           workspaceId: PERSONAL_WS_ID,
           request: {
             identity: draftPayload.identity,
-            basedIn: draftPayload.basedIn,
+            basedIn: strictBasedIn,
             disciplines: draftPayload.disciplines,
             confirmationVersion: "m2-profile-publication-v1",
             idempotencyKey: "ddddddd-eeee-ffff-0000-111111111111",
@@ -444,6 +635,93 @@ describe("SellerProfileService.updatePublishedProfile", () => {
         return (
           err instanceof SellerProfileServiceError && err.code === "SELLER_PROFILE_NOT_PUBLISHED"
         );
+      },
+    );
+  });
+
+  test("update with unsupported Caribbean affiliation returns SELLER_PROFILE_INVALID with field errors", async () => {
+    // Caribbean affiliation validation must apply on the UPDATE
+    // path too — a Published profile cannot be re-published with a
+    // smuggled affiliation code.
+    const { service } = buildService();
+    await service.saveDraft({
+      userAccountId: ACTING_USER,
+      workspaceId: PERSONAL_WS_ID,
+      request: draftPayload,
+    });
+    await service.publishProfile({
+      userAccountId: ACTING_USER,
+      workspaceId: PERSONAL_WS_ID,
+      request: publishPayload,
+      requestId: "req_pub_for_update_smuggle",
+    });
+    const smuggled: SellerProfileUpdateRequestV1 = {
+      identity: draftPayload.identity,
+      basedIn: strictBasedIn,
+      disciplines: {
+        ...draftPayload.disciplines,
+        caribbeanAffiliationCodes: ["ZZ"],
+      },
+      confirmationVersion: "m2-profile-publication-v1",
+      idempotencyKey: "eeeeeee-ffff-0000-1111-222222222222",
+    };
+    await assert.rejects(
+      () =>
+        service.updatePublishedProfile({
+          userAccountId: ACTING_USER,
+          workspaceId: PERSONAL_WS_ID,
+          request: smuggled,
+          requestId: "req_update_smuggle",
+        }),
+      (err: unknown) => {
+        if (!(err instanceof SellerProfileServiceError)) return false;
+        if (err.code !== "SELLER_PROFILE_INVALID") return false;
+        assert.equal(err.fieldErrors[0]?.path, "disciplines.caribbeanAffiliationCodes");
+        return true;
+      },
+    );
+  });
+
+  test("update with both disciplines missing returns SELLER_PROFILE_INCOMPLETE with BOTH field errors", async () => {
+    const { service } = buildService();
+    await service.saveDraft({
+      userAccountId: ACTING_USER,
+      workspaceId: PERSONAL_WS_ID,
+      request: draftPayload,
+    });
+    await service.publishProfile({
+      userAccountId: ACTING_USER,
+      workspaceId: PERSONAL_WS_ID,
+      request: publishPayload,
+      requestId: "req_pub_for_update_both",
+    });
+    const incomplete: SellerProfileUpdateRequestV1 = {
+      identity: draftPayload.identity,
+      basedIn: strictBasedIn,
+      disciplines: {
+        specialtyKeys: [],
+        caribbeanAffiliationCodes: [],
+      },
+      confirmationVersion: "m2-profile-publication-v1",
+      idempotencyKey: "ffffff-0000-1111-2222-333333333333",
+    };
+    await assert.rejects(
+      () =>
+        service.updatePublishedProfile({
+          userAccountId: ACTING_USER,
+          workspaceId: PERSONAL_WS_ID,
+          request: incomplete,
+          requestId: "req_update_both",
+        }),
+      (err: unknown) => {
+        if (!(err instanceof SellerProfileServiceError)) return false;
+        if (err.code !== "SELLER_PROFILE_INCOMPLETE") return false;
+        const paths = err.fieldErrors.map((f) => f.path);
+        assert.deepEqual(paths, [
+          "disciplines.specialtyKeys",
+          "disciplines.caribbeanAffiliationCodes",
+        ]);
+        return true;
       },
     );
   });
