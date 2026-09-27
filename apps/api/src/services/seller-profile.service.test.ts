@@ -36,7 +36,6 @@ import type {
   SellerProfileDraftRequestV1,
   SellerProfilePublishRequestV1,
   SellerProfileUpdateRequestV1,
-  WorkspaceMembershipRoleV1,
 } from "@soundhub/types";
 
 const ACTING_USER = "user_acting_1";
@@ -181,8 +180,8 @@ const publishPayload: SellerProfilePublishRequestV1 = {
   idempotencyKey: "11111111-2222-3333-4444-555555555555",
 };
 
-describe("SellerProfileService.saveDraft", () => {
-  test("lazy first save creates a Draft row and persists the values", async () => {
+void describe("SellerProfileService.saveDraft", () => {
+  void test("lazy first save creates a Draft row and persists the values", async () => {
     const { service } = buildService();
     const result = await service.saveDraft({
       userAccountId: ACTING_USER,
@@ -195,7 +194,7 @@ describe("SellerProfileService.saveDraft", () => {
     assert.deepEqual(result.profile.disciplines.caribbeanAffiliationCodes, ["HT"]);
   });
 
-  test("partial draft with empty professional name + bio is allowed (resume on later save)", async () => {
+  void test("partial draft with empty professional name + bio is allowed (resume on later save)", async () => {
     // Per M2 #84 acceptance criteria: "Incomplete pre-publication
     // Drafts remain private, resumable, absent from public DTOs,
     // and presented as Private draft." The first-save payload may
@@ -223,7 +222,7 @@ describe("SellerProfileService.saveDraft", () => {
     assert.equal(stored.status, "Draft");
   });
 
-  test("a partial draft can be resumed: subsequent save fills the missing fields", async () => {
+  void test("a partial draft can be resumed: subsequent save fills the missing fields", async () => {
     const { service } = buildService();
     const partial: SellerProfileDraftRequestV1 = {
       identity: { professionalName: "", bio: "" },
@@ -245,7 +244,7 @@ describe("SellerProfileService.saveDraft", () => {
     assert.deepEqual(resumed.profile.disciplines.specialtyKeys, ["Producer", "SoundEngineer"]);
   });
 
-  test("partial draft with no countryCode is allowed (resume on later save)", async () => {
+  void test("partial draft with no countryCode is allowed (resume on later save)", async () => {
     // Per M2 #84 acceptance: the editor must not silently
     // fabricate a country the seller never selected. A first-save
     // payload may omit basedIn.countryCode entirely; the row
@@ -269,7 +268,7 @@ describe("SellerProfileService.saveDraft", () => {
     assert.equal(stored.basedInCountryCode, null);
   });
 
-  test("unsupported Caribbean affiliation code is rejected at draft save with SELLER_PROFILE_INVALID + field errors", async () => {
+  void test("unsupported Caribbean affiliation code is rejected at draft save with SELLER_PROFILE_INVALID + field errors", async () => {
     // Per M2 #84: Caribbean connection is a closed self-declared
     // surface. A direct API client must NOT be able to persist
     // `US` or `ZZ` as an affiliation. Validate at the trusted
@@ -304,7 +303,7 @@ describe("SellerProfileService.saveDraft", () => {
     );
   });
 
-  test("a second save converges on the same row (no duplicate insert)", async () => {
+  void test("a second save converges on the same row (no duplicate insert)", async () => {
     const { service, repo } = buildService();
     const first = await service.saveDraft({
       userAccountId: ACTING_USER,
@@ -326,7 +325,7 @@ describe("SellerProfileService.saveDraft", () => {
     assert.equal(repo._peekProfile(PERSONAL_WS_ID)?.id, first.profile.sellerProfileId);
   });
 
-  test("Organization Workspace actor is rejected with SELLER_PROFILE_FORBIDDEN", async () => {
+  void test("Organization Workspace actor is rejected with SELLER_PROFILE_FORBIDDEN", async () => {
     const { service, auth } = buildService();
     // The Personal-only authorization throws when the requested
     // workspaceId is the Organization Workspace (type check fails).
@@ -344,7 +343,7 @@ describe("SellerProfileService.saveDraft", () => {
     );
   });
 
-  test("Buyer-only Personal Workspace is rejected with SELLER_PROFILE_FORBIDDEN", async () => {
+  void test("Buyer-only Personal Workspace is rejected with SELLER_PROFILE_FORBIDDEN", async () => {
     const { service, auth } = buildService();
     auth.personalMembership = buildPersonalMembership(["Buyer"]);
     await assert.rejects(
@@ -361,8 +360,8 @@ describe("SellerProfileService.saveDraft", () => {
   });
 });
 
-describe("SellerProfileService.publishProfile", () => {
-  test("first publish transitions Draft to Published and inserts the evidence row", async () => {
+void describe("SellerProfileService.publishProfile", () => {
+  void test("first publish transitions Draft to Published and inserts the evidence row", async () => {
     const { service, repo } = buildService();
     await service.saveDraft({
       userAccountId: ACTING_USER,
@@ -388,7 +387,7 @@ describe("SellerProfileService.publishProfile", () => {
     );
   });
 
-  test("a second publish with the same idempotencyKey converges on the existing evidence row", async () => {
+  void test("a second publish with the same idempotencyKey converges on the existing evidence row", async () => {
     const { service, repo } = buildService();
     await service.saveDraft({
       userAccountId: ACTING_USER,
@@ -422,7 +421,7 @@ describe("SellerProfileService.publishProfile", () => {
     assert.equal(after?.publishedAt?.getTime(), before.publishedAt?.getTime());
   });
 
-  test("a second publish with a NEW idempotencyKey is rejected with SELLER_PROFILE_NOT_DRAFT", async () => {
+  void test("a second publish with a NEW idempotencyKey is rejected with SELLER_PROFILE_NOT_DRAFT", async () => {
     const { service } = buildService();
     await service.saveDraft({
       userAccountId: ACTING_USER,
@@ -453,7 +452,7 @@ describe("SellerProfileService.publishProfile", () => {
     );
   });
 
-  test("incomplete payload (no Caribbean affiliation) returns SELLER_PROFILE_INCOMPLETE", async () => {
+  void test("incomplete payload (no Caribbean affiliation) returns SELLER_PROFILE_INCOMPLETE", async () => {
     const { service } = buildService();
     await service.saveDraft({
       userAccountId: ACTING_USER,
@@ -478,7 +477,7 @@ describe("SellerProfileService.publishProfile", () => {
     );
   });
 
-  test("incomplete payload (no controlled Specialty) returns SELLER_PROFILE_INCOMPLETE", async () => {
+  void test("incomplete payload (no controlled Specialty) returns SELLER_PROFILE_INCOMPLETE", async () => {
     const { service } = buildService();
     await service.saveDraft({
       userAccountId: ACTING_USER,
@@ -503,7 +502,7 @@ describe("SellerProfileService.publishProfile", () => {
     );
   });
 
-  test("publish with both specialties and Caribbean missing returns SELLER_PROFILE_INCOMPLETE with BOTH field errors", async () => {
+  void test("publish with both specialties and Caribbean missing returns SELLER_PROFILE_INCOMPLETE with BOTH field errors", async () => {
     // The review recovery flow renders a focusable linked error
     // summary; it must list every missing-discipline field in one
     // response so the user sees the full picture without submitting
@@ -542,7 +541,7 @@ describe("SellerProfileService.publishProfile", () => {
     );
   });
 
-  test("publish with unsupported Caribbean affiliation returns SELLER_PROFILE_INVALID with field errors", async () => {
+  void test("publish with unsupported Caribbean affiliation returns SELLER_PROFILE_INVALID with field errors", async () => {
     const { service } = buildService();
     await service.saveDraft({
       userAccountId: ACTING_USER,
@@ -575,8 +574,8 @@ describe("SellerProfileService.publishProfile", () => {
   });
 });
 
-describe("SellerProfileService.updatePublishedProfile", () => {
-  test("post-publication update replaces the field set and inserts a new evidence row", async () => {
+void describe("SellerProfileService.updatePublishedProfile", () => {
+  void test("post-publication update replaces the field set and inserts a new evidence row", async () => {
     const { service, repo } = buildService();
     await service.saveDraft({
       userAccountId: ACTING_USER,
@@ -610,7 +609,7 @@ describe("SellerProfileService.updatePublishedProfile", () => {
     assert.ok(repo._peekPublication(PERSONAL_WS_ID, updatePayload.idempotencyKey));
   });
 
-  test("update on a Draft profile is rejected with SELLER_PROFILE_NOT_PUBLISHED", async () => {
+  void test("update on a Draft profile is rejected with SELLER_PROFILE_NOT_PUBLISHED", async () => {
     const { service } = buildService();
     await service.saveDraft({
       userAccountId: ACTING_USER,
@@ -639,7 +638,7 @@ describe("SellerProfileService.updatePublishedProfile", () => {
     );
   });
 
-  test("update with unsupported Caribbean affiliation returns SELLER_PROFILE_INVALID with field errors", async () => {
+  void test("update with unsupported Caribbean affiliation returns SELLER_PROFILE_INVALID with field errors", async () => {
     // Caribbean affiliation validation must apply on the UPDATE
     // path too — a Published profile cannot be re-published with a
     // smuggled affiliation code.
@@ -682,7 +681,7 @@ describe("SellerProfileService.updatePublishedProfile", () => {
     );
   });
 
-  test("update with both disciplines missing returns SELLER_PROFILE_INCOMPLETE with BOTH field errors", async () => {
+  void test("update with both disciplines missing returns SELLER_PROFILE_INCOMPLETE with BOTH field errors", async () => {
     const { service } = buildService();
     await service.saveDraft({
       userAccountId: ACTING_USER,
@@ -727,8 +726,8 @@ describe("SellerProfileService.updatePublishedProfile", () => {
   });
 });
 
-describe("SellerProfileService.getCurrentProfile", () => {
-  test("returns null when no draft row exists yet", async () => {
+void describe("SellerProfileService.getCurrentProfile", () => {
+  void test("returns null when no draft row exists yet", async () => {
     const { service } = buildService();
     const result = await service.getCurrentProfile({
       userAccountId: ACTING_USER,
@@ -737,7 +736,7 @@ describe("SellerProfileService.getCurrentProfile", () => {
     assert.equal(result.profile, null);
   });
 
-  test("returns the persisted Draft on subsequent calls", async () => {
+  void test("returns the persisted Draft on subsequent calls", async () => {
     const { service } = buildService();
     await service.saveDraft({
       userAccountId: ACTING_USER,

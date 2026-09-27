@@ -18,14 +18,15 @@
 /* eslint-disable @typescript-eslint/no-floating-promises */
 /* eslint-disable @typescript-eslint/no-unsafe-assignment */
 /* eslint-disable @typescript-eslint/no-unsafe-member-access */
-/* eslint-disable @typescript-eslint/consistent-type-imports */
 
 import assert from "node:assert/strict";
 import { beforeEach, describe, test } from "node:test";
 import request from "supertest";
-import { buildApp } from "../index.js";
+import type { Application } from "express";
 import { InMemoryAuthRepository } from "../auth-repository/in-memory-auth-repository.js";
 import { InMemorySellerProfileRepository } from "../repositories/in-memory-seller-profile.repository.js";
+import { buildApp, type AppOptions } from "../index.js";
+
 import { SellerProfileService } from "../services/seller-profile.service.js";
 import { WorkspaceAuthorizationService } from "../services/workspace-authorization.service.js";
 import { AuthenticationService } from "../services/authentication.service.js";
@@ -51,7 +52,7 @@ const stubPrisma = new Proxy({} as never, {
   },
 });
 
-function buildUsers() {
+function buildUsers(): InMemoryAuthRepository {
   return new InMemoryAuthRepository([
     {
       userAccountId: SELLER_USER,
@@ -116,8 +117,7 @@ describe("SellerProfile route (in-memory)", () => {
   let sellerProfileService: SellerProfileService;
   let personalWorkspaceConvergenceService: PersonalWorkspaceConvergenceService;
   let sellerProfileRepository: InMemorySellerProfileRepository;
-  // eslint-disable-next-line @typescript-eslint/no-explicit-any
-  let app: any;
+  let app: Application;
 
   beforeEach(() => {
     authRepo = buildUsers();
@@ -137,7 +137,7 @@ describe("SellerProfile route (in-memory)", () => {
       repository: sellerProfileRepository,
       workspaceAuthorizationService,
     });
-    app = buildApp({
+    const options: AppOptions = {
       authenticationService,
       workspaceAuthorizationService,
       authRepository: authRepo,
@@ -146,7 +146,8 @@ describe("SellerProfile route (in-memory)", () => {
       sellerProfileService,
       sellerProfileRepository,
       prismaClient: stubPrisma,
-    }).app;
+    };
+    app = buildApp(options).app;
   });
 
   async function signIn(email: string): Promise<string> {
@@ -296,7 +297,9 @@ describe("SellerProfile route (in-memory)", () => {
       .set("Content-Type", "application/json");
     assert.equal(response.status, 400);
     assert.equal(response.body.error.code, "SELLER_PROFILE_INVALID");
-    const paths = (response.body.error.fields ?? []).map((f: { path: string }) => f.path);
+    const fields = response.body.error?.fields;
+    const fieldArr: readonly { readonly path: string }[] = Array.isArray(fields) ? fields : [];
+    const paths = fieldArr.map((f) => f.path);
     assert.ok(
       paths.includes("identity.bio"),
       `expected identity.bio in field errors; got ${JSON.stringify(paths)}`,

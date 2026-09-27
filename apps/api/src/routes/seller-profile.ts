@@ -383,13 +383,22 @@ async function handleGet(req: Request, res: Response, deps: SellerProfileRouteDe
   }
 }
 
-async function resolveSafeReturnTo(
+function resolveSafeReturnTo(
   deps: SellerProfileRouteDeps,
-  freshUser: import("@soundhub/types").Bg1PublicUserV1,
+  freshUser: Bg1PublicUserV1,
   workspaceId: string,
   returnTo: string | undefined,
 ): Promise<string | null> {
-  if (!returnTo) return null;
+  // The body is synchronous (it does not await anything) but
+  // callers `await` the result inside an async route handler. Wrap
+  // each branch's value in `Promise.resolve` so the function
+  // genuinely returns a Promise — this is the cleanest typing-
+  // correct shape per the user-facing contract; we avoid faking
+  // an `async function` (which the @typescript-eslint/require-
+  // await rule flags) and avoid leaving the body synchronous
+  // (which the @typescript-eslint/await-thenable rule flags when
+  // callers do `await` the result).
+  if (!returnTo) return Promise.resolve(null);
   try {
     const resolved = resolvePostCommandReturnDestination({
       returnTo,
@@ -397,10 +406,10 @@ async function resolveSafeReturnTo(
       actingWorkspaceId: workspaceId,
       allowedOrigin: deps.allowedReturnOrigin,
     });
-    return resolved?.path ?? null;
+    return Promise.resolve(resolved?.path ?? null);
   } catch (err) {
     if (err instanceof SafeReturnToFallback) {
-      return null;
+      return Promise.resolve(null);
     }
     throw err;
   }

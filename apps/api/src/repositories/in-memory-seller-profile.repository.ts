@@ -76,7 +76,7 @@ export class InMemorySellerProfileRepository implements SellerProfileRepository 
   // chain; awaits resolve in FIFO order.
   private readonly mutexChains = new Map<string, Promise<void>>();
 
-  private async withWorkspaceLock<T>(workspaceId: string, fn: () => Promise<T>): Promise<T> {
+  private withWorkspaceLock<T>(workspaceId: string, fn: () => T | PromiseLike<T>): Promise<T> {
     const previous = this.mutexChains.get(workspaceId) ?? Promise.resolve();
     let release!: () => void;
     const next = new Promise<void>((resolve) => {
@@ -86,12 +86,18 @@ export class InMemorySellerProfileRepository implements SellerProfileRepository 
       workspaceId,
       previous.then(() => next),
     );
-    await previous;
-    try {
-      return await fn();
-    } finally {
-      release();
-    }
+    // The mutex-chain handshake is the same shape as before: callers
+    // wait their turn, and the try/finally guarantees `release()`
+    // runs regardless of `fn`'s outcome. `fn` may return a plain value
+    // or a Promise — both get awaited into a Promise<T> by the line
+    // below, so callers do not have to wrap sync results.
+    return previous.then(async () => {
+      try {
+        return await fn();
+      } finally {
+        release();
+      }
+    });
   }
 
   private idemKey(workspaceId: string, idempotencyKey: string): string {
@@ -135,14 +141,14 @@ export class InMemorySellerProfileRepository implements SellerProfileRepository 
   }
 
   async findCurrentProfile(workspaceId: string): Promise<SellerProfileOwnerViewRecord | null> {
-    return this.withWorkspaceLock(workspaceId, async () => {
+    return this.withWorkspaceLock(workspaceId, () => {
       const existing = this.profilesByWorkspace.get(workspaceId) ?? null;
       return existing ? this.toOwnerView(existing) : null;
     });
   }
 
   async saveDraft(input: SellerProfileDraftInput): Promise<SellerProfileOwnerViewRecord> {
-    return this.withWorkspaceLock(input.workspaceId, async () => {
+    return this.withWorkspaceLock(input.workspaceId, () => {
       const existing = this.profilesByWorkspace.get(input.workspaceId);
       if (existing) {
         if (existing.status === "Published" || existing.status === "Suspended") {
@@ -206,7 +212,7 @@ export class InMemorySellerProfileRepository implements SellerProfileRepository 
     input: SellerProfilePublicationInput,
     requireDraft: boolean,
   ): Promise<SellerProfilePublicationResult> {
-    return this.withWorkspaceLock(input.workspaceId, async () => {
+    return this.withWorkspaceLock(input.workspaceId, () => {
       // Step 1: idempotency check. A transport retry with the
       // same key converges on the already-persisted evidence.
       const idemKey = this.idemKey(input.workspaceId, input.idempotencyKey);
