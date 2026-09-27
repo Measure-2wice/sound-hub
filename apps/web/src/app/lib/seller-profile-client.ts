@@ -242,7 +242,9 @@ export async function publishSellerProfile(input: {
   readonly workspaceId: string;
   readonly publish: SellerProfilePublishRequestV1;
 }): Promise<SellerProfilePublicationResponseV1> {
-  const payload = ensureParsedStrict(() => sellerProfilePublishRequestV1Schema.parse(input.publish));
+  const payload = ensureParsedStrict(() =>
+    sellerProfilePublishRequestV1Schema.parse(input.publish),
+  );
   const response = await fetch(actionPath(input.workspaceId, "publish"), {
     method: "POST",
     credentials: "include",
