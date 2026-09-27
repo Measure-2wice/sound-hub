@@ -10,6 +10,7 @@ import type {
   AudioOfferingContext,
   AudioRepository,
   AudioSampleCleanupStatus,
+  AudioSampleConfirmation,
   AudioSampleRecord,
 } from "./audio-repository.js";
 
@@ -37,6 +38,7 @@ export interface InMemoryAudioSampleSeed {
   readonly storageRef: string;
   readonly cleanupStatus?: AudioSampleCleanupStatus;
   readonly cleanupAttempts?: number;
+  readonly confirmation?: AudioSampleConfirmation;
 }
 
 export class InMemoryAudioRepository implements AudioRepository {
@@ -68,6 +70,7 @@ export class InMemoryAudioRepository implements AudioRepository {
         storageRef: seed.storageRef,
         cleanupStatus: seed.cleanupStatus ?? "Live",
         cleanupAttempts: seed.cleanupAttempts ?? 0,
+        confirmation: seed.confirmation ?? null,
         createdAt: now,
         updatedAt: now,
       });
@@ -93,7 +96,11 @@ export class InMemoryAudioRepository implements AudioRepository {
    * Atomic guarded insert mirroring the Prisma adapter's
    * transaction. JavaScript is single-threaded so the count +
    * insert pair is implicitly serialized; the cap is enforced
-   * before display-order allocation.
+   * before display-order allocation. The seller-side upload
+   * boundary requires a closed-version media-use confirmation;
+   * the in-memory adapter stores it directly on the record so
+   * the activation completeness recheck reads the same field the
+   * Prisma adapter persists.
    */
   createSampleWithCap(input: {
     offeringId: string;
@@ -101,6 +108,7 @@ export class InMemoryAudioRepository implements AudioRepository {
     contentType: "audio/mpeg";
     byteSize: number;
     storageRef: string;
+    confirmation: AudioSampleConfirmation;
   }): Promise<AudioSampleRecord | null> {
     const liveRows = [...this.samples.values()].filter(
       (s) => s.offeringId === input.offeringId && s.cleanupStatus === "Live",
@@ -127,6 +135,7 @@ export class InMemoryAudioRepository implements AudioRepository {
       storageRef: input.storageRef,
       cleanupStatus: "Live",
       cleanupAttempts: 0,
+      confirmation: input.confirmation,
       createdAt: now,
       updatedAt: now,
     };
@@ -212,5 +221,40 @@ export class InMemoryAudioRepository implements AudioRepository {
   async removeOrphanedStorage(storageRef: string): Promise<void> {
     this.orphans.delete(storageRef);
     return Promise.resolve();
+  }
+
+  /**
+   * Test-only helper: seed a Live sample whose `confirmation` is
+   * null, simulating a legacy sample persisted before the M2
+   * migration. Used by the round-2 PR-review feedback test that
+   * proves the public buyer-side list does not crash on a
+   * grandfathered sample.
+   */
+  _seedLegacyLiveSample(input: {
+    readonly offeringId: string;
+    readonly sampleId: string;
+    readonly label: string;
+    readonly byteSize: number;
+    readonly displayOrder: number;
+    readonly storageRef: string;
+  }): void {
+    if (this.samples.has(input.sampleId)) {
+      throw new Error(`Sample ${input.sampleId} already exists in the in-memory store`);
+    }
+    const now = new Date();
+    this.samples.set(input.sampleId, {
+      sampleId: input.sampleId,
+      offeringId: input.offeringId,
+      label: input.label,
+      contentType: "audio/mpeg",
+      byteSize: input.byteSize,
+      displayOrder: input.displayOrder,
+      storageRef: input.storageRef,
+      cleanupStatus: "Live",
+      cleanupAttempts: 0,
+      confirmation: null,
+      createdAt: now,
+      updatedAt: now,
+    });
   }
 }

@@ -216,6 +216,17 @@ function buildMultipart(
   body: Buffer;
   contentType: string;
 } {
+  // M2 (#85) PR-review feedback: every audio upload carries a
+  // closed-version media-use confirmation. The harness default
+  // includes the current version so every happy-path upload
+  // succeeds; tests that exercise the confirmation rejection
+  // override `extraFields` to omit it.
+  const allFields = [
+    { name: "confirmationVersion", value: "m2-audio-confirmation-v1" },
+    ...extraFields,
+  ];
+  void allFields;
+
   const boundary = `----SoundHubBG2Boundary${Math.random().toString(36).slice(2)}`;
   const buffers: Buffer[] = [];
   const writeField = (
@@ -235,8 +246,11 @@ function buildMultipart(
   };
   writeField("actingWorkspaceId", parts.actingWorkspaceId);
   writeField("label", parts.label);
-  for (const extra of extraFields) {
-    writeField(extra.name, extra.value, extra.contentType);
+  // M2 (#85) PR-review feedback: always include the closed-version
+  // media-use confirmation. Tests that want to exercise the
+  // rejection path override via extraFields with a sentinel value.
+  for (const field of allFields) {
+    writeField(field.name, field.value, field.contentType);
   }
   buffers.push(
     Buffer.from(
@@ -601,11 +615,18 @@ describe("BG2 audio samples routes (in-memory, deterministic adapter)", () => {
   test("missing actingWorkspaceId in upload is rejected at the trusted boundary", async () => {
     const { app, adapter } = buildTestHarness();
     const cookie = await signIn(app, adapter, "seller-route@example.com");
-    // No actingWorkspaceId field — the multipart payload is well-
-    // formed but the boundary rejects it.
+    // No actingWorkspaceId field — the multipart payload includes
+    // every OTHER required part (label, file, confirmationVersion)
+    // so the boundary's missing-field check isolates the
+    // actingWorkspaceId rejection. The validation order in the
+    // parser checks actingWorkspaceId before confirmationVersion
+    // so the surface code stays stable.
     const boundary = "----SoundHubBG2BoundaryNoActing";
     const head = Buffer.from(
       `--${boundary}\r\n` +
+        `Content-Disposition: form-data; name="confirmationVersion"\r\n\r\n` +
+        `m2-audio-confirmation-v1\r\n` +
+        `--${boundary}\r\n` +
         `Content-Disposition: form-data; name="label"\r\n\r\n` +
         `Demo\r\n` +
         `--${boundary}\r\n` +

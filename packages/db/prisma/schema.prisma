@@ -234,6 +234,15 @@ model UserAccount {
   // for audit; authorization is decided by WorkspaceMembership +
   // Seller capability, NOT by this relation.
   activatedServiceOfferings        ServiceOfferingActivation[] @relation("ServiceOfferingActivationActivatedBy")
+  // M2 (#85) PR-review feedback: media-use confirmation attribution
+  // for every uploaded audio sample. Recorded for audit; the
+  // authorization to upload is decided by Seller capability + the
+  // acting Workspace, NOT by this relation.
+  confirmedAudioSamples            ServiceOfferingAudioSample[] @relation("ServiceOfferingAudioSampleConfirmedBy")
+  // M2 (#85) PR-review feedback: reverse relation on the
+  // ServiceOfferingCreation evidence table; ON DELETE RESTRICT on
+  // the FK preserves the durable creation record.
+  createdServiceOfferings          ServiceOfferingCreation[]   @relation("ServiceOfferingCreationCreatedBy")
 
   @@map("user_accounts")
 }
@@ -346,6 +355,11 @@ model Workspace {
   // relation on the ServiceOfferingActivation table; ON DELETE
   // RESTRICT on the FK preserves the durable evidence row.
   serviceOfferingActivations ServiceOfferingActivation[]
+  // M2 (#85) PR-review feedback: narrow append-only creation
+  // evidence. The reverse relation on the ServiceOfferingCreation
+  // table; ON DELETE RESTRICT on the FK preserves the durable
+  // evidence row.
+  serviceOfferingCreations   ServiceOfferingCreation[]
 
   @@map("workspaces")
 }
@@ -552,6 +566,9 @@ model ServiceOffering {
   // FK preserves the durable evidence even if the source records
   // are hard-deleted.
   activations          ServiceOfferingActivation[]
+  // M2 (#85) PR-review feedback: reverse relation on the
+  // ServiceOfferingCreation evidence table.
+  creations            ServiceOfferingCreation[]
   // BG4 references: a ServiceOffering can be selected by many
   // ProjectRequests over time and become the basis for many Deals.
   // RESTRICT on delete prevents an offering from being removed
@@ -597,6 +614,37 @@ model ServiceOfferingActivation {
   @@index([offeringId, activatedAt(sort: Desc)], map: "service_offering_activations_offering_activatedAt_idx")
   @@index([workspaceId], map: "service_offering_activations_workspace_idx")
   @@map("service_offering_activations")
+}
+
+// M2 (#85) PR-review feedback: narrow append-only ServiceOffering
+// creation evidence. Each successful `createDraft` produces ONE
+// row carrying the new offeringId + the (workspaceId, idempotencyKey)
+// unique key. The application-layer pre-check is the first defense;
+// this DB unique index is the second defense so a transport retry
+// with the same idempotencyKey converges on the SAME offeringId, and
+// a deliberate second click (a new idempotencyKey) creates a NEW
+// offering. Mirrors the SellerProfilePublication pattern. ON DELETE
+// RESTRICT on every FK preserves the durable evidence even if the
+// source UserAccount, Workspace, or SellerProfile is hard-deleted.
+model ServiceOfferingCreation {
+  id                String   @id @default(cuid())
+  offeringId        String
+  workspaceId       String
+  createdByUserId   String
+  createdAt         DateTime @default(now())
+  // Client-supplied UUID generated when the user clicks "Create
+  // service". The (workspaceId, idempotencyKey) tuple is the unique
+  // convergence key.
+  idempotencyKey    String
+  requestId         String
+
+  offering      ServiceOffering @relation(fields: [offeringId], references: [id], onDelete: Restrict)
+  workspace     Workspace      @relation(fields: [workspaceId], references: [id], onDelete: Restrict)
+  createdBy     UserAccount    @relation("ServiceOfferingCreationCreatedBy", fields: [createdByUserId], references: [id], onDelete: Restrict)
+
+  @@unique([workspaceId, idempotencyKey], map: "service_offering_creations_workspace_idem_unique_idx")
+  @@index([offeringId], map: "service_offering_creations_offering_idx")
+  @@map("service_offering_creations")
 }
 
 model IncludedService {
@@ -811,13 +859,29 @@ model ServiceOfferingAudioSample {
   // recent provider failure without logging the provider error
   // message.
   cleanupLastFailureAt DateTime?
+  // M2 (#85) PR-review feedback: durable media-use confirmation.
+  // The seller must tick the current version of the media-use
+  // acknowledgement in the editor before each upload; the
+  // application boundary carries the closed version (e.g.
+  // `m2-audio-confirmation-v1`), the actor, and the timestamp
+  // alongside the sample. Activation completeness counts only
+  // samples where these fields are populated and match the current
+  // version. NULL on legacy rows from before this column existed.
+  confirmationVersion  String?
+  confirmedByUserId    String?
+  confirmedAt          DateTime?
   createdAt            DateTime                 @default(now())
   updatedAt            DateTime                 @updatedAt
 
-  offering ServiceOffering @relation(fields: [offeringId], references: [id], onDelete: Cascade)
+  offering    ServiceOffering @relation(fields: [offeringId], references: [id], onDelete: Cascade)
+  // Audit attribution only. ON DELETE RESTRICT preserves the
+  // durable confirmation record even if the human is later hard-
+  // deleted. Future uploads re-validate current membership.
+  confirmedBy UserAccount?    @relation("ServiceOfferingAudioSampleConfirmedBy", fields: [confirmedByUserId], references: [id], onDelete: Restrict)
 
   @@index([offeringId])
   @@index([cleanupStatus])
+  @@index([offeringId, confirmationVersion], map: "offering_audio_samples_confirmation_idx")
   @@map("offering_audio_samples")
 }
 

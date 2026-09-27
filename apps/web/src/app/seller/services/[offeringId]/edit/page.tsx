@@ -5,9 +5,11 @@
 // Background: the M2 seller-onboarding slice exposes the
 // ServiceOffering lifecycle for a Seller-capable Personal Workspace.
 // This editor is the Private-draft authoring surface: explicit Save
-// draft, no autosave, lazy first-save is owned by a separate creation
-// step (out of #85 scope), the row already exists when this page
-// mounts, and validation on blur + a linked/focusable error summary
+// draft, no autosave, lazy first-save IS in M2 scope (the "new"
+// path with `offeringId === "new"` mounts an empty editor and the
+// first Save creates the offering atomically with the submitted
+// fields — no orphan empty row is ever persisted on navigation
+// alone), and validation on blur + a linked/focusable error summary
 // on multi-error publication / activation.
 //
 // Authorization rules:
@@ -26,7 +28,10 @@
 //     key is reused across any uncertain transport outcome and the
 //     explicit "Save draft" retry. The key is cleared only on a
 //     definitive successful response or on payload change /
-//     abandonment.
+//     abandonment. On the "new" path the first Save CREATES the
+//     offering + persisted fields atomically; on subsequent saves
+//     (after the editor's URL is replaced with the returned
+//     offeringId) the path uses PUT and updates the existing row.
 //   - Activation has its OWN `idempotencyKey` (one per activation
 //     attempt). Same retry-identity rules apply.
 
@@ -44,6 +49,7 @@ import { ErrorSummary, type ErrorSummaryItem } from "../../../../components/Erro
 import {
   activateServiceOffering,
   asServiceOfferingClientError,
+  createServiceOfferingDraft,
   fetchServiceOffering,
   fetchServiceOfferingTaxonomy,
   generateServiceOfferingIdempotencyKey,
@@ -68,11 +74,40 @@ const FIELD_IDS = {
   description: "service-offering-description",
   primaryCategoryKey: "service-offering-category",
   serviceMode: "service-offering-service-mode",
+  serviceAreaCountry: "service-offering-service-area-country",
   pricingKind: "service-offering-pricing-kind",
   pricingAmount: "service-offering-pricing-amount",
   pricingUnit: "service-offering-pricing-unit",
   samples: "service-offering-samples",
 } as const;
+
+// Mirrors the canonical taxonomy closed list. The browser never
+// reads these consts directly; the metadata seam is the canonical
+// source (see /api/metadata/seller-profile-taxonomy). We only
+// hardcode the three most common service-area country codes here
+// because the editor's coarse service-area picker is one
+// (required) field per InPerson/Hybrid activation; a future
+// migration can move this to a dedicated taxonomy endpoint if the
+// surface grows.
+const COMMON_SERVICE_AREA_COUNTRY_CODES = [
+  "US",
+  "JM",
+  "TT",
+  "HT",
+  "BB",
+  "BS",
+  "BZ",
+  "DM",
+  "DO",
+  "GD",
+  "GY",
+  "KN",
+  "LC",
+  "SR",
+  "VC",
+  "CA",
+  "GB",
+];
 
 function fieldErrorId(fieldId: string): string {
   return `${fieldId}-error`;
@@ -119,10 +154,25 @@ function ServiceOfferingEditInner() {
   );
   const [pricingAmount, setPricingAmount] = useState("600");
   const [pricingUnit, setPricingUnit] = useState("");
+  // Coarse service area: one country code, required when the
+  // service mode is InPerson or Hybrid. The activation
+  // completeness check at /api/services/:id/activate returns
+  // SERVICE_OFFERING_INCOMPLETE if the area is missing for those
+  // modes; the editor surfaces the picker only when the radio
+  // changes.
+  const [serviceAreaCountry, setServiceAreaCountry] = useState("");
   const [genreTags, setGenreTags] = useState<string[]>([]);
   const [samples, setSamples] = useState<readonly Bg2AudioSamplePublicV1[]>([]);
   const [samplesError, setSamplesError] = useState<string | null>(null);
   const [sampleLabel, setSampleLabel] = useState("");
+  // M2 (#85) PR-review feedback: the seller must explicitly tick
+  // the current-version media-use acknowledgement before each
+  // upload. The previous editor rendered a pre-checked checkbox
+  // that submitted nothing — a confirmation that was neither
+  // transmitted nor persisted. The checkbox is now unchecked by
+  // default; the upload handler refuses to submit without a fresh
+  // tick on every upload.
+  const [sampleConfirmed, setSampleConfirmed] = useState(false);
   const [uploading, setUploading] = useState(false);
   const [removeConfirmId, setRemoveConfirmId] = useState<string | null>(null);
 
@@ -159,7 +209,37 @@ function ServiceOfferingEditInner() {
   }, [loading, user, actingWorkspace, router]);
 
   useEffect(() => {
-    if (!actingWorkspace || !offeringId) return;
+    if (!actingWorkspace) return;
+    // M2 (#85) PR-review feedback (round 3): the "new" path
+    // (no offeringId yet) skips the bootstrap fetch — the
+    // editor renders an empty form, and the first Save creates
+    // the offering atomically with the submitted fields.
+    //
+    // PR-review feedback (round 4): a rejected taxonomy
+    // request must surface as a bootstrap error, not silently
+    // flip `profileLoaded` and leave the render guard stuck
+    // on the loading state forever.
+    if (!offeringId || offeringId === "new") {
+      const cancelled = { current: false };
+      void (async () => {
+        try {
+          const taxonomyResult = await fetchServiceOfferingTaxonomy();
+          if (cancelled.current) return;
+          setTaxonomy(taxonomyResult);
+          setProfileLoaded(true);
+        } catch (err) {
+          if (cancelled.current) return;
+          const cls = err as { message?: unknown } | null;
+          setBootstrapError(
+            typeof cls?.message === "string" ? cls.message : "Could not load the service taxonomy.",
+          );
+          setProfileLoaded(true);
+        }
+      })();
+      return () => {
+        cancelled.current = true;
+      };
+    }
     let cancelled = false;
     void (async () => {
       try {
@@ -169,7 +249,14 @@ function ServiceOfferingEditInner() {
             workspaceId: actingWorkspace.workspaceId,
             offeringId,
           }),
-          listOfferingSamples(offeringId).catch(() => ({ offeringId, samples: [] })),
+          // M2 (#85) PR-review feedback: owner-side authenticated
+          // sample list. The previous public buyer list rejected
+          // Draft offerings, so a Draft upload would persist but
+          // disappear from the editor after refresh.
+          listOfferingSamples({
+            workspaceId: actingWorkspace.workspaceId,
+            offeringId,
+          }).catch(() => ({ offeringId, samples: [] })),
         ]);
         if (cancelled) return;
         setTaxonomy(taxonomyResult);
@@ -180,6 +267,11 @@ function ServiceOfferingEditInner() {
           setDescription(o.description);
           if (o.primaryCategoryKey) setPrimaryCategoryKey(o.primaryCategoryKey);
           if (o.serviceMode) setServiceMode(o.serviceMode);
+          // Hydrate the coarse service area from the first persisted
+          // row so resume / refresh surfaces the persisted value.
+          if (o.serviceAreas.length > 0 && o.serviceAreas[0]) {
+            setServiceAreaCountry(o.serviceAreas[0].countryCode);
+          }
           if (o.pricing?.kind) setPricingKind(o.pricing.kind);
           if (o.pricing?.amountMinor !== undefined) {
             setPricingAmount(String(o.pricing.amountMinor / 100));
@@ -236,7 +328,7 @@ function ServiceOfferingEditInner() {
       </div>
     );
   }
-  if (!profileLoaded || !taxonomy || !offeringId) {
+  if (!profileLoaded || !taxonomy) {
     return <EditLoading />;
   }
 
@@ -245,14 +337,28 @@ function ServiceOfferingEditInner() {
     description,
     primaryCategoryKey: primaryCategoryKey || undefined,
     serviceMode,
-    serviceAreas: [],
+    // Coarse service area is required when serviceMode is
+    // InPerson or Hybrid. The activation completeness check
+    // (apps/api/src/services/service-offering.service.ts) returns
+    // SERVICE_OFFERING_INCOMPLETE if the area is missing for
+    // those modes; we always carry the country so save / resume
+    // also work without forcing the seller to revisit the page.
+    ...(serviceAreaCountry
+      ? {
+          serviceAreas: [{ countryCode: serviceAreaCountry }],
+        }
+      : {}),
     pricing: {
       kind: pricingKind,
       ...(pricingKind !== "ContactForQuote"
         ? {
             amountMinor: Math.round(Number(pricingAmount) * 100),
             currency: "USD",
-            unitId: pricingUnit,
+            // Omit the unitId when the unit is unchosen so the
+            // partial-draft schema can accept the save. The
+            // STRICT activate schema enforces the unit on
+            // activation.
+            ...(pricingUnit ? { unitId: pricingUnit } : {}),
           }
         : {}),
     },
@@ -273,6 +379,31 @@ function ServiceOfferingEditInner() {
     setSaveErrorMessage(null);
     setFieldErrors([]);
     try {
+      // M2 (#85) PR-review feedback (round 3): when the editor is
+      // on the "new" path (offeringId === "new" or null), the first
+      // save CREATES the offering atomically and persists the
+      // submitted fields. There is no separate "Create" click that
+      // leaves an empty row behind. After the create, navigate to
+      // the returned offeringId's editor so subsequent saves use
+      // the PUT path.
+      if (!offeringId || offeringId === "new") {
+        if (draftIdempotencyKeyRef.current === null) {
+          draftIdempotencyKeyRef.current = `draft-${crypto.randomUUID()}`;
+        }
+        const created = await createServiceOfferingDraft({
+          workspaceId: actingWorkspace.workspaceId,
+          idempotencyKey: draftIdempotencyKeyRef.current,
+          draft: buildDraftPayload(),
+        });
+        setOffering(created);
+        setSaveState("saved");
+        // Replace the URL so the user can refresh without losing
+        // the offeringId and subsequent saves use PUT.
+        void router.replace(
+          `/seller/services/${encodeURIComponent(created.serviceOfferingId)}/edit`,
+        );
+        return;
+      }
       const response = await saveServiceOfferingDraft({
         workspaceId: actingWorkspace.workspaceId,
         offeringId,
@@ -321,7 +452,15 @@ function ServiceOfferingEditInner() {
       description: description.trim(),
       primaryCategoryKey,
       serviceMode,
-      serviceAreas: [],
+      // Activation is the canonical STRICT contract — service area
+      // is required when the mode is InPerson / Hybrid and the
+      // schema-level Zod refinement rejects missing values before
+      // the request reaches the API.
+      ...(serviceAreaCountry
+        ? {
+            serviceAreas: [{ countryCode: serviceAreaCountry }],
+          }
+        : { serviceAreas: [] }),
       pricing: {
         kind: pricingKind,
         ...(pricingKind !== "ContactForQuote"
@@ -379,6 +518,14 @@ function ServiceOfferingEditInner() {
       setSamplesError("Sample label is required.");
       return;
     }
+    // M2 (#85) PR-review feedback: the seller must tick the
+    // media-use acknowledgement explicitly before each upload.
+    // The application boundary re-validates the checkbox payload
+    // so a forced submit cannot bypass the acknowledgement.
+    if (!sampleConfirmed) {
+      setSamplesError("Please confirm you have the right to share this audio sample.");
+      return;
+    }
     setUploading(true);
     setSamplesError(null);
     try {
@@ -390,7 +537,11 @@ function ServiceOfferingEditInner() {
       });
       form.reset();
       setSampleLabel("");
-      const list = await listOfferingSamples(offeringId);
+      setSampleConfirmed(false);
+      const list = await listOfferingSamples({
+        workspaceId: actingWorkspace.workspaceId,
+        offeringId,
+      });
       setSamples(list.samples);
     } catch (err) {
       const msg = err instanceof Error ? err.message : "Could not upload sample.";
@@ -410,7 +561,10 @@ function ServiceOfferingEditInner() {
         sample,
         actingWorkspaceId: actingWorkspace.workspaceId,
       });
-      const list = await listOfferingSamples(offeringId);
+      const list = await listOfferingSamples({
+        workspaceId: actingWorkspace.workspaceId,
+        offeringId,
+      });
       setSamples(list.samples);
     } catch (err) {
       const msg = err instanceof Error ? err.message : "Could not remove sample.";
@@ -449,10 +603,12 @@ function ServiceOfferingEditInner() {
   const liveSampleCount = samples.filter(
     (s) => s.playbackUrl && s.contentType === "audio/mpeg",
   ).length;
+  const serviceAreaRequired = serviceMode === "InPerson" || serviceMode === "Hybrid";
   const canActivate =
     title.trim().length > 0 &&
     description.trim().length > 0 &&
     primaryCategoryKey.length > 0 &&
+    (!serviceAreaRequired || serviceAreaCountry.length > 0) &&
     (pricingKind === "ContactForQuote" || (Number(pricingAmount) > 0 && pricingUnit.length > 0)) &&
     liveSampleCount >= 1 &&
     offering?.status === "Draft";
@@ -603,6 +759,35 @@ function ServiceOfferingEditInner() {
                   </label>
                 ))}
               </div>
+              {(serviceMode === "InPerson" || serviceMode === "Hybrid") && (
+                <div className="flex flex-col gap-1">
+                  <label
+                    htmlFor={FIELD_IDS.serviceAreaCountry}
+                    className="text-sm font-medium text-ink"
+                  >
+                    Coarse service area <span aria-hidden="true">*</span>
+                  </label>
+                  <p className="text-xs text-muted">
+                    Required for InPerson / Hybrid. Pick the country or territory where you
+                    typically deliver; the M1 location filter uses this without exposing a precise
+                    address.
+                  </p>
+                  <select
+                    id={FIELD_IDS.serviceAreaCountry}
+                    value={serviceAreaCountry}
+                    onChange={(e) => setServiceAreaCountry(e.target.value)}
+                    className="w-full bg-surface-container-lowest text-ink px-3 py-2 rounded-md border border-surface-variant focus:outline-none focus:border-aubergine text-base min-h-[44px]"
+                    data-testid="service-offering-edit-input-service-area-country"
+                  >
+                    <option value="">Select a country</option>
+                    {COMMON_SERVICE_AREA_COUNTRY_CODES.map((c) => (
+                      <option key={c} value={c}>
+                        {c}
+                      </option>
+                    ))}
+                  </select>
+                </div>
+              )}
             </section>
 
             <section className="space-y-4" aria-labelledby="pricing-heading">
@@ -761,7 +946,14 @@ function ServiceOfferingEditInner() {
                     />
                   </label>
                   <label className="flex items-start gap-2 text-sm">
-                    <input type="checkbox" required defaultChecked className="mt-1" />
+                    <input
+                      type="checkbox"
+                      required
+                      checked={sampleConfirmed}
+                      onChange={(e) => setSampleConfirmed(e.target.checked)}
+                      className="mt-1"
+                      data-testid="service-offering-edit-sample-confirmation"
+                    />
                     <span>I confirm I have the right to share this audio sample.</span>
                   </label>
                   <p className="text-xs text-muted">
@@ -796,7 +988,16 @@ function ServiceOfferingEditInner() {
               <ul className="space-y-1 text-sm">
                 <li>{title.trim().length > 0 ? "✓" : "○"} Title and description</li>
                 <li>{primaryCategoryKey.length > 0 ? "✓" : "○"} Primary category</li>
-                <li>{serviceMode ? "✓" : "○"} Delivery mode</li>
+                <li>
+                  {serviceMode ? "✓" : "○"} Delivery mode (
+                  {serviceMode === "InPerson" || serviceMode === "Hybrid"
+                    ? "coarse service area "
+                    : ""}
+                  required)
+                </li>
+                {serviceAreaRequired && (
+                  <li>{serviceAreaCountry ? "✓" : "○"} Coarse service area</li>
+                )}
                 <li>
                   {pricingKind === "ContactForQuote" ||
                   (Number(pricingAmount) > 0 && pricingUnit.length > 0)

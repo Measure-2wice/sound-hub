@@ -5,9 +5,14 @@
 // Background: the dashboard's Your Services surface lists the
 // seller's ServiceOffering rows with their durable status aliased
 // to the customer-facing presentation. Each row links into the
-// editor surface. The page is read-only — activation, draft
-// management, and audio management live on the editor surface
-// (apps/web/src/app/seller/services/[offeringId]/edit/page.tsx).
+// editor surface. The page provides a "Create service" affordance
+// that NAVIGATES to /seller/services/new/edit without making any
+// server call — M2 (#85) PR-review feedback (round 3): the
+// stable identity is created on the first successful save, so the
+// listing page must NOT persist an empty row when the user clicks
+// "Create service". The empty-form editor on /seller/services/new/edit
+// renders without an offeringId; the editor's first Save creates
+// the offering atomically with the user's submitted fields.
 
 import { useEffect, useState } from "react";
 import Link from "next/link";
@@ -65,6 +70,15 @@ export default function ServicesListPage() {
     };
   }, [actingWorkspace]);
 
+  const handleCreate = () => {
+    // M2 (#85) PR-review feedback (round 3): no server call. The
+    // listing page NAVIGATES to the editor with no offeringId so
+    // the first Save action creates the offering atomically with
+    // the submitted fields. An empty row is never persisted.
+    if (!actingWorkspace) return;
+    void router.push("/seller/services/new/edit");
+  };
+
   if (loading || !actingWorkspace) {
     return (
       <div className="min-h-screen bg-canvas">
@@ -104,11 +118,23 @@ export default function ServicesListPage() {
       <div className="max-w-[1440px] mx-auto px-6 lg:px-12 py-8 space-y-6">
         <Card variant="parchment">
           <Card.Header>
-            <h1 className="text-3xl font-serif text-ink">Your services</h1>
-            <p className="text-base text-muted mt-1">
-              Each row shows the current lifecycle status. Activate one to make it visible to
-              buyers.
-            </p>
+            <div className="flex items-start justify-between gap-4">
+              <div>
+                <h1 className="text-3xl font-serif text-ink">Your services</h1>
+                <p className="text-base text-muted mt-1">
+                  Each row shows the current lifecycle status. Activate one to make it visible to
+                  buyers.
+                </p>
+              </div>
+              <button
+                type="button"
+                onClick={handleCreate}
+                className="inline-flex items-center justify-center min-h-[44px] py-3 px-6 text-base font-medium text-white bg-aubergine hover:bg-aubergine-hover rounded focus:outline-none focus-visible:outline focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-aubergine"
+                data-testid="services-list-create"
+              >
+                Create service
+              </button>
+            </div>
           </Card.Header>
           <Card.Content>
             {error && (
@@ -118,7 +144,7 @@ export default function ServicesListPage() {
             )}
             {loaded && offerings.length === 0 && !error && (
               <p className="text-sm text-muted" data-testid="services-list-empty">
-                No services yet. Create your first service offering from the dashboard.
+                No services yet. Click "Create service" to start a draft.
               </p>
             )}
             <ul className="space-y-3" data-testid="services-list">

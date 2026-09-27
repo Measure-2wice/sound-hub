@@ -736,4 +736,31 @@ describe("Dashboard no-actor recovery surface (M2 #83 Codex P1-001 second iterat
       "no-actor fallback Alert MUST use role='alert' for screen-reader announcement",
     );
   });
+
+  test("dashboard's `Manage your services` quick action leads to the #85 ServiceOffering surface", () => {
+    // M2 (#85) entry-flow manual-QA fix: the `Manage your services`
+    // quick action MUST lead to `/seller/services`, not the legacy
+    // `/dashboard/audio` route. Audio is central ServiceOffering
+    // evidence — it lives inside the #85 editor, not a separate
+    // horizontal administration feature.
+    const manageServicesLinkBlock = DASHBOARD_PAGE_SOURCE.match(
+      /data-testid="dashboard-manage-services"[\s\S]{0,400}?<\/Link>/,
+    );
+    assert.ok(
+      manageServicesLinkBlock,
+      "expected a dashboard-manage-services Link on the dashboard",
+    );
+    assert.match(
+      manageServicesLinkBlock[0],
+      /href="\/seller\/services"/,
+      "dashboard-manage-services MUST link to /seller/services (the #85 management surface)",
+    );
+    assert.equal(
+      /data-testid="dashboard-manage-services"[\s\S]{0,400}?href="\/dashboard\/audio"/.test(
+        DASHBOARD_PAGE_SOURCE,
+      ),
+      false,
+      "dashboard-manage-services MUST NOT link to /dashboard/audio; that legacy route is no longer the ServiceOffering destination",
+    );
+  });
 });

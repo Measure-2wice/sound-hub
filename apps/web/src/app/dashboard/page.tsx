@@ -332,8 +332,14 @@ function PersonalActingDashboard() {
             )}
             {actingWorkspace.capabilities.includes("Seller") && (
               <li>
+                {/* M2 entry-flow manual-QA fix: the `Manage your
+                    services` quick action must lead to the
+                    ServiceOffering management surface
+                    (`/seller/services`), not the legacy audio
+                    administration page (`/dashboard/audio`).
+                    Audio lives inside the ServiceOffering editor. */}
                 <Link
-                  href="/dashboard/audio"
+                  href="/seller/services"
                   className="text-aubergine hover:text-aubergine-hover font-medium focus:outline-none focus-visible:outline focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-aubergine rounded"
                   data-testid="dashboard-manage-services"
                 >

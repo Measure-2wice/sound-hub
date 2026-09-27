@@ -587,6 +587,12 @@ export const apiErrorCodeV1Schema = z.enum([
   "SERVICE_OFFERING_NOT_DRAFT",
   "SERVICE_OFFERING_ALREADY_ACTIVE",
   "SERVICE_OFFERING_SELLER_PROFILE_NOT_PUBLISHED",
+  // M2 (#85) PR-review feedback: the application boundary now
+  // requires an explicit media-use confirmation version on every
+  // audio upload. A missing or unknown version collapses to this
+  // 400 — a 422 (semantic) would be misleading because the
+  // request is structurally incomplete without the field.
+  "AUDIO_SAMPLE_MEDIA_CONFIRMATION_REQUIRED",
   "SERVICE_OFFERING_INTERNAL_FAILED",
 ]);
 export type ApiErrorCodeV1 = z.infer<typeof apiErrorCodeV1Schema>;
@@ -1095,6 +1101,37 @@ export const serviceOfferingDraftRequestV1Schema = z
   .strict();
 export type ServiceOfferingDraftRequestV1 = z.infer<typeof serviceOfferingDraftRequestV1Schema>;
 
+// ---------- ServiceOffering create request ----------
+//
+// M2 (#85) PR-review feedback (round 3): the POST that lazy-creates
+// a Draft offering ALSO persists the first-save draft payload
+// atomically. The body carries the client-supplied idempotencyKey
+// PLUS the full RELAXED draft field set (every field optional —
+// a fresh Draft may save without a category, mode, pricing, or
+// service areas, but the seller must type SOMETHING into the
+// editor before pressing Save, so the create-empty-then-navigate-
+// away orphan is impossible). The route also accepts the same
+// idempotencyKey via the `Idempotency-Key` header for clients that
+// prefer that convention. A deliberate second click (a new
+// idempotencyKey) creates a NEW offering AND starts a fresh
+// field-set.
+export const serviceOfferingCreateDraftRequestV1Schema = z
+  .object({
+    idempotencyKey: z.string().min(1).max(128),
+    title: serviceOfferingDraftTitleV1Schema.optional(),
+    description: serviceOfferingDraftDescriptionV1Schema.optional(),
+    primaryCategoryKey: z.string().min(1).max(64).optional(),
+    serviceMode: z.enum(serviceModeValuesV1).optional(),
+    serviceAreas: z.array(serviceOfferingDraftServiceAreaV1Schema).max(20).optional(),
+    pricing: serviceOfferingDraftPricingV1Schema.optional(),
+    genreTags: z.array(z.string().min(1).max(60)).max(30).optional(),
+    includedServiceCategoryKeys: z.array(z.string().min(1).max(64)).max(20).optional(),
+  })
+  .strict();
+export type ServiceOfferingCreateDraftRequestV1 = z.infer<
+  typeof serviceOfferingCreateDraftRequestV1Schema
+>;
+
 // ---------- ServiceOffering activation request ----------
 //
 // Activation requires the FULL public field set (mirrors the
@@ -1169,6 +1206,17 @@ export type ServiceOfferingActivateRequestV1 = z.infer<
   typeof serviceOfferingActivateRequestV1Schema
 >;
 
+// M2 (#85) PR-review feedback: closed set of media-use confirmation
+// versions the seller must acknowledge before each upload. Declared
+// here (before the ServiceOfferingOwnerSampleSummaryV1 schema and
+// the bg2AudioSamplePublicV1Schema that reference it) so the forward
+// reference resolves at type-check time.
+export const SERVICE_OFFERING_AUDIO_MEDIA_CONFIRMATION_VERSIONS = [
+  "m2-audio-confirmation-v1",
+] as const;
+export type ServiceOfferingAudioMediaConfirmationVersionV1 =
+  (typeof SERVICE_OFFERING_AUDIO_MEDIA_CONFIRMATION_VERSIONS)[number];
+
 // ---------- ServiceOffering owner view (read shape) ----------
 //
 // Mirrors the SellerProfile owner view: the editor / review on-mount
@@ -1190,6 +1238,18 @@ export const serviceOfferingOwnerSampleSummaryV1Schema = z
       .max(25 * 1024 * 1024),
     displayOrder: z.number().int().min(1).max(3),
     playbackUrl: z.string().url(),
+    // M2 (#85) PR-review feedback: the owner-view sample summary
+    // surfaces the same confirmation fields the activation
+    // completeness recheck uses, so the editor can render the
+    // readiness checklist from the durable persisted state rather
+    // than a client-side filter on confirmation-only metadata it
+    // never receives.
+    confirmation: z
+      .object({
+        version: z.enum(SERVICE_OFFERING_AUDIO_MEDIA_CONFIRMATION_VERSIONS),
+        confirmedAt: z.string().datetime(),
+      })
+      .strict(),
     createdAt: z.string().datetime(),
   })
   .strict();
@@ -2146,6 +2206,11 @@ export type AiInterpretBriefOutputV1 = z.infer<typeof aiInterpretBriefOutputV1Sc
 // playback route, depending on which adapter the server wires.
 // Both adapters produce a URL that resolves to actual playable
 // audio without further resolution on the client.
+// M2 (#85) PR-review feedback: the public DTO now carries the
+// persisted media-use confirmation (version + timestamp). The
+// constant declaration for the closed version set lives above so
+// the forward reference resolves at type-check time.
+
 export const bg2AudioSamplePublicV1Schema = z
   .object({
     sampleId: z.string().min(1).max(128),
@@ -2167,6 +2232,23 @@ export const bg2AudioSamplePublicV1Schema = z
     // URL is emitted, so an ineligible or removed sample never
     // appears with a playable handle.
     playbackUrl: z.string().url(),
+    // M2 (#85) PR-review feedback (round 2): durable media-use
+    // confirmation. OPTIONAL on the public DTO so legacy Live
+    // samples (persisted before the confirmation columns existed)
+    // can still be listed and played by buyers — the activation
+    // gate filters confirmation != null, so legacy samples do
+    // NOT satisfy activation eligibility until a seller
+    // re-uploads them with the current version. The buyer-side
+    // playback gate and the seller-side preview gate do not
+    // require confirmation; they only require Live status +
+    // workspace ownership + lifecycle state.
+    confirmation: z
+      .object({
+        version: z.enum(SERVICE_OFFERING_AUDIO_MEDIA_CONFIRMATION_VERSIONS),
+        confirmedAt: z.string().datetime(),
+      })
+      .strict()
+      .optional(),
     createdAt: z.string().datetime(),
   })
   .strict();

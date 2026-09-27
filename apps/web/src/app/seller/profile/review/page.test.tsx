@@ -118,4 +118,33 @@ describe("SellerProfileReviewPage — M2 Professional Profile publish confirmati
       "review page MUST expose a Continue CTA on the success surface",
     );
   });
+
+  test("`Create your first service` post-publication CTA enters the #85 lazy-first-save flow", () => {
+    // M2 (#85) entry-flow manual-QA fix: the post-publication
+    // `Create your first service` CTA MUST lead to the #85
+    // lazy-first-save editor (`/seller/services/new/edit`), NOT the
+    // legacy `/dashboard/audio` audio-administration page. Audio
+    // is central ServiceOffering evidence — the new-editor path is
+    // the only #85 entry.
+    const source = readFile("seller/profile/review/page.tsx");
+    const createServiceCta = source.match(
+      /data-testid="profile-review-success-create-service"[\s\S]{0,400}?<\/Link>/,
+    );
+    assert.ok(
+      createServiceCta,
+      "expected a profile-review-success-create-service Link on the post-publication success surface",
+    );
+    assert.match(
+      createServiceCta[0],
+      /href="\/seller\/services\/new\/edit"/,
+      "post-publication `Create your first service` MUST link to /seller/services/new/edit (the #85 lazy-first-save editor)",
+    );
+    assert.equal(
+      /data-testid="profile-review-success-create-service"[\s\S]{0,400}?href="\/dashboard\/audio"/.test(
+        source,
+      ),
+      false,
+      "post-publication `Create your first service` MUST NOT link to /dashboard/audio; that legacy route is no longer the ServiceOffering destination",
+    );
+  });
 });

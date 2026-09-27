@@ -75,7 +75,13 @@ function deriveNavigationDestinations({
   }
   if (capabilities.includes("Seller")) {
     out.push({ href: "/seller-requests", label: "Requests", testId: "nav-requests-link" });
-    out.push({ href: "/dashboard/audio", label: "Your services", testId: "nav-services-link" });
+    // M2 entry-flow manual-QA fix: the `Your services`
+    // destination must lead to the ServiceOffering management
+    // surface, not the legacy `Seller discovery samples` page
+    // (`/dashboard/audio`). Audio is central ServiceOffering
+    // evidence, not a separate horizontal administration
+    // feature.
+    out.push({ href: "/seller/services", label: "Your services", testId: "nav-services-link" });
   }
   return out;
 }

@@ -2,13 +2,38 @@
 //
 // Background: the M2 seller-onboarding slice exposes the
 // ServiceOffering lifecycle for a Seller-capable Personal Workspace.
-// Five commands hang off this route family:
+// Eight commands hang off this route family:
+//
+//   - POST /api/workspaces/:workspaceId/service-offerings/draft
+//     M2 (#85) PR-review feedback: lazy first-create. The route
+//     generates a Draft offering row tied to the Workspace's
+//     SellerProfile and returns the new offeringId. The
+//     `(workspaceId, idempotencyKey)` tuple on the create-evidence
+//     row is the convergence key — a transport retry with the
+//     same idempotencyKey returns the SAME offeringId; a
+//     deliberate new attempt (a new idempotencyKey) creates a
+//     fresh offering.
+//
+//   - GET  /api/workspaces/:workspaceId/service-offerings/:offeringId/audio-samples
+//     M2 (#85) PR-review feedback: authenticated owner-side
+//     sample list. Returns Draft + Paused + Active samples for the
+//     owning Workspace only.
+//
+//   - GET  /api/workspaces/:workspaceId/service-offerings/:offeringId/audio-samples/:sampleId/play
+//     M2 (#85) PR-review feedback: authenticated seller-side
+//     preview. Resolves the session cookie, revalidates Seller
+//     capability on the acting Workspace, and streams the
+//     sample bytes for Draft / Paused / Active offerings owned by
+//     that Workspace.
 //
 //   - PUT  /api/workspaces/:workspaceId/service-offerings/:offeringId/draft
-//     Lazy first-save / resume / update-draft. The same-attempt
-//     retry identity is enforced via the application-layer compare-
-//     and-set UPDATE; a deliberate second-offering creation is a
-//     SEPARATE POST (owned by a different ticket — not in #85 scope).
+//     Resume / update-draft. The same-attempt retry identity is
+//     enforced via the application-layer compare-and-set UPDATE.
+//     Lazy first-create (an empty editor on the "new" path that
+//     becomes a real row only on the first Save) uses the
+//     `POST /:workspaceId/service-offerings/draft` endpoint above
+//     with the supplied draft payload; a deliberate second-offering
+//     creation is a new POST with a new `Idempotency-Key`.
 //
 //   - POST /api/workspaces/:workspaceId/service-offerings/:offeringId/activate
 //     Atomic Draft → Active transition with immutable evidence
@@ -48,8 +73,11 @@
 
 import { Router, type Request, type Response } from "express";
 import {
+  BG2_AUDIO_SAMPLE_CONTENT_TYPE,
+  bg2AudioSampleListResponseV1Schema,
   serviceOfferingActivateRequestV1Schema,
   serviceOfferingActivationResponseV1Schema,
+  serviceOfferingCreateDraftRequestV1Schema,
   serviceOfferingDraftRequestV1Schema,
   serviceOfferingDraftResponseV1Schema,
   serviceOfferingGetResponseV1Schema,
@@ -66,6 +94,8 @@ import {
 import { getRequestId } from "../lib/request-id.js";
 import type { ServiceOfferingService } from "../services/service-offering.service.js";
 import { ServiceOfferingServiceError } from "../services/service-offering.service.js";
+import type { AudioSampleService } from "../services/audio-sample.service.js";
+import { AudioSampleError } from "../services/audio-sample.service.js";
 
 const SERVICE_OFFERING_REQUEST_BODY_LIMIT = 32 * 1024;
 
@@ -73,6 +103,14 @@ export interface ServiceOfferingRouteDeps {
   readonly service: ServiceOfferingService;
   readonly authenticationService: AuthenticationService;
   readonly allowedReturnOrigin: string;
+  /**
+   * M2 (#85) PR-review feedback: the authenticated seller-side
+   * audio routes (owner list + owner play) hang off this router
+   * alongside the ServiceOffering writes. The audio slice keeps
+   * its existing public router for the buyer-side list / play;
+   * this surface is the authenticated mirror.
+   */
+  readonly audioSampleService: AudioSampleService;
 }
 
 export function createServiceOfferingRouter(deps: ServiceOfferingRouteDeps): Router {
@@ -82,6 +120,9 @@ export function createServiceOfferingRouter(deps: ServiceOfferingRouteDeps): Rou
   // The intent router at `apps/api/src/routes/intent.ts:99` uses the
   // same shape (`/:workspaceId/intent`); mirror it here so the
   // `:workspaceId` param is available to the handlers.
+  router.post("/:workspaceId/service-offerings/draft", (req, res) => {
+    void handleCreateDraft(req, res, deps);
+  });
   router.put("/:workspaceId/service-offerings/:offeringId/draft", (req, res) => {
     void handleDraft(req, res, deps);
   });
@@ -94,6 +135,19 @@ export function createServiceOfferingRouter(deps: ServiceOfferingRouteDeps): Rou
   router.get("/:workspaceId/service-offerings/:offeringId", (req, res) => {
     void handleGet(req, res, deps);
   });
+  // M2 (#85) PR-review feedback: authenticated owner-side audio
+  // surface. Mounted under the same workspace-scoped router so
+  // the session + workspace ownership + Seller capability
+  // authorization chain matches the rest of the slice.
+  router.get("/:workspaceId/service-offerings/:offeringId/audio-samples", (req, res) => {
+    void handleOwnerListSamples(req, res, deps);
+  });
+  router.get(
+    "/:workspaceId/service-offerings/:offeringId/audio-samples/:sampleId/play",
+    (req, res) => {
+      void handleOwnerPlay(req, res, deps);
+    },
+  );
   return router;
 }
 
@@ -419,4 +473,210 @@ function writeTranslatedError(
 ): void {
   const fields = fieldErrors.length > 0 ? fieldErrors : undefined;
   writeSafeError(res, buildSafeError(code, message, fields, requestId));
+}
+
+// ---------- M2 (#85) PR-review feedback: create + owner-side audio ----------
+
+async function handleCreateDraft(
+  req: Request,
+  res: Response,
+  deps: ServiceOfferingRouteDeps,
+): Promise<void> {
+  const requestId = generateRequestId();
+  res.setHeader("x-request-id", requestId);
+  const actor = await resolveActor(req, res, deps);
+  if (!actor) return;
+
+  // The idempotency key arrives via the `Idempotency-Key` header
+  // (preferred) or a `idempotencyKey` JSON body field for clients
+  // that cannot set custom headers. The body carries the full
+  // RELAXED draft field set — the create-and-save is one atomic
+  // transaction (M2 #85 PR-review feedback round 3).
+  //
+  // PR-review feedback (round 4): a malformed or oversized body
+  // MUST NOT be silently coerced to `undefined`. With every
+  // draft field optional and a valid `Idempotency-Key` header,
+  // the schema would pass and the route would persist an
+  // empty Draft — a regression of round 3's "no empty orphans"
+  // contract. Surface the parse error as
+  // SERVICE_OFFERING_INVALID without invoking the service.
+  let body: unknown = undefined;
+  try {
+    body = await readBody(req);
+  } catch (err) {
+    const message =
+      err instanceof Error && err.message.length > 0
+        ? `Malformed create request body: ${err.message}`
+        : "Malformed create request body";
+    writeSafeError(res, buildSafeError("SERVICE_OFFERING_INVALID", message, undefined, requestId));
+    return;
+  }
+  const idempotencyKey = readIdempotencyKey(req, body);
+  const parsed = serviceOfferingCreateDraftRequestV1Schema.safeParse({
+    ...(body && typeof body === "object" ? body : {}),
+    idempotencyKey,
+  });
+  if (!parsed.success) {
+    const fields = parsed.error.issues.map((issue) => ({
+      path: issue.path.join("."),
+      code: issue.code,
+      message: issue.message,
+    }));
+    writeSafeError(
+      res,
+      buildSafeError("SERVICE_OFFERING_INVALID", "Malformed create request", fields, requestId),
+    );
+    return;
+  }
+
+  try {
+    const result = await deps.service.createDraft({
+      userAccountId: actor.userAccountId,
+      workspaceId: actor.workspaceId,
+      requestId,
+      idempotencyKey: parsed.data.idempotencyKey,
+      draft: parsed.data,
+    });
+    const body = serviceOfferingDraftResponseV1Schema.parse({
+      ok: true,
+      offering: result,
+      returnTo: null,
+      safeReturnTo: null,
+    });
+    res.status(201).json(body);
+  } catch (err) {
+    writeServiceError(res, err, requestId);
+  }
+}
+
+function readIdempotencyKey(req: Request, body: unknown): string {
+  const headerVal = req.headers["idempotency-key"];
+  if (typeof headerVal === "string" && headerVal.length > 0) {
+    return headerVal;
+  }
+  if (
+    body &&
+    typeof body === "object" &&
+    "idempotencyKey" in body &&
+    typeof (body as { idempotencyKey?: unknown }).idempotencyKey === "string"
+  ) {
+    return (body as { idempotencyKey: string }).idempotencyKey;
+  }
+  return "";
+}
+
+async function handleOwnerListSamples(
+  req: Request,
+  res: Response,
+  deps: ServiceOfferingRouteDeps,
+): Promise<void> {
+  const requestId = generateRequestId();
+  res.setHeader("x-request-id", requestId);
+  const actor = await resolveActor(req, res, deps);
+  if (!actor) return;
+  const offeringId = readOfferingIdFromParams(req);
+  if (!offeringId) {
+    writeSafeError(
+      res,
+      buildSafeError("SERVICE_OFFERING_INVALID", "Missing serviceOfferingId", undefined, requestId),
+    );
+    return;
+  }
+  try {
+    const result = await deps.audioSampleService.listSamplesForSeller({
+      userAccountId: actor.userAccountId,
+      offeringId,
+      actingWorkspaceId: actor.workspaceId,
+    });
+    const body = bg2AudioSampleListResponseV1Schema.parse({
+      offeringId: result.offeringId,
+      samples: result.samples,
+    });
+    res.status(200).json(body);
+  } catch (err) {
+    writeAudioErrorForServiceOffering(res, err, requestId);
+  }
+}
+
+async function handleOwnerPlay(
+  req: Request,
+  res: Response,
+  deps: ServiceOfferingRouteDeps,
+): Promise<void> {
+  const requestId = generateRequestId();
+  res.setHeader("x-request-id", requestId);
+  const actor = await resolveActor(req, res, deps);
+  if (!actor) return;
+  const offeringId = readOfferingIdFromParams(req);
+  const sampleId = readSampleIdFromParams(req);
+  if (!offeringId || !sampleId) {
+    writeSafeError(
+      res,
+      buildSafeError(
+        "INVALID_AUTH_REQUEST",
+        "ServiceOffering id and sample id are required.",
+        undefined,
+        requestId,
+      ),
+    );
+    return;
+  }
+  try {
+    const playback = await deps.audioSampleService.getBytesForPlayback({
+      offeringId,
+      sampleId,
+      actingUserAccountId: actor.userAccountId,
+      actingWorkspaceId: actor.workspaceId,
+    });
+    if (!playback) {
+      writeSafeError(
+        res,
+        buildSafeError(
+          "AUDIO_SAMPLE_NOT_FOUND",
+          "Sample is not available for playback.",
+          undefined,
+          requestId,
+        ),
+      );
+      return;
+    }
+    res.setHeader("Content-Type", BG2_AUDIO_SAMPLE_CONTENT_TYPE);
+    res.setHeader("Content-Length", String(playback.bytes.byteLength));
+    res.setHeader("Cache-Control", "private, max-age=60");
+    res.status(200).end(Buffer.from(playback.bytes));
+  } catch (err) {
+    writeAudioErrorForServiceOffering(res, err, requestId);
+  }
+}
+
+function readOfferingIdFromParams(req: Request): string | null {
+  const raw = req.params["offeringId"];
+  return typeof raw === "string" && raw.length > 0 && raw.length <= 128 ? raw : null;
+}
+
+function readSampleIdFromParams(req: Request): string | null {
+  const raw = req.params["sampleId"];
+  return typeof raw === "string" && raw.length > 0 && raw.length <= 128 ? raw : null;
+}
+
+function writeAudioErrorForServiceOffering(res: Response, err: unknown, requestId: string): void {
+  if (err instanceof AudioSampleError) {
+    // The AudioSampleError code is a stable API error code (the
+    // BG2 + new AUDIO_SAMPLE_MEDIA_CONFIRMATION_REQUIRED codes
+    // are all part of `apiErrorCodeV1Schema`), so passing it
+    // directly to `buildSafeError` is type-correct. Cast through
+    // `unknown` to satisfy the strict signature.
+    writeSafeError(res, buildSafeError(err.code, err.message, undefined, requestId));
+    return;
+  }
+  console.error(`[service-offering-audio] requestId=${requestId} unhandled:`, err);
+  writeSafeError(
+    res,
+    buildSafeError(
+      "SERVICE_OFFERING_INTERNAL_FAILED",
+      "An unexpected error occurred while processing the request.",
+      undefined,
+      requestId,
+    ),
+  );
 }

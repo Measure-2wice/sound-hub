@@ -354,6 +354,11 @@ void describe("ServiceOfferingService", () => {
       byteSize: 1024,
       displayOrder: 1,
       storageRef: "ref://demo",
+      confirmation: {
+        version: "m2-audio-confirmation-v1",
+        confirmedByUserId: ACTING_USER,
+        confirmedAt: new Date(),
+      },
     });
     await assert.rejects(
       () =>
@@ -380,6 +385,11 @@ void describe("ServiceOfferingService", () => {
       byteSize: 1024,
       displayOrder: 1,
       storageRef: "ref://demo",
+      confirmation: {
+        version: "m2-audio-confirmation-v1",
+        confirmedByUserId: ACTING_USER,
+        confirmedAt: new Date(),
+      },
     });
     const result = await service.activate({
       userAccountId: ACTING_USER,
@@ -405,6 +415,11 @@ void describe("ServiceOfferingService", () => {
       byteSize: 1024,
       displayOrder: 1,
       storageRef: "ref://demo",
+      confirmation: {
+        version: "m2-audio-confirmation-v1",
+        confirmedByUserId: ACTING_USER,
+        confirmedAt: new Date(),
+      },
     });
     const idemKey = crypto.randomUUID();
     const first = await service.activate({
@@ -443,6 +458,11 @@ void describe("ServiceOfferingService", () => {
       byteSize: 1024,
       displayOrder: 1,
       storageRef: "ref://demo",
+      confirmation: {
+        version: "m2-audio-confirmation-v1",
+        confirmedByUserId: ACTING_USER,
+        confirmedAt: new Date(),
+      },
     });
     await assert.rejects(
       () =>
@@ -477,6 +497,11 @@ void describe("ServiceOfferingService", () => {
       byteSize: 1024,
       displayOrder: 1,
       storageRef: "ref://demo",
+      confirmation: {
+        version: "m2-audio-confirmation-v1",
+        confirmedByUserId: ACTING_USER,
+        confirmedAt: new Date(),
+      },
     });
     await assert.rejects(
       () =>

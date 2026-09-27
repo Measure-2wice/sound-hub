@@ -110,6 +110,12 @@ function mapStatus(code: ApiErrorCodeV1): number {
       return 413;
     case "AUDIO_PROVIDER_UNAVAILABLE":
       return 503;
+    case "AUDIO_SAMPLE_MEDIA_CONFIRMATION_REQUIRED":
+      // M2 (#85) PR-review feedback: the upload boundary requires a
+      // closed-version media-use confirmation. A missing or unknown
+      // version is a structural omission, not a semantic
+      // well-formedness issue — surface as 400.
+      return 400;
     case "AUDIO_STORAGE_FAILED":
       return 500;
     case "AUDIO_SAMPLE_NOT_FOUND":

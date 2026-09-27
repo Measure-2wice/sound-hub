@@ -15,12 +15,22 @@
 //   - The SellerProfile's Published status: activation requires a
 //     Published SellerProfile so draft-profile sellers cannot
 //     activate a marketplace-eligible offering before their
-//     professional identity is in the public catalog.
-//   - `ServiceOfferingRepository.saveDraft` for the lazy first-save /
-//     resume / update-draft flow.
+//     professional identity is in the public catalog. The
+//     createDraft path does NOT require Published (a Draft
+//     SellerProfile can own a Draft offering).
+//   - `ServiceOfferingRepository.createDraft` for the lazy first-create
+//     flow. Idempotent on the `(workspaceId, idempotencyKey)` tuple
+//     via the sibling creation-evidence row.
+//   - `ServiceOfferingRepository.saveDraft` for the resume /
+//     update-draft flow.
 //   - `ServiceOfferingRepository.activate` for the atomic
 //     Draft → Active transition with same-attempt retry convergence
-//     via `idempotencyKey`.
+//     via `idempotencyKey`. The activation transaction ALSO re-counts
+//     CONFIRMED Live samples inside the lock so a concurrent remove
+//     cannot produce a newly Active offering with zero qualifying
+//     samples (per PR-review feedback #4). The repository's
+//     recheck is the source of truth; the service-layer pre-check
+//     was removed to avoid the race window.
 //
 // The service exposes typed errors that the route layer translates to
 // the safe error envelope via `buildSafeError` + `mapStatus`. The
@@ -28,13 +38,19 @@
 // error is a stable `ServiceOfferingServiceError` instance.
 //
 // Atomicity invariants:
+//   - `createDraft` is idempotent w.r.t. the same
+//     `(workspaceId, idempotencyKey)` pair via the application-layer
+//     pre-check + the sibling creation-evidence unique index.
 //   - `saveDraft` is idempotent w.r.t. the same (offeringId,
 //     payload) pair via the application-layer compare-and-set
 //     UPDATE inside the repository.
 //   - `activate` is idempotent w.r.t. the same
 //     `(offeringId, idempotencyKey)` pair via the application-layer
 //     pre-check + the DB unique index
-//     `service_offering_activations_offering_idem_unique_idx`.
+//     `service_offering_activations_offering_idem_unique_idx`. The
+//     activation transaction also re-counts CONFIRMED Live samples
+//     and rejects with SERVICE_OFFERING_INCOMPLETE if the count
+//     drops below the minimum inside the lock.
 //   - All three write methods run inside a `Prisma.$transaction` on
 //     the Prisma adapter; the in-memory adapter uses a
 //     per-offering mutex chain. A failure mid-write rolls back
@@ -44,20 +60,24 @@ import type {
   ApiFieldErrorV1,
   ServiceOfferingActivateRequestV1,
   ServiceOfferingActivationResponseV1,
+  ServiceOfferingCreateDraftRequestV1,
   ServiceOfferingDraftRequestV1,
   ServiceOfferingDraftResponseV1,
   ServiceOfferingGetResponseV1,
   ServiceOfferingOwnerListResponseV1,
+  ServiceOfferingOwnerViewV1,
 } from "@soundhub/types";
 import type {
   ServiceOfferingOwnerViewRecord,
   ServiceOfferingRepository,
 } from "../repositories/service-offering.repository.js";
+import { ServiceOfferingIncompleteError } from "../repositories/service-offering.repository.js";
 import { ServiceOfferingNotDraftError } from "../repositories/service-offering.repository.js";
 import { ServiceOfferingNotFoundError } from "../repositories/service-offering.repository.js";
 import { ServiceOfferingNotOwnedError } from "../repositories/service-offering.repository.js";
+import { ServiceOfferingSellerProfileMissingError } from "../repositories/service-offering.repository.js";
+import { ServiceOfferingUnknownKeyError } from "../repositories/service-offering.repository.js";
 import type { WorkspaceAuthorizationService } from "./workspace-authorization.service.js";
-import { BG2_AUDIO_SAMPLE_MAX_PER_OFFERING } from "@soundhub/types";
 
 export class ServiceOfferingServiceError extends Error {
   constructor(
@@ -104,6 +124,21 @@ export interface ServiceOfferingServiceDeps {
   readonly now?: () => Date;
 }
 
+export interface ServiceOfferingCreateDraftInput {
+  readonly userAccountId: string;
+  readonly workspaceId: string;
+  readonly idempotencyKey: string;
+  readonly requestId: string;
+  /**
+   * M2 (#85) PR-review feedback (round 3): the first-save draft
+   * payload. The repository creates the offering AND persists these
+   * fields atomically — no orphan empty rows. A deliberate
+   * second click with a new idempotencyKey creates a NEW offering
+   * row AND starts a fresh field-set.
+   */
+  readonly draft: ServiceOfferingCreateDraftRequestV1;
+}
+
 export interface ServiceOfferingSaveDraftInput {
   readonly userAccountId: string;
   readonly workspaceId: string;
@@ -133,6 +168,49 @@ export interface ServiceOfferingListInput {
 export class ServiceOfferingService {
   constructor(private readonly deps: ServiceOfferingServiceDeps) {}
 
+  /**
+   * M2 (#85) PR-review feedback (round 3): lazy first-create bound
+   * to the first Save action. Delegates to the repository's
+   * `createDraft` which (a) enforces same-attempt retry
+   * convergence on `(workspaceId, idempotencyKey)` via the sibling
+   * creation-evidence row, and (b) atomically persists the
+   * supplied draft fields in the same transaction. No empty orphan
+   * row can be left behind — the create-and-save is one operation.
+   * The SellerProfile must exist for the Workspace but does NOT
+   * have to be Published — a Draft profile can own a Draft
+   * offering and the editor's onboarding path only reaches "Save
+   * Draft" after profile creation.
+   */
+  async createDraft(input: ServiceOfferingCreateDraftInput): Promise<ServiceOfferingOwnerViewV1> {
+    await this.assertPersonalSellerCapability(input.userAccountId, input.workspaceId);
+    const draft = input.draft;
+    try {
+      const offering = await this.deps.repository.createDraft({
+        workspaceId: input.workspaceId,
+        createdByUserId: input.userAccountId,
+        idempotencyKey: input.idempotencyKey,
+        requestId: input.requestId,
+        title: draft.title ?? "",
+        description: draft.description ?? "",
+        primaryCategoryKey: draft.primaryCategoryKey ?? null,
+        serviceMode: draft.serviceMode ?? null,
+        serviceAreas: (draft.serviceAreas ?? []).map((sa) => ({
+          countryCode: sa.countryCode,
+          ...(sa.region !== undefined ? { region: sa.region } : {}),
+          ...(sa.city !== undefined ? { city: sa.city } : {}),
+        })),
+        pricing: draft.pricing ? toPricingInput(draft.pricing) : null,
+        genreTags: draft.genreTags ?? [],
+        includedServiceCategoryKeys: draft.includedServiceCategoryKeys ?? [],
+        now: new Date(),
+        playbackUrlFor: this.deps.playbackUrlFor,
+      });
+      return toResponseOwnerView(offering);
+    } catch (err) {
+      throw this.translateRepositoryError(err);
+    }
+  }
+
   async saveDraft(input: ServiceOfferingSaveDraftInput): Promise<ServiceOfferingDraftResponseV1> {
     await this.assertPersonalSellerCapability(input.userAccountId, input.workspaceId);
     try {
@@ -148,6 +226,7 @@ export class ServiceOfferingService {
         genreTags: input.request.genreTags ?? [],
         includedServiceCategoryKeys: input.request.includedServiceCategoryKeys ?? [],
         now: new Date(),
+        playbackUrlFor: this.deps.playbackUrlFor,
       });
       return {
         ok: true,
@@ -174,28 +253,21 @@ export class ServiceOfferingService {
       );
     }
 
-    const existing = await this.deps.repository.findForOwner({
-      workspaceId: input.workspaceId,
-      offeringId: input.offeringId,
-      playbackUrlFor: this.deps.playbackUrlFor,
-    });
-    if (!existing) {
-      throw new ServiceOfferingServiceError(
-        "ServiceOffering not found for this Workspace.",
-        "SERVICE_OFFERING_NOT_FOUND",
-      );
-    }
-    const liveSampleCount = await this.deps.repository.countLiveSamples(input.offeringId);
-    this.assertActivationCompleteness({
-      request: input.request,
-      liveSampleCount,
-    });
-
+    // M2 (#85) PR-review feedback: the activation transaction
+    // owns the source-of-truth sample re-check (it runs INSIDE
+    // the same advisory lock as the Draft → Active transition).
+    // The service-layer pre-check is gone — its race window was
+    // the bug. The repository raises
+    // ServiceOfferingIncompleteError when the re-check fails,
+    // which the service translates to the existing
+    // SERVICE_OFFERING_INCOMPLETE envelope code.
     try {
       const result = await this.deps.repository.activate({
         offeringId: input.offeringId,
         workspaceId: input.workspaceId,
-        sellerProfileId: existing.sellerProfileId,
+        // The repository looks up sellerProfileId itself; the
+        // service no longer needs the pre-fetched OwnerView.
+        sellerProfileId: "",
         activatedByUserId: input.userAccountId,
         title: input.request.title,
         description: input.request.description,
@@ -209,6 +281,7 @@ export class ServiceOfferingService {
         idempotencyKey: input.request.idempotencyKey,
         requestId: input.requestId,
         now: new Date(),
+        playbackUrlFor: this.deps.playbackUrlFor,
       });
       return {
         ok: true,
@@ -276,11 +349,60 @@ export class ServiceOfferingService {
     }
     if (err instanceof ServiceOfferingNotOwnedError) {
       // The acting Workspace does not own this ServiceOffering. The
-      // safe envelope collapses this to a 403 FORBIDDEN; the
-      // offering id is not echoed.
+      // safe envelope collapses this to a 404 NOT_FOUND rather
+      // than 403 FORBIDDEN so a cross-Workspace requester cannot
+      // distinguish "exists but not yours" from "does not exist".
+      // The offering id is not echoed.
       return new ServiceOfferingServiceError(
-        "Acting Workspace is not the owner of this ServiceOffering.",
-        "SERVICE_OFFERING_FORBIDDEN",
+        "ServiceOffering not found for this Workspace.",
+        "SERVICE_OFFERING_NOT_FOUND",
+      );
+    }
+    if (err instanceof ServiceOfferingUnknownKeyError) {
+      return new ServiceOfferingServiceError(
+        `Unknown ${err.field}: ${err.key}`,
+        "SERVICE_OFFERING_INVALID",
+        [
+          {
+            path: err.field,
+            code: "unknown_controlled_value",
+            message: `Unknown ${err.field}: ${err.key}`,
+          },
+        ],
+      );
+    }
+    if (err instanceof ServiceOfferingSellerProfileMissingError) {
+      // Surface the missing SellerProfile as the same
+      // SERVICE_OFFERING_INCOMPLETE envelope the activation
+      // precondition produces — the editor's onboarding path
+      // already routes the seller through profile creation, so a
+      // missing profile here indicates a state the UI cannot
+      // recover from without redirecting back to onboarding.
+      return new ServiceOfferingServiceError(
+        "ServiceOffering creation requires a SellerProfile for the Workspace.",
+        "SERVICE_OFFERING_INCOMPLETE",
+        [
+          {
+            path: "sellerProfile",
+            code: "seller_profile_required",
+            message: "Create your seller profile before authoring a service offering.",
+          },
+        ],
+      );
+    }
+    if (err instanceof ServiceOfferingIncompleteError) {
+      // The repository's activation recheck failed inside the
+      // advisory lock — either a field-level value is missing
+      // or a concurrent remove dropped the last CONFIRMED sample
+      // after the caller's pre-check passed. Map to the same
+      // SERVICE_OFFERING_INCOMPLETE envelope the service-layer
+      // pre-check used to produce; the repository's
+      // `fieldErrors` carry the same `ApiFieldErrorV1` shape the
+      // editor renders.
+      return new ServiceOfferingServiceError(
+        "Activation requires a complete ServiceOffering.",
+        "SERVICE_OFFERING_INCOMPLETE",
+        err.fieldErrors,
       );
     }
     return new ServiceOfferingServiceError(
@@ -319,69 +441,6 @@ export class ServiceOfferingService {
       );
     }
   }
-
-  /**
-   * Validate the activation contract at the trusted boundary so a
-   * direct API client cannot smuggle an incomplete payload through.
-   * Mirrors `SellerProfileService.assertPublishCompleteness`.
-   */
-  private assertActivationCompleteness(input: {
-    readonly request: ServiceOfferingActivateRequestV1;
-    readonly liveSampleCount: number;
-  }): void {
-    const fields: ApiFieldErrorV1[] = [];
-    if (!input.request.title.trim()) {
-      fields.push({
-        path: "title",
-        code: "title_required",
-        message: "Title is required to activate.",
-      });
-    }
-    if (!input.request.description.trim()) {
-      fields.push({
-        path: "description",
-        code: "description_required",
-        message: "Description is required to activate.",
-      });
-    }
-    if (!input.request.primaryCategoryKey) {
-      fields.push({
-        path: "primaryCategoryKey",
-        code: "category_required",
-        message: "A controlled primary ServiceCategory is required to activate.",
-      });
-    }
-    if (input.request.serviceMode === "InPerson" || input.request.serviceMode === "Hybrid") {
-      if (input.request.serviceAreas.length === 0) {
-        fields.push({
-          path: "serviceAreas",
-          code: "service_area_required",
-          message: "At least one coarse service area is required for InPerson or Hybrid offerings.",
-        });
-      }
-    }
-    if (!input.request.pricing.kind) {
-      fields.push({
-        path: "pricing.kind",
-        code: "pricing_required",
-        message: "An explicit pricing choice is required to activate.",
-      });
-    }
-    if (input.liveSampleCount < 1 || input.liveSampleCount > BG2_AUDIO_SAMPLE_MAX_PER_OFFERING) {
-      fields.push({
-        path: "samples",
-        code: "samples_required",
-        message: `Activation requires 1 to ${BG2_AUDIO_SAMPLE_MAX_PER_OFFERING} playable samples.`,
-      });
-    }
-    if (fields.length > 0) {
-      throw new ServiceOfferingServiceError(
-        "Activation requires a complete ServiceOffering.",
-        "SERVICE_OFFERING_INCOMPLETE",
-        fields,
-      );
-    }
-  }
 }
 
 function toPricingInput(
@@ -401,9 +460,7 @@ function toPricingInput(
   };
 }
 
-function toResponseOwnerView(
-  record: ServiceOfferingOwnerViewRecord,
-): ServiceOfferingDraftResponseV1["offering"] {
+function toResponseOwnerView(record: ServiceOfferingOwnerViewRecord): ServiceOfferingOwnerViewV1 {
   return {
     serviceOfferingId: record.serviceOfferingId,
     workspaceId: record.workspaceId,

@@ -107,6 +107,12 @@ describe("ServiceOffering route (in-memory)", () => {
       sellerProfileId: "sp_test",
       status: "Draft",
     });
+    // The in-memory adapter maintains a minimal SellerProfile
+    // registry so `createDraft` can find the precondition satisfied.
+    serviceOfferingRepository._registerSellerProfile({
+      workspaceId: PERSONAL_WS,
+      sellerProfileId: "sp_test",
+    });
     personalWorkspaceConvergenceService = new PersonalWorkspaceConvergenceService({
       authRepository: authRepo,
     });
@@ -235,6 +241,154 @@ describe("ServiceOffering route (in-memory)", () => {
     assert.equal(response.body.offering.primaryCategoryKey, "music-production");
     assert.equal(response.body.offering.pricing.kind, "StartingAt");
     assert.equal(response.body.offering.pricing.amountMinor, 60000);
+  });
+
+  test("M2 (#85) PR-review feedback round 3: POST /draft creates the offering AND persists the supplied fields atomically", async () => {
+    // The spec requires the stable identity to be created on the
+    // first successful save. Clicking "Create service" on the
+    // listing page must NOT persist an empty row that the seller
+    // can navigate away from. The create-and-save is one atomic
+    // transaction; the listing page navigates to the empty editor
+    // and the first Save creates the row with the user's submitted
+    // fields.
+    const cookie = await signIn(SELLER_EMAIL);
+    const idempotencyKey = "draft-create-save-1";
+    const response = await request(app)
+      .post(`/api/workspaces/${PERSONAL_WS}/service-offerings/draft`)
+      .set("Cookie", cookie)
+      .set("Content-Type", "application/json")
+      .set("Idempotency-Key", idempotencyKey)
+      .send(draftBody);
+    assert.equal(response.status, 201, JSON.stringify(response.body));
+    assert.equal(response.body.ok, true);
+    const created = response.body.offering;
+    assert.notEqual(
+      created.serviceOfferingId,
+      "",
+      "POST /draft must return a non-empty offeringId",
+    );
+    assert.equal(created.title, draftBody.title);
+    assert.equal(created.primaryCategoryKey, draftBody.primaryCategoryKey);
+    assert.equal(created.pricing.kind, draftBody.pricing.kind);
+    assert.equal(created.pricing.amountMinor, draftBody.pricing.amountMinor);
+    assert.equal(created.status, "Draft");
+    // The newly created offering is reachable via the regular
+    // OwnerView GET endpoint so subsequent saves (PUT) can find it.
+    const followup = await request(app)
+      .get(
+        `/api/workspaces/${PERSONAL_WS}/service-offerings/${encodeURIComponent(String(created.serviceOfferingId))}`,
+      )
+      .set("Cookie", cookie);
+    assert.equal(followup.status, 200);
+    assert.equal(followup.body.offering.serviceOfferingId, created.serviceOfferingId);
+    assert.equal(followup.body.offering.title, draftBody.title);
+  });
+
+  test("M2 (#85) PR-review feedback round 3: same-attempt POST /draft retry converges on the same offeringId (and the same persisted fields)", async () => {
+    const cookie = await signIn(SELLER_EMAIL);
+    const idempotencyKey = "draft-create-save-converge-1";
+    const first = await request(app)
+      .post(`/api/workspaces/${PERSONAL_WS}/service-offerings/draft`)
+      .set("Cookie", cookie)
+      .set("Content-Type", "application/json")
+      .set("Idempotency-Key", idempotencyKey)
+      .send(draftBody);
+    assert.equal(first.status, 201);
+    const firstId = first.body.offering.serviceOfferingId;
+    // Same idempotencyKey + same payload → returns the SAME
+    // offeringId (DB unique constraint + service-layer pre-check).
+    const second = await request(app)
+      .post(`/api/workspaces/${PERSONAL_WS}/service-offerings/draft`)
+      .set("Cookie", cookie)
+      .set("Content-Type", "application/json")
+      .set("Idempotency-Key", idempotencyKey)
+      .send(draftBody);
+    assert.equal(second.status, 201);
+    assert.equal(second.body.offering.serviceOfferingId, firstId);
+  });
+
+  test("M2 (#85) PR-review feedback round 3: a fresh idempotencyKey creates a NEW offering (deliberate second click)", async () => {
+    const cookie = await signIn(SELLER_EMAIL);
+    const first = await request(app)
+      .post(`/api/workspaces/${PERSONAL_WS}/service-offerings/draft`)
+      .set("Cookie", cookie)
+      .set("Content-Type", "application/json")
+      .set("Idempotency-Key", "draft-create-save-fresh-A")
+      .send(draftBody);
+    const second = await request(app)
+      .post(`/api/workspaces/${PERSONAL_WS}/service-offerings/draft`)
+      .set("Cookie", cookie)
+      .set("Content-Type", "application/json")
+      .set("Idempotency-Key", "draft-create-save-fresh-B")
+      .send(draftBody);
+    assert.equal(first.status, 201);
+    assert.equal(second.status, 201);
+    assert.notEqual(
+      first.body.offering.serviceOfferingId,
+      second.body.offering.serviceOfferingId,
+      "distinct idempotencyKeys create distinct offerings",
+    );
+  });
+
+  test("M2 (#85) PR-review feedback round 4: malformed JSON on POST /draft does NOT create an empty Draft", async () => {
+    // Round 3 promised "no empty orphan rows". With every draft
+    // field optional and a valid `Idempotency-Key` header, a
+    // request whose body fails to parse MUST be rejected with
+    // SERVICE_OFFERING_INVALID — not silently coerced to `undefined`
+    // and routed through the all-optional create schema (which
+    // would create an empty Draft on every failure).
+    const cookie = await signIn(SELLER_EMAIL);
+    const before = await request(app)
+      .get(`/api/workspaces/${PERSONAL_WS}/service-offerings`)
+      .set("Cookie", cookie);
+    const beforeCount = (before.body.offerings ?? []).length;
+    const response = await request(app)
+      .post(`/api/workspaces/${PERSONAL_WS}/service-offerings/draft`)
+      .set("Cookie", cookie)
+      .set("Content-Type", "application/json")
+      .set("Idempotency-Key", "draft-malformed-body-1")
+      // Intentionally malformed JSON: trailing comma + unbalanced
+      // braces. The route's `readBody` throws.
+      .send('{"title": "oops",}');
+    assert.equal(response.status, 400, JSON.stringify(response.body));
+    assert.equal(response.body.error.code, "SERVICE_OFFERING_INVALID");
+    const after = await request(app)
+      .get(`/api/workspaces/${PERSONAL_WS}/service-offerings`)
+      .set("Cookie", cookie);
+    const afterCount = (after.body.offerings ?? []).length;
+    assert.equal(afterCount, beforeCount, "malformed body must not have persisted a new Draft");
+  });
+
+  test("M2 (#85) PR-review feedback round 4: oversized JSON body on POST /draft returns SERVICE_OFFERING_INVALID without creating a Draft", async () => {
+    // The route's `readBody` enforces a hard byte limit and
+    // throws when exceeded. With a valid `Idempotency-Key` header
+    // and every draft field optional, the old behavior would
+    // silently coerce the parse failure to `undefined` and create
+    // an empty Draft; the round-4 fix rejects at the boundary.
+    const cookie = await signIn(SELLER_EMAIL);
+    const before = await request(app)
+      .get(`/api/workspaces/${PERSONAL_WS}/service-offerings`)
+      .set("Cookie", cookie);
+    const beforeCount = (before.body.offerings ?? []).length;
+    // 64 KB JSON body — comfortably above the route's 32 KB limit.
+    const oversized = JSON.stringify({
+      title: "x".repeat(64 * 1024),
+      description: "y",
+      idempotencyKey: "draft-oversized-body-1",
+    });
+    const response = await request(app)
+      .post(`/api/workspaces/${PERSONAL_WS}/service-offerings/draft`)
+      .set("Cookie", cookie)
+      .set("Content-Type", "application/json")
+      .set("Idempotency-Key", "draft-oversized-body-1")
+      .send(oversized);
+    assert.equal(response.status, 400, JSON.stringify(response.body));
+    assert.equal(response.body.error.code, "SERVICE_OFFERING_INVALID");
+    const after = await request(app)
+      .get(`/api/workspaces/${PERSONAL_WS}/service-offerings`)
+      .set("Cookie", cookie);
+    const afterCount = (after.body.offerings ?? []).length;
+    assert.equal(afterCount, beforeCount, "oversized body must not have persisted a new Draft");
   });
 
   test("POST activate on an unpublished SellerProfile returns SERVICE_OFFERING_SELLER_PROFILE_NOT_PUBLISHED", async () => {

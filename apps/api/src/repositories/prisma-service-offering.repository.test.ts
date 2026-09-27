@@ -181,6 +181,7 @@ void test("saveDraft: a fresh Draft row persists the RELAXED payload (nullable p
     pricing: null,
     genreTags: ["dancehall"],
     includedServiceCategoryKeys: [],
+    playbackUrlFor: PLAYBACK,
     now: new Date(),
   });
   assert.equal(draft.title, "Draft title");
@@ -204,6 +205,7 @@ void test("saveDraft: rejected with ServiceOfferingNotFoundError when no offerin
         pricing: null,
         genreTags: [],
         includedServiceCategoryKeys: [],
+        playbackUrlFor: PLAYBACK,
         now: new Date(),
       }),
     (err: unknown) => err instanceof ServiceOfferingNotFoundError,
@@ -227,6 +229,7 @@ void test("saveDraft: rejected with ServiceOfferingNotDraftError when the offeri
         pricing: null,
         genreTags: [],
         includedServiceCategoryKeys: [],
+        playbackUrlFor: PLAYBACK,
         now: new Date(),
       }),
     (err: unknown) => err instanceof ServiceOfferingNotDraftError,
@@ -256,6 +259,9 @@ void test("activate: transitions Draft -> Active and inserts ONE ServiceOffering
       displayOrder: 1,
       storageRef: "ref://demo",
       cleanupStatus: "Live",
+      confirmationVersion: "m2-audio-confirmation-v1",
+      confirmedByUserId: fixture.userId,
+      confirmedAt: new Date(),
     },
   });
   const idempotencyKey = "idempotency-1";
@@ -280,6 +286,7 @@ void test("activate: transitions Draft -> Active and inserts ONE ServiceOffering
     confirmationVersion: "m2-service-activation-v1",
     idempotencyKey,
     requestId: "req-1",
+    playbackUrlFor: PLAYBACK,
     now: new Date(),
   });
   assert.equal(result.offering.status, "Active");
@@ -307,6 +314,9 @@ void test("activate: same idempotencyKey converges on the existing evidence row 
       displayOrder: 1,
       storageRef: "ref://demo",
       cleanupStatus: "Live",
+      confirmationVersion: "m2-audio-confirmation-v1",
+      confirmedByUserId: fixture.userId,
+      confirmedAt: new Date(),
     },
   });
   const idempotencyKey = "idempotency-2";
@@ -331,6 +341,7 @@ void test("activate: same idempotencyKey converges on the existing evidence row 
     confirmationVersion: "m2-service-activation-v1",
     idempotencyKey,
     requestId: "req-1",
+    playbackUrlFor: PLAYBACK,
     now: new Date(),
   });
   const second = await repo.activate({
@@ -354,6 +365,7 @@ void test("activate: same idempotencyKey converges on the existing evidence row 
     confirmationVersion: "m2-service-activation-v1",
     idempotencyKey,
     requestId: "req-2",
+    playbackUrlFor: PLAYBACK,
     now: new Date(),
   });
   assert.equal(first.evidence.idempotencyKey, second.evidence.idempotencyKey);
@@ -377,6 +389,9 @@ void test("activate: rejected with ServiceOfferingNotOwnedError when the offerin
       displayOrder: 1,
       storageRef: "ref://demo",
       cleanupStatus: "Live",
+      confirmationVersion: "m2-audio-confirmation-v1",
+      confirmedByUserId: fixture.userId,
+      confirmedAt: new Date(),
     },
   });
   await assert.rejects(
@@ -402,17 +417,18 @@ void test("activate: rejected with ServiceOfferingNotOwnedError when the offerin
         confirmationVersion: "m2-service-activation-v1",
         idempotencyKey: "idempotency-3",
         requestId: "req-1",
+        playbackUrlFor: PLAYBACK,
         now: new Date(),
       }),
     (err: unknown) => err instanceof ServiceOfferingNotOwnedError,
   );
 });
 
-void test("countLiveSamples returns 0 for an offering with no audio samples", async () => {
+void test("countLiveConfirmedSamples returns 0 for an offering with no audio samples", async () => {
   const fixture = await loadFixture();
   const id = "of_test_no_samples";
   await seedOffering({ id, fixture });
-  const count = await repo.countLiveSamples(id);
+  const count = await repo.countLiveConfirmedSamples(id);
   assert.equal(count, 0);
 });
 

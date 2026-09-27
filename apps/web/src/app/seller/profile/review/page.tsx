@@ -594,8 +594,16 @@ function SuccessSurface({
           >
             Continue
           </button>
+          {/* M2 entry-flow manual-QA fix: the post-publication
+              "Create your first service" CTA must enter the
+              ServiceOffering creation flow (an empty/private
+              editor at `/seller/services/new/edit`), not the
+              legacy audio administration page
+              (`/dashboard/audio`). Audio is central
+              ServiceOffering evidence; the new-editor path is
+              the lazy-first-save entry. */}
           <Link
-            href="/dashboard/audio"
+            href="/seller/services/new/edit"
             className="inline-flex items-center justify-center min-h-[44px] min-w-[44px] py-3 px-6 text-base font-medium text-aubergine hover:text-aubergine-hover border border-aubergine rounded focus:outline-none focus-visible:outline focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-aubergine"
             data-testid="profile-review-success-create-service"
           >

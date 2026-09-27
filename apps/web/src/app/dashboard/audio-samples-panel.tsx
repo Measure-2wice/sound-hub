@@ -72,7 +72,10 @@ export function AudioSamplesPanel({
     setLoading(true);
     setError(null);
     try {
-      const list = await listOfferingSamples(offeringId);
+      const list = await listOfferingSamples({
+        workspaceId: actingWorkspaceId,
+        offeringId,
+      });
       setSamples(list.samples);
     } catch (err) {
       setError(err instanceof Error ? err.message : "Could not load audio samples.");

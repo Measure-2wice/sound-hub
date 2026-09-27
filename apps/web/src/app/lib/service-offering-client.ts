@@ -23,6 +23,7 @@
 import {
   serviceOfferingActivateRequestV1Schema,
   serviceOfferingActivationResponseV1Schema,
+  serviceOfferingCreateDraftRequestV1Schema,
   serviceOfferingDraftRequestV1Schema,
   serviceOfferingDraftResponseV1Schema,
   serviceOfferingGetResponseV1Schema,
@@ -35,6 +36,7 @@ import {
   type ServiceOfferingDraftResponseV1,
   type ServiceOfferingGetResponseV1,
   type ServiceOfferingOwnerListResponseV1,
+  type ServiceOfferingOwnerViewV1,
   type ServiceOfferingTaxonomyResponseV1,
 } from "@soundhub/types";
 
@@ -105,6 +107,52 @@ export function generateServiceOfferingIdempotencyKey(): string {
   // crypto.randomUUID is supported in all modern browsers and
   // matches the Zod `z.string().uuid()` schema on activate.
   return crypto.randomUUID();
+}
+
+/**
+ * M2 (#85) PR-review feedback (round 3): lazy first-create bound
+ * to the first Save action. When `offeringId` is null, the server
+ * creates the offering AND persists the supplied draft fields
+ * atomically — no orphan empty row can be left behind. The
+ * browser sends ONE idempotencyKey per first-save attempt; a
+ * same-attempt retry (network blip, double-click) converges on
+ * the SAME offeringId. A deliberate second click generates a
+ * new idempotencyKey and creates a NEW offering.
+ *
+ * After a successful response, the browser navigates to the
+ * returned offeringId's editor page so subsequent saves use the
+ * PUT path (update).
+ */
+export async function createServiceOfferingDraft(input: {
+  readonly workspaceId: string;
+  readonly idempotencyKey: string;
+  readonly draft: ServiceOfferingDraftRequestV1;
+}): Promise<ServiceOfferingOwnerViewV1> {
+  const payload = serviceOfferingCreateDraftRequestV1Schema.parse({
+    ...input.draft,
+    idempotencyKey: input.idempotencyKey,
+  });
+  const response = await fetch(
+    `/api/workspaces/${encodeURIComponent(input.workspaceId)}/service-offerings/draft`,
+    {
+      method: "POST",
+      credentials: "include",
+      headers: {
+        "Content-Type": "application/json",
+        Accept: "application/json",
+        // Carry the idempotency key as a header for clients that
+        // prefer that convention over the JSON body field.
+        "Idempotency-Key": input.idempotencyKey,
+      },
+      body: JSON.stringify(payload),
+    },
+  );
+  if (!response.ok) {
+    throw ensureError(null, await parseErrorResponse(response));
+  }
+  const body: unknown = await response.json();
+  const parsed = serviceOfferingDraftResponseV1Schema.parse(body);
+  return parsed.offering;
 }
 
 export async function fetchServiceOfferingTaxonomy(): Promise<ServiceOfferingTaxonomyResponseV1> {

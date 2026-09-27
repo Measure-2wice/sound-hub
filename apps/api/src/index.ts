@@ -582,6 +582,13 @@ export function buildApp(options: AppOptions = {}): BuiltApp {
     createServiceOfferingRouter({
       service: serviceOfferingService,
       authenticationService,
+      // M2 (#85) PR-review feedback: the authenticated owner-side
+      // audio surface (owner list + owner play) hangs off the
+      // service-offering router, so the same workspace-scoped
+      // authorization chain guards the audio routes. The public
+      // buyer-side audio surface lives on the standalone audio
+      // router at /api/services/... (unchanged).
+      audioSampleService,
       allowedReturnOrigin: process.env.FRONTEND_URL ?? "http://localhost:3000",
     }),
   );

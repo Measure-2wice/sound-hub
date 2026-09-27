@@ -40,13 +40,19 @@ import {
   BG2_AUDIO_SAMPLE_CONTENT_TYPE,
   BG2_AUDIO_SAMPLE_MAX_BYTE_SIZE,
   BG2_AUDIO_SAMPLE_MAX_PER_OFFERING,
+  SERVICE_OFFERING_AUDIO_MEDIA_CONFIRMATION_VERSIONS,
   type Bg2AudioSamplePublicV1,
+  type ServiceOfferingAudioMediaConfirmationVersionV1,
 } from "@soundhub/types";
 import {
   AuthorizationError,
   type WorkspaceAuthorizationService,
 } from "./workspace-authorization.service.js";
-import type { AudioRepository, AudioSampleRecord } from "../audio-repository/audio-repository.js";
+import type {
+  AudioRepository,
+  AudioSampleConfirmation,
+  AudioSampleRecord,
+} from "../audio-repository/audio-repository.js";
 import { toPublicAudioSample } from "../audio-repository/audio-repository.js";
 import {
   StorageReferenceUnknownError,
@@ -68,7 +74,8 @@ export class AudioSampleError extends Error {
       | "AUDIO_PAYLOAD_MISSING"
       | "AUDIO_PROVIDER_UNAVAILABLE"
       | "AUDIO_STORAGE_FAILED"
-      | "INVALID_AUTH_REQUEST",
+      | "INVALID_AUTH_REQUEST"
+      | "AUDIO_SAMPLE_MEDIA_CONFIRMATION_REQUIRED",
   ) {
     super(message);
     this.name = "AudioSampleError";
@@ -281,6 +288,19 @@ export interface UploadSampleInput {
   readonly contentType: string;
   readonly byteSize: number;
   readonly bytes: Uint8Array;
+  /**
+   * M2 (#85) PR-review feedback: the seller must acknowledge the
+   * current closed-version media-use confirmation in the editor
+   * before each upload. The application boundary carries the
+   * version, the actor, and the timestamp; the repository persists
+   * the trio alongside the sample so activation completeness can
+   * re-verify against the persisted evidence, not the client
+   * round-trip.
+   */
+  readonly mediaUseConfirmation: {
+    readonly version: ServiceOfferingAudioMediaConfirmationVersionV1;
+    readonly confirmedAt: Date;
+  };
 }
 
 export interface ListSamplesInput {
@@ -379,6 +399,23 @@ export class AudioSampleService {
         "AUDIO_OFFERING_INELIGIBLE",
       );
     }
+    // M2 (#85) PR-review feedback: every upload requires the
+    // current closed-version media-use confirmation. The editor
+    // sends an unchecked-required checkbox; the application
+    // boundary re-validates the version against the closed enum
+    // before the storage write so a stale acknowledgement cannot
+    // silently reach the repository.
+    if (
+      !input.mediaUseConfirmation ||
+      !SERVICE_OFFERING_AUDIO_MEDIA_CONFIRMATION_VERSIONS.includes(
+        input.mediaUseConfirmation.version,
+      )
+    ) {
+      throw new AudioSampleError(
+        `Media-use confirmation version "${input.mediaUseConfirmation?.version ?? ""}" is not the current required version.`,
+        "AUDIO_SAMPLE_MEDIA_CONFIRMATION_REQUIRED",
+      );
+    }
     if (input.contentType !== BG2_AUDIO_SAMPLE_CONTENT_TYPE) {
       throw new AudioSampleError(
         `Only ${BG2_AUDIO_SAMPLE_CONTENT_TYPE} samples are allowed.`,
@@ -458,12 +495,18 @@ export class AudioSampleService {
     }
 
     try {
+      const confirmation: AudioSampleConfirmation = {
+        version: input.mediaUseConfirmation.version,
+        confirmedByUserId: input.userAccountId,
+        confirmedAt: input.mediaUseConfirmation.confirmedAt,
+      };
       const created = await this.repository.createSampleWithCap({
         offeringId: input.offeringId,
         label: input.label,
         contentType: BG2_AUDIO_SAMPLE_CONTENT_TYPE,
         byteSize: input.byteSize,
         storageRef,
+        confirmation,
       });
       if (!created) {
         // Concurrent writer beat us to the slot under the
@@ -595,7 +638,10 @@ export class AudioSampleService {
     return {
       offeringId: input.offeringId,
       samples: samples.map((record) =>
-        toPublicAudioSample({ record, playbackUrl: this.playbackUrlFor(record) }),
+        toPublicAudioSample({
+          record,
+          playbackUrl: this.playbackUrlForSeller(record, input.actingWorkspaceId),
+        }),
       ),
     };
   }
@@ -623,6 +669,10 @@ export class AudioSampleService {
       );
     }
     const samples = await this.repository.listSamplesForOffering(offeringId);
+    // Buyer-side URL: no `actingWorkspaceId` query parameter, so
+    // the play route runs the public buyer-side gate (Active +
+    // Published + Active Workspace + Seller capability). A Draft
+    // or Paused offering's samples never reach this method.
     return {
       offeringId,
       samples: samples.map((record) =>
@@ -735,28 +785,77 @@ export class AudioSampleService {
   }
 
   /**
-   * Read a single sample's bytes for the buyer-facing playback
-   * route. Re-runs eligibility + sample-existence checks on
-   * every request (per the reviewer's P0-001 invariant: "after
+   * Read a single sample's bytes for the application-mediated
+   * playback route. Re-runs eligibility + sample-existence checks
+   * on every request (per the reviewer's P0-001 invariant: "after
    * removal or offering ineligibility, subsequent application-
    * mediated playback must be rejected"). The deterministic and
    * Supabase adapters both implement the provider-neutral
    * `getPlaybackBytes` contract.
+   *
+   * M2 (#85) PR-review feedback: the seller-side preview path is
+   * no longer gated by a guessable `?actingWorkspaceId` query
+   * parameter. The route layer authenticates the request via the
+   * HttpOnly session cookie, derives the acting Workspace from
+   * the URL path, re-runs Seller capability, and passes both
+   * `actingUserAccountId` + `actingWorkspaceId` into this method.
+   * When both are present the service runs the seller-side gate
+   * (owner check + Archived rejected + Suspended profile rejected
+   * + Draft + Paused + Active allowed). When absent, the public
+   * buyer-side gate applies (Active + Published + Active Workspace
+   * + Seller capability).
    */
   async getBytesForPlayback(input: {
     readonly offeringId: string;
     readonly sampleId: string;
+    /**
+     * When present, identifies the authenticated seller-side
+     * request: the route derived `actingWorkspaceId` from the URL
+     * path and the UserAccount id from the session cookie. The
+     * service re-runs Seller capability to ensure the session
+     * still authorizes the Workspace and rejects the playback.
+     */
+    readonly actingUserAccountId?: string;
+    readonly actingWorkspaceId?: string;
   }): Promise<PlaybackBytes | null> {
     const context = await this.repository.getOfferingContext(input.offeringId);
     if (!context) return null;
-    if (
-      context.offeringStatus !== "Active" ||
-      context.sellerProfileStatus !== "Published" ||
-      context.sellerWorkspaceStatus !== "Active" ||
-      !context.hasSellerCapability
-    ) {
-      // Ineligible offerings never expose playable bytes.
-      return null;
+    if (input.actingUserAccountId !== undefined && input.actingWorkspaceId !== undefined) {
+      // Seller-side preview gate. The acting Workspace must own
+      // the offering, the offering must not be Archived, and
+      // the SellerProfile must not be Suspended (a suspended
+      // seller cannot play media anywhere). Draft + Paused +
+      // Active are all allowed — the #85 acceptance criterion
+      // is "private preview" of Draft media. The Seller
+      // capability is re-validated here, not at the route, so a
+      // later capability revocation still rejects the stream.
+      if (
+        context.sellerWorkspaceId !== input.actingWorkspaceId ||
+        context.offeringStatus === "Archived" ||
+        context.sellerProfileStatus === "Suspended"
+      ) {
+        return null;
+      }
+      try {
+        await this.workspaceAuthorization.requireCapability({
+          userAccountId: input.actingUserAccountId,
+          workspaceId: input.actingWorkspaceId,
+          requiredCapability: "Seller",
+        });
+      } catch {
+        return null;
+      }
+    } else {
+      // Public buyer-side gate. No Draft, no Paused, no Archived,
+      // no Suspended profile, no Suspended workspace.
+      if (
+        context.offeringStatus !== "Active" ||
+        context.sellerProfileStatus !== "Published" ||
+        context.sellerWorkspaceStatus !== "Active" ||
+        !context.hasSellerCapability
+      ) {
+        return null;
+      }
     }
     const sample = await this.repository.findSampleById({
       offeringId: input.offeringId,
@@ -849,6 +948,22 @@ export class AudioSampleService {
    */
   private playbackUrlFor(record: AudioSampleRecord): string {
     return `${this.publicApiBaseUrl}/api/services/${encodeURIComponent(record.offeringId)}/audio-samples/${encodeURIComponent(record.sampleId)}/play`;
+  }
+
+  /**
+   * Compose the seller-side preview URL. M2 (#85) PR-review
+   * feedback: the seller preview route is now an authenticated
+   * workspace-scoped endpoint at
+   * `/api/workspaces/:workspaceId/service-offerings/:offeringId/audio-samples/:sampleId/play`.
+   * The HttpOnly session cookie rides on the `<audio>` request
+   * automatically; the route re-validates Seller capability +
+   * workspace ownership + lifecycle state. The previous
+   * `?actingWorkspaceId=...` query-parameter gate was guessable
+   * and is removed. Provider signed URLs, bucket names, and object
+   * paths are NEVER part of either URL.
+   */
+  private playbackUrlForSeller(record: AudioSampleRecord, actingWorkspaceId: string): string {
+    return `${this.publicApiBaseUrl}/api/workspaces/${encodeURIComponent(actingWorkspaceId)}/service-offerings/${encodeURIComponent(record.offeringId)}/audio-samples/${encodeURIComponent(record.sampleId)}/play`;
   }
 
   private assertActingWorkspace(actingWorkspaceId: string): void {

@@ -7,32 +7,44 @@
 // from `@soundhub/types` so the browser cannot drift from the
 // contract.
 //
-// The list endpoint is unauthenticated; the upload and remove
-// endpoints require the seller session AND the explicit acting
-// Workspace id (the GS 4 contract: every consequential command
-// names an acting Workspace). The seller management UI calls the
-// list endpoint on mount and again after every successful upload or
-// remove, so a freshly-removed sample disappears from the UI
-// without an explicit optimistic update.
+// M2 (#85) PR-review feedback: the seller-side audio surface is
+// now authenticated. The list endpoint is at
+// `/api/workspaces/:workspaceId/service-offerings/:offeringId/audio-samples`
+// and returns Draft + Paused + Active samples for the owner (the
+// public buyer list at `/api/services/:offeringId/audio-samples`
+// still rejects Draft offerings — the editor used to call that
+// endpoint, which silently broke the refresh after a Draft
+// upload). The seller preview URL is at
+// `/api/workspaces/:workspaceId/service-offerings/:offeringId/audio-samples/:sampleId/play`
+// and authenticates via the HttpOnly session cookie (no
+// `?actingWorkspaceId` query parameter — that gate was guessable).
 //
-// Playback: the server-provided `playbackUrl` is the only audio
-// handle the browser holds. For the deployed Supabase backend that
-// is a narrowly scoped signed URL; for the deterministic backend it
-// is the in-app `/api/services/.../audio-samples/.../play` route.
-// The browser renders the value as the `<audio>` tag's `src` and
-// never inspects its internals.
+// The upload endpoint still lives at
+// `/api/services/:offeringId/audio-samples` (no change to the
+// seller-side upload/remove surface) but now requires a
+// `confirmationVersion` multipart field so the application boundary
+// can persist the closed media-use acknowledgement alongside the
+// sample row.
 
 import type {
   Bg2AudioSampleListResponseV1,
   Bg2AudioSamplePublicV1,
   Bg2AudioSampleRemoveResponseV1,
   Bg2AudioSampleUploadResponseV1,
+  ServiceOfferingAudioMediaConfirmationVersionV1,
 } from "@soundhub/types";
 import {
   bg2AudioSampleListResponseV1Schema,
   bg2AudioSampleRemoveResponseV1Schema,
   bg2AudioSampleUploadResponseV1Schema,
 } from "@soundhub/types";
+
+// The current closed set of media-use confirmation versions the
+// application boundary accepts. The editor's confirmation checkbox
+// carries this version so a stale acknowledgement can never satisfy
+// a future contract bump.
+export const AUDIO_MEDIA_CONFIRMATION_VERSION: ServiceOfferingAudioMediaConfirmationVersionV1 =
+  "m2-audio-confirmation-v1";
 
 export interface AudioSampleError extends Error {
   readonly status: number;
@@ -60,7 +72,39 @@ async function parseErrorResponse(response: Response): Promise<AudioSampleError>
   return err;
 }
 
-export async function listOfferingSamples(
+/**
+ * M2 (#85) PR-review feedback: owner-side authenticated sample list.
+ * Replaces the previous public buyer list which rejected Draft
+ * offerings. The HttpOnly session cookie rides on the request via
+ * `credentials: "include"`; the route re-validates Seller
+ * capability + workspace ownership server-side.
+ */
+export async function listOfferingSamples(input: {
+  readonly workspaceId: string;
+  readonly offeringId: string;
+}): Promise<Bg2AudioSampleListResponseV1> {
+  const response = await fetch(
+    `/api/workspaces/${encodeURIComponent(input.workspaceId)}/service-offerings/${encodeURIComponent(input.offeringId)}/audio-samples`,
+    {
+      method: "GET",
+      credentials: "include",
+      headers: { Accept: "application/json" },
+    },
+  );
+  if (!response.ok) throw await parseErrorResponse(response);
+  const raw: unknown = await response.json();
+  return bg2AudioSampleListResponseV1Schema.parse(raw);
+}
+
+/**
+ * Public buyer-side sample list. Calls the unauthenticated
+ * `/api/services/:offeringId/audio-samples` route (the route's
+ * buyer-side gate requires Active + Published + Active Workspace
+ * + Seller capability; Draft / Paused offerings are rejected at
+ * the route). The recommendation preview calls this so a Draft
+ * offering simply yields no preview rather than a hard error.
+ */
+export async function listOfferingSamplesPublic(
   offeringId: string,
 ): Promise<Bg2AudioSampleListResponseV1> {
   const response = await fetch(`/api/services/${encodeURIComponent(offeringId)}/audio-samples`, {
@@ -85,10 +129,14 @@ export async function uploadOfferingSample(
 ): Promise<Bg2AudioSampleUploadResponseV1> {
   // Browser-driven multipart upload. The browser owns the boundary;
   // the server validates it. `actingWorkspaceId` is required on
-  // every consequential command per the GS 4 contract.
+  // every consequential command per the GS 4 contract. M2 (#85)
+  // PR-review feedback: the upload boundary also requires a
+  // `confirmationVersion` text part so the application can persist
+  // a durable media-use acknowledgement alongside the sample.
   const body = new FormData();
   body.append("actingWorkspaceId", input.actingWorkspaceId);
   body.append("label", input.label);
+  body.append("confirmationVersion", AUDIO_MEDIA_CONFIRMATION_VERSION);
   body.append("file", input.file);
   const response = await fetch(
     `/api/services/${encodeURIComponent(input.offeringId)}/audio-samples`,
