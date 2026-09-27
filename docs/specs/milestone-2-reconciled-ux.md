@@ -173,40 +173,40 @@ All paths below are relative to `~/Desktop/soundhub-m2-stitch-reconciliation/`. 
 `code.html` is structural and content evidence. Its `screen.png` is visual evidence only where the
 file is a valid rendered image.
 
-| Canonical screen                        | Variant | Canonical Stitch export directory                                                              | Rendered evidence                                     |
-| --------------------------------------- | ------- | ---------------------------------------------------------------------------------------------- | ----------------------------------------------------- |
-| Public landing                          | Desktop | `01-product-onboarding/soundhub_landing_page_desktop/`                                         | Available                                             |
-| Public landing                          | Mobile  | `01-product-onboarding/soundhub_landing_page_mobile/`                                          | Available; capture width is not a breakpoint contract |
-| Initial intent selection                | Desktop | `01-product-onboarding/soundhub_initial_intent_selection_desktop/`                             | Available                                             |
-| Initial intent selection                | Mobile  | `01-product-onboarding/soundhub_initial_intent_selection_mobile/`                              | Available                                             |
-| Personal Workspace dashboard            | Desktop | `01-product-onboarding/soundhub_personal_workspace_dashboard_desktop/`                         | Available                                             |
-| Personal Workspace dashboard            | Mobile  | `01-product-onboarding/soundhub_personal_workspace_dashboard_mobile/`                          | Available; capture width is not a breakpoint contract |
-| Professional Profile editor             | Desktop | `02-transaction-authority-a/soundhub_professional_profile_editor_desktop/`                     | Unavailable; failed `screen.png`                      |
-| Professional Profile editor             | Mobile  | `02-transaction-authority-a/soundhub_professional_profile_editor_mobile/`                      | Unavailable; failed `screen.png`                      |
-| Professional Profile publication review | Desktop | `02-transaction-authority-a/soundhub_publication_review_desktop/`                              | Unavailable; failed `screen.png`                      |
-| Professional Profile publication review | Mobile  | `02-transaction-authority-a/soundhub_publication_review_mobile/`                               | Unavailable; failed `screen.png`                      |
-| Service editor with audio               | Desktop | `01-product-onboarding/soundhub_edit_your_service_desktop/`                                    | Available; capture width is not a breakpoint contract |
-| Service editor with audio               | Mobile  | `01-product-onboarding/soundhub_edit_your_service_mobile/`                                     | Available; capture width is not a breakpoint contract |
-| Legacy Active service remediation       | Desktop | `03-transaction-authority-b/soundhub_service_remediation_desktop/`                             | Available                                             |
-| Legacy Active service remediation       | Mobile  | `03-transaction-authority-b/soundhub_service_remediation_mobile/`                              | Available; capture width is not a breakpoint contract |
-| Matchmaker brief entry                  | Desktop | `01-product-onboarding/soundhub_matchmaker_brief_entry_desktop/`                               | Available                                             |
-| Matchmaker brief entry                  | Mobile  | `01-product-onboarding/soundhub_matchmaker_brief_entry_mobile/`                                | Available                                             |
-| Matchmaker recommendations              | Desktop | `01-product-onboarding/soundhub_matchmaker_recommendations_desktop/`                           | Available                                             |
-| Matchmaker recommendations              | Mobile  | `01-product-onboarding/soundhub_matchmaker_recommendations_mobile/`                            | Available                                             |
-| Buyer ProjectRequest detail             | Desktop | `02-transaction-authority-a/soundhub_buyer_request_detail_desktop/`                            | Unavailable; failed `screen.png`                      |
-| Buyer ProjectRequest detail             | Mobile  | `02-transaction-authority-a/soundhub_buyer_request_detail_mobile/`                             | Unavailable; failed `screen.png`                      |
-| Seller ProjectRequest detail            | Desktop | `02-transaction-authority-a/soundhub_seller_request_detail_desktop/`                           | Unavailable; failed `screen.png`                      |
-| Seller ProjectRequest detail            | Mobile  | `02-transaction-authority-a/soundhub_seller_request_detail_mobile/`                            | Unavailable; failed `screen.png`                      |
-| Negotiating Deal / TermsVersion         | Desktop | `02-transaction-authority-a/soundhub_negotiating_deal_desktop/`                                | Unavailable; failed `screen.png`                      |
-| Negotiating Deal / TermsVersion         | Mobile  | `02-transaction-authority-a/soundhub_negotiating_deal_mobile/`                                 | Unavailable; failed `screen.png`                      |
-| JIT permission-to-approve setup         | Desktop | `03-transaction-authority-b/soundhub_set_up_permission_to_approve_terms_desktop/`              | Available                                             |
-| JIT permission-to-approve setup         | Mobile  | `03-transaction-authority-b/soundhub_set_up_permission_to_approve_terms_mobile/`               | Unavailable; failed `screen.png`                      |
-| Permission-success return               | Desktop | `03-transaction-authority-b/soundhub_negotiating_deal_permission_set_up_return_state_desktop/` | Unavailable; failed `screen.png`                      |
-| Permission-success return               | Mobile  | `03-transaction-authority-b/soundhub_negotiating_deal_permission_set_up_return_state_mobile/`  | Unavailable; failed `screen.png`                      |
-| Workspace switch interstitial           | Desktop | `03-transaction-authority-b/soundhub_workspace_switch_interstitial_desktop/`                   | Available                                             |
-| Workspace switch interstitial           | Mobile  | `03-transaction-authority-b/soundhub_workspace_switch_interstitial_mobile/`                    | Available                                             |
-| Workspace setup recovery                | Desktop | `03-transaction-authority-b/soundhub_workspace_setup_recovery_desktop/`                        | Available                                             |
-| Workspace setup recovery                | Mobile  | `03-transaction-authority-b/soundhub_workspace_setup_recovery_mobile/`                         | Available                                             |
+| Canonical screen                        | Variant | Canonical Stitch export directory                                                              | Rendered evidence                                                                                             |
+| --------------------------------------- | ------- | ---------------------------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------- |
+| Public landing                          | Desktop | `01-product-onboarding/soundhub_landing_page_desktop/`                                         | Available                                                                                                     |
+| Public landing                          | Mobile  | `01-product-onboarding/soundhub_landing_page_mobile/`                                          | Available; capture width is not a breakpoint contract                                                         |
+| Initial intent selection                | Desktop | `01-product-onboarding/soundhub_initial_intent_selection_desktop/`                             | Available                                                                                                     |
+| Initial intent selection                | Mobile  | `01-product-onboarding/soundhub_initial_intent_selection_mobile/`                              | Available                                                                                                     |
+| Personal Workspace dashboard            | Desktop | `01-product-onboarding/soundhub_personal_workspace_dashboard_desktop/`                         | Available                                                                                                     |
+| Personal Workspace dashboard            | Mobile  | `01-product-onboarding/soundhub_personal_workspace_dashboard_mobile/`                          | Available; capture width is not a breakpoint contract                                                         |
+| Professional Profile editor             | Desktop | `.local/stitch/84-professional-profile/soundhub_professional_profile_editor_desktop/`          | Code available; `screen.png` is `<FIFE Image failed to fetch>` placeholder (code.html is structural evidence) |
+| Professional Profile editor             | Mobile  | `.local/stitch/84-professional-profile/soundhub_professional_profile_editor_mobile/`           | Code available; `screen.png` is `<FIFE Image failed to fetch>` placeholder (code.html is structural evidence) |
+| Professional Profile publication review | Desktop | `.local/stitch/84-professional-profile/soundhub_publication_review_desktop/`                   | Available (1446×1600 PNG)                                                                                     |
+| Professional Profile publication review | Mobile  | `.local/stitch/84-professional-profile/soundhub_publication_review_mobile/`                    | Available (427×1600 PNG)                                                                                      |
+| Service editor with audio               | Desktop | `01-product-onboarding/soundhub_edit_your_service_desktop/`                                    | Available; capture width is not a breakpoint contract                                                         |
+| Service editor with audio               | Mobile  | `01-product-onboarding/soundhub_edit_your_service_mobile/`                                     | Available; capture width is not a breakpoint contract                                                         |
+| Legacy Active service remediation       | Desktop | `03-transaction-authority-b/soundhub_service_remediation_desktop/`                             | Available                                                                                                     |
+| Legacy Active service remediation       | Mobile  | `03-transaction-authority-b/soundhub_service_remediation_mobile/`                              | Available; capture width is not a breakpoint contract                                                         |
+| Matchmaker brief entry                  | Desktop | `01-product-onboarding/soundhub_matchmaker_brief_entry_desktop/`                               | Available                                                                                                     |
+| Matchmaker brief entry                  | Mobile  | `01-product-onboarding/soundhub_matchmaker_brief_entry_mobile/`                                | Available                                                                                                     |
+| Matchmaker recommendations              | Desktop | `01-product-onboarding/soundhub_matchmaker_recommendations_desktop/`                           | Available                                                                                                     |
+| Matchmaker recommendations              | Mobile  | `01-product-onboarding/soundhub_matchmaker_recommendations_mobile/`                            | Available                                                                                                     |
+| Buyer ProjectRequest detail             | Desktop | `02-transaction-authority-a/soundhub_buyer_request_detail_desktop/`                            | Unavailable; failed `screen.png`                                                                              |
+| Buyer ProjectRequest detail             | Mobile  | `02-transaction-authority-a/soundhub_buyer_request_detail_mobile/`                             | Unavailable; failed `screen.png`                                                                              |
+| Seller ProjectRequest detail            | Desktop | `02-transaction-authority-a/soundhub_seller_request_detail_desktop/`                           | Unavailable; failed `screen.png`                                                                              |
+| Seller ProjectRequest detail            | Mobile  | `02-transaction-authority-a/soundhub_seller_request_detail_mobile/`                            | Unavailable; failed `screen.png`                                                                              |
+| Negotiating Deal / TermsVersion         | Desktop | `02-transaction-authority-a/soundhub_negotiating_deal_desktop/`                                | Unavailable; failed `screen.png`                                                                              |
+| Negotiating Deal / TermsVersion         | Mobile  | `02-transaction-authority-a/soundhub_negotiating_deal_mobile/`                                 | Unavailable; failed `screen.png`                                                                              |
+| JIT permission-to-approve setup         | Desktop | `03-transaction-authority-b/soundhub_set_up_permission_to_approve_terms_desktop/`              | Available                                                                                                     |
+| JIT permission-to-approve setup         | Mobile  | `03-transaction-authority-b/soundhub_set_up_permission_to_approve_terms_mobile/`               | Unavailable; failed `screen.png`                                                                              |
+| Permission-success return               | Desktop | `03-transaction-authority-b/soundhub_negotiating_deal_permission_set_up_return_state_desktop/` | Unavailable; failed `screen.png`                                                                              |
+| Permission-success return               | Mobile  | `03-transaction-authority-b/soundhub_negotiating_deal_permission_set_up_return_state_mobile/`  | Unavailable; failed `screen.png`                                                                              |
+| Workspace switch interstitial           | Desktop | `03-transaction-authority-b/soundhub_workspace_switch_interstitial_desktop/`                   | Available                                                                                                     |
+| Workspace switch interstitial           | Mobile  | `03-transaction-authority-b/soundhub_workspace_switch_interstitial_mobile/`                    | Available                                                                                                     |
+| Workspace setup recovery                | Desktop | `03-transaction-authority-b/soundhub_workspace_setup_recovery_desktop/`                        | Available                                                                                                     |
+| Workspace setup recovery                | Mobile  | `03-transaction-authority-b/soundhub_workspace_setup_recovery_mobile/`                         | Available                                                                                                     |
 
 The thirteen unavailable screenshots do not represent missing product states. Their canonical
 directories and byte-identical generated HTML establish screen identity and structural evidence,
@@ -214,12 +214,27 @@ but they cannot establish pixel-level acceptance. The standalone Stitch logo and
 photograph are supporting explorations, not automatically production assets. `.DS_Store` files and
 `<FIFE Image failed to fetch>` placeholders are not design references.
 
+The #84 Professional Profile editor pair (desktop + mobile) has new exports at
+`.local/stitch/84-professional-profile/`. Their `screen.png` files are still `<FIFE Image failed
+to fetch>` placeholders, but their `code.html` is fresh structural evidence that supersedes the
+prior `02-transaction-authority-a/...` paths above; those older rows are retained only for
+historical traceability of the earlier failed renderings. The #84 publication review pair has
+valid rendered PNGs at the new path and supersedes the older rows for pixel-level evidence as
+well. The accompanying `soundhub_design_system/DESIGN.md` at the new path remains supporting
+design-system evidence only; semantic rules in this addendum remain authoritative where they
+differ from its prose (notably the semantic treatment of sea-glass and gold).
+
 The three files at
 `01-product-onboarding/soundhub_design_system/DESIGN.md`,
 `02-transaction-authority-a/soundhub_design_system/DESIGN.md`, and
 `03-transaction-authority-b/soundhub_design_system/DESIGN.md` are byte-identical repeated exports.
-They express one design direction, not three competing systems. Where their prose and frontmatter
-differ, the semantic rules below are authoritative.
+They express one design direction, not three competing systems. The #84 design system evidence
+at `.local/stitch/84-professional-profile/soundhub_design_system/DESIGN.md` shares the same
+aubergine / coral / sea-glass / parchment palette but assigns sea-glass to "verified credentials"
+and gold to "verified creator badges, union endorsements, and mastering credit stamps"; those
+assignments conflict with the semantic rules in _Color foundations and semantic families_ below
+(sea-glass is supporting state, gold is warning-only, neither implies verification). Where their
+prose and frontmatter differ, the semantic rules below are authoritative.
 
 ### Visual character
 

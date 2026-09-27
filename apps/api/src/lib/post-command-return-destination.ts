@@ -91,6 +91,17 @@ const CAPABILITY_GATES: ReadonlyMap<
   ["/deals", new Set<MarketplaceCapabilityV1>(["Buyer", "Seller"])],
   ["/seller-requests", new Set<MarketplaceCapabilityV1>(["Seller"])],
   ["/dashboard/audio", new Set<MarketplaceCapabilityV1>(["Seller"])],
+  // M2 (#84): Professional Profile editor + publication review. The
+  // SellerProfile slice is Personal-Workspace-only AND
+  // Seller-capable. A Buyer-only Workspace returning from a non-#84
+  // command cannot resume the editor under a stale Buyer actor.
+  // Personal-only authorization is enforced at the route layer
+  // (requirePersonalActingMembership); the capability gate here
+  // closes the return-target path so a Buyer returning from intent
+  // selection cannot use `returnTo: "/seller/profile/edit"` to bypass
+  // the route-layer check.
+  ["/seller/profile/edit", new Set<MarketplaceCapabilityV1>(["Seller"])],
+  ["/seller/profile/review", new Set<MarketplaceCapabilityV1>(["Seller"])],
 ]);
 
 export interface ResolveReturnInput {

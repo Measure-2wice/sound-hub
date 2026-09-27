@@ -11,6 +11,7 @@ import { createAudioSamplesRouter } from "./routes/audio-samples.js";
 import { createOfferingCatalogRouter } from "./routes/offering-catalog.js";
 import { createMatchmakerRouter } from "./routes/matchmaker.js";
 import { createIntentRouter } from "./routes/intent.js";
+import { createSellerProfileRouter } from "./routes/seller-profile.js";
 import { PrismaOfferingCatalogRepository } from "./repositories/prisma-offering-catalog.repository.js";
 import { createProjectRequestRouter } from "./routes/project-requests.js";
 import { createDealTermsRouter } from "./routes/deal-terms.js";
@@ -24,6 +25,7 @@ import { AuthenticationService } from "./services/authentication.service.js";
 import { WorkspaceAuthorizationService } from "./services/workspace-authorization.service.js";
 import { PersonalWorkspaceConvergenceService } from "./services/personal-workspace-convergence.service.js";
 import { IntentService } from "./services/intent.service.js";
+import { SellerProfileService } from "./services/seller-profile.service.js";
 import { AudioSampleService } from "./services/audio-sample.service.js";
 import { MatchmakerService } from "./services/matchmaker.service.js";
 import { ProjectRequestService } from "./project-request/project-request.service.js";
@@ -37,7 +39,9 @@ import { PrismaDealTermsRepository } from "./deal-terms/prisma-deal-terms.reposi
 import { DealTermsService } from "./deal-terms/deal-terms.service.js";
 import { PrismaDealListRepository } from "./deal-list/prisma-deal-list.repository.js";
 import { DealListService } from "./deal-list/deal-list.service.js";
+import { PrismaSellerProfileRepository } from "./repositories/prisma-seller-profile.repository.js";
 import type { DealListRepository } from "./deal-list/deal-list.repository.js";
+import type { SellerProfileRepository } from "./repositories/seller-profile.repository.js";
 import type { ProjectBriefRepository } from "./matchmaker/project-brief.repository.js";
 import type { ProjectRequestRepository } from "./project-request/project-request.repository.js";
 import type { MetadataRepository } from "./repositories/metadata.repository.js";
@@ -159,6 +163,20 @@ export interface AppOptions {
    */
   readonly dealListService?: DealListService;
   /**
+   * Override for the SellerProfile service (ticket #84). When
+   * supplied, the composition root does NOT construct the service
+   * from the repository and authorization service; the override is
+   * served directly. Tests inject an in-memory-backed service.
+   */
+  readonly sellerProfileService?: SellerProfileService;
+  /**
+   * Override for the SellerProfile repository (ticket #84). When
+   * supplied, the composition root does NOT construct the Prisma
+   * adapter; the override is served directly. Tests inject the
+   * in-memory adapter.
+   */
+  readonly sellerProfileRepository?: SellerProfileRepository;
+  /**
    * Override for the Personal Workspace convergence service
    * (ticket #82). When supplied, the composition root does NOT
    * construct the service from the auth repository; the override
@@ -202,6 +220,13 @@ export interface BuiltApp {
    * into `createIntentRouter`.
    */
   readonly intentService: IntentService;
+  /**
+   * M2 (#84): SellerProfile service. Composed at the composition
+   * root from the SellerProfile repository and the workspace
+   * authorization service; injected into `createSellerProfileRouter`.
+   */
+  readonly sellerProfileService: SellerProfileService;
+  readonly sellerProfileRepository: SellerProfileRepository;
 }
 
 export function buildApp(options: AppOptions = {}): BuiltApp {
@@ -372,6 +397,21 @@ export function buildApp(options: AppOptions = {}): BuiltApp {
   const dealListService =
     options.dealListService ?? new DealListService({ repository: dealListRepository });
 
+  // M2 (#84): SellerProfile service. Composed from the
+  // SellerProfile repository (Prisma adapter by default; tests
+  // inject the in-memory adapter) and the workspace authorization
+  // service. The SellerProfile repository is the only place that
+  // reads or writes `seller_profiles`, `seller_profile_specialties`,
+  // `caribbean_affiliations`, and `seller_profile_publications`.
+  const sellerProfileRepository =
+    options.sellerProfileRepository ?? new PrismaSellerProfileRepository(prisma);
+  const sellerProfileService =
+    options.sellerProfileService ??
+    new SellerProfileService({
+      repository: sellerProfileRepository,
+      workspaceAuthorizationService,
+    });
+
   const app: Application = express();
   app.disable("x-powered-by");
   app.use(helmet());
@@ -467,6 +507,20 @@ export function buildApp(options: AppOptions = {}): BuiltApp {
       allowedReturnOrigin: process.env.FRONTEND_URL ?? "http://localhost:3000",
     }),
   );
+  // M2 (#84): SellerProfile route family. Mounted at
+  // `/api/workspaces` so the URL path
+  // `/:workspaceId/seller-profile/...` reads the acting Workspace
+  // id directly. The service revalidates current membership +
+  // Seller capability + Personal-Workspace identity via
+  // `WorkspaceAuthorizationService`.
+  app.use(
+    "/api/workspaces",
+    createSellerProfileRouter({
+      service: sellerProfileService,
+      authenticationService,
+      allowedReturnOrigin: process.env.FRONTEND_URL ?? "http://localhost:3000",
+    }),
+  );
   app.use(
     "/api/deals",
     createDealTermsRouter({
@@ -546,6 +600,8 @@ export function buildApp(options: AppOptions = {}): BuiltApp {
     dealListService,
     personalWorkspaceConvergenceService,
     intentService,
+    sellerProfileService,
+    sellerProfileRepository,
   };
 }
 

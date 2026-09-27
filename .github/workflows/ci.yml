@@ -70,6 +70,16 @@ jobs:
       - name: Build shared workspace packages
         run: pnpm --filter @soundhub/types build && pnpm --filter @soundhub/db build
 
+      # `typedRoutes: true` in apps/web/next.config.js makes
+      # `@typescript-eslint/no-unnecessary-type-assertion` sensitive
+      # to whether `.next/types/routes.d.ts` exists. The root
+      # `pnpm lint` and `pnpm type-check` scripts already chain
+      # `pnpm web:typegen` ahead of themselves; this explicit step
+      # documents the dependency for CI readers and protects a fresh
+      # checkout (no prior `next dev`/`next build` artifacts).
+      - name: Generate Next.js route types
+        run: pnpm web:typegen
+
       - name: Format check (Prettier)
         run: pnpm format:check
 

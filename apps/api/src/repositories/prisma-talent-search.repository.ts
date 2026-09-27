@@ -44,9 +44,18 @@ const sellerProfileInclude = {
   },
 } satisfies Prisma.SellerProfileInclude;
 
-type SellerWithRelations = Prisma.SellerProfileGetPayload<{
-  include: typeof sellerProfileInclude;
-}>;
+type SellerWithRelations = Omit<
+  Prisma.SellerProfileGetPayload<{ include: typeof sellerProfileInclude }>,
+  "basedInCountryCode"
+> & {
+  // A Published profile always carries a non-null countryCode (the
+  // publish STRICT schema enforces it). The DB column is nullable
+  // for Drafts, but the `search` query excludes null countryCodes
+  // at the WHERE clause; this wrapper row lets us read the field
+  // as `string` inside the adapter without changing the public
+  // repository contract.
+  readonly basedInCountryCode: string;
+};
 
 export class PrismaTalentSearchRepository implements TalentSearchRepository {
   constructor(private readonly prisma: PrismaClient) {}
@@ -58,7 +67,19 @@ export class PrismaTalentSearchRepository implements TalentSearchRepository {
       orderBy: [{ id: "asc" }],
     });
 
-    return sellers
+    // The Prisma `basedInCountryCode: { not: null }` filter narrows
+    // the row at runtime, but Prisma 7's type generator does not
+    // propagate that narrowing into the row payload. Cast through
+    // `string` defensively — the publish STRICT schema and the
+    // `not: null` filter together make a Published-seller row with
+    // a null countryCode impossible.
+    return (
+      sellers as ReadonlyArray<
+        Omit<(typeof sellers)[number], "basedInCountryCode"> & {
+          basedInCountryCode: string;
+        }
+      >
+    )
       .map((seller) => this.toCandidate(seller, input))
       .filter((seller) => seller.offerings.length > 0);
   }
@@ -89,6 +110,12 @@ export class PrismaTalentSearchRepository implements TalentSearchRepository {
 
     return {
       status: SellerProfileStatus.Published,
+      // A Published profile ALWAYS carries a non-null
+      // basedInCountryCode (the publish STRICT schema enforces
+      // it). Filter the null case here so TypeScript narrows the
+      // `string | null` Prisma row to `string` at the read site
+      // without requiring a non-null assertion.
+      basedInCountryCode: { not: null },
       workspace: { is: workspaceWhere },
     };
   }
