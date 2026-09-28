@@ -582,3 +582,146 @@ void test("Draft resume via saveDraft + findForOwner preserves the public Pricin
     "Draft resume must surface the public PricingUnit.key (per-track), not the FK cuid",
   );
 });
+
+// Codex/Tenki Blocker 1 — idempotent activation retry must
+// surface the SAME valid owner-view sample playback URLs as the
+// successful first activation path.
+//
+// The previous retry branch called `toOwnerView` without the
+// `playbackUrlFor` resolver; the helper's `?? ""` fallback then
+// produced an empty-string `playbackUrl` per sample, which
+// fails the `z.string().url()` schema on
+// `serviceOfferingOwnerViewV1Schema` and surfaces as a 500
+// even though activation already succeeded. This test
+// reproduces that exact sequence at the real repository
+// boundary so a future regression that drops the resolver on
+// the retry path fails this suite.
+void test("idempotent activation retry returns a valid sample playbackUrl (the retry cannot 500)", async () => {
+  const fixture = await loadFixture();
+  await cleanTestRows();
+  const id = "of_test_retry_playback";
+  await seedOffering({ id, fixture });
+
+  // Seed a CONFIRMED Live sample so the activation
+  // completeness check (which requires ≥ 1 sample) passes.
+  await prisma.serviceOfferingAudioSample.create({
+    data: {
+      offeringId: id,
+      label: "Retry Demo",
+      contentType: "audio/mpeg",
+      byteSize: 4096,
+      displayOrder: 1,
+      storageRef: "ref://retry-demo",
+      cleanupStatus: "Live",
+      confirmationVersion: SERVICE_OFFERING_AUDIO_MEDIA_CONFIRMATION_VERSIONS[0],
+      confirmedByUserId: fixture.userId,
+      confirmedAt: new Date(),
+    },
+  });
+
+  const idempotencyKey = "00000000-0000-4000-8000-000000000001";
+  const requestId = `req-retry-playback-${id}`;
+  const baseInput = {
+    offeringId: id,
+    workspaceId: fixture.workspaceId,
+    sellerProfileId: fixture.sellerProfileId,
+    activatedByUserId: fixture.userId,
+    title: "Haitian dancehall production",
+    description: "Description",
+    primaryCategoryKey: "music-production",
+    serviceMode: "Remote" as const,
+    serviceAreas: [],
+    pricing: {
+      kind: "StartingAt" as const,
+      amountMinor: 60000,
+      currency: "USD",
+      unitId: "per-track",
+    },
+    genreTags: [],
+    includedServiceCategoryKeys: [],
+    confirmationVersion: "m2-service-activation-v1" as const,
+    idempotencyKey,
+    requestId,
+    playbackUrlFor: PLAYBACK,
+    now: new Date(),
+  };
+
+  // First activation: creates the ServiceOfferingActivation
+  // evidence row and transitions Draft → Active.
+  const first = await repo.activate(baseInput);
+  assert.equal(first.convergedFromExistingActivation, false);
+  assert.equal(first.offering.status, "Active");
+  assert.equal(first.offering.samples.length, 1, "first activation must surface the seeded sample");
+  assert.notEqual(
+    first.offering.samples[0]?.playbackUrl,
+    "",
+    "first activation must surface a non-empty playbackUrl",
+  );
+  // z.string().url() — round-trip through the runtime URL
+  // parser proves the value satisfies the DTO schema's URL
+  // invariant (not just a non-empty string).
+  assert.doesNotThrow(
+    () => new URL(first.offering.samples[0]!.playbackUrl),
+    "first activation playbackUrl must parse as a URL",
+  );
+
+  // Idempotent retry: same offeringId + same idempotencyKey.
+  // The pre-check converges on the existing activation row.
+  const retry = await repo.activate(baseInput);
+  assert.equal(retry.convergedFromExistingActivation, true);
+  assert.equal(retry.offering.status, "Active");
+  assert.deepEqual(retry.evidence, first.evidence);
+  // The retry MUST surface the same non-empty, URL-valid
+  // playbackUrl per sample (this is what the route response
+  // validates against `z.string().url()`).
+  assert.equal(retry.offering.samples.length, 1, "retry must surface the seeded sample");
+  const retryPlaybackUrl = retry.offering.samples[0]?.playbackUrl;
+  assert.ok(retryPlaybackUrl, "retry must surface a non-empty playbackUrl");
+  assert.notEqual(retryPlaybackUrl, "", "retry playbackUrl must NOT be the empty-string fallback");
+  assert.doesNotThrow(
+    () => new URL(retryPlaybackUrl),
+    "retry playbackUrl must parse as a URL (z.string().url() invariant)",
+  );
+  assert.equal(
+    retryPlaybackUrl,
+    first.offering.samples[0]?.playbackUrl,
+    "retry must surface the SAME playbackUrl as the first activation",
+  );
+
+  // No duplicate activation evidence row — the (offeringId,
+  // idempotencyKey) unique index converged on the first row.
+  const evidenceCount = await prisma.serviceOfferingActivation.count({
+    where: { offeringId: id },
+  });
+  assert.equal(
+    evidenceCount,
+    1,
+    "idempotent retry must not insert a duplicate activation evidence row",
+  );
+
+  // Round-trip through the actual activation RESPONSE schema
+  // (the route layer) after the service-layer Date→ISOString
+  // conversion that `toResponseOwnerView` performs. If
+  // `playbackUrl` were empty (or any other field malformed),
+  // `serviceOfferingActivationResponseV1Schema.parse` would
+  // throw — this is the exact failure mode that would surface
+  // as a 500 in production.
+  const { serviceOfferingActivationResponseV1Schema } = await import("@soundhub/types");
+  const response = {
+    ok: true as const,
+    offering: {
+      ...retry.offering,
+      activatedAt: retry.offering.activatedAt ? retry.offering.activatedAt.toISOString() : null,
+    },
+    evidence: {
+      ...retry.evidence,
+      activatedAt: retry.evidence.activatedAt.toISOString(),
+    },
+    returnTo: null,
+    safeReturnTo: null,
+  };
+  assert.doesNotThrow(
+    () => serviceOfferingActivationResponseV1Schema.parse(response),
+    "idempotent activation retry response must parse through serviceOfferingActivationResponseV1Schema (would otherwise 500)",
+  );
+});

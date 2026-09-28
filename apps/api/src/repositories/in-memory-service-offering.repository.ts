@@ -613,6 +613,24 @@ export class InMemoryServiceOfferingRepository implements ServiceOfferingReposit
     });
   }
 
+  /**
+   * Codex/Tenki Blocker 2 — test-only accessor that returns the
+   * stored activation evidence rows for an offering, so the
+   * regression suite can assert that the internal
+   * `activatedByUserId` is still recorded (NOT leaked through
+   * `activatedByDisplayName`). Production code MUST use the
+   * repository's read methods; this accessor exists for the
+   * `in-memory-service-offering.repository.test.ts` invariant
+   * that the OwnerView never serializes the raw user id.
+   */
+  _activationsForTest(offeringId: string): readonly StoredActivation[] {
+    const matches: StoredActivation[] = [];
+    for (const a of this.activationsByOfferingIdem.values()) {
+      if (a.offeringId === offeringId) matches.push(a);
+    }
+    return matches;
+  }
+
   private toOwnerView(
     row: StoredOffering,
     playbackUrlFor?: (input: { offeringId: string; sampleId: string }) => string,
@@ -672,7 +690,21 @@ export class InMemoryServiceOfferingRepository implements ServiceOfferingReposit
       includedServiceCategoryKeys: [...row.includedServiceCategoryKeys],
       samples,
       activatedAt: row.activatedAt,
-      activatedByDisplayName: row.activatedByUserId,
+      // Codex/Tenki Blocker 2 — the in-memory adapter's
+      // stored activation row records the internal actor
+      // (`activatedByUserId`) for authorization / evidence,
+      // but the in-memory store has no human-readable
+      // display value to resolve. Returning the raw user ID
+      // here would leak an internal identifier through a
+      // human-facing DTO field and diverge from the Prisma
+      // adapter (which resolves the related `UserAccount.email`
+      // via the OFFERING_INCLUDE join). Contract-consistent
+      // parity with Prisma: return `null` rather than
+      // inventing a display value or leaking the internal
+      // identifier. `activatedByUserId` remains available
+      // internally on `StoredActivation` for authorization /
+      // audit and is never serialized to the OwnerView.
+      activatedByDisplayName: null,
     };
   }
 }

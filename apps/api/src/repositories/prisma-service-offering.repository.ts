@@ -482,10 +482,27 @@ export class PrismaServiceOfferingRepository implements ServiceOfferingRepositor
           throw new ServiceOfferingNotFoundError(input.offeringId);
         }
         return {
-          offering: toOwnerView(existingOffering, {
-            workspaceId: existingOffering.sellerProfile.workspaceId,
-            sellerProfileId: existingOffering.sellerProfile.id,
-          }),
+          // Codex/Tenki Blocker 1 — idempotent activation retry
+          // must surface the SAME valid owner-view sample
+          // playback URLs as the successful first activation
+          // path. The retry previously called `toOwnerView`
+          // without the `playbackUrlFor` resolver; the helper's
+          // `?? ""` fallback then produced an empty-string
+          // `playbackUrl` per sample, which fails the
+          // `z.string().url()` schema on the activation response
+          // DTO (`serviceOfferingOwnerViewV1Schema`) and surfaces
+          // as a 500 even though activation already succeeded.
+          // The resolver is contract-required for ANY
+          // owner-view return path; the retry branch is no
+          // exception.
+          offering: toOwnerView(
+            existingOffering,
+            {
+              workspaceId: existingOffering.sellerProfile.workspaceId,
+              sellerProfileId: existingOffering.sellerProfile.id,
+            },
+            input.playbackUrlFor,
+          ),
           evidence: toEvidenceView(existingActivation),
           convergedFromExistingActivation: true,
         };
