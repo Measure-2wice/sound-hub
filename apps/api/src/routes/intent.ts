@@ -94,9 +94,18 @@ export function createIntentRouter(deps: IntentRouteDeps): Router {
   // code as the auth surface — the safe envelope does not
   // distinguish intent from auth at the malformed-body layer
   // because both are domain-validated request surfaces).
-  router.use(parseIntentRequestBody);
-
-  router.post("/:workspaceId/intent", (req, res, next) => {
+  //
+  // M2 (#85) PR-review feedback (round 4): the body parser is
+  // attached as per-route middleware (NOT as `router.use(...)`)
+  // so it only fires for the POST `/:workspaceId/intent`
+  // route. Mounting it as router-wide middleware caused it to
+  // short-circuit any sibling router mounted under
+  // `/api/workspaces` (e.g. the ServiceOffering router) when
+  // the request body was malformed — the parser wrote
+  // INTENT_INVALID to the response and destroyed the request
+  // before the ServiceOffering handler could surface its own
+  // SERVICE_OFFERING_INVALID code.
+  router.post("/:workspaceId/intent", parseIntentRequestBody, (req, res, next) => {
     handleIntent(req, res, deps).catch((err: unknown) => {
       if (res.headersSent) return;
       next(err);

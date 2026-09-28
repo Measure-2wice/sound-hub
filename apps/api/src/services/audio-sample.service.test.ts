@@ -41,6 +41,7 @@ const OFFERING_ID = "of-active";
 const DUAL_OFFERING_ID = "of-dual-seller";
 const DRAFT_OFFERING_ID = "of-draft";
 const SUSPENDED_OFFERING_ID = "of-suspended";
+const ARCHIVED_OFFERING_ID = "of-archived";
 
 const ONE_MB = 1024 * 1024;
 
@@ -196,6 +197,8 @@ describe("AudioSampleService", () => {
       contentType: "audio/mpeg",
       byteSize: 1024,
       bytes: mp3Bytes(1024),
+
+      mediaUseConfirmation: { version: "m2-audio-confirmation-v1", confirmedAt: new Date() },
     });
     assert.equal(uploaded.sample.label, "Sample 1");
     assert.equal(uploaded.sample.byteSize, 1024);
@@ -250,6 +253,8 @@ describe("AudioSampleService", () => {
           contentType: "audio/mpeg",
           byteSize: 1024,
           bytes: mp3Bytes(1024),
+
+          mediaUseConfirmation: { version: "m2-audio-confirmation-v1", confirmedAt: new Date() },
         }),
       (err: unknown) => err instanceof AudioSampleError && err.code === "AUDIO_OFFERING_INELIGIBLE",
     );
@@ -279,6 +284,8 @@ describe("AudioSampleService", () => {
           contentType: "audio/mpeg",
           byteSize: 1024,
           bytes: mp3Bytes(1024),
+
+          mediaUseConfirmation: { version: "m2-audio-confirmation-v1", confirmedAt: new Date() },
         }),
       (err: unknown) => err instanceof AudioSampleError && err.code === "AUDIO_OFFERING_INELIGIBLE",
     );
@@ -292,6 +299,8 @@ describe("AudioSampleService", () => {
       contentType: "audio/mpeg",
       byteSize: 1024,
       bytes: mp3Bytes(1024),
+
+      mediaUseConfirmation: { version: "m2-audio-confirmation-v1", confirmedAt: new Date() },
     });
     assert.ok(ok.sample.playbackUrl);
   });
@@ -322,6 +331,8 @@ describe("AudioSampleService", () => {
           contentType: "audio/mpeg",
           byteSize: 1024,
           bytes: mp3Bytes(1024),
+
+          mediaUseConfirmation: { version: "m2-audio-confirmation-v1", confirmedAt: new Date() },
         }),
       (err: unknown) => err instanceof AudioSampleError && err.code === "AUDIO_OFFERING_INELIGIBLE",
     );
@@ -340,6 +351,8 @@ describe("AudioSampleService", () => {
         contentType: "audio/mpeg",
         byteSize: 1024,
         bytes: mp3Bytes(1024),
+
+        mediaUseConfirmation: { version: "m2-audio-confirmation-v1", confirmedAt: new Date() },
       });
     }
     await assert.rejects(
@@ -352,6 +365,8 @@ describe("AudioSampleService", () => {
           contentType: "audio/mpeg",
           byteSize: 1024,
           bytes: mp3Bytes(1024),
+
+          mediaUseConfirmation: { version: "m2-audio-confirmation-v1", confirmedAt: new Date() },
         }),
       (err: unknown) =>
         err instanceof AudioSampleError && err.code === "AUDIO_SAMPLE_LIMIT_EXCEEDED",
@@ -372,6 +387,8 @@ describe("AudioSampleService", () => {
           contentType: "audio/wav",
           byteSize: 1024,
           bytes: mp3Bytes(1024),
+
+          mediaUseConfirmation: { version: "m2-audio-confirmation-v1", confirmedAt: new Date() },
         }),
       (err: unknown) =>
         err instanceof AudioSampleError && err.code === "AUDIO_CONTENT_TYPE_UNSUPPORTED",
@@ -393,28 +410,36 @@ describe("AudioSampleService", () => {
           contentType: "audio/mpeg",
           byteSize: oversize,
           bytes: mp3Bytes(oversize),
+
+          mediaUseConfirmation: { version: "m2-audio-confirmation-v1", confirmedAt: new Date() },
         }),
       (err: unknown) => err instanceof AudioSampleError && err.code === "AUDIO_PAYLOAD_TOO_LARGE",
     );
   });
 
-  test("a draft offering cannot carry discovery samples (GS 10)", async () => {
+  test("M2 (#85): a draft offering's owner can carry discovery samples (Draft seller-side audio allowed)", async () => {
+    // The #85 acceptance criteria require the seller to be able to
+    // upload, list, privately preview, and remove MP3 samples on
+    // their own Draft offering. The buyer-side listSamplesForBuyer
+    // and the play route remain gated on Active + Published +
+    // Active Workspace + Seller capability; this test covers the
+    // seller-side upload path only.
     const storage = new DeterministicStorageAdapter();
     const repo = makeAudioRepo();
     const service = buildService(repo, storage);
-    await assert.rejects(
-      () =>
-        service.uploadSample({
-          userAccountId: SELLER_USER,
-          offeringId: DRAFT_OFFERING_ID,
-          actingWorkspaceId: SELLER_WORKSPACE,
-          label: "Draft",
-          contentType: "audio/mpeg",
-          byteSize: 1024,
-          bytes: mp3Bytes(1024),
-        }),
-      (err: unknown) => err instanceof AudioSampleError && err.code === "AUDIO_OFFERING_INELIGIBLE",
-    );
+    const result = await service.uploadSample({
+      userAccountId: SELLER_USER,
+      offeringId: DRAFT_OFFERING_ID,
+      actingWorkspaceId: SELLER_WORKSPACE,
+      label: "Draft sample",
+      contentType: "audio/mpeg",
+      byteSize: 1024,
+      bytes: mp3Bytes(1024),
+
+      mediaUseConfirmation: { version: "m2-audio-confirmation-v1", confirmedAt: new Date() },
+    });
+    assert.ok(result.sample.sampleId.length > 0);
+    assert.equal(result.sample.offeringId, DRAFT_OFFERING_ID);
   });
 
   test("a suspended profile offering cannot carry discovery samples (GS 10)", async () => {
@@ -431,6 +456,41 @@ describe("AudioSampleService", () => {
           contentType: "audio/mpeg",
           byteSize: 1024,
           bytes: mp3Bytes(1024),
+
+          mediaUseConfirmation: { version: "m2-audio-confirmation-v1", confirmedAt: new Date() },
+        }),
+      (err: unknown) => err instanceof AudioSampleError && err.code === "AUDIO_OFFERING_INELIGIBLE",
+    );
+  });
+
+  test("M2 (#85): an archived offering cannot carry discovery samples (Archived remains rejected)", async () => {
+    const storage = new DeterministicStorageAdapter();
+    const repo = new InMemoryAudioRepository({
+      offerings: [
+        {
+          offeringId: ARCHIVED_OFFERING_ID,
+          offeringStatus: "Archived",
+          sellerProfileStatus: "Published",
+          sellerWorkspaceId: SELLER_WORKSPACE,
+          sellerWorkspaceStatus: "Active",
+          hasSellerCapability: true,
+          title: "Archived offering",
+        },
+      ],
+    });
+    const service = buildService(repo, storage);
+    await assert.rejects(
+      () =>
+        service.uploadSample({
+          userAccountId: SELLER_USER,
+          offeringId: ARCHIVED_OFFERING_ID,
+          actingWorkspaceId: SELLER_WORKSPACE,
+          label: "Archived",
+          contentType: "audio/mpeg",
+          byteSize: 1024,
+          bytes: mp3Bytes(1024),
+
+          mediaUseConfirmation: { version: "m2-audio-confirmation-v1", confirmedAt: new Date() },
         }),
       (err: unknown) => err instanceof AudioSampleError && err.code === "AUDIO_OFFERING_INELIGIBLE",
     );
@@ -448,6 +508,8 @@ describe("AudioSampleService", () => {
       contentType: "audio/mpeg",
       byteSize: 1024,
       bytes: mp3Bytes(1024),
+
+      mediaUseConfirmation: { version: "m2-audio-confirmation-v1", confirmedAt: new Date() },
     });
     const before = await service.listSamplesForBuyer(OFFERING_ID);
     assert.equal(before.samples.length, 1);
@@ -504,6 +566,8 @@ describe("AudioSampleService", () => {
           contentType: "audio/mpeg",
           byteSize: 1024,
           bytes: mp3Bytes(1024),
+
+          mediaUseConfirmation: { version: "m2-audio-confirmation-v1", confirmedAt: new Date() },
         }),
       (err: unknown) =>
         err instanceof AudioSampleError && err.code === "AUDIO_PROVIDER_UNAVAILABLE",
@@ -543,6 +607,8 @@ describe("AudioSampleService", () => {
           contentType: "audio/mpeg",
           byteSize: 1024,
           bytes: mp3Bytes(1024),
+
+          mediaUseConfirmation: { version: "m2-audio-confirmation-v1", confirmedAt: new Date() },
         }),
       (err: unknown) =>
         err instanceof AudioSampleError && err.code === "AUDIO_CONTENT_TYPE_UNSUPPORTED",
@@ -561,6 +627,8 @@ describe("AudioSampleService", () => {
       contentType: "audio/mpeg",
       byteSize: 1024,
       bytes: mp3Bytes(1024),
+
+      mediaUseConfirmation: { version: "m2-audio-confirmation-v1", confirmedAt: new Date() },
     });
     assert.equal(a.sample.displayOrder, 1);
     const b = await service.uploadSample({
@@ -571,6 +639,8 @@ describe("AudioSampleService", () => {
       contentType: "audio/mpeg",
       byteSize: 1024,
       bytes: mp3Bytes(1024),
+
+      mediaUseConfirmation: { version: "m2-audio-confirmation-v1", confirmedAt: new Date() },
     });
     assert.equal(b.sample.displayOrder, 2);
     await service.removeSample({
@@ -587,6 +657,8 @@ describe("AudioSampleService", () => {
       contentType: "audio/mpeg",
       byteSize: 1024,
       bytes: mp3Bytes(1024),
+
+      mediaUseConfirmation: { version: "m2-audio-confirmation-v1", confirmedAt: new Date() },
     });
     assert.equal(c.sample.displayOrder, 1);
   });
@@ -603,6 +675,8 @@ describe("AudioSampleService", () => {
       contentType: "audio/mpeg",
       byteSize: 1024,
       bytes: mp3Bytes(1024),
+
+      mediaUseConfirmation: { version: "m2-audio-confirmation-v1", confirmedAt: new Date() },
     });
     const list = await service.listSamplesForBuyer(OFFERING_ID);
     assert.equal(list.samples.length, 1);
@@ -631,6 +705,8 @@ describe("AudioSampleService", () => {
           contentType: "audio/mpeg",
           byteSize: 1024,
           bytes: mp3Bytes(1024),
+
+          mediaUseConfirmation: { version: "m2-audio-confirmation-v1", confirmedAt: new Date() },
         }),
       (err: unknown) => err instanceof AudioSampleError && err.code === "INVALID_AUTH_REQUEST",
     );
@@ -654,6 +730,8 @@ describe("AudioSampleService", () => {
           contentType: "audio/mpeg",
           byteSize: textBytes.length,
           bytes: textBytes,
+
+          mediaUseConfirmation: { version: "m2-audio-confirmation-v1", confirmedAt: new Date() },
         }),
       (err: unknown) =>
         err instanceof AudioSampleError && err.code === "AUDIO_CONTENT_TYPE_UNSUPPORTED",
@@ -686,6 +764,8 @@ describe("AudioSampleService", () => {
       contentType: "audio/mpeg",
       byteSize: frame.length,
       bytes: frame,
+
+      mediaUseConfirmation: { version: "m2-audio-confirmation-v1", confirmedAt: new Date() },
     });
     assert.ok(uploaded.sample);
   });
@@ -715,6 +795,8 @@ describe("AudioSampleService", () => {
       contentType: "audio/mpeg",
       byteSize: frame.length,
       bytes: frame,
+
+      mediaUseConfirmation: { version: "m2-audio-confirmation-v1", confirmedAt: new Date() },
     });
     assert.ok(uploaded.sample);
   });
@@ -737,6 +819,8 @@ describe("AudioSampleService", () => {
           contentType: "audio/mpeg",
           byteSize: empty.length,
           bytes: empty,
+
+          mediaUseConfirmation: { version: "m2-audio-confirmation-v1", confirmedAt: new Date() },
         }),
       (err: unknown) =>
         err instanceof AudioSampleError && err.code === "AUDIO_CONTENT_TYPE_UNSUPPORTED",
@@ -760,6 +844,8 @@ describe("AudioSampleService", () => {
           contentType: "audio/mpeg",
           byteSize: invalid.length,
           bytes: invalid,
+
+          mediaUseConfirmation: { version: "m2-audio-confirmation-v1", confirmedAt: new Date() },
         }),
       (err: unknown) =>
         err instanceof AudioSampleError && err.code === "AUDIO_CONTENT_TYPE_UNSUPPORTED",
@@ -788,6 +874,8 @@ describe("AudioSampleService", () => {
           contentType: "audio/mpeg",
           byteSize: truncated.length,
           bytes: truncated,
+
+          mediaUseConfirmation: { version: "m2-audio-confirmation-v1", confirmedAt: new Date() },
         }),
       (err: unknown) =>
         err instanceof AudioSampleError && err.code === "AUDIO_CONTENT_TYPE_UNSUPPORTED",
@@ -815,6 +903,8 @@ describe("AudioSampleService", () => {
           contentType: "audio/mpeg",
           byteSize: layer2.length,
           bytes: layer2,
+
+          mediaUseConfirmation: { version: "m2-audio-confirmation-v1", confirmedAt: new Date() },
         }),
       (err: unknown) =>
         err instanceof AudioSampleError && err.code === "AUDIO_CONTENT_TYPE_UNSUPPORTED",
@@ -844,6 +934,8 @@ describe("AudioSampleService", () => {
           contentType: "audio/mpeg",
           byteSize: truncated.length,
           bytes: truncated,
+
+          mediaUseConfirmation: { version: "m2-audio-confirmation-v1", confirmedAt: new Date() },
         }),
       (err: unknown) =>
         err instanceof AudioSampleError && err.code === "AUDIO_CONTENT_TYPE_UNSUPPORTED",
@@ -871,6 +963,8 @@ describe("AudioSampleService", () => {
       contentType: "audio/mpeg",
       byteSize: mpeg2Frame.length,
       bytes: mpeg2Frame,
+
+      mediaUseConfirmation: { version: "m2-audio-confirmation-v1", confirmedAt: new Date() },
     });
     assert.ok(uploaded.sample);
   });
@@ -896,6 +990,8 @@ describe("AudioSampleService", () => {
           contentType: "audio/mpeg",
           byteSize: truncated.length,
           bytes: truncated,
+
+          mediaUseConfirmation: { version: "m2-audio-confirmation-v1", confirmedAt: new Date() },
         }),
       (err: unknown) =>
         err instanceof AudioSampleError && err.code === "AUDIO_CONTENT_TYPE_UNSUPPORTED",
@@ -916,6 +1012,8 @@ describe("AudioSampleService", () => {
         contentType: "audio/mpeg",
         byteSize: 1024,
         bytes: mp3Bytes(1024),
+
+        mediaUseConfirmation: { version: "m2-audio-confirmation-v1", confirmedAt: new Date() },
       });
     }
     const mp3 = (): Uint8Array => mp3Bytes(512);
@@ -930,6 +1028,8 @@ describe("AudioSampleService", () => {
         contentType: "audio/mpeg",
         byteSize: 512,
         bytes: mp3(),
+
+        mediaUseConfirmation: { version: "m2-audio-confirmation-v1", confirmedAt: new Date() },
       }),
       service.uploadSample({
         userAccountId: SELLER_USER,
@@ -939,6 +1039,8 @@ describe("AudioSampleService", () => {
         contentType: "audio/mpeg",
         byteSize: 512,
         bytes: mp3(),
+
+        mediaUseConfirmation: { version: "m2-audio-confirmation-v1", confirmedAt: new Date() },
       }),
     ]);
     const fulfilled = results.filter((r) => r.status === "fulfilled");
@@ -1012,6 +1114,8 @@ describe("AudioSampleService", () => {
         contentType: "audio/mpeg",
         byteSize: 512,
         bytes: mp3Bytes(512),
+
+        mediaUseConfirmation: { version: "m2-audio-confirmation-v1", confirmedAt: new Date() },
       });
     }
     assert.equal(uploadCalls.length, 3, "three uploads = three storage calls");
@@ -1026,6 +1130,8 @@ describe("AudioSampleService", () => {
           contentType: "audio/mpeg",
           byteSize: 512,
           bytes: mp3Bytes(512),
+
+          mediaUseConfirmation: { version: "m2-audio-confirmation-v1", confirmedAt: new Date() },
         }),
       (err: unknown) =>
         err instanceof AudioSampleError && err.code === "AUDIO_SAMPLE_LIMIT_EXCEEDED",
@@ -1097,6 +1203,8 @@ describe("AudioSampleService", () => {
         contentType: "audio/mpeg",
         byteSize: 512,
         bytes: mp3Bytes(512),
+
+        mediaUseConfirmation: { version: "m2-audio-confirmation-v1", confirmedAt: new Date() },
       }),
     );
     assert.equal(
@@ -1169,6 +1277,8 @@ describe("AudioSampleService", () => {
         contentType: "audio/mpeg",
         byteSize: 512,
         bytes: mp3Bytes(512),
+
+        mediaUseConfirmation: { version: "m2-audio-confirmation-v1", confirmedAt: new Date() },
       }),
     );
     // Exactly one immediate remove attempt; it failed because the
@@ -1253,6 +1363,8 @@ describe("AudioSampleService", () => {
       contentType: "audio/mpeg",
       byteSize: 512,
       bytes: mp3Bytes(512),
+
+      mediaUseConfirmation: { version: "m2-audio-confirmation-v1", confirmedAt: new Date() },
     });
     await assert.rejects(
       () =>
@@ -1351,6 +1463,8 @@ describe("AudioSampleService", () => {
       contentType: "audio/mpeg",
       byteSize: 512,
       bytes: mp3Bytes(512),
+
+      mediaUseConfirmation: { version: "m2-audio-confirmation-v1", confirmedAt: new Date() },
     });
     await assert.rejects(
       () =>
@@ -1397,6 +1511,8 @@ describe("AudioSampleService", () => {
       contentType: "audio/mpeg",
       byteSize: 512,
       bytes: mp3Bytes(512),
+
+      mediaUseConfirmation: { version: "m2-audio-confirmation-v1", confirmedAt: new Date() },
     });
     const url = uploaded.sample.playbackUrl;
     assert.ok(url.startsWith("http://api.example.test/api/services/"));
@@ -1420,6 +1536,8 @@ describe("AudioSampleService", () => {
       contentType: "audio/mpeg",
       byteSize: 512,
       bytes: mp3Bytes(512),
+
+      mediaUseConfirmation: { version: "m2-audio-confirmation-v1", confirmedAt: new Date() },
     });
     const playback = await service.getBytesForPlayback({
       offeringId: OFFERING_ID,
@@ -1438,5 +1556,38 @@ describe("AudioSampleService", () => {
       sampleId: uploaded.sample.sampleId,
     });
     assert.equal(after, null, "playback route returns null after removal");
+  });
+
+  test("M2 (#85) PR-review feedback round 2: a Live sample whose confirmation is null still surfaces on the buyer-side list (legacy grandfathering)", async () => {
+    // The migration intentionally leaves the confirmation columns
+    // null for samples persisted before the M2 schema change.
+    // Such a sample must NOT crash `listSamplesForBuyer` (which
+    // maps every Live sample through `toPublicAudioSample`); the
+    // mapper now emits the sample WITHOUT a `confirmation` field
+    // so a buyer can still see and play the legacy audio. The
+    // activation gate (the `countLiveConfirmedSamples` predicate
+    // on `prisma-service-offering.repository`) separately filters
+    // these rows out of activation eligibility.
+    const repo = makeAudioRepo();
+    const storage = new DeterministicStorageAdapter();
+    const service = buildService(repo, storage);
+    repo._seedLegacyLiveSample({
+      offeringId: OFFERING_ID,
+      sampleId: "smp-legacy-no-confirmation",
+      label: "Legacy sample (pre-M2)",
+      byteSize: 1024,
+      displayOrder: 1,
+      storageRef: "det:test:prisma:legacy-no-confirmation",
+    });
+    const list = await service.listSamplesForBuyer(OFFERING_ID);
+    assert.equal(list.samples.length, 1, "legacy Live sample still appears on the buyer list");
+    const sample = list.samples[0]!;
+    assert.equal(sample.sampleId, "smp-legacy-no-confirmation");
+    assert.equal(
+      sample.confirmation,
+      undefined,
+      "legacy sample carries no `confirmation` field in the public DTO",
+    );
+    assert.ok(sample.playbackUrl, "legacy sample still has a playable URL");
   });
 });

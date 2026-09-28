@@ -12,7 +12,7 @@
 // The recommendation DTO does NOT carry audio metadata — fetching
 // here keeps the M1 search surface decoupled from BG2 storage.
 
-import { listOfferingSamples } from "./audio-samples-client";
+import { listOfferingSamplesPublic } from "./audio-samples-client";
 
 export interface RecommendationAudioPreview {
   readonly offeringId: string;
@@ -33,7 +33,7 @@ export interface RecommendationAudioPreview {
 export async function fetchRecommendationAudioPreview(
   offeringId: string,
 ): Promise<RecommendationAudioPreview | null> {
-  const response = await listOfferingSamples(offeringId);
+  const response = await listOfferingSamplesPublic(offeringId);
   if (response.samples.length === 0) return null;
   const first = response.samples[0]!;
   return {

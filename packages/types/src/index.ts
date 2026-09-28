@@ -569,6 +569,31 @@ export const apiErrorCodeV1Schema = z.enum([
   "SELLER_PROFILE_NOT_DRAFT",
   "SELLER_PROFILE_NOT_PUBLISHED",
   "SELLER_PROFILE_INTERNAL_FAILED",
+  // M2 (#85): ServiceOffering creation / draft / activate surface.
+  // Mirrors the #84 pattern: 400 for malformed bodies (including
+  // missing/invalid `idempotencyKey`), 403 for authorization
+  // rejections (Personal-Workspace-only AND Seller-capable AND the
+  // SellerProfile is Published; non-current members, suspended
+  // Workspaces, and unactivated SellerProfiles collapse to the safe
+  // envelope), 404 for missing offering rows on read, 409 for
+  // not-Draft-on-activate / already-Active, 422 for incomplete
+  // activation payload (semantic-but-well-formed rejection; the
+  // safe envelope carries `fields` for the multi-error summary),
+  // 500 for unexpected internal failures.
+  "SERVICE_OFFERING_INVALID",
+  "SERVICE_OFFERING_FORBIDDEN",
+  "SERVICE_OFFERING_NOT_FOUND",
+  "SERVICE_OFFERING_INCOMPLETE",
+  "SERVICE_OFFERING_NOT_DRAFT",
+  "SERVICE_OFFERING_ALREADY_ACTIVE",
+  "SERVICE_OFFERING_SELLER_PROFILE_NOT_PUBLISHED",
+  // M2 (#85) PR-review feedback: the application boundary now
+  // requires an explicit media-use confirmation version on every
+  // audio upload. A missing or unknown version collapses to this
+  // 400 — a 422 (semantic) would be misleading because the
+  // request is structurally incomplete without the field.
+  "AUDIO_SAMPLE_MEDIA_CONFIRMATION_REQUIRED",
+  "SERVICE_OFFERING_INTERNAL_FAILED",
 ]);
 export type ApiErrorCodeV1 = z.infer<typeof apiErrorCodeV1Schema>;
 
@@ -996,6 +1021,354 @@ export const sellerProfileGetResponseV1Schema = z
   })
   .strict();
 export type SellerProfileGetResponseV1 = z.infer<typeof sellerProfileGetResponseV1Schema>;
+
+// ===========================================================================
+// Milestone 2 (#85): ServiceOffering creation / draft / activate surface.
+//
+// The schemas below cover the seller-facing Private-draft authoring surface:
+// lazy first-save, resume / update-draft, explicit activate, and the
+// editor / review on-mount read. The browser NEVER holds a second list of
+// ServiceCategory / PricingUnit / IncludedService keys — the metadata seam
+// (see serviceOfferingTaxonomyResponseV1Schema below and the
+// GET /api/metadata/service-offering-taxonomy route) is the only source of
+// truth.
+//
+// Body validation follows the same patterns as the v1 search contract and
+// the BG1 runtime contracts: shared Zod is the executable contract;
+// TypeScript types are inferred from it; the same schema is consumed by
+// the Express route validator and the browser response parser. `.strict()`
+// rejects unknown fields. No Prisma model or raw storage reference ever
+// crosses a public DTO.
+// ===========================================================================
+
+// ---------- ServiceOffering drafts: lazy first-save / resume / update ----------
+//
+// The draft schema is RELAXED — every field is optional — so a partial
+// first-save does not silently fabricate a value the seller never chose
+// (the same lazy-first-save rule that the #84 draft schema applies).
+// Activate requires the STRICT complete payload below.
+
+// RELAXED title / description. Drafts may save with empty / partial
+// values; the trimmed-non-empty validator applies only on the
+// STRICT schema. Both fields preserve the canonical M1 surface
+// limits (60 / 80 char title, 800 / 500 char description) — the
+// stitch counter values are presentation-only and the implementation
+// normalizes to the canonical domain limits.
+const serviceOfferingDraftTitleV1Schema = z.string().max(80);
+const serviceOfferingDraftDescriptionV1Schema = z.string().max(2000);
+
+const serviceOfferingDraftServiceAreaV1Schema = z
+  .object({
+    countryCode: countryCodeSchema,
+    region: z.string().min(1).max(120).optional(),
+    city: z.string().min(1).max(120).optional(),
+  })
+  .strict();
+
+// RELAXED pricing — any subset of fields. The STRICT schema below
+// validates that Fixed / StartingAt carry a USD amount + currency +
+// unitId, and that ContactForQuote carries no advertised amount.
+const serviceOfferingDraftPricingV1Schema = z
+  .object({
+    kind: z.enum(pricingKindValuesV1).optional(),
+    amountMinor: z.number().int().nonnegative().max(1_000_000_000).optional(),
+    currency: z.string().length(3).optional(),
+    unitId: z.string().min(1).max(64).optional(),
+  })
+  .strict();
+
+// The draft request. Lazy first-save / resume / update-draft; the
+// offering row is created on the first successful save (the
+// `idempotencyKey` carries the same-attempt retry identity).
+export const serviceOfferingDraftRequestV1Schema = z
+  .object({
+    title: serviceOfferingDraftTitleV1Schema.optional(),
+    description: serviceOfferingDraftDescriptionV1Schema.optional(),
+    primaryCategoryKey: z.string().min(1).max(64).optional(),
+    serviceMode: z.enum(serviceModeValuesV1).optional(),
+    serviceAreas: z.array(serviceOfferingDraftServiceAreaV1Schema).max(20).optional(),
+    pricing: serviceOfferingDraftPricingV1Schema.optional(),
+    genreTags: z.array(z.string().min(1).max(60)).max(30).optional(),
+    includedServiceCategoryKeys: z.array(z.string().min(1).max(64)).max(20).optional(),
+    // Same-attempt retry identity. Generated on the FIRST save of a
+    // fresh session, retained across transport retries, cleared on
+    // definitive success or on payload change. The DB unique
+    // constraint on (offeringId, idempotencyKey) is the second
+    // defense against transport-retry duplicates.
+    idempotencyKey: z.string().min(1).max(64),
+    returnTo: z.string().min(1).max(256).optional(),
+  })
+  .strict();
+export type ServiceOfferingDraftRequestV1 = z.infer<typeof serviceOfferingDraftRequestV1Schema>;
+
+// ---------- ServiceOffering create request ----------
+//
+// M2 (#85) PR-review feedback (round 3): the POST that lazy-creates
+// a Draft offering ALSO persists the first-save draft payload
+// atomically. The body carries the client-supplied idempotencyKey
+// PLUS the full RELAXED draft field set (every field optional —
+// a fresh Draft may save without a category, mode, pricing, or
+// service areas, but the seller must type SOMETHING into the
+// editor before pressing Save, so the create-empty-then-navigate-
+// away orphan is impossible). The route also accepts the same
+// idempotencyKey via the `Idempotency-Key` header for clients that
+// prefer that convention. A deliberate second click (a new
+// idempotencyKey) creates a NEW offering AND starts a fresh
+// field-set.
+export const serviceOfferingCreateDraftRequestV1Schema = z
+  .object({
+    idempotencyKey: z.string().min(1).max(128),
+    title: serviceOfferingDraftTitleV1Schema.optional(),
+    description: serviceOfferingDraftDescriptionV1Schema.optional(),
+    primaryCategoryKey: z.string().min(1).max(64).optional(),
+    serviceMode: z.enum(serviceModeValuesV1).optional(),
+    serviceAreas: z.array(serviceOfferingDraftServiceAreaV1Schema).max(20).optional(),
+    pricing: serviceOfferingDraftPricingV1Schema.optional(),
+    genreTags: z.array(z.string().min(1).max(60)).max(30).optional(),
+    includedServiceCategoryKeys: z.array(z.string().min(1).max(64)).max(20).optional(),
+  })
+  .strict();
+export type ServiceOfferingCreateDraftRequestV1 = z.infer<
+  typeof serviceOfferingCreateDraftRequestV1Schema
+>;
+
+// ---------- ServiceOffering activation request ----------
+//
+// Activation requires the FULL public field set (mirrors the
+// publish/update STRICT pattern for SellerProfile). Each "required"
+// field uses trimmedNonEmptyString so a whitespace-only payload is
+// rejected at the trusted boundary, not later in the service.
+//
+// Activation also carries the same idempotencyKey + confirmationVersion
+// contract: the (offeringId, idempotencyKey) unique constraint on the
+// service_offering_activations table is the second defense against
+// transport-retry duplicates.
+
+export const SERVICE_OFFERING_ACTIVATION_CONFIRMATION_VERSIONS = [
+  "m2-service-activation-v1",
+] as const;
+export type ServiceOfferingActivationConfirmationVersionV1 =
+  (typeof SERVICE_OFFERING_ACTIVATION_CONFIRMATION_VERSIONS)[number];
+
+const serviceOfferingActivationTitleV1Schema = trimmedNonEmptyString(1, 80, "title");
+const serviceOfferingActivationDescriptionV1Schema = trimmedNonEmptyString(1, 2000, "description");
+
+const serviceOfferingActivationServiceAreaV1Schema = z
+  .object({
+    countryCode: countryCodeSchema,
+    region: z.string().min(1).max(120).optional(),
+    city: z.string().min(1).max(120).optional(),
+  })
+  .strict();
+
+// Pricing on activation. The kind, amount, currency, and unitId
+// must satisfy the canonical Fixed / StartingAt / ContactForQuote
+// semantics — Fixed and StartingAt require a USD amount in minor
+// units plus a PricingUnit; ContactForQuote carries no amount.
+const serviceOfferingActivationPricingV1Schema = z
+  .object({
+    kind: z.enum(pricingKindValuesV1),
+    amountMinor: z.number().int().nonnegative().max(1_000_000_000).optional(),
+    currency: z.string().length(3).optional(),
+    unitId: z.string().min(1).max(64).optional(),
+  })
+  .strict()
+  .refine(
+    (p) =>
+      p.kind === "ContactForQuote" ||
+      (p.amountMinor !== undefined && p.currency === "USD" && p.unitId !== undefined),
+    {
+      message: "Fixed or StartingAt pricing requires amountMinor, currency=USD, and unitId.",
+      path: ["pricing"],
+    },
+  )
+  .refine((p) => p.kind !== "ContactForQuote" || p.amountMinor === undefined, {
+    message: "ContactForQuote pricing must not advertise an amount.",
+    path: ["pricing"],
+  });
+
+export const serviceOfferingActivateRequestV1Schema = z
+  .object({
+    title: serviceOfferingActivationTitleV1Schema,
+    description: serviceOfferingActivationDescriptionV1Schema,
+    primaryCategoryKey: z.string().min(1).max(64),
+    serviceMode: z.enum(serviceModeValuesV1),
+    serviceAreas: z.array(serviceOfferingActivationServiceAreaV1Schema).max(20),
+    pricing: serviceOfferingActivationPricingV1Schema,
+    genreTags: z.array(z.string().min(1).max(60)).max(30),
+    includedServiceCategoryKeys: z.array(z.string().min(1).max(64)).max(20),
+    confirmationVersion: z.enum(SERVICE_OFFERING_ACTIVATION_CONFIRMATION_VERSIONS),
+    idempotencyKey: z.string().uuid().min(36).max(64),
+    returnTo: z.string().min(1).max(256).optional(),
+  })
+  .strict();
+export type ServiceOfferingActivateRequestV1 = z.infer<
+  typeof serviceOfferingActivateRequestV1Schema
+>;
+
+// M2 (#85) PR-review feedback: closed set of media-use confirmation
+// versions the seller must acknowledge before each upload. Declared
+// here (before the ServiceOfferingOwnerSampleSummaryV1 schema and
+// the bg2AudioSamplePublicV1Schema that reference it) so the forward
+// reference resolves at type-check time.
+export const SERVICE_OFFERING_AUDIO_MEDIA_CONFIRMATION_VERSIONS = [
+  "m2-audio-confirmation-v1",
+] as const;
+export type ServiceOfferingAudioMediaConfirmationVersionV1 =
+  (typeof SERVICE_OFFERING_AUDIO_MEDIA_CONFIRMATION_VERSIONS)[number];
+
+// ---------- ServiceOffering owner view (read shape) ----------
+//
+// Mirrors the SellerProfile owner view: the editor / review on-mount
+// read returns Draft rows to their owner. The status, activation
+// evidence, and audio sample summary are included so the editor can
+// derive readiness without a second round trip. Sample playbackUrl is
+// generated server-side at read time so the browser can render the
+// player without an additional resolve step.
+
+export const serviceOfferingOwnerSampleSummaryV1Schema = z
+  .object({
+    sampleId: z.string().min(1).max(128),
+    label: z.string().min(1).max(120),
+    contentType: z.literal("audio/mpeg"),
+    byteSize: z
+      .number()
+      .int()
+      .nonnegative()
+      .max(25 * 1024 * 1024),
+    displayOrder: z.number().int().min(1).max(3),
+    playbackUrl: z.string().url(),
+    // M2 (#85) PR-review feedback: the owner-view sample summary
+    // surfaces the same confirmation fields the activation
+    // completeness recheck uses, so the editor can render the
+    // readiness checklist from the durable persisted state rather
+    // than a client-side filter on confirmation-only metadata it
+    // never receives.
+    confirmation: z
+      .object({
+        version: z.enum(SERVICE_OFFERING_AUDIO_MEDIA_CONFIRMATION_VERSIONS),
+        confirmedAt: z.string().datetime(),
+      })
+      .strict(),
+    createdAt: z.string().datetime(),
+  })
+  .strict();
+export type ServiceOfferingOwnerSampleSummaryV1 = z.infer<
+  typeof serviceOfferingOwnerSampleSummaryV1Schema
+>;
+
+export const serviceOfferingOwnerViewV1Schema = z
+  .object({
+    serviceOfferingId: z.string().min(1).max(128),
+    workspaceId: z.string().min(1).max(128),
+    sellerProfileId: z.string().min(1).max(128),
+    status: z.enum(serviceOfferingStatusValuesV1),
+    title: z.string().max(80),
+    description: z.string().max(2000),
+    primaryCategoryKey: z.string().max(64).nullable(),
+    serviceMode: z.enum(serviceModeValuesV1).nullable(),
+    serviceAreas: z.array(serviceOfferingDraftServiceAreaV1Schema).max(20),
+    pricing: serviceOfferingDraftPricingV1Schema.nullable(),
+    genreTags: z.array(z.string().min(1).max(60)).max(30),
+    includedServiceCategoryKeys: z.array(z.string().min(1).max(64)).max(20),
+    // The bounded sample summary the editor renders. PendingCleanup
+    // and Removed samples are excluded; the buyer-facing list never
+    // sees a Draft offering's samples either way (the buyer-side
+    // gate is on Active + Published + Active Workspace + Seller
+    // capability).
+    samples: z.array(serviceOfferingOwnerSampleSummaryV1Schema).max(3),
+    activatedAt: z.string().datetime().nullable(),
+    activatedByDisplayName: z.string().min(1).max(200).nullable(),
+  })
+  .strict();
+export type ServiceOfferingOwnerViewV1 = z.infer<typeof serviceOfferingOwnerViewV1Schema>;
+
+// ---------- ServiceOffering list (owner scope) ----------
+
+export const serviceOfferingOwnerListResponseV1Schema = z
+  .object({
+    ok: z.literal(true),
+    offerings: z.array(serviceOfferingOwnerViewV1Schema).max(200),
+  })
+  .strict();
+export type ServiceOfferingOwnerListResponseV1 = z.infer<
+  typeof serviceOfferingOwnerListResponseV1Schema
+>;
+
+// ---------- Draft / activate responses ----------
+
+export const serviceOfferingDraftResponseV1Schema = z
+  .object({
+    ok: z.literal(true),
+    offering: serviceOfferingOwnerViewV1Schema,
+    returnTo: z.string().min(1).max(256).nullable(),
+    safeReturnTo: z.string().min(1).max(256).nullable(),
+  })
+  .strict();
+export type ServiceOfferingDraftResponseV1 = z.infer<typeof serviceOfferingDraftResponseV1Schema>;
+
+export const serviceOfferingActivationEvidenceV1Schema = z
+  .object({
+    activatedAt: z.string().datetime(),
+    confirmationVersion: z.enum(SERVICE_OFFERING_ACTIVATION_CONFIRMATION_VERSIONS),
+    idempotencyKey: z.string().uuid(),
+  })
+  .strict();
+export type ServiceOfferingActivationEvidenceV1 = z.infer<
+  typeof serviceOfferingActivationEvidenceV1Schema
+>;
+
+export const serviceOfferingActivationResponseV1Schema = z
+  .object({
+    ok: z.literal(true),
+    offering: serviceOfferingOwnerViewV1Schema,
+    evidence: serviceOfferingActivationEvidenceV1Schema,
+    returnTo: z.string().min(1).max(256).nullable(),
+    safeReturnTo: z.string().min(1).max(256).nullable(),
+  })
+  .strict();
+export type ServiceOfferingActivationResponseV1 = z.infer<
+  typeof serviceOfferingActivationResponseV1Schema
+>;
+
+export const serviceOfferingGetResponseV1Schema = z
+  .object({
+    ok: z.literal(true),
+    offering: serviceOfferingOwnerViewV1Schema.nullable(),
+  })
+  .strict();
+export type ServiceOfferingGetResponseV1 = z.infer<typeof serviceOfferingGetResponseV1Schema>;
+
+// ---------- ServiceOffering taxonomy (controlled values) ----------
+//
+// One round trip on editor mount. The categories list comes from
+// the existing `ServiceCategory` table seeded by
+// packages/db/prisma/seed.ts; the pricingUnits list comes from the
+// existing `PricingUnit` table; the bundleOnlyCategoryKeys are the
+// subset of ServiceCategory rows with `bundleOnly: true` (the only
+// kind the canonical IncludedService surface accepts).
+//
+// The HTTP layer is the only consumer — the browser never reads
+// these consts directly.
+export const serviceOfferingTaxonomyResponseV1Schema = z
+  .object({
+    categories: z.array(categoryMetadataItemV1Schema).max(200),
+    pricingUnits: z
+      .array(
+        z
+          .object({
+            key: z.string().min(1).max(64),
+            name: z.string().min(1).max(200),
+          })
+          .strict(),
+      )
+      .max(50),
+    bundleOnlyCategoryKeys: z.array(z.string().min(1).max(64)).max(200),
+  })
+  .strict();
+export type ServiceOfferingTaxonomyResponseV1 = z.infer<
+  typeof serviceOfferingTaxonomyResponseV1Schema
+>;
 
 // ===========================================================================
 // Buildathon Golden Slice 1 (BG1) shared runtime contracts.
@@ -1833,6 +2206,11 @@ export type AiInterpretBriefOutputV1 = z.infer<typeof aiInterpretBriefOutputV1Sc
 // playback route, depending on which adapter the server wires.
 // Both adapters produce a URL that resolves to actual playable
 // audio without further resolution on the client.
+// M2 (#85) PR-review feedback: the public DTO now carries the
+// persisted media-use confirmation (version + timestamp). The
+// constant declaration for the closed version set lives above so
+// the forward reference resolves at type-check time.
+
 export const bg2AudioSamplePublicV1Schema = z
   .object({
     sampleId: z.string().min(1).max(128),
@@ -1854,6 +2232,23 @@ export const bg2AudioSamplePublicV1Schema = z
     // URL is emitted, so an ineligible or removed sample never
     // appears with a playable handle.
     playbackUrl: z.string().url(),
+    // M2 (#85) PR-review feedback (round 2): durable media-use
+    // confirmation. OPTIONAL on the public DTO so legacy Live
+    // samples (persisted before the confirmation columns existed)
+    // can still be listed and played by buyers — the activation
+    // gate filters confirmation != null, so legacy samples do
+    // NOT satisfy activation eligibility until a seller
+    // re-uploads them with the current version. The buyer-side
+    // playback gate and the seller-side preview gate do not
+    // require confirmation; they only require Live status +
+    // workspace ownership + lifecycle state.
+    confirmation: z
+      .object({
+        version: z.enum(SERVICE_OFFERING_AUDIO_MEDIA_CONFIRMATION_VERSIONS),
+        confirmedAt: z.string().datetime(),
+      })
+      .strict()
+      .optional(),
     createdAt: z.string().datetime(),
   })
   .strict();

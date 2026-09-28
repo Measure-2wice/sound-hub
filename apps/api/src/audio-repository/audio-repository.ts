@@ -8,9 +8,28 @@
 // at the service layer; the repository never returns Prisma models to
 // the public contract.
 
-import type { Bg2AudioSamplePublicV1 } from "@soundhub/types";
+import type {
+  Bg2AudioSamplePublicV1,
+  ServiceOfferingAudioMediaConfirmationVersionV1,
+} from "@soundhub/types";
 
 export type AudioSampleCleanupStatus = "Live" | "PendingCleanup" | "Removed";
+
+/**
+ * M2 (#85) PR-review feedback: durable media-use confirmation.
+ * The application boundary requires a closed-version confirmation
+ * acknowledgement from the seller on every upload; the actor +
+ * timestamp are persisted alongside the sample so activation
+ * completeness can re-verify the confirmation against the current
+ * version. Legacy rows persisted before this column was added have
+ * nulls and do not satisfy the activation gate until the seller
+ * re-uploads with a current acknowledgement.
+ */
+export interface AudioSampleConfirmation {
+  readonly version: ServiceOfferingAudioMediaConfirmationVersionV1;
+  readonly confirmedByUserId: string;
+  readonly confirmedAt: Date;
+}
 
 export interface AudioSampleRecord {
   readonly sampleId: string;
@@ -22,6 +41,7 @@ export interface AudioSampleRecord {
   readonly storageRef: string;
   readonly cleanupStatus: AudioSampleCleanupStatus;
   readonly cleanupAttempts: number;
+  readonly confirmation: AudioSampleConfirmation | null;
   readonly createdAt: Date;
   readonly updatedAt: Date;
 }
@@ -66,6 +86,13 @@ export interface AudioRepository {
    * atomically against that lock. The repository owns display-
    * order allocation; callers do not pass it in.
    *
+   * M2 (#85) PR-review feedback: the seller-side upload boundary
+   * requires a current closed-version media-use confirmation. The
+   * repository persists the confirmation (version + actor +
+   * timestamp) alongside the sample; the activation completeness
+   * recheck reads the persisted confirmation, not a client-supplied
+   * flag.
+   *
    * Returns `null` when the cap is hit (the row was NOT inserted).
    * Throws for other persistence failures.
    */
@@ -75,6 +102,7 @@ export interface AudioRepository {
     readonly contentType: "audio/mpeg";
     readonly byteSize: number;
     readonly storageRef: string;
+    readonly confirmation: AudioSampleConfirmation;
   }): Promise<AudioSampleRecord | null>;
 
   /**
@@ -160,12 +188,23 @@ export interface AudioRepository {
  * consulting the storage adapter so the serialized DTO only
  * carries buyer-safe fields. Storage credentials, bucket names,
  * object keys, and provider subjects never appear here.
+ *
+ * M2 (#85) PR-review feedback (round 2): the public DTO's
+ * `confirmation` field is OPTIONAL so a Live sample whose
+ * confirmation columns are NULL (a legacy row persisted before
+ * the M2 migration added the columns) still round-trips through
+ * the public mapper. The activation gate filters on
+ * `confirmationVersion != null`, so legacy samples do NOT satisfy
+ * activation eligibility until the seller re-uploads them with
+ * the current version. The buyer can still see and play the
+ * sample in the meantime — the persisted media gate is
+ * unrelated to the playback gate.
  */
 export function toPublicAudioSample(input: {
   readonly record: AudioSampleRecord;
   readonly playbackUrl: string;
 }): Bg2AudioSamplePublicV1 {
-  return {
+  const base = {
     sampleId: input.record.sampleId,
     offeringId: input.record.offeringId,
     label: input.record.label,
@@ -175,4 +214,14 @@ export function toPublicAudioSample(input: {
     playbackUrl: input.playbackUrl,
     createdAt: input.record.createdAt.toISOString(),
   };
+  if (input.record.confirmation) {
+    return {
+      ...base,
+      confirmation: {
+        version: input.record.confirmation.version,
+        confirmedAt: input.record.confirmation.confirmedAt.toISOString(),
+      },
+    };
+  }
+  return base;
 }

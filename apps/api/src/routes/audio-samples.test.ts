@@ -216,6 +216,17 @@ function buildMultipart(
   body: Buffer;
   contentType: string;
 } {
+  // M2 (#85) PR-review feedback: every audio upload carries a
+  // closed-version media-use confirmation. The harness default
+  // includes the current version so every happy-path upload
+  // succeeds; tests that exercise the confirmation rejection
+  // override `extraFields` to omit it.
+  const allFields = [
+    { name: "confirmationVersion", value: "m2-audio-confirmation-v1" },
+    ...extraFields,
+  ];
+  void allFields;
+
   const boundary = `----SoundHubBG2Boundary${Math.random().toString(36).slice(2)}`;
   const buffers: Buffer[] = [];
   const writeField = (
@@ -235,8 +246,11 @@ function buildMultipart(
   };
   writeField("actingWorkspaceId", parts.actingWorkspaceId);
   writeField("label", parts.label);
-  for (const extra of extraFields) {
-    writeField(extra.name, extra.value, extra.contentType);
+  // M2 (#85) PR-review feedback: always include the closed-version
+  // media-use confirmation. Tests that want to exercise the
+  // rejection path override via extraFields with a sentinel value.
+  for (const field of allFields) {
+    writeField(field.name, field.value, field.contentType);
   }
   buffers.push(
     Buffer.from(
@@ -502,6 +516,120 @@ describe("BG2 audio samples routes (in-memory, deterministic adapter)", () => {
     assert.deepEqual(Buffer.from(play.body as Buffer).toString("hex"), bytes.toString("hex"));
   });
 
+  // M2 (#85) Manual QA Round 4 — private audio playback.
+  //
+  // Helmet's default `Cross-Origin-Resource-Policy: same-origin`
+  // blocks the SoundHub browser origin from embedding the audio
+  // stream the API serves. The fix narrows the override to the
+  // owner-side authenticated `/play` route only; the public
+  // buyer-side `/play` route stays at helmet's default. These
+  // tests pin BOTH the route-specific relaxation AND the buyer-
+  // side non-relaxation so a future global helmet loosening (or
+  // accidental broadcast of the override) fails the suite.
+  test("owner-side playback sets Cross-Origin-Resource-Policy: cross-origin so the SoundHub web origin can embed the audio", async () => {
+    const { app, adapter } = buildTestHarness();
+    const cookie = await signIn(app, adapter, "seller-route@example.com");
+    const bytes = mp3FrameBytes();
+    const { body: mp3Body, contentType } = buildMultipart({
+      actingWorkspaceId: SELLER_WORKSPACE_ID,
+      label: "Owner play",
+      file: {
+        name: "sample.mp3",
+        type: "audio/mpeg",
+        bytes,
+      },
+    });
+    const upload = await request(app)
+      .post(`/api/services/${OFFERING_ID}/audio-samples`)
+      .set("Cookie", cookie)
+      .set("Content-Type", contentType)
+      .send(mp3Body);
+    assert.equal(upload.status, 200);
+    const sampleId = upload.body.sample.sampleId as string;
+    const play = await request(app)
+      .get(
+        `/api/workspaces/${SELLER_WORKSPACE_ID}/service-offerings/${OFFERING_ID}/audio-samples/${sampleId}/play`,
+      )
+      .set("Cookie", cookie);
+    assert.equal(play.status, 200);
+    assert.equal(play.headers["content-type"], "audio/mpeg");
+    assert.equal(play.headers["content-length"], String(bytes.length));
+    // The route-specific override. With this header the
+    // SoundHub browser origin (and any other origin) is
+    // permitted to embed the bytes; CORS still gates
+    // non-credentialed cross-origin fetches.
+    assert.equal(play.headers["cross-origin-resource-policy"], "cross-origin");
+    // The body must match the uploaded bytes.
+    assert.deepEqual(Buffer.from(play.body as Buffer).toString("hex"), bytes.toString("hex"));
+  });
+
+  test("owner-side playback rejects a request with no session (authorization intact)", async () => {
+    const { app } = buildTestHarness();
+    // No cookie — a signed-out client must never reach the byte
+    // stream. The route resolves the session before invoking the
+    // audio service, so CORP / content-type / bytes are not
+    // relevant; the response is the safe envelope.
+    const play = await request(app).get(
+      `/api/workspaces/${SELLER_WORKSPACE_ID}/service-offerings/${OFFERING_ID}/audio-samples/smp-does-not-matter/play`,
+    );
+    assert.equal(play.status, 401);
+    assert.equal(play.body.error.code, "SESSION_INVALID");
+  });
+
+  test("owner-side playback rejects a non-owner Workspace actor with AUDIO_SAMPLE_NOT_FOUND (intentionally opaque)", async () => {
+    const { app, adapter } = buildTestHarness();
+    // A buyer's session cannot read another Workspace's
+    // seller-side preview. The route authenticates the session
+    // successfully (the buyer IS signed in), but the workspace
+    // authorization check inside `getBytesForPlayback` fails —
+    // the buyer has no Seller capability on the seller's
+    // workspace — and the service deliberately returns `null`
+    // so the response is indistinguishable from a missing
+    // sample. This is the audio-service's authorization-privacy
+    // invariant: a non-owner must not learn whether the sample
+    // exists.
+    const cookie = await signIn(app, adapter, "buyer-route@example.com");
+    const play = await request(app)
+      .get(
+        `/api/workspaces/${SELLER_WORKSPACE_ID}/service-offerings/${OFFERING_ID}/audio-samples/smp-does-not-matter/play`,
+      )
+      .set("Cookie", cookie);
+    assert.equal(play.status, 404);
+    assert.equal(play.body.error.code, "AUDIO_SAMPLE_NOT_FOUND");
+  });
+
+  test("public buyer-side `/play` keeps Helmet's default CORP (no global weakening)", async () => {
+    const { app, adapter } = buildTestHarness();
+    const cookie = await signIn(app, adapter, "seller-route@example.com");
+    const bytes = mp3FrameBytes();
+    const { body: mp3Body, contentType } = buildMultipart({
+      actingWorkspaceId: SELLER_WORKSPACE_ID,
+      label: "Buyer-only CORP",
+      file: {
+        name: "sample.mp3",
+        type: "audio/mpeg",
+        bytes,
+      },
+    });
+    const upload = await request(app)
+      .post(`/api/services/${OFFERING_ID}/audio-samples`)
+      .set("Cookie", cookie)
+      .set("Content-Type", contentType)
+      .send(mp3Body);
+    assert.equal(upload.status, 200);
+    const sampleId = upload.body.sample.sampleId as string;
+    const play = await request(app).get(
+      `/api/services/${OFFERING_ID}/audio-samples/${sampleId}/play`,
+    );
+    assert.equal(play.status, 200);
+    // The public buyer-side route MUST NOT pick up the owner-side
+    // override. Helmet's default `same-origin` stays in place —
+    // a global relaxation would weaken the public DTO contract
+    // and is the exact regression the fix is structured against.
+    assert.notEqual(play.headers["cross-origin-resource-policy"], "cross-origin");
+    assert.equal(play.headers["cross-origin-resource-policy"], "same-origin");
+  });
+
   test("buyer-facing list returns the buyer-safe DTO without a session", async () => {
     const { app, adapter } = buildTestHarness();
     const cookie = await signIn(app, adapter, "seller-route@example.com");
@@ -601,11 +729,18 @@ describe("BG2 audio samples routes (in-memory, deterministic adapter)", () => {
   test("missing actingWorkspaceId in upload is rejected at the trusted boundary", async () => {
     const { app, adapter } = buildTestHarness();
     const cookie = await signIn(app, adapter, "seller-route@example.com");
-    // No actingWorkspaceId field — the multipart payload is well-
-    // formed but the boundary rejects it.
+    // No actingWorkspaceId field — the multipart payload includes
+    // every OTHER required part (label, file, confirmationVersion)
+    // so the boundary's missing-field check isolates the
+    // actingWorkspaceId rejection. The validation order in the
+    // parser checks actingWorkspaceId before confirmationVersion
+    // so the surface code stays stable.
     const boundary = "----SoundHubBG2BoundaryNoActing";
     const head = Buffer.from(
       `--${boundary}\r\n` +
+        `Content-Disposition: form-data; name="confirmationVersion"\r\n\r\n` +
+        `m2-audio-confirmation-v1\r\n` +
+        `--${boundary}\r\n` +
         `Content-Disposition: form-data; name="label"\r\n\r\n` +
         `Demo\r\n` +
         `--${boundary}\r\n` +

@@ -131,23 +131,29 @@ export class PrismaTalentSearchRepository implements TalentSearchRepository {
 
     const offerings = seller.offerings
       .filter((offering) => offering.status === ServiceOfferingStatus.Active)
+      // Active offerings always carry a primary category and service
+      // mode (the #85 activation contract enforces both at the
+      // trusted boundary). The narrow is for the type system.
+      .filter((offering) => offering.primaryCategory !== null)
+      .filter((offering) => offering.serviceMode !== null)
       // Hard eligibility: primaryCategory must be a non-bundle-only
       // independently purchasable category, and only then is it eligible
       // for the `independentlyPurchasableServiceKeys` filter.
       .filter((offering) => {
         if (input.independentlyPurchasableServiceKeys.length === 0) return true;
+        const primaryCategory = offering.primaryCategory!;
         return (
-          !offering.primaryCategory.bundleOnly &&
-          input.independentlyPurchasableServiceKeys.includes(offering.primaryCategory.key)
+          !primaryCategory.bundleOnly &&
+          input.independentlyPurchasableServiceKeys.includes(primaryCategory.key)
         );
       })
       .filter((offering) =>
         input.primaryCategoryKeys.length === 0
           ? true
-          : input.primaryCategoryKeys.includes(offering.primaryCategory.key),
+          : input.primaryCategoryKeys.includes(offering.primaryCategory!.key),
       )
       .filter((offering) =>
-        input.serviceModes.length === 0 ? true : input.serviceModes.includes(offering.serviceMode),
+        input.serviceModes.length === 0 ? true : input.serviceModes.includes(offering.serviceMode!),
       )
       .filter((offering) => matchesAnyServiceArea(offering.serviceAreas, input.serviceArea))
       .map(
@@ -157,11 +163,11 @@ export class PrismaTalentSearchRepository implements TalentSearchRepository {
           title: offering.title,
           description: offering.description,
           status: offering.status,
-          serviceMode: offering.serviceMode,
+          serviceMode: offering.serviceMode!,
           primaryCategory: {
-            key: offering.primaryCategory.key,
-            name: offering.primaryCategory.name,
-            bundleOnly: offering.primaryCategory.bundleOnly,
+            key: offering.primaryCategory!.key,
+            name: offering.primaryCategory!.name,
+            bundleOnly: offering.primaryCategory!.bundleOnly,
           },
           includedServices: offering.includedServices.map((included) => ({
             key: included.category.key,

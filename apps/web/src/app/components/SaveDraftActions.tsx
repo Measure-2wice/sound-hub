@@ -26,6 +26,7 @@
 "use client";
 
 import { useEffect, useState } from "react";
+import { CheckCircleIcon, SyncIcon } from "./ui/Icon";
 
 export type SaveDraftActionState = "idle" | "saving" | "saved" | "error";
 
@@ -83,7 +84,7 @@ export function SaveDraftActions({
         className="inline-flex items-center gap-2 text-base text-muted"
         data-testid={`${testIdPrefix}-saving`}
       >
-        <span className="material-symbols-outlined text-[20px] animate-spin">sync</span>
+        <SyncIcon width={20} height={20} className="animate-spin" aria-hidden="true" />
         <span>Saving draft…</span>
       </div>
     );
@@ -97,7 +98,7 @@ export function SaveDraftActions({
         className="inline-flex items-center gap-2 text-base text-seaGlass"
         data-testid={`${testIdPrefix}-saved`}
       >
-        <span className="material-symbols-outlined text-[20px]">check_circle</span>
+        <CheckCircleIcon width={20} height={20} aria-hidden="true" />
         <span>Saved</span>
       </div>
     );

@@ -33,13 +33,19 @@ import {
 import type {
   AudioOfferingContext,
   AudioRepository,
+  AudioSampleConfirmation,
   AudioSampleRecord,
 } from "./audio-repository.js";
+import {
+  AUDIO_SAMPLE_LOCK_CLASS,
+  acquireAudioSampleLockTx,
+  audioSampleLockKey,
+} from "./audio-sample-lock.js";
 
 const MAX_SAMPLES_PER_OFFERING = 3;
 // Lock class — distinct from any other advisory-lock users in the
 // schema (none today; reserved for future expansion).
-const AUDIO_SAMPLE_LOCK_CLASS = 0x4155_4449; // 'AUDI'
+export { AUDIO_SAMPLE_LOCK_CLASS };
 const MAX_DISPLAY_ORDER = 1024;
 
 export class PrismaAudioRepository implements AudioRepository {
@@ -97,15 +103,9 @@ export class PrismaAudioRepository implements AudioRepository {
    * correctness gap.
    */
   private lockKeyForOffering(offeringId: string): number {
-    // FNV-1a 32-bit. Stable across processes and languages.
-    let hash = 0x811c9dc5;
-    for (let i = 0; i < offeringId.length; i++) {
-      hash ^= offeringId.charCodeAt(i);
-      hash = Math.imul(hash, 0x01000193);
-    }
-    // Force into a signed 32-bit range as required by the
-    // pg_advisory_xact_lock(int, int) signature.
-    return hash | 0;
+    // Delegated to the shared helper so the activation transaction
+    // uses the same per-offering key.
+    return audioSampleLockKey(offeringId);
   }
 
   /**
@@ -129,6 +129,7 @@ export class PrismaAudioRepository implements AudioRepository {
     contentType: "audio/mpeg";
     byteSize: number;
     storageRef: string;
+    confirmation: AudioSampleConfirmation;
   }): Promise<AudioSampleRecord | null> {
     return this.prisma.$transaction(async (tx) => {
       // Acquire the per-offering advisory lock so concurrent
@@ -173,6 +174,14 @@ export class PrismaAudioRepository implements AudioRepository {
           byteSize: input.byteSize,
           displayOrder,
           storageRef: input.storageRef,
+          // M2 (#85) PR-review feedback: durable media-use
+          // confirmation. The actor and version are persisted
+          // alongside the sample; the activation completeness
+          // recheck reads these columns rather than any
+          // client-supplied flag.
+          confirmationVersion: input.confirmation.version,
+          confirmedByUserId: input.confirmation.confirmedByUserId,
+          confirmedAt: input.confirmation.confirmedAt,
         },
       });
       return toRecord(row);
@@ -206,19 +215,33 @@ export class PrismaAudioRepository implements AudioRepository {
    * successful provider delete. `restoreLiveToRemoved` is used
    * by the rare case where the row was already deleted by a
    * concurrent retry before the caller observed PendingCleanup.
+   *
+   * M2 (#85) PR-review feedback (round 2): both removal steps
+   * take the per-offering audio-sample advisory lock so a
+   * concurrent activation transaction (which ALSO acquires this
+   * lock — see `prisma-service-offering.repository.activate`)
+   * serializes with the removal. Without the lock, a removal
+   * can commit AFTER the activation counted the last Live
+   * sample but BEFORE the activation commits, leaving a newly
+   * Active offering whose only sample is PendingCleanup (which
+   * the buyer-side list filters out — effectively zero playable
+   * samples).
    */
   async markPendingCleanup(input: { offeringId: string; sampleId: string }): Promise<void> {
-    await this.prisma.serviceOfferingAudioSample.updateMany({
-      where: {
-        id: input.sampleId,
-        offeringId: input.offeringId,
-        cleanupStatus: AudioSampleCleanupStatus.Live,
-      },
-      data: {
-        cleanupStatus: AudioSampleCleanupStatus.PendingCleanup,
-        cleanupAttempts: { increment: 1 },
-        cleanupLastFailureAt: new Date(),
-      },
+    await this.prisma.$transaction(async (tx) => {
+      await acquireAudioSampleLockTx(tx, input.offeringId);
+      await tx.serviceOfferingAudioSample.updateMany({
+        where: {
+          id: input.sampleId,
+          offeringId: input.offeringId,
+          cleanupStatus: AudioSampleCleanupStatus.Live,
+        },
+        data: {
+          cleanupStatus: AudioSampleCleanupStatus.PendingCleanup,
+          cleanupAttempts: { increment: 1 },
+          cleanupLastFailureAt: new Date(),
+        },
+      });
     });
   }
 
@@ -226,17 +249,22 @@ export class PrismaAudioRepository implements AudioRepository {
    * Idempotent: deletes a PendingCleanup (or Live) row for the
    * given offering. Called by the application service after a
    * successful provider deletion OR after the provider already
-   * reports the object as gone.
+   * reports the object as gone. Acquires the per-offering
+   * audio-sample advisory lock (see `markPendingCleanup` for the
+   * removal-vs-activation race rationale).
    */
   async finalizePendingCleanup(input: { offeringId: string; sampleId: string }): Promise<void> {
-    await this.prisma.serviceOfferingAudioSample.deleteMany({
-      where: {
-        id: input.sampleId,
-        offeringId: input.offeringId,
-        cleanupStatus: {
-          in: [AudioSampleCleanupStatus.PendingCleanup, AudioSampleCleanupStatus.Live],
+    await this.prisma.$transaction(async (tx) => {
+      await acquireAudioSampleLockTx(tx, input.offeringId);
+      await tx.serviceOfferingAudioSample.deleteMany({
+        where: {
+          id: input.sampleId,
+          offeringId: input.offeringId,
+          cleanupStatus: {
+            in: [AudioSampleCleanupStatus.PendingCleanup, AudioSampleCleanupStatus.Live],
+          },
         },
-      },
+      });
     });
   }
 
@@ -300,6 +328,9 @@ function toRecord(row: {
   storageRef: string;
   cleanupStatus: AudioSampleCleanupStatus;
   cleanupAttempts: number;
+  confirmationVersion: string | null;
+  confirmedByUserId: string | null;
+  confirmedAt: Date | null;
   createdAt: Date;
   updatedAt: Date;
 }): AudioSampleRecord {
@@ -307,6 +338,24 @@ function toRecord(row: {
     throw new Error(
       `ServiceOfferingAudioSample ${row.id} has unexpected contentType ${row.contentType}; refusing to map.`,
     );
+  }
+  // Legacy rows (persisted before the confirmation columns
+  // existed) surface as `confirmation: null` so the activation
+  // recheck filters them out. They remain readable for
+  // listSamplesForOffering callers that scope to Live, but the
+  // public mapper throws if a legacy row slips through without
+  // being filtered.
+  let confirmation: AudioSampleConfirmation | null = null;
+  if (
+    row.confirmationVersion !== null &&
+    row.confirmedByUserId !== null &&
+    row.confirmedAt !== null
+  ) {
+    confirmation = {
+      version: row.confirmationVersion as AudioSampleConfirmation["version"],
+      confirmedByUserId: row.confirmedByUserId,
+      confirmedAt: row.confirmedAt,
+    };
   }
   return {
     sampleId: row.id,
@@ -318,6 +367,7 @@ function toRecord(row: {
     storageRef: row.storageRef,
     cleanupStatus: row.cleanupStatus,
     cleanupAttempts: row.cleanupAttempts,
+    confirmation,
     createdAt: row.createdAt,
     updatedAt: row.updatedAt,
   };

@@ -35,6 +35,7 @@ import type {
   MetadataRepository,
   RepositoryCaribbeanAffiliationMetadata,
   RepositoryCategoryMetadata,
+  RepositoryPricingUnitMetadata,
   RepositorySpecialtyMetadata,
 } from "../repositories/metadata.repository.js";
 
@@ -42,6 +43,8 @@ class StubMetadataRepository implements MetadataRepository {
   private currentRows: readonly RepositoryCategoryMetadata[];
   private currentSpecialtyRows: readonly RepositorySpecialtyMetadata[] = [];
   private currentCaribbeanRows: readonly RepositoryCaribbeanAffiliationMetadata[] = [];
+  private currentPricingUnitRows: readonly RepositoryPricingUnitMetadata[] = [];
+  private currentBundleOnlyKeys: readonly string[] = [];
   callCount = 0;
   constructor(initial: readonly RepositoryCategoryMetadata[]) {
     this.currentRows = initial;
@@ -60,6 +63,14 @@ class StubMetadataRepository implements MetadataRepository {
     this.callCount += 1;
     return Promise.resolve(this.currentCaribbeanRows);
   }
+  getCanonicalPricingUnits(): Promise<readonly RepositoryPricingUnitMetadata[]> {
+    this.callCount += 1;
+    return Promise.resolve(this.currentPricingUnitRows);
+  }
+  getCanonicalBundleOnlyCategoryKeys(): Promise<readonly string[]> {
+    this.callCount += 1;
+    return Promise.resolve(this.currentBundleOnlyKeys);
+  }
   setRows(next: readonly RepositoryCategoryMetadata[]): void {
     this.currentRows = next;
   }
@@ -68,6 +79,12 @@ class StubMetadataRepository implements MetadataRepository {
   }
   setCaribbeanRows(next: readonly RepositoryCaribbeanAffiliationMetadata[]): void {
     this.currentCaribbeanRows = next;
+  }
+  setPricingUnitRows(next: readonly RepositoryPricingUnitMetadata[]): void {
+    this.currentPricingUnitRows = next;
+  }
+  setBundleOnlyKeys(next: readonly string[]): void {
+    this.currentBundleOnlyKeys = next;
   }
 }
 

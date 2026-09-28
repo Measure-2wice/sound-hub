@@ -168,6 +168,8 @@ async function handleUpload(
   } catch (err) {
     if (err instanceof MultipartError) {
       const code = mapMultipartErrorCode(err);
+      // The multipart code is a closed set that overlaps with the
+      // apiErrorCodeV1 enum.
       writeSafeError(res, buildSafeError(code, err.message, undefined, requestId));
       return;
     }
@@ -190,6 +192,7 @@ async function handleUpload(
       contentType: parsed.contentType,
       byteSize: parsed.byteSize,
       bytes: parsed.bytes,
+      mediaUseConfirmation: parsed.mediaUseConfirmation,
     });
     const body = bg2AudioSampleUploadResponseV1Schema.parse({ ok: true, sample: result.sample });
     res.status(200).json(body);
@@ -315,8 +318,20 @@ async function handlePlay(req: Request, res: Response, deps: AudioSamplesRouteDe
     return;
   }
 
+  // M2 (#85) PR-review feedback: the public `/play` route is the
+  // buyer-side discovery gate. The seller-side preview lives on
+  // the auth-gated workspace-scoped route mounted by
+  // `routes/service-offering.ts` (where the session cookie is
+  // resolved and the workspaceId is derived from the URL path).
+  // No `?actingWorkspaceId` query parameter — a guessable
+  // parameter would let an unauthenticated client stream private
+  // Draft audio. Eligibility on this public route requires
+  // Active + Published + Active Workspace + Seller capability.
   try {
-    const playback = await deps.service.getBytesForPlayback({ offeringId, sampleId });
+    const playback = await deps.service.getBytesForPlayback({
+      offeringId,
+      sampleId,
+    });
     if (!playback) {
       writeSafeError(
         res,
@@ -363,6 +378,10 @@ async function resolveAuth(
 
 function writeAudioError(res: Response, err: unknown, requestId: string): void {
   if (err instanceof AudioSampleError) {
+    // The AudioSampleError code is a stable API error code (the
+    // BG2 codes + the new AUDIO_SAMPLE_MEDIA_CONFIRMATION_REQUIRED
+    // are all part of `apiErrorCodeV1Schema`), so passing it
+    // directly to `buildSafeError` is type-correct.
     const safe: SafeErrorResponse = buildSafeError(err.code, err.message, undefined, requestId);
     console.error(`[audio-samples] requestId=${requestId} code=${err.code}:`, err);
     writeSafeError(res, safe);
@@ -470,6 +489,7 @@ class MultipartError extends Error {
       | "AUDIO_PAYLOAD_TOO_LARGE"
       | "AUDIO_PAYLOAD_MISSING"
       | "AUDIO_CONTENT_TYPE_UNSUPPORTED"
+      | "AUDIO_SAMPLE_MEDIA_CONFIRMATION_REQUIRED"
       | "INVALID_AUTH_REQUEST",
   ) {
     super(message);
@@ -483,6 +503,7 @@ function mapMultipartErrorCode(
   | "AUDIO_PAYLOAD_TOO_LARGE"
   | "AUDIO_PAYLOAD_MISSING"
   | "AUDIO_CONTENT_TYPE_UNSUPPORTED"
+  | "AUDIO_SAMPLE_MEDIA_CONFIRMATION_REQUIRED"
   | "INVALID_AUTH_REQUEST" {
   return err.code;
 }
@@ -493,6 +514,18 @@ interface ParsedMultipart {
   readonly contentType: string;
   readonly byteSize: number;
   readonly bytes: Buffer;
+  /**
+   * M2 (#85) PR-review feedback: the seller must acknowledge the
+   * current closed-version media-use confirmation in the editor
+   * before each upload. The multipart parser extracts the
+   * `confirmationVersion` text part and carries it alongside the
+   * bytes; the service validates it against the closed enum and
+   * the repository persists it with the sample row.
+   */
+  readonly mediaUseConfirmation: {
+    readonly version: "m2-audio-confirmation-v1";
+    readonly confirmedAt: Date;
+  };
 }
 
 // Minimal multipart/form-data parser for the seller-audio slice.
@@ -604,6 +637,7 @@ function parseMultipartBuffer(
   let actingWorkspaceId: string | null = null;
   let label: string | null = null;
   let file: { contentType: string; bytes: Buffer } | null = null;
+  let confirmationVersion: string | null = null;
 
   const openingBoundary = crlfBoundary.slice(2);
   const partStart = buffer.indexOf(openingBoundary, cursor);
@@ -656,6 +690,21 @@ function parseMultipartBuffer(
           );
         }
         actingWorkspaceId = text;
+      } else if (name === "confirmationVersion") {
+        // M2 (#85) PR-review feedback: the multipart payload must
+        // carry a closed-version media-use acknowledgement. The
+        // parser strips and forwards it; the service validates the
+        // version against the closed enum and rejects the upload
+        // if it is missing or stale. The route maps that rejection
+        // to AUDIO_SAMPLE_MEDIA_CONFIRMATION_REQUIRED (400).
+        const text = body.toString("utf8").trim();
+        if (text.length === 0) {
+          throw new MultipartError(
+            "confirmationVersion is required on every audio-sample upload.",
+            "AUDIO_SAMPLE_MEDIA_CONFIRMATION_REQUIRED",
+          );
+        }
+        confirmationVersion = text;
       } else if (name === "label") {
         const text = body.toString("utf8").trim();
         if (text.length === 0) {
@@ -699,18 +748,27 @@ function parseMultipartBuffer(
     cursor = partEnd + crlfBoundary.length + 2;
   }
 
-  if (!actingWorkspaceId || !label || !file) {
+  if (!actingWorkspaceId || !label || !file || !confirmationVersion) {
     // Distinguish between authorization-contract violations and
     // payload-shape violations so the safe envelope carries the
     // most actionable code:
     //   - actingWorkspaceId is the GS 4 authorization handle; a
     //     missing value is INVALID_AUTH_REQUEST, not a payload
     //     deficiency.
+    //   - confirmationVersion is the M2 (#85) PR-review feedback
+    //     media-use acknowledgement. Missing it is a structural
+    //     omission that maps to AUDIO_SAMPLE_MEDIA_CONFIRMATION_REQUIRED.
     //   - label or file missing is a multipart payload deficiency.
-    //   - all three missing means the multipart body is genuinely
-    //     empty; return null so the route can answer with
-    //     AUDIO_PAYLOAD_MISSING (mapped to 400, not 413).
-    if (!actingWorkspaceId && !label && !file) return null;
+    //   - all required parts missing means the multipart body is
+    //     genuinely empty; return null so the route can answer
+    //     with AUDIO_PAYLOAD_MISSING (mapped to 400, not 413).
+    if (!actingWorkspaceId && !label && !file && !confirmationVersion) return null;
+    if (!confirmationVersion) {
+      throw new MultipartError(
+        "confirmationVersion is required on every audio-sample upload.",
+        "AUDIO_SAMPLE_MEDIA_CONFIRMATION_REQUIRED",
+      );
+    }
     if (!actingWorkspaceId) {
       throw new MultipartError(
         "actingWorkspaceId is required on every audio-sample command.",
@@ -731,6 +789,15 @@ function parseMultipartBuffer(
     contentType: file.contentType,
     byteSize: file.bytes.length,
     bytes: file.bytes,
+    mediaUseConfirmation: {
+      version: confirmationVersion as "m2-audio-confirmation-v1",
+      // The boundary boundary is the trusted boundary; we
+      // stamp the confirmation time at parse time so a
+      // client-side pre-stamped timestamp cannot be replayed
+      // across requests. The repository persists the
+      // authoritative timestamp alongside the sample.
+      confirmedAt: new Date(),
+    },
   };
 }
 

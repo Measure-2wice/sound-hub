@@ -14,6 +14,12 @@
 // names (closed const in `@soundhub/types`). One round trip on editor
 // mount; no second, independently deployable list lives in the browser.
 //
+// M2 (#85) extends the seam again with
+// `GET /api/metadata/service-offering-taxonomy` which returns the
+// canonical category + PricingUnit catalog and the bundle-only
+// ServiceCategory keys. Same read-only, public, no-acting-Workspace
+// shape as the existing routes.
+//
 // The route is read-only, public, and never exposes private fields,
 // controlled internal flags, or storage details. It depends only on the
 // repository interface — Prisma queries never leak into the HTTP layer
@@ -27,6 +33,7 @@ import { Router, type Request, type Response } from "express";
 import {
   categoryMetadataResponseV1Schema,
   sellerProfileTaxonomyResponseV1Schema,
+  serviceOfferingTaxonomyResponseV1Schema,
 } from "@soundhub/types";
 import { buildSafeError, generateRequestId, writeSafeError } from "../lib/errors.js";
 import type { MetadataRepository } from "../repositories/metadata.repository.js";
@@ -45,6 +52,13 @@ export function createMetadataRouter(deps: MetadataRouteDeps): Router {
   // Workspace — the same shape as the existing `/categories` route.
   router.get("/seller-profile-taxonomy", (_req: Request, res: Response) => {
     void handleSellerProfileTaxonomy(_req, res, deps);
+  });
+  // M2 (#85): ServiceOffering editor controlled-values catalog.
+  // Same read-only, public, no-acting-Workspace shape. Returns the
+  // category + PricingUnit catalog plus the bundle-only category keys
+  // that drive the offering's `includedServiceCategoryKeys` picker.
+  router.get("/service-offering-taxonomy", (_req: Request, res: Response) => {
+    void handleServiceOfferingTaxonomy(_req, res, deps);
   });
   return router;
 }
@@ -101,6 +115,39 @@ async function handleSellerProfileTaxonomy(
     const safe = buildSafeError(
       "SEARCH_FAILED",
       "An unexpected error occurred while loading the seller profile taxonomy.",
+      undefined,
+      requestId,
+    );
+    writeSafeError(res, safe);
+  }
+}
+
+async function handleServiceOfferingTaxonomy(
+  _req: Request,
+  res: Response,
+  deps: MetadataRouteDeps,
+): Promise<void> {
+  const requestId = generateRequestId();
+  res.setHeader("x-request-id", requestId);
+
+  try {
+    const [categories, pricingUnits, bundleOnlyCategoryKeys] = await Promise.all([
+      deps.repository.getCanonicalCategories(),
+      deps.repository.getCanonicalPricingUnits(),
+      deps.repository.getCanonicalBundleOnlyCategoryKeys(),
+    ]);
+    const payload = {
+      categories: [...categories],
+      pricingUnits: [...pricingUnits],
+      bundleOnlyCategoryKeys: [...bundleOnlyCategoryKeys],
+    };
+    const validated = serviceOfferingTaxonomyResponseV1Schema.parse(payload);
+    res.status(200).json(validated);
+  } catch (err) {
+    console.error(`[metadata] requestId=${requestId} unhandled:`, err);
+    const safe = buildSafeError(
+      "SEARCH_FAILED",
+      "An unexpected error occurred while loading the service offering taxonomy.",
       undefined,
       requestId,
     );
