@@ -743,8 +743,18 @@ describe("Dashboard no-actor recovery surface (M2 #83 Codex P1-001 second iterat
     // `/dashboard/audio` route. Audio is central ServiceOffering
     // evidence — it lives inside the #85 editor, not a separate
     // horizontal administration feature.
+    // M2 (#85) entry-flow manual-QA fix: the `Manage your services`
+    // quick action MUST lead to `/seller/services`, not the legacy
+    // `/dashboard/audio` route. Audio is central ServiceOffering
+    // evidence — it lives inside the #85 editor, not a separate
+    // horizontal administration feature.
+    //
+    // The JSX places `href` BEFORE `data-testid` on the <Link>
+    // element, so the structural pin must capture the whole element
+    // (from the `<Link` open tag through `</Link>`) — not just the
+    // tail after `data-testid`.
     const manageServicesLinkBlock = DASHBOARD_PAGE_SOURCE.match(
-      /data-testid="dashboard-manage-services"[\s\S]{0,400}?<\/Link>/,
+      /<Link[\s\S]{0,400}?data-testid="dashboard-manage-services"[\s\S]{0,400}?<\/Link>/,
     );
     assert.ok(
       manageServicesLinkBlock,
@@ -756,7 +766,7 @@ describe("Dashboard no-actor recovery surface (M2 #83 Codex P1-001 second iterat
       "dashboard-manage-services MUST link to /seller/services (the #85 management surface)",
     );
     assert.equal(
-      /data-testid="dashboard-manage-services"[\s\S]{0,400}?href="\/dashboard\/audio"/.test(
+      /<Link[\s\S]{0,400}?data-testid="dashboard-manage-services"[\s\S]{0,400}?href="\/dashboard\/audio"/.test(
         DASHBOARD_PAGE_SOURCE,
       ),
       false,

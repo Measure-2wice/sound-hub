@@ -120,7 +120,15 @@ describe("seller/services listing page (M2 #85 entry-flow manual-QA)", () => {
     );
     // Strip the call site block out of the editor source and verify
     // nothing else invokes createServiceOfferingDraft.
-    const sourceWithoutCallSite = EDIT_PAGE_SOURCE.replace(EDITOR_POST_DRAFT_BODY, "");
+    //
+    // The import line at the top of the file ALSO matches the bare
+    // identifier `createServiceOfferingDraft`, so strip the import
+    // statement too — the assertion is about CALL sites, not symbol
+    // references.
+    const sourceWithoutCallSite = EDIT_PAGE_SOURCE.replace(EDITOR_POST_DRAFT_BODY, "").replace(
+      /import\s*\{[^}]*createServiceOfferingDraft[^}]*\}\s*from\s*[^;]+;/,
+      "",
+    );
     assert.equal(
       /createServiceOfferingDraft/.test(sourceWithoutCallSite),
       false,

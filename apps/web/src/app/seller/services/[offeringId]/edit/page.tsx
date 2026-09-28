@@ -148,10 +148,18 @@ type DraftFieldsSnapshot = {
   readonly title: string;
   readonly description: string;
   readonly primaryCategoryKey: string;
-  readonly serviceMode: "Remote" | "InPerson" | "Hybrid";
+  // Phase 2 #85 Manual QA Round 10 — faithful Draft round-trip.
+  // The RELAXED Draft contract (packages/types/src/index.ts:1044)
+  // marks every field as optional; fabricating "Remote" /
+  // "StartingAt" / "600" for missing persisted values and then
+  // resending them on the next save persists choices the seller
+  // never made. Local state now mirrors the persisted shape — null
+  // for unset fields — so the next save sends exactly the fields
+  // the seller has actually populated.
+  readonly serviceMode: "Remote" | "InPerson" | "Hybrid" | null;
   readonly serviceAreaCountry: string;
-  readonly pricingKind: "Fixed" | "StartingAt" | "ContactForQuote";
-  readonly pricingAmount: string;
+  readonly pricingKind: "Fixed" | "StartingAt" | "ContactForQuote" | null;
+  readonly pricingAmount: string | null;
   readonly pricingUnit: string;
   readonly genreTags: readonly string[];
 };
@@ -161,11 +169,18 @@ function snapshotFromOffering(o: ServiceOfferingOwnerViewV1): DraftFieldsSnapsho
     title: o.title,
     description: o.description,
     primaryCategoryKey: o.primaryCategoryKey ?? "",
-    serviceMode: o.serviceMode ?? "Remote",
+    // Phase 2 #85 Manual QA Round 10 — do not fabricate defaults.
+    // The previous `?? "Remote"` / `?? "StartingAt"` / `: "600"`
+    // pattern converted a missing persisted value into a value
+    // the seller never chose, then `buildDraftPayload` persisted
+    // that fabricated value on the next save. The snapshot now
+    // mirrors the persisted shape so the dirty-detection
+    // baseline reflects exactly what the API returned.
+    serviceMode: o.serviceMode ?? null,
     serviceAreaCountry: o.serviceAreas[0]?.countryCode ?? "",
-    pricingKind: o.pricing?.kind ?? "StartingAt",
+    pricingKind: o.pricing?.kind ?? null,
     pricingAmount:
-      o.pricing?.amountMinor !== undefined ? String(o.pricing.amountMinor / 100) : "600",
+      o.pricing?.amountMinor !== undefined ? String(o.pricing.amountMinor / 100) : null,
     pricingUnit: o.pricing?.unitId ?? "",
     genreTags: [...o.genreTags],
   };
@@ -175,10 +190,15 @@ function snapshotFromFormState(state: {
   readonly title: string;
   readonly description: string;
   readonly primaryCategoryKey: string;
-  readonly serviceMode: "Remote" | "InPerson" | "Hybrid";
+  // Phase 2 #85 Manual QA Round 10 — nullable fields match the
+  // useState types below. The form snapshot is compared to the
+  // persisted snapshot for dirty-state detection; both nulls are
+  // equal, so an unpopulated serviceMode / pricingKind /
+  // pricingAmount doesn't trip the dirty flag spuriously.
+  readonly serviceMode: "Remote" | "InPerson" | "Hybrid" | null;
   readonly serviceAreaCountry: string;
-  readonly pricingKind: "Fixed" | "StartingAt" | "ContactForQuote";
-  readonly pricingAmount: string;
+  readonly pricingKind: "Fixed" | "StartingAt" | "ContactForQuote" | null;
+  readonly pricingAmount: string | null;
   readonly pricingUnit: string;
   readonly genreTags: readonly string[];
 }): DraftFieldsSnapshot {
@@ -536,11 +556,20 @@ function ServiceOfferingEditInner() {
   const [title, setTitle] = useState("");
   const [description, setDescription] = useState("");
   const [primaryCategoryKey, setPrimaryCategoryKey] = useState("");
-  const [serviceMode, setServiceMode] = useState<"Remote" | "InPerson" | "Hybrid">("Remote");
-  const [pricingKind, setPricingKind] = useState<"Fixed" | "StartingAt" | "ContactForQuote">(
-    "StartingAt",
+  // Phase 2 #85 Manual QA Round 10 — faithful Draft round-trip.
+  // The relaxed Draft contract marks every field as optional;
+  // the previous defaults ("Remote" / "StartingAt" / "600") would
+  // fabricate a persisted value on the first save even when the
+  // seller had not chosen one, and would round-trip those
+  // fabricated values back into the form on every resume. Local
+  // state now starts null; the seller populates fields
+  // explicitly, and `buildDraftPayload` only sends populated
+  // fields.
+  const [serviceMode, setServiceMode] = useState<"Remote" | "InPerson" | "Hybrid" | null>(null);
+  const [pricingKind, setPricingKind] = useState<"Fixed" | "StartingAt" | "ContactForQuote" | null>(
+    null,
   );
-  const [pricingAmount, setPricingAmount] = useState("600");
+  const [pricingAmount, setPricingAmount] = useState<string | null>(null);
   const [pricingUnit, setPricingUnit] = useState("");
   // Coarse service area: one country code, required when the
   // service mode is InPerson or Hybrid. The activation
@@ -939,8 +968,15 @@ function ServiceOfferingEditInner() {
   const buildDraftPayload = (): ServiceOfferingDraftRequestV1 => ({
     title,
     description,
-    primaryCategoryKey: primaryCategoryKey || undefined,
-    serviceMode,
+    // Phase 2 #85 Manual QA Round 10 — faithful Draft round-trip.
+    // Every field is now conditional on the seller having
+    // populated it; the previous build always emitted
+    // serviceMode / pricing regardless of whether the seller had
+    // chosen a value. The relaxed Draft contract accepts the
+    // optional shape; the STRICT activate schema still enforces
+    // completeness downstream via the activation re-check.
+    ...(primaryCategoryKey ? { primaryCategoryKey } : {}),
+    ...(serviceMode ? { serviceMode } : {}),
     // Coarse service area is required when serviceMode is
     // InPerson or Hybrid. The activation completeness check
     // (apps/api/src/services/service-offering.service.ts) returns
@@ -952,20 +988,26 @@ function ServiceOfferingEditInner() {
           serviceAreas: [{ countryCode: serviceAreaCountry }],
         }
       : {}),
-    pricing: {
-      kind: pricingKind,
-      ...(pricingKind !== "ContactForQuote"
-        ? {
-            amountMinor: Math.round(Number(pricingAmount) * 100),
-            currency: "USD",
-            // Omit the unitId when the unit is unchosen so the
-            // partial-draft schema can accept the save. The
-            // STRICT activate schema enforces the unit on
-            // activation.
-            ...(pricingUnit ? { unitId: pricingUnit } : {}),
-          }
-        : {}),
-    },
+    ...(pricingKind
+      ? {
+          pricing: {
+            kind: pricingKind,
+            ...(pricingKind !== "ContactForQuote"
+              ? {
+                  ...(pricingAmount
+                    ? { amountMinor: Math.round(Number(pricingAmount) * 100) }
+                    : {}),
+                  currency: "USD",
+                  // Omit the unitId when the unit is unchosen so
+                  // the partial-draft schema can accept the
+                  // save. The STRICT activate schema enforces the
+                  // unit on activation.
+                  ...(pricingUnit ? { unitId: pricingUnit } : {}),
+                }
+              : {}),
+          },
+        }
+      : {}),
     genreTags,
     includedServiceCategoryKeys: [],
     idempotencyKey: draftIdempotencyKeyRef.current ?? "",
@@ -1062,11 +1104,18 @@ function ServiceOfferingEditInner() {
       // Fallback: should be set by handleActivate before this runs.
       activateIdempotencyKeyRef.current = generateServiceOfferingIdempotencyKey();
     }
+    // Phase 2 #85 Manual QA Round 10 — performActivate is gated
+    // by `canActivate`, which now requires `serviceMode !== null`
+    // AND `pricingKind !== null` AND `pricingAmount !== null`
+    // (for Fixed / StartingAt). The non-null assertions below are
+    // safe at runtime — handleActivate cannot be reached without
+    // the gate — and they preserve the STRICT activate schema's
+    // required-field shape (`z.enum(...)`, not `z.enum(...).optional()`).
     const payload: ServiceOfferingActivateRequestV1 = {
       title: title.trim(),
       description: description.trim(),
       primaryCategoryKey,
-      serviceMode,
+      serviceMode: serviceMode!,
       // Activation is the canonical STRICT contract — service area
       // is required when the mode is InPerson / Hybrid and the
       // schema-level Zod refinement rejects missing values before
@@ -1077,7 +1126,7 @@ function ServiceOfferingEditInner() {
           }
         : { serviceAreas: [] }),
       pricing: {
-        kind: pricingKind,
+        kind: pricingKind!,
         ...(pricingKind !== "ContactForQuote"
           ? {
               amountMinor: Math.round(Number(pricingAmount) * 100),
@@ -1219,7 +1268,18 @@ function ServiceOfferingEditInner() {
     (s) => s.playbackUrl && s.contentType === "audio/mpeg",
   ).length;
   const serviceAreaRequired = serviceMode === "InPerson" || serviceMode === "Hybrid";
+  // Phase 2 #85 Manual QA Round 10 — faithful Draft round-trip.
+  // serviceMode and pricingKind are REQUIRED for activation (the
+  // activation completeness check fails without them). The previous
+  // gate relied on the fabricated "Remote" / "StartingAt" defaults
+  // — once the defaults are null, the gate must require explicit
+  // values so the Activate button isn't enabled when activation
+  // would fail downstream. The pricing sub-clause handles
+  // ContactForQuote (no amount/unit required) and Fixed /
+  // StartingAt (both amount > 0 and unit required).
   const canActivate =
+    serviceMode !== null &&
+    pricingKind !== null &&
     title.trim().length > 0 &&
     description.trim().length > 0 &&
     primaryCategoryKey.length > 0 &&
@@ -1728,7 +1788,7 @@ function ServiceOfferingEditInner() {
                             id={FIELD_IDS.pricingAmount}
                             type="number"
                             min={1}
-                            value={pricingAmount}
+                            value={pricingAmount ?? ""}
                             onChange={(e) => setPricingAmount(e.target.value)}
                             // Phase 2 #85 Manual QA Round 8 — final active
                             // read-only presentation.

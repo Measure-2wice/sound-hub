@@ -127,8 +127,12 @@ describe("SellerProfileReviewPage — M2 Professional Profile publish confirmati
     // is central ServiceOffering evidence — the new-editor path is
     // the only #85 entry.
     const source = readFile("seller/profile/review/page.tsx");
+    // The JSX places `href` BEFORE `data-testid` on the <Link>
+    // element, so the structural pin must capture the whole element
+    // (from `<Link` through `</Link>`) — not just the tail after
+    // `data-testid`.
     const createServiceCta = source.match(
-      /data-testid="profile-review-success-create-service"[\s\S]{0,400}?<\/Link>/,
+      /<Link[\s\S]{0,400}?data-testid="profile-review-success-create-service"[\s\S]{0,400}?<\/Link>/,
     );
     assert.ok(
       createServiceCta,
