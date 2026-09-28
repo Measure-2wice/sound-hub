@@ -605,6 +605,29 @@ async function handleOwnerPlay(
 ): Promise<void> {
   const requestId = generateRequestId();
   res.setHeader("x-request-id", requestId);
+  // M2 (#85) Manual QA Round 4 — private audio playback blocker.
+  //
+  // Helmet's default `Cross-Origin-Resource-Policy: same-origin`
+  // (apps/api/src/index.ts `app.use(helmet())`) prevents the
+  // SoundHub web origin from embedding the audio stream it
+  // serves. The SoundHub web runs on `localhost:3000`, the API
+  // on `localhost:4000` (production is the same shape — different
+  // origins), and the global helmet policy blocks the browser
+  // from loading the response body. The result on the editor was
+  // `Runtime NotSupportedError` raised by the `<audio>` element.
+  //
+  // The owner-side `/play` route is the single audio playback
+  // surface hung off the workspace-scoped router, and it is the
+  // ONLY authenticated media route in the application (the
+  // buyer-side `/api/services/.../play` is unauthenticated and
+  // stays at helmet's default). The route already enforces
+  // authorization, workspace ownership, and offering lifecycle
+  // state via the session cookie + the audio service. Releasing
+  // the CORP policy here lets the SoundHub browser app embed
+  // the authenticated preview bytes without disabling helmet
+  // globally and without weakening any other API route's CORP
+  // policy.
+  res.setHeader("Cross-Origin-Resource-Policy", "cross-origin");
   const actor = await resolveActor(req, res, deps);
   if (!actor) return;
   const offeringId = readOfferingIdFromParams(req);

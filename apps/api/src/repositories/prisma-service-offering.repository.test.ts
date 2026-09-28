@@ -30,6 +30,7 @@ import {
   ServiceOfferingNotFoundError,
   ServiceOfferingNotOwnedError,
 } from "./service-offering.repository.js";
+import { SERVICE_OFFERING_AUDIO_MEDIA_CONFIRMATION_VERSIONS } from "@soundhub/types";
 
 let prisma: PrismaClient;
 let repo: PrismaServiceOfferingRepository;
@@ -453,4 +454,131 @@ void test("listForOwner returns only offerings owned by the target Workspace", a
   const ids = list.map((row) => row.serviceOfferingId);
   assert.ok(ids.includes("of_test_list_a"));
   assert.ok(ids.includes("of_test_list_b"));
+});
+
+// Phase 2 #85 Manual QA Round 9 — pricing unit hydration bug.
+//
+// The Prisma FK column `ServiceOfferingPricing.unitId` stores the
+// internal `PricingUnit.id` (cuid), but the activation payload
+// and the editor's <option value> both use the public
+// `PricingUnit.key`. The OwnerView's `pricing.unitId` must
+// surface `unit.key` (not the FK cuid) so the editor's resumed
+// select hydrates to the saved unit. The DTO schema
+// (`z.string().min(1).max(64)`) is unchanged — only the resolved
+// value differs.
+void test("OwnerView pricing.unitId surfaces the public PricingUnit.key, not the internal FK cuid (resume hydration)", async () => {
+  const fixture = await loadFixture();
+  await cleanTestRows();
+  const id = "of_test_unit_hydration";
+  await seedOffering({ id, fixture });
+  // Seed a sample so activation completeness can succeed.
+  await prisma.serviceOfferingAudioSample.create({
+    data: {
+      offeringId: id,
+      label: "Demo",
+      contentType: "audio/mpeg",
+      byteSize: 1024,
+      displayOrder: 1,
+      storageRef: "ref://demo",
+      cleanupStatus: "Live",
+      confirmationVersion: SERVICE_OFFERING_AUDIO_MEDIA_CONFIRMATION_VERSIONS[0],
+      confirmedByUserId: fixture.userId,
+      confirmedAt: new Date(),
+    },
+  });
+  const category = await prisma.serviceCategory.findUnique({
+    where: { key: "music-production" },
+  });
+  const unit = await prisma.pricingUnit.findUnique({
+    where: { key: "per-track" },
+  });
+  assert.ok(category);
+  assert.ok(unit);
+  const result = await repo.activate({
+    offeringId: id,
+    workspaceId: fixture.workspaceId,
+    sellerProfileId: fixture.sellerProfileId,
+    activatedByUserId: fixture.userId,
+    title: "Haitian dancehall production",
+    description: "Description",
+    primaryCategoryKey: "music-production",
+    serviceMode: "Remote",
+    serviceAreas: [],
+    pricing: {
+      kind: "StartingAt",
+      amountMinor: 60000,
+      currency: "USD",
+      unitId: "per-track",
+    },
+    genreTags: [],
+    includedServiceCategoryKeys: [],
+    confirmationVersion: "m2-service-activation-v1",
+    idempotencyKey: `unit-hydration-${id}`,
+    requestId: `req-unit-hydration-${id}`,
+    playbackUrlFor: PLAYBACK,
+    now: new Date(),
+  });
+  // Sanity: the FK in the DB row is the cuid (NOT the public
+  // key). This is the existing persistence shape and must NOT
+  // be changed by the Round 9 fix.
+  const dbRow = await prisma.serviceOfferingPricing.findUnique({
+    where: { offeringId: id },
+  });
+  assert.ok(dbRow);
+  assert.equal(dbRow.unitId, unit.id, "DB persists the cuid (internal FK) — unchanged by Round 9");
+  // The OwnerView's `pricing.unitId` MUST surface the public
+  // key (`per-track`), NOT the cuid. This is what makes the
+  // editor's resumed <option value={u.key}> match and the
+  // select render the saved unit.
+  assert.ok(result.offering.pricing, "OwnerView.pricing must be present after activation");
+  assert.equal(
+    result.offering.pricing.unitId,
+    "per-track",
+    "OwnerView.pricing.unitId must surface the public PricingUnit.key so the editor's resumed select hydrates to the saved unit",
+  );
+  assert.notEqual(
+    result.offering.pricing.unitId,
+    unit.id,
+    "OwnerView.pricing.unitId must NOT leak the internal FK cuid",
+  );
+});
+
+void test("Draft resume via saveDraft + findForOwner preserves the public PricingUnit.key in OwnerView.pricing.unitId", async () => {
+  const fixture = await loadFixture();
+  await cleanTestRows();
+  const id = "of_test_draft_unit_hydration";
+  await seedOffering({ id, fixture });
+  await repo.saveDraft({
+    offeringId: id,
+    workspaceId: fixture.workspaceId,
+    title: "Haitian dancehall production",
+    description: "Description",
+    primaryCategoryKey: "music-production",
+    serviceMode: "Remote",
+    serviceAreas: [],
+    pricing: {
+      kind: "StartingAt",
+      amountMinor: 60000,
+      currency: "USD",
+      unitId: "per-track",
+    },
+    genreTags: [],
+    includedServiceCategoryKeys: [],
+    now: new Date(),
+    playbackUrlFor: PLAYBACK,
+  });
+  // findForOwner is the read path the editor bootstrap uses
+  // on resume.
+  const owner = await repo.findForOwner({
+    offeringId: id,
+    workspaceId: fixture.workspaceId,
+    playbackUrlFor: PLAYBACK,
+  });
+  assert.ok(owner, "findForOwner must return the Draft row");
+  assert.ok(owner.pricing, "OwnerView.pricing must be present after Draft save");
+  assert.equal(
+    owner.pricing.unitId,
+    "per-track",
+    "Draft resume must surface the public PricingUnit.key (per-track), not the FK cuid",
+  );
 });

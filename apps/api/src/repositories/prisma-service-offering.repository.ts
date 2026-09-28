@@ -106,7 +106,15 @@ function workspaceCreateLockSql(workspaceId: string): Prisma.Sql {
 const OFFERING_INCLUDE = {
   primaryCategory: { select: { key: true } },
   serviceAreas: true,
-  pricing: true,
+  // Phase 2 #85 Manual QA Round 9 — pricing unit hydration bug.
+  // The Prisma FK column stores the internal `PricingUnit.id`
+  // (cuid), but the API input/output contract uses the public
+  // `PricingUnit.key` (the slug the editor's <option value>
+  // matches and the activation payload accepts via
+  // `resolvePricingUnitId`). Loading the related `unit` here
+  // lets the OwnerView mapper surface `unit.key` so the editor's
+  // resumed select hydrates to the saved pricing unit.
+  pricing: { include: { unit: { select: { key: true } } } },
   includedServices: { include: { category: { select: { key: true } } } },
   // M2 (#85) PR-review feedback: only CONFIRMED Live samples
   // appear in the OwnerView so the editor's readiness checklist
@@ -807,6 +815,13 @@ type OwnerViewRowShape = {
     readonly amountMinor: number | null;
     readonly currency: string | null;
     readonly unitId: string | null;
+    // Phase 2 #85 Manual QA Round 9 — the related PricingUnit row
+    // (loaded via OFFERING_INCLUDE) carries the public `key` the
+    // OwnerView surfaces for `pricing.unitId`. The internal FK
+    // cuid is the persistence-layer identifier; the `key` is the
+    // contract-layer identifier (matches the value the editor's
+    // <option value> binds to).
+    readonly unit: { readonly key: string } | null;
   } | null;
   readonly genreTags: string[];
   readonly includedServices: readonly {
@@ -885,7 +900,17 @@ function toOwnerView(
         kind: row.pricing.kind,
         ...(row.pricing.amountMinor !== null ? { amountMinor: row.pricing.amountMinor } : {}),
         ...(row.pricing.currency !== null ? { currency: row.pricing.currency } : {}),
-        ...(row.pricing.unitId !== null ? { unitId: row.pricing.unitId } : {}),
+        // Phase 2 #85 Manual QA Round 9 — pricing unit hydration
+        // bug. The Prisma FK `unitId` column stores the internal
+        // PricingUnit.id (cuid), but the activation payload and
+        // the editor's <option value> both use the public
+        // PricingUnit.key. Surface `unit.key` here so the editor's
+        // resumed select hydrates to the saved unit (the cuid
+        // would not match any <option value>, so the select would
+        // fall back to "Select a unit"). The schema
+        // (z.string().min(1).max(64)) is unchanged; only the
+        // resolved value differs.
+        ...(row.pricing.unit?.key ? { unitId: row.pricing.unit.key } : {}),
       }
     : null;
   const latestActivation = row.activations[0];
