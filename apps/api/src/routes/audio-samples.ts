@@ -49,13 +49,14 @@
 import { Router, type NextFunction, type Request, type Response } from "express";
 import {
   bg2AudioSampleListResponseV1Schema,
+  bg2AudioSampleRemoveRequestV1Schema,
   bg2AudioSampleRemoveResponseV1Schema,
   bg2AudioSampleUploadResponseV1Schema,
   BG2_AUDIO_SAMPLE_CONTENT_TYPE,
   BG2_AUDIO_SAMPLE_MAX_BYTE_SIZE,
   BG2_AUDIO_SAMPLE_MAX_LABEL_LENGTH,
 } from "@soundhub/types";
-import { z, ZodError } from "zod";
+import { ZodError } from "zod";
 import type { AudioSampleService } from "../services/audio-sample.service.js";
 import { AudioSampleError } from "../services/audio-sample.service.js";
 import {
@@ -261,9 +262,17 @@ async function handleRemove(
   if (rawBody === undefined) return;
 
   let actingWorkspaceId: string;
+  let confirmEligibilityLoss: boolean | undefined;
   try {
-    const parsed = removeRequestSchema.parse(rawBody);
+    const parsed = bg2AudioSampleRemoveRequestV1Schema.parse(rawBody);
     actingWorkspaceId = parsed.actingWorkspaceId;
+    // M2 (#86): the eligibility-loss confirmation flag is transient
+    // and never persisted. Pass it through to the service so the
+    // application boundary can enforce the final-sample confirmation
+    // for Active offerings. The flag is intentionally optional — a
+    // removal without the flag is accepted for non-final-sample
+    // removals and for non-Active offerings.
+    confirmEligibilityLoss = parsed.confirmEligibilityLoss;
   } catch (err) {
     if (err instanceof ZodError) {
       writeSafeError(
@@ -286,6 +295,7 @@ async function handleRemove(
       offeringId,
       sampleId,
       actingWorkspaceId,
+      ...(confirmEligibilityLoss !== undefined ? { confirmEligibilityLoss } : {}),
     });
     const body = bg2AudioSampleRemoveResponseV1Schema.parse({
       ok: true,
@@ -824,7 +834,11 @@ function splitPart(partBytes: Buffer): PartSplit {
   return { headers, body };
 }
 
-const removeRequestSchema = z.object({ actingWorkspaceId: z.string().min(1).max(128) }).strict();
+// M2 (#86): the audio remove request schema lives in @soundhub/types
+// as `bg2AudioSampleRemoveRequestV1Schema` and now includes the
+// transient `confirmEligibilityLoss?: boolean` flag for the final-
+// sample-on-Active eligibility-loss confirmation flow. The handler
+// above parses against the shared schema.
 
 async function readJsonBodyOrRespond(
   req: Request,

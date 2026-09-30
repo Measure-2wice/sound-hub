@@ -221,6 +221,133 @@ export interface ServiceOfferingActivationEvidenceView {
   readonly idempotencyKey: string;
 }
 
+// M2 (#86): ServiceOfferingPause evidence and input shapes.
+//
+// Pause authorization is independent of activation completeness — a
+// grandfathered nonconforming Active offering must remain pausable
+// without satisfying the activation contract. Pause therefore records
+// only the facts established by the Pause command (no
+// `confirmationVersion` column — fabricating such a column would
+// invent an attestation the Pause command did not invoke).
+export type ServiceOfferingPauseReasonValue = "user_initiated" | "final_sample_removal";
+
+export interface ServiceOfferingPauseInput {
+  readonly offeringId: string;
+  readonly workspaceId: string;
+  readonly sellerProfileId: string;
+  readonly pausedByUserId: string;
+  readonly reason: ServiceOfferingPauseReasonValue;
+  readonly idempotencyKey: string;
+  readonly requestId: string;
+  readonly now: Date;
+}
+
+export interface ServiceOfferingPauseEvidenceView {
+  readonly pausedAt: Date;
+  readonly reason: ServiceOfferingPauseReasonValue;
+  readonly idempotencyKey: string;
+}
+
+export interface ServiceOfferingPauseResult {
+  readonly offering: ServiceOfferingOwnerViewRecord;
+  readonly evidence: ServiceOfferingPauseEvidenceView;
+  /**
+   * `true` when the operation converged on an already-persisted
+   * pause row (transport retry after a lost response). The caller
+   * treats this as success.
+   */
+  readonly convergedFromExistingPause: boolean;
+}
+
+// M2 (#86): ServiceOfferingReactivate input — same STRICT public
+// field set as activation because the repository re-runs the same
+// activation completeness check. Failure leaves the offering Paused
+// (no new ServiceOfferingActivation row written). The reactivation
+// idempotencyKey is bound to the existing
+// (offeringId, idempotencyKey) DB unique constraint on the
+// `service_offering_activations` table.
+export interface ServiceOfferingReactivateInput {
+  readonly offeringId: string;
+  readonly workspaceId: string;
+  readonly sellerProfileId: string;
+  readonly reactivatedByUserId: string;
+  readonly title: string;
+  readonly description: string;
+  readonly primaryCategoryKey: string;
+  readonly serviceMode: "Remote" | "InPerson" | "Hybrid";
+  readonly serviceAreas: readonly {
+    readonly countryCode: string;
+    readonly region?: string;
+    readonly city?: string;
+  }[];
+  readonly pricing: {
+    readonly kind: "Fixed" | "StartingAt" | "ContactForQuote";
+    readonly amountMinor?: number;
+    readonly currency?: string;
+    readonly unitId?: string;
+  };
+  readonly genreTags: readonly string[];
+  readonly includedServiceCategoryKeys: readonly string[];
+  readonly confirmationVersion: ServiceOfferingActivationConfirmationVersionV1;
+  readonly idempotencyKey: string;
+  readonly requestId: string;
+  readonly now: Date;
+  readonly playbackUrlFor: (input: { offeringId: string; sampleId: string }) => string;
+}
+
+// M2 (#86): ServiceOfferingUpdateActive input — same STRICT public
+// field set as activation because the repository runs the same
+// activation completeness check before replacing the public fields
+// atomically. The lifecycle does NOT change (Active → Active); the
+// existing ServiceOfferingActivation rows are NOT touched. The
+// idempotencyKey is bound to a NEW unique index on the
+// `service_offering_updates` table.
+export interface ServiceOfferingUpdateActiveInput {
+  readonly offeringId: string;
+  readonly workspaceId: string;
+  readonly sellerProfileId: string;
+  readonly updatedByUserId: string;
+  readonly title: string;
+  readonly description: string;
+  readonly primaryCategoryKey: string;
+  readonly serviceMode: "Remote" | "InPerson" | "Hybrid";
+  readonly serviceAreas: readonly {
+    readonly countryCode: string;
+    readonly region?: string;
+    readonly city?: string;
+  }[];
+  readonly pricing: {
+    readonly kind: "Fixed" | "StartingAt" | "ContactForQuote";
+    readonly amountMinor?: number;
+    readonly currency?: string;
+    readonly unitId?: string;
+  };
+  readonly genreTags: readonly string[];
+  readonly includedServiceCategoryKeys: readonly string[];
+  readonly confirmationVersion: ServiceOfferingActivationConfirmationVersionV1;
+  readonly idempotencyKey: string;
+  readonly requestId: string;
+  readonly now: Date;
+  readonly playbackUrlFor: (input: { offeringId: string; sampleId: string }) => string;
+}
+
+export interface ServiceOfferingUpdateEvidenceView {
+  readonly updatedAt: Date;
+  readonly confirmationVersion: ServiceOfferingActivationConfirmationVersionV1;
+  readonly idempotencyKey: string;
+}
+
+export interface ServiceOfferingUpdateActiveResult {
+  readonly offering: ServiceOfferingOwnerViewRecord;
+  readonly evidence: ServiceOfferingUpdateEvidenceView;
+  /**
+   * `true` when the operation converged on an already-persisted
+   * update row (transport retry after a lost response). The caller
+   * treats this as success.
+   */
+  readonly convergedFromExistingUpdate: boolean;
+}
+
 export interface ServiceOfferingOwnerViewRecord {
   readonly serviceOfferingId: string;
   readonly workspaceId: string;
@@ -348,6 +475,86 @@ export class ServiceOfferingSellerProfileMissingError extends Error {
   }
 }
 
+// M2 (#86): typed errors for the post-activation lifecycle commands.
+// The service layer translates each into the corresponding safe
+// envelope via `mapStatus` (see `apps/api/src/lib/errors.ts`).
+
+/**
+ * Raised by `pause` when the offering row does not exist.
+ */
+export class ServiceOfferingNotActiveError extends Error {
+  constructor(
+    public readonly offeringId: string,
+    public readonly currentStatus: "Draft" | "Active" | "Paused" | "Archived",
+  ) {
+    super(`ServiceOffering ${offeringId} is ${currentStatus}; pause requires Active`);
+    this.name = "ServiceOfferingNotActiveError";
+  }
+}
+
+/**
+ * Raised by `pause` when the offering has already transitioned to
+ * Paused AND no pause evidence row exists for the supplied
+ * idempotencyKey (the lookup-before-precondition rule from the
+ * corrected idempotency table). A retry of the same
+ * previously-committed idempotencyKey converges on the existing
+ * pause row and does NOT surface this error.
+ */
+export class ServiceOfferingAlreadyPausedError extends Error {
+  constructor(public readonly offeringId: string) {
+    super(`ServiceOffering ${offeringId} is already Paused`);
+    this.name = "ServiceOfferingAlreadyPausedError";
+  }
+}
+
+/**
+ * Raised by `reactivate` when the offering is not in Paused state
+ * AND no ServiceOfferingActivation evidence row exists for the
+ * supplied reactivation idempotencyKey. Surfaced as 409
+ * `SERVICE_OFFERING_NOT_PAUSED`.
+ */
+export class ServiceOfferingNotPausedError extends Error {
+  constructor(
+    public readonly offeringId: string,
+    public readonly currentStatus: "Draft" | "Active" | "Paused" | "Archived",
+  ) {
+    super(`ServiceOffering ${offeringId} is ${currentStatus}; reactivate requires Paused`);
+    this.name = "ServiceOfferingNotPausedError";
+  }
+}
+
+/**
+ * Raised by `updateActive` when the offering is not in Active state
+ * AND no ServiceOfferingUpdate evidence row exists for the supplied
+ * update idempotencyKey. Surfaced as 409 `SERVICE_OFFERING_NOT_ACTIVE`.
+ */
+export class ServiceOfferingUpdateNotActiveError extends Error {
+  constructor(
+    public readonly offeringId: string,
+    public readonly currentStatus: "Draft" | "Active" | "Paused" | "Archived",
+  ) {
+    super(`ServiceOffering ${offeringId} is ${currentStatus}; updateActive requires Active`);
+    this.name = "ServiceOfferingUpdateNotActiveError";
+  }
+}
+
+/**
+ * Raised by `updateActive` when the payload fails the activation
+ * completeness check inside the transaction. Surfaced as 422
+ * `SERVICE_OFFERING_INVALID_UPDATE` carrying the field-error list.
+ * Mirrors the `ServiceOfferingIncompleteError` semantics for the
+ * update flow.
+ */
+export class ServiceOfferingInvalidUpdateError extends Error {
+  constructor(
+    public readonly reasons: readonly string[],
+    public readonly fieldErrors: readonly ApiFieldErrorV1[] = [],
+  ) {
+    super(`Update completeness re-check failed: ${reasons.join(", ")}`);
+    this.name = "ServiceOfferingInvalidUpdateError";
+  }
+}
+
 export interface ServiceOfferingRepository {
   /**
    * Atomically create a Draft ServiceOffering for the Workspace's
@@ -438,4 +645,79 @@ export interface ServiceOfferingRepository {
    * editor's readiness checklist cannot drift.
    */
   countLiveConfirmedSamples(offeringId: string): Promise<number>;
+
+  // -------------------------------------------------------------------------
+  // M2 (#86): post-activation lifecycle commands.
+  //
+  // These methods are OPTIONAL on the interface so slice 86A can
+  // establish the persistence + type contracts without introducing
+  // implementations that would amount to fake stub bodies. Slices
+  // 86B (Pause + Reactivate) and 86C (updateActive) add the
+  // implementations to both adapters AND tighten the interface to
+  // required methods; the call sites in those slices drop the `!`
+  // non-null assertion.
+  //
+  // Idempotency contract enforced by each implementation, in order:
+  //   1. acquire transaction + advisory lock
+  //   2. lookup `(offeringId, idempotencyKey)` evidence row
+  //   3. if found → return as converged success
+  //   4. otherwise enforce the lifecycle precondition (status check)
+  //   5. then execute the command
+  // -------------------------------------------------------------------------
+
+  /**
+   * Atomic Active → Paused transition + append-only evidence row
+   * insertion. The (offeringId, idempotencyKey) DB unique constraint
+   * on `service_offering_pauses` is the second defense against
+   * transport-retry duplicates; the advisory lock acquired at the
+   * start of the transaction is the first.
+   *
+   * Throws `ServiceOfferingNotFoundError` if the offering row does
+   * not exist. Throws `ServiceOfferingNotActiveError` (or the
+   * derived `ServiceOfferingAlreadyPausedError` if the offering has
+   * already transitioned to Paused and the lookup found no row for
+   * the supplied idempotencyKey — see slice 86B precondition rules).
+   * Throws `ServiceOfferingNotOwnedError` if the offering is owned
+   * by a different workspace.
+   */
+  pause?(input: ServiceOfferingPauseInput): Promise<ServiceOfferingPauseResult>;
+
+  /**
+   * Atomic Paused → Active transition + new ServiceOfferingActivation
+   * evidence row insertion. The (offeringId, idempotencyKey) DB
+   * unique constraint on `service_offering_activations` is the
+   * second defense; the per-offering + per-offering audio-sample
+   * advisory locks are the first.
+   *
+   * INSIDE the transaction the repository re-runs the activation
+   * completeness check (`buildActivationCompletenessFieldErrors` +
+   * CONFIRMED Live sample count + `SellerProfile.published`
+   * precondition). Throws `ServiceOfferingIncompleteError` when the
+   * re-check fails. Throws `ServiceOfferingNotFoundError` /
+   * `ServiceOfferingNotOwnedError` / `ServiceOfferingNotPausedError`
+   * per the slice 86B precondition rules.
+   */
+  reactivate?(input: ServiceOfferingReactivateInput): Promise<ServiceOfferingActivationResult>;
+
+  /**
+   * Atomic Active → Active update: validate the complete resulting
+   * state, in-place update the public fields, append a new
+   * ServiceOfferingUpdate evidence row. The existing
+   * ServiceOfferingActivation rows are NOT touched (the activation
+   * timestamp from the original Draft → Active transition is
+   * preserved verbatim per ADR 0008).
+   *
+   * The (offeringId, idempotencyKey) DB unique constraint on
+   * `service_offering_updates` is the second defense; the
+   * per-offering + audio-sample advisory locks are the first.
+   *
+   * Throws `ServiceOfferingIncompleteError` (mapped to
+   * SERVICE_OFFERING_INVALID_UPDATE) when the re-check fails.
+   * Throws `ServiceOfferingNotFoundError` /
+   * `ServiceOfferingNotOwnedError` / `ServiceOfferingNotActiveError`
+   * per the slice 86C precondition rules.
+   */
+  updateActive?(
+    input: ServiceOfferingUpdateActiveInput,
+  ): Promise<ServiceOfferingUpdateActiveResult>;
 }

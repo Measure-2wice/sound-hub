@@ -319,6 +319,19 @@ export interface RemoveSampleInput {
   readonly offeringId: string;
   readonly sampleId: string;
   readonly actingWorkspaceId: string;
+  /**
+   * M2 (#86): explicit eligibility-loss confirmation flag. When the
+   * removal would be the last qualifying sample from an Active
+   * offering, the application boundary requires this flag to be
+   * `true`; without it the service raises
+   * `AUDIO_SAMPLE_FINAL_REMOVAL_CONFIRMATION_REQUIRED`. For all other
+   * removals (non-final sample, non-Active offering) the flag is
+   * optional and unused. The flag is transient — it is never
+   * persisted on the sample row. The slice that consumes this flag
+   * (the final-sample-on-Active atomic transition) lands in slice
+   * 86D.
+   */
+  readonly confirmEligibilityLoss?: boolean;
 }
 
 export interface RemoveSampleResult {
