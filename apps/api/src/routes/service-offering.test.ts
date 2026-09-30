@@ -33,6 +33,7 @@ import { DeterministicIdentityAdapter } from "../identity/deterministic-identity
 import { PersonalWorkspaceConvergenceService } from "../services/personal-workspace-convergence.service.js";
 
 const SELLER_USER = "user-service-offering-route";
+const SELLER_USER_ID = SELLER_USER;
 const ORG_SELLER_USER = "user-org-service-offering";
 const PERSONAL_WS = "ws-service-offering-personal";
 const ORG_WS = "ws-service-offering-org";
@@ -595,6 +596,190 @@ describe("ServiceOffering route (in-memory)", () => {
     const response = await request(app)
       .post(`/api/workspaces/${PERSONAL_WS}/service-offerings/of_test_reactivate_unpub/reactivate`)
       .send(reactivateBody)
+      .set("Cookie", cookie)
+      .set("Content-Type", "application/json");
+    assert.equal(response.status, 422);
+    assert.equal(response.body.error.code, "SERVICE_OFFERING_SELLER_PROFILE_NOT_PUBLISHED");
+  });
+
+  // M2 (#86, slice 86C): PUT /update route coverage. The Update
+  // command is Active → Active; it requires the SellerProfile
+  // .published precondition (same as Activate / Reactivate) and
+  // the strict activation completeness contract (same as Activate
+  // / Reactivate). The response shape is the dedicated
+  // `serviceOfferingUpdateResponseV1Schema` (carries `updatedAt`
+  // rather than `activatedAt`).
+  const updateBody = {
+    title: "Updated service title",
+    description: "Updated service description.",
+    primaryCategoryKey: "music-production",
+    serviceMode: "Remote",
+    serviceAreas: [],
+    pricing: { kind: "StartingAt", amountMinor: 75000, currency: "USD", unitId: "per-track" },
+    genreTags: ["dancehall"],
+    includedServiceCategoryKeys: [],
+    confirmationVersion: "m2-service-activation-v1",
+    idempotencyKey: "44444444-5555-6666-7777-888888888881",
+  };
+
+  void test("PUT /update returns 200 + serviceOfferingUpdateResponseV1 shape on happy path", async () => {
+    seedAsActive("of_test_update_happy");
+    serviceOfferingRepository._seedSample("of_test_update_happy", {
+      sampleId: "smp_update_happy",
+      label: "Demo",
+      byteSize: 1024,
+      displayOrder: 1,
+      storageRef: "ref://update-happy",
+      confirmation: {
+        version: "m2-audio-confirmation-v1",
+        confirmedByUserId: SELLER_USER_ID,
+        confirmedAt: new Date(),
+      },
+    });
+    // Register the SellerProfile as Published so the in-tx
+    // SellerProfile.published check passes.
+    serviceOfferingRepository._registerSellerProfile({
+      workspaceId: PERSONAL_WS,
+      sellerProfileId: "sp_test",
+      status: "Published",
+    });
+    const cookie = await signIn(SELLER_EMAIL);
+    const response = await request(app)
+      .put(`/api/workspaces/${PERSONAL_WS}/service-offerings/of_test_update_happy/update`)
+      .send(updateBody)
+      .set("Cookie", cookie)
+      .set("Content-Type", "application/json");
+    assert.equal(response.status, 200);
+    assert.equal(response.body.ok, true);
+    assert.equal(response.body.offering.status, "Active");
+    assert.equal(response.body.offering.title, "Updated service title");
+    // The `updatedAt` is the timestamp of the update evidence row,
+    // NOT the activation timestamp (which is preserved verbatim).
+    assert.ok(typeof response.body.evidence.updatedAt === "string");
+    assert.equal(response.body.evidence.confirmationVersion, "m2-service-activation-v1");
+    assert.equal(response.body.evidence.idempotencyKey, "44444444-5555-6666-7777-888888888881");
+  });
+
+  void test("PUT /update same-key retry returns converged success", async () => {
+    seedAsActive("of_test_update_idem");
+    serviceOfferingRepository._seedSample("of_test_update_idem", {
+      sampleId: "smp_update_idem",
+      label: "Demo",
+      byteSize: 1024,
+      displayOrder: 1,
+      storageRef: "ref://update-idem",
+      confirmation: {
+        version: "m2-audio-confirmation-v1",
+        confirmedByUserId: SELLER_USER_ID,
+        confirmedAt: new Date(),
+      },
+    });
+    serviceOfferingRepository._registerSellerProfile({
+      workspaceId: PERSONAL_WS,
+      sellerProfileId: "sp_test",
+      status: "Published",
+    });
+    const cookie = await signIn(SELLER_EMAIL);
+    // First call.
+    const first = await request(app)
+      .put(`/api/workspaces/${PERSONAL_WS}/service-offerings/of_test_update_idem/update`)
+      .send(updateBody)
+      .set("Cookie", cookie)
+      .set("Content-Type", "application/json");
+    assert.equal(first.status, 200);
+    // Same-key retry.
+    const retry = await request(app)
+      .put(`/api/workspaces/${PERSONAL_WS}/service-offerings/of_test_update_idem/update`)
+      .send(updateBody)
+      .set("Cookie", cookie)
+      .set("Content-Type", "application/json");
+    assert.equal(retry.status, 200);
+    assert.deepEqual(retry.body.evidence, first.body.evidence);
+  });
+
+  void test("PUT /update on a Paused offering returns 409 SERVICE_OFFERING_NOT_ACTIVE", async () => {
+    // The Paused offering is seeded (Draft at the same time would
+    // also surface this error — the precondition is `status ===
+    // Active`).
+    serviceOfferingRepository._seedOffering({
+      id: "of_test_update_paused",
+      workspaceId: PERSONAL_WS,
+      sellerProfileId: "sp_test",
+      status: "Paused",
+    });
+    const cookie = await signIn(SELLER_EMAIL);
+    const response = await request(app)
+      .put(`/api/workspaces/${PERSONAL_WS}/service-offerings/of_test_update_paused/update`)
+      .send(updateBody)
+      .set("Cookie", cookie)
+      .set("Content-Type", "application/json");
+    assert.equal(response.status, 409);
+    assert.equal(response.body.error.code, "SERVICE_OFFERING_NOT_ACTIVE");
+  });
+
+  void test("PUT /update with zero CONFIRMED Live samples returns 422 SERVICE_OFFERING_INVALID_UPDATE with samples_required", async () => {
+    // The repository's completeness recheck enforces
+    // 1..BG2_AUDIO_SAMPLE_MAX_PER_OFFERING CONFIRMED Live samples.
+    // A new STRICT request validates the schema but seeds no
+    // sample, so the repository's in-tx count check trips and
+    // throws `ServiceOfferingInvalidUpdateError` carrying the
+    // `samples_required` field error.
+    seedAsActive("of_test_update_no_samples");
+    // No sample is seeded — the completeness recheck trips on the
+    // sample-count predicate inside the repository transaction.
+    serviceOfferingRepository._registerSellerProfile({
+      workspaceId: PERSONAL_WS,
+      sellerProfileId: "sp_test",
+      status: "Published",
+    });
+    const cookie = await signIn(SELLER_EMAIL);
+    const response = await request(app)
+      .put(`/api/workspaces/${PERSONAL_WS}/service-offerings/of_test_update_no_samples/update`)
+      .send(updateBody)
+      .set("Cookie", cookie)
+      .set("Content-Type", "application/json");
+    assert.equal(response.status, 422);
+    assert.equal(response.body.error.code, "SERVICE_OFFERING_INVALID_UPDATE");
+    assert.ok(
+      Array.isArray(response.body.error.fields) &&
+        (
+          response.body.error.fields as ReadonlyArray<{
+            path: string;
+            code: string;
+          }>
+        ).some((f) => f.path === "samples" && f.code === "samples_required"),
+      "SERVICE_OFFERING_INVALID_UPDATE must carry the samples_required field error",
+    );
+  });
+
+  void test("PUT /update without SellerProfile Published returns 422 SERVICE_OFFERING_SELLER_PROFILE_NOT_PUBLISHED", async () => {
+    seedAsActive("of_test_update_unpub");
+    serviceOfferingRepository._seedSample("of_test_update_unpub", {
+      sampleId: "smp_update_unpub",
+      label: "Demo",
+      byteSize: 1024,
+      displayOrder: 1,
+      storageRef: "ref://update-unpub",
+      confirmation: {
+        version: "m2-audio-confirmation-v1",
+        confirmedByUserId: SELLER_USER_ID,
+        confirmedAt: new Date(),
+      },
+    });
+    // The repository's Update publication check runs inside the
+    // transaction and reads the SellerProfile status from the
+    // in-memory registry; the default Published registration must
+    // be overwritten with a Draft status to surface the precondition
+    // rejection.
+    serviceOfferingRepository._registerSellerProfile({
+      workspaceId: PERSONAL_WS,
+      sellerProfileId: "sp_test",
+      status: "Draft",
+    });
+    const cookie = await signIn(SELLER_EMAIL);
+    const response = await request(app)
+      .put(`/api/workspaces/${PERSONAL_WS}/service-offerings/of_test_update_unpub/update`)
+      .send(updateBody)
       .set("Cookie", cookie)
       .set("Content-Type", "application/json");
     assert.equal(response.status, 422);

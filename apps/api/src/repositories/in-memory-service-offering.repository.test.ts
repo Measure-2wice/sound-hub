@@ -597,4 +597,258 @@ void describe("InMemoryServiceOfferingRepository — ServiceOfferingPause / Serv
       assert.equal(repo._peekSellerProfileStatus(SELLER_PROFILE_ID), "Suspended");
     });
   });
+
+  // ===========================================================================
+  // M2 (#86, slice 86C): `updateActive` repository tests
+  // ===========================================================================
+  void describe("updateActive", () => {
+    function buildActiveRepo(): InMemoryServiceOfferingRepository {
+      const repo = new InMemoryServiceOfferingRepository();
+      repo._seedOffering({
+        id: "of_a",
+        workspaceId: WS_ID,
+        sellerProfileId: SELLER_PROFILE_ID,
+        status: "Active",
+      });
+      repo._seedOffering({
+        id: "of_b",
+        workspaceId: WS_ID,
+        sellerProfileId: SELLER_PROFILE_ID,
+        status: "Active",
+      });
+      repo._registerSellerProfile({
+        workspaceId: WS_ID,
+        sellerProfileId: SELLER_PROFILE_ID,
+        status: "Published",
+      });
+      return repo;
+    }
+
+    function minimalUpdate(
+      overrides: Partial<Parameters<InMemoryServiceOfferingRepository["updateActive"]>[0]> = {},
+    ) {
+      return {
+        offeringId: "of_a",
+        workspaceId: WS_ID,
+        updatedByUserId: ACTIVATED_BY,
+        title: "Updated title",
+        description: "Updated description.",
+        primaryCategoryKey: "music-production",
+        serviceMode: "Remote" as const,
+        serviceAreas: [],
+        pricing: {
+          kind: "StartingAt" as const,
+          amountMinor: 75000,
+          currency: "USD",
+          unitId: "per-track",
+        },
+        genreTags: ["dancehall"],
+        includedServiceCategoryKeys: [],
+        confirmationVersion: "m2-service-activation-v1" as const,
+        idempotencyKey: "22222222-3333-4444-5555-666666666666",
+        requestId: "req-update-1",
+        now: new Date("2026-09-27T15:00:00.000Z"),
+        playbackUrlFor: playbackUrl,
+        ...overrides,
+      };
+    }
+
+    void test("updateActive on Active with full STRICT pass replaces the public field set atomically, appends ONE update row, and preserves the activation timestamp", async () => {
+      const repo = buildActiveRepo();
+      seedConfirmedLive(repo, "of_a", "sample-1");
+      // Capture the original activatedAt on the offering so we
+      // can assert it is preserved verbatim by Update.
+      const beforePeek = repo._peekOffering("of_a");
+      const originalActivatedAt = beforePeek?.activatedAt ?? null;
+      const originalActivatedByUserId = beforePeek?.activatedByUserId ?? null;
+
+      const result = await repo.updateActive(minimalUpdate({ title: "New title after update" }));
+
+      assert.equal(result.convergedFromExistingUpdate, false);
+      assert.equal(result.offering.status, "Active");
+      // Lifecycle did NOT change (slice 86C invariant).
+      assert.equal(result.offering.status, "Active");
+      // Public fields were replaced atomically.
+      assert.equal(result.offering.title, "New title after update");
+      assert.equal(result.offering.description, "Updated description.");
+      // The activation timestamp on the OWNERVIEW is preserved
+      // (the OwnerView derives `activatedAt` from the latest
+      // ServiceOfferingActivation row, which Update never touches).
+      assert.equal(result.offering.activatedAt, originalActivatedAt);
+      assert.equal(
+        JSON.stringify(result.offering.activatedAt),
+        JSON.stringify(originalActivatedAt),
+      );
+      // Evidence carries the update timestamp + idempotency key.
+      assert.equal(result.evidence.updatedAt.toISOString(), "2026-09-27T15:00:00.000Z");
+      assert.equal(result.evidence.confirmationVersion, "m2-service-activation-v1");
+      assert.equal(result.evidence.idempotencyKey, "22222222-3333-4444-5555-666666666666");
+
+      // Internal: the underlying offering row's `activatedAt` and
+      // `activatedByUserId` were NOT touched by Update — they
+      // remain at the values the original activation committed.
+      const afterPeek = repo._peekOffering("of_a");
+      assert.equal(afterPeek?.activatedAt, originalActivatedAt);
+      assert.equal(afterPeek?.activatedByUserId, originalActivatedByUserId);
+    });
+
+    void test("updateActive same-key retry converges on the existing update row", async () => {
+      const repo = buildActiveRepo();
+      seedConfirmedLive(repo, "of_a", "sample-1");
+      const first = await repo.updateActive(minimalUpdate({}));
+      const second = await repo.updateActive(
+        minimalUpdate({
+          now: new Date("2026-09-27T16:00:00.000Z"),
+        }),
+      );
+      assert.equal(second.convergedFromExistingUpdate, true);
+      // The evidence row is the SAME one (the second call returns
+      // the persisted evidence from the first call).
+      assert.deepEqual(second.evidence, first.evidence);
+    });
+
+    void test("updateActive different-key on Paused throws UpdateNotActiveError", async () => {
+      const repo = new InMemoryServiceOfferingRepository();
+      repo._seedOffering({
+        id: "of_a",
+        workspaceId: WS_ID,
+        sellerProfileId: SELLER_PROFILE_ID,
+        status: "Paused",
+      });
+      repo._registerSellerProfile({
+        workspaceId: WS_ID,
+        sellerProfileId: SELLER_PROFILE_ID,
+        status: "Published",
+      });
+      await assert.rejects(repo.updateActive(minimalUpdate({})), (err: unknown) => {
+        const e = err as { name?: string; currentStatus?: string };
+        assert.equal(e.name, "ServiceOfferingUpdateNotActiveError");
+        assert.equal(e.currentStatus, "Paused");
+        return true;
+      });
+    });
+
+    void test("updateActive different-key on Draft throws UpdateNotActiveError", async () => {
+      const repo = new InMemoryServiceOfferingRepository();
+      repo._seedOffering({
+        id: "of_a",
+        workspaceId: WS_ID,
+        sellerProfileId: SELLER_PROFILE_ID,
+        status: "Draft",
+      });
+      repo._registerSellerProfile({
+        workspaceId: WS_ID,
+        sellerProfileId: SELLER_PROFILE_ID,
+        status: "Published",
+      });
+      await assert.rejects(repo.updateActive(minimalUpdate({})), (err: unknown) => {
+        const e = err as { name?: string; currentStatus?: string };
+        assert.equal(e.name, "ServiceOfferingUpdateNotActiveError");
+        assert.equal(e.currentStatus, "Draft");
+        return true;
+      });
+    });
+
+    void test("updateActive on missing offering throws NotFoundError", async () => {
+      const repo = buildActiveRepo();
+      await assert.rejects(
+        repo.updateActive(minimalUpdate({ offeringId: "of_missing" })),
+        (err: unknown) => {
+          assert.equal((err as { name?: string }).name, "ServiceOfferingNotFoundError");
+          return true;
+        },
+      );
+    });
+
+    void test("updateActive cross-workspace throws NotOwnedError", async () => {
+      const repo = buildActiveRepo();
+      seedConfirmedLive(repo, "of_a", "sample-1");
+      await assert.rejects(
+        repo.updateActive(minimalUpdate({ workspaceId: "ws_other" })),
+        (err: unknown) => {
+          assert.equal((err as { name?: string }).name, "ServiceOfferingNotOwnedError");
+          return true;
+        },
+      );
+    });
+
+    void test("updateActive with no CONFIRMED Live samples throws InvalidUpdateError carrying samples_required", async () => {
+      const repo = buildActiveRepo();
+      // No seedConfirmedLive call — the offering has zero Live samples.
+      await assert.rejects(repo.updateActive(minimalUpdate({})), (err: unknown) => {
+        const e = err as {
+          name?: string;
+          fieldErrors?: Array<{ path: string; code: string }>;
+        };
+        assert.equal(e.name, "ServiceOfferingInvalidUpdateError");
+        assert.ok(
+          e.fieldErrors?.some((f) => f.path === "samples" && f.code === "samples_required"),
+          "InvalidUpdateError must carry the samples_required field error",
+        );
+        return true;
+      });
+    });
+
+    void test("updateActive with missing primaryCategoryKey throws InvalidUpdateError carrying category_required", async () => {
+      const repo = buildActiveRepo();
+      seedConfirmedLive(repo, "of_a", "sample-1");
+      await assert.rejects(
+        repo.updateActive(minimalUpdate({ primaryCategoryKey: "" })),
+        (err: unknown) => {
+          const e = err as {
+            name?: string;
+            fieldErrors?: Array<{ path: string; code: string }>;
+          };
+          assert.equal(e.name, "ServiceOfferingInvalidUpdateError");
+          assert.ok(
+            e.fieldErrors?.some(
+              (f) => f.path === "primaryCategoryKey" && f.code === "category_required",
+            ),
+            "InvalidUpdateError must carry the category_required field error",
+          );
+          return true;
+        },
+      );
+    });
+
+    void test("updateActive with unpublished SellerProfile throws SellerProfileNotPublishedError", async () => {
+      const repo = buildActiveRepo();
+      seedConfirmedLive(repo, "of_a", "sample-1");
+      // Re-register the SellerProfile as Draft (not Published).
+      repo._registerSellerProfile({
+        workspaceId: WS_ID,
+        sellerProfileId: SELLER_PROFILE_ID,
+        status: "Draft",
+      });
+      await assert.rejects(repo.updateActive(minimalUpdate({})), (err: unknown) => {
+        assert.equal(
+          (err as { name?: string }).name,
+          "ServiceOfferingSellerProfileNotPublishedError",
+        );
+        return true;
+      });
+    });
+
+    void test("updateActive failure preserves the prior public state (no field changes committed)", async () => {
+      const repo = buildActiveRepo();
+      seedConfirmedLive(repo, "of_a", "sample-1");
+      const beforePeek = repo._peekOffering("of_a");
+      const beforeTitle = beforePeek?.title;
+      const beforeDescription = beforePeek?.description;
+      // The update payload is missing the primaryCategoryKey, so
+      // the repository's completeness recheck throws
+      // InvalidUpdateError.
+      await assert.rejects(
+        repo.updateActive(minimalUpdate({ primaryCategoryKey: "" })),
+        (err: unknown) => {
+          assert.equal((err as { name?: string }).name, "ServiceOfferingInvalidUpdateError");
+          return true;
+        },
+      );
+      // The offering's prior public state is preserved verbatim.
+      const afterPeek = repo._peekOffering("of_a");
+      assert.equal(afterPeek?.title, beforeTitle);
+      assert.equal(afterPeek?.description, beforeDescription);
+    });
+  });
 });

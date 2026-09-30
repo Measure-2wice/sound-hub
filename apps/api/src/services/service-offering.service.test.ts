@@ -39,6 +39,11 @@ import {
   type ActingMembership,
 } from "./workspace-authorization.service.js";
 import { InMemoryServiceOfferingRepository } from "../repositories/in-memory-service-offering.repository.js";
+import {
+  ServiceOfferingInvalidUpdateError,
+  ServiceOfferingSellerProfileNotPublishedError,
+  ServiceOfferingUpdateNotActiveError,
+} from "../repositories/service-offering.repository.js";
 import { ServiceOfferingService, ServiceOfferingServiceError } from "./service-offering.service.js";
 
 const ACTING_USER = "user_acting_1";
@@ -855,5 +860,116 @@ void describe("ServiceOfferingService — Pause / Reactivate (M2 #86, slice 86B)
         return true;
       },
     );
+  });
+
+  // ===========================================================================
+  // M2 (#86, slice 86C): `updateActive` service tests
+  // ===========================================================================
+  void describe("updateActive", () => {
+    function minimalUpdate(
+      overrides: Partial<Parameters<ServiceOfferingService["updateActive"]>[0]> = {},
+    ) {
+      return {
+        userAccountId: "user-1",
+        workspaceId: PERSONAL_WS_ID,
+        offeringId: "of_1",
+        request: minimalActivate({}),
+        requestId: "req-update-1",
+        ...overrides,
+      };
+    }
+
+    void test("updateActive rejects with SERVICE_OFFERING_FORBIDDEN when the actor is on a Buyer-only Workspace", async () => {
+      // Build the auth stub with a Buyer-only capability (no Seller
+      // capability); requireCapability then fails. The default
+      // StubWorkspaceAuthorizationService grants Seller, so we
+      // override `personalMembership` post-construction to drop
+      // the Seller capability.
+      const repo = new InMemoryServiceOfferingRepository();
+      repo._seedOffering({
+        id: "of_1",
+        workspaceId: PERSONAL_WS_ID,
+        sellerProfileId: SELLER_PROFILE_ID,
+        status: "Active",
+      });
+      repo._registerSellerProfile({
+        workspaceId: PERSONAL_WS_ID,
+        sellerProfileId: SELLER_PROFILE_ID,
+        status: "Published",
+      });
+      const auth = new StubWorkspaceAuthorizationService();
+      // Drop the Seller capability from the personal membership so
+      // requireCapability("Seller") fails with MISSING_CAPABILITY.
+      auth.personalMembership = buildPersonalMembership([]);
+      const svc = new ServiceOfferingService({
+        repository: repo,
+        workspaceAuthorizationService: auth as unknown as WorkspaceAuthorizationService,
+        getSellerProfileStatus: () => Promise.resolve("Published"),
+        playbackUrlFor: (input) =>
+          `https://api.test/services/${input.offeringId}/samples/${input.sampleId}/play`,
+      });
+      await assert.rejects(svc.updateActive(minimalUpdate({})), (err: unknown) => {
+        assert.ok(err instanceof ServiceOfferingServiceError);
+        assert.equal((err as { code: string }).code, "SERVICE_OFFERING_FORBIDDEN");
+        return true;
+      });
+    });
+
+    void test("updateActive translates ServiceOfferingUpdateNotActiveError to SERVICE_OFFERING_NOT_ACTIVE", async () => {
+      const { repo, service } = buildService({});
+      // Override updateActive to reject with the typed error.
+      repo.updateActive = () =>
+        Promise.reject(new ServiceOfferingUpdateNotActiveError("of_1", "Paused"));
+      await assert.rejects(service.updateActive(minimalUpdate({})), (err: unknown) => {
+        assert.ok(err instanceof ServiceOfferingServiceError);
+        assert.equal((err as { code: string }).code, "SERVICE_OFFERING_NOT_ACTIVE");
+        return true;
+      });
+    });
+
+    void test("updateActive translates ServiceOfferingInvalidUpdateError to SERVICE_OFFERING_INVALID_UPDATE with the field error list", async () => {
+      const { repo, service } = buildService({});
+      const fieldErrors = [
+        {
+          path: "samples",
+          code: "samples_required",
+          message: "Update requires 1 to 3 playable samples.",
+        },
+      ];
+      repo.updateActive = () =>
+        Promise.reject(
+          new ServiceOfferingInvalidUpdateError(
+            ["field errors: 1", "live confirmed sample count 0 outside [1, 3]"],
+            fieldErrors,
+          ),
+        );
+      await assert.rejects(service.updateActive(minimalUpdate({})), (err: unknown) => {
+        assert.ok(err instanceof ServiceOfferingServiceError);
+        const e = err as unknown as { code: string; fieldErrors: typeof fieldErrors };
+        assert.equal(e.code, "SERVICE_OFFERING_INVALID_UPDATE");
+        assert.deepEqual(e.fieldErrors, fieldErrors);
+        return true;
+      });
+    });
+
+    void test("updateActive translates ServiceOfferingSellerProfileNotPublishedError to SERVICE_OFFERING_SELLER_PROFILE_NOT_PUBLISHED", async () => {
+      const { repo, service } = buildService({});
+      repo.updateActive = () =>
+        Promise.reject(
+          new ServiceOfferingSellerProfileNotPublishedError(
+            PERSONAL_WS_ID,
+            SELLER_PROFILE_ID,
+            "Suspended",
+          ),
+        );
+      await assert.rejects(service.updateActive(minimalUpdate({})), (err: unknown) => {
+        assert.ok(err instanceof ServiceOfferingServiceError);
+        assert.equal(
+          (err as { code: string }).code,
+          "SERVICE_OFFERING_SELLER_PROFILE_NOT_PUBLISHED",
+        );
+        return true;
+      });
+    });
   });
 });

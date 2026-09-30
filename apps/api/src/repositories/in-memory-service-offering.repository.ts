@@ -48,11 +48,15 @@ import type {
   ServiceOfferingPauseResult,
   ServiceOfferingReactivateInput,
   ServiceOfferingRepository,
+  ServiceOfferingUpdateActiveInput,
+  ServiceOfferingUpdateActiveResult,
+  ServiceOfferingUpdateEvidenceView,
 } from "./service-offering.repository.js";
 import {
   buildActivationCompletenessFieldErrors,
   ServiceOfferingAlreadyPausedError,
   ServiceOfferingIncompleteError,
+  ServiceOfferingInvalidUpdateError,
   ServiceOfferingNotActiveError,
   ServiceOfferingNotDraftError,
   ServiceOfferingNotFoundError,
@@ -60,6 +64,7 @@ import {
   ServiceOfferingNotPausedError,
   ServiceOfferingSellerProfileMissingError,
   ServiceOfferingSellerProfileNotPublishedError,
+  ServiceOfferingUpdateNotActiveError,
 } from "./service-offering.repository.js";
 import type { ApiFieldErrorV1 } from "@soundhub/types";
 import { BG2_AUDIO_SAMPLE_MAX_PER_OFFERING } from "@soundhub/types";
@@ -151,6 +156,23 @@ interface StoredPause {
   readonly requestId: string;
 }
 
+// M2 (#86, slice 86C): Active → Active update evidence. Mirrors
+// the `StoredActivation` shape but carries `updatedAt` +
+// `updatedByUserId` so the activation history (separate append-only
+// `service_offering_activations` table) is preserved verbatim per
+// ADR 0008 — Update never writes to the activations table.
+interface StoredUpdate {
+  readonly id: string;
+  readonly offeringId: string;
+  readonly workspaceId: string;
+  readonly sellerProfileId: string;
+  readonly updatedByUserId: string;
+  readonly confirmationVersion: ServiceOfferingActivationConfirmationVersionV1;
+  readonly updatedAt: Date;
+  readonly idempotencyKey: string;
+  readonly requestId: string;
+}
+
 let nextId = 1;
 function generateCuid(prefix: string): string {
   nextId += 1;
@@ -168,6 +190,14 @@ export class InMemoryServiceOfferingRepository implements ServiceOfferingReposit
   // ServiceOfferingActivation row and reuses the activations map;
   // Pause has its own map because the evidence table is separate.
   private readonly pausesByOfferingIdem = new Map<string, StoredPause>();
+  // M2 (#86, slice 86C): update evidence keyed by
+  // `${offeringId}::${idempotencyKey}`. Update writes a new
+  // ServiceOfferingUpdate row in a separate table from the
+  // activations table; this map mirrors the schema's separate
+  // append-only `service_offering_updates` evidence. The
+  // activation history is preserved because Update never writes
+  // to the activations map.
+  private readonly updatesByOfferingIdem = new Map<string, StoredUpdate>();
   // Per-offering mutex chain (mirrors in-memory-seller-profile.repository.ts).
   private readonly mutexChains = new Map<string, Promise<void>>();
   // M2 (#86, slice 86B Codex re-review): per-Workspace mutex chain
@@ -800,6 +830,180 @@ export class InMemoryServiceOfferingRepository implements ServiceOfferingReposit
     );
   }
 
+  /**
+   * M2 (#86, slice 86C): Active → Active update. Validates the
+   * complete resulting state via the same STRICT activation
+   * completeness contract, in-place updates the public fields,
+   * and appends one new `ServiceOfferingUpdate` evidence row.
+   * The existing `ServiceOfferingActivation` rows are NOT
+   * touched — the activation timestamp from the original
+   * Draft → Active transition is preserved verbatim per ADR
+   * 0008. The lock-acquisition order mirrors `reactivate`
+   * (slice 86B re-review): the per-Workspace mutex
+   * (`withWorkspaceLock`) wraps the per-offering mutex
+   * (`withOfferingLock`) so the in-transaction
+   * `SellerProfile.published` read serializes against any
+   * concurrent SellerProfile write that also acquires the
+   * workspaceLock.
+   */
+  async updateActive(
+    input: ServiceOfferingUpdateActiveInput,
+  ): Promise<ServiceOfferingUpdateActiveResult> {
+    return this.withWorkspaceLock(input.workspaceId, () =>
+      this.withOfferingLock(input.offeringId, () => {
+        // Step 1: idempotency pre-check against the updates map.
+        const idemKey = this.idemKey(input.offeringId, input.idempotencyKey);
+        const existingUpdate = this.updatesByOfferingIdem.get(idemKey);
+        if (existingUpdate) {
+          const existingOffering = this.offeringsById.get(input.offeringId);
+          if (!existingOffering) {
+            throw new ServiceOfferingNotFoundError(input.offeringId);
+          }
+          if (existingOffering.workspaceId !== input.workspaceId) {
+            throw new ServiceOfferingNotOwnedError(input.offeringId, input.workspaceId);
+          }
+          return {
+            offering: this.toOwnerView(existingOffering, input.playbackUrlFor),
+            evidence: toUpdateEvidenceView(existingUpdate),
+            convergedFromExistingUpdate: true,
+          };
+        }
+
+        // Step 2: precondition check. Update requires Active state;
+        // a same-key retry after the offering has since
+        // transitioned would NOT reach this branch (the
+        // idempotency pre-check above would have returned the
+        // existing update row).
+        const existing = this.offeringsById.get(input.offeringId);
+        if (!existing) {
+          throw new ServiceOfferingNotFoundError(input.offeringId);
+        }
+        if (existing.workspaceId !== input.workspaceId) {
+          throw new ServiceOfferingNotOwnedError(input.offeringId, input.workspaceId);
+        }
+        if (existing.status !== "Active") {
+          throw new ServiceOfferingUpdateNotActiveError(input.offeringId, existing.status);
+        }
+
+        // Step 3 (M2 #86, slice 86C): the `SellerProfile.published`
+        // precondition is enforced INSIDE the workspaceLock AFTER
+        // the idempotency lookup and BEFORE the update evidence
+        // row is inserted. The mutex chain acquired at the top of
+        // this method serializes against any concurrent SellerProfile
+        // write that also acquires the workspaceLock
+        // (matching the Prisma adapter's workspaceLock
+        // acquisition). Same-key retry of an already-committed
+        // Update converges regardless of the current SellerProfile
+        // status because the idempotency pre-check above returns
+        // BEFORE this read.
+        const sellerProfileStatus = this.sellerProfileStatusById.get(existing.sellerProfileId);
+        if (!sellerProfileStatus) {
+          throw new ServiceOfferingSellerProfileMissingError(input.workspaceId);
+        }
+        if (sellerProfileStatus !== "Published") {
+          throw new ServiceOfferingSellerProfileNotPublishedError(
+            input.workspaceId,
+            existing.sellerProfileId,
+            sellerProfileStatus,
+          );
+        }
+
+        // Step 4: full STRICT activation completeness re-check
+        // INSIDE the per-offering lock. The field-level checks
+        // mirror the service-layer pre-check; the sample-count
+        // check closes the same race window the activation
+        // recheck does. The repository raises
+        // `ServiceOfferingInvalidUpdateError` (mapped to
+        // `SERVICE_OFFERING_INVALID_UPDATE`) instead of the
+        // activation-shared `ServiceOfferingIncompleteError`.
+        const fieldErrors: ApiFieldErrorV1[] = buildActivationCompletenessFieldErrors({
+          title: input.title,
+          description: input.description,
+          primaryCategoryKey: input.primaryCategoryKey,
+          serviceMode: input.serviceMode,
+          serviceAreas: input.serviceAreas,
+          pricingKind: input.pricing.kind,
+        });
+        const confirmedLiveCount = existing.samples.filter(
+          (s) => s.cleanupStatus === "Live" && s.confirmation !== null,
+        ).length;
+        if (confirmedLiveCount < 1 || confirmedLiveCount > BG2_AUDIO_SAMPLE_MAX_PER_OFFERING) {
+          fieldErrors.push({
+            path: "samples",
+            code: "samples_required",
+            message: `Update requires 1 to ${BG2_AUDIO_SAMPLE_MAX_PER_OFFERING} playable samples.`,
+          });
+        }
+        if (fieldErrors.length > 0) {
+          throw new ServiceOfferingInvalidUpdateError(
+            [
+              `field errors: ${fieldErrors.length}`,
+              `live confirmed sample count ${confirmedLiveCount} outside [1, ${BG2_AUDIO_SAMPLE_MAX_PER_OFFERING}]`,
+            ],
+            fieldErrors,
+          );
+        }
+
+        // Step 5: snapshot for rollback on any failure mid-write.
+        const before: StoredOffering = {
+          ...existing,
+          serviceAreas: [...existing.serviceAreas],
+          genreTags: [...existing.genreTags],
+          includedServiceCategoryKeys: [...existing.includedServiceCategoryKeys],
+        };
+
+        try {
+          // Status NOT changed — stays Active per the 86C invariant.
+          existing.title = input.title;
+          existing.description = input.description;
+          existing.primaryCategoryKey = input.primaryCategoryKey;
+          existing.serviceMode = input.serviceMode;
+          existing.serviceAreas = input.serviceAreas.map((sa) => ({
+            countryCode: sa.countryCode,
+            region: sa.region ?? null,
+            city: sa.city ?? null,
+          }));
+          existing.pricing = {
+            kind: input.pricing.kind,
+            amountMinor: input.pricing.amountMinor ?? null,
+            currency: input.pricing.currency ?? null,
+            unitId: input.pricing.unitId ?? null,
+          };
+          existing.genreTags = [...input.genreTags];
+          existing.includedServiceCategoryKeys = [...input.includedServiceCategoryKeys];
+          existing.updatedAt = input.now;
+          // The original activation timestamp + actor are NOT
+          // touched — Update preserves the activation history per
+          // ADR 0008 (the slice plan's "Owner-facing lifecycle
+          // history" invariant).
+          const update: StoredUpdate = {
+            id: generateCuid("soupd"),
+            offeringId: input.offeringId,
+            workspaceId: input.workspaceId,
+            sellerProfileId: existing.sellerProfileId,
+            updatedByUserId: input.updatedByUserId,
+            confirmationVersion: input.confirmationVersion,
+            updatedAt: input.now,
+            idempotencyKey: input.idempotencyKey,
+            requestId: input.requestId,
+          };
+          this.updatesByOfferingIdem.set(idemKey, update);
+          return {
+            offering: this.toOwnerView(existing, input.playbackUrlFor),
+            evidence: toUpdateEvidenceView(update),
+            convergedFromExistingUpdate: false,
+          };
+        } catch (err) {
+          if (err instanceof ServiceOfferingInvalidUpdateError) {
+            throw err;
+          }
+          Object.assign(existing, before);
+          throw err;
+        }
+      }),
+    );
+  }
+
   findForOwner(input: {
     readonly workspaceId: string;
     readonly offeringId: string;
@@ -1089,5 +1293,21 @@ function toEvidenceView(a: StoredActivation): ServiceOfferingActivationEvidenceV
     activatedAt: a.activatedAt,
     confirmationVersion: a.confirmationVersion,
     idempotencyKey: a.idempotencyKey,
+  };
+}
+
+// M2 (#86, slice 86C): project a `StoredUpdate` row onto the
+// public `ServiceOfferingUpdateEvidenceView` shape. The
+// `confirmationVersion` carries the same closed enum value as
+// activation because `updateActive` re-runs the same activation
+// contract; the timestamp is the `updatedAt` (the moment the
+// Active → Active transition committed), NOT the activation
+// timestamp — the activation history is preserved verbatim per
+// ADR 0008.
+function toUpdateEvidenceView(u: StoredUpdate): ServiceOfferingUpdateEvidenceView {
+  return {
+    updatedAt: u.updatedAt,
+    confirmationVersion: u.confirmationVersion,
+    idempotencyKey: u.idempotencyKey,
   };
 }

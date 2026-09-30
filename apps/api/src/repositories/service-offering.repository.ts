@@ -304,17 +304,21 @@ export interface ServiceOfferingReactivateInput {
   readonly playbackUrlFor: (input: { offeringId: string; sampleId: string }) => string;
 }
 
-// M2 (#86): ServiceOfferingUpdateActive input — same STRICT public
-// field set as activation because the repository runs the same
-// activation completeness check before replacing the public fields
-// atomically. The lifecycle does NOT change (Active → Active); the
-// existing ServiceOfferingActivation rows are NOT touched. The
-// idempotencyKey is bound to a NEW unique index on the
-// `service_offering_updates` table.
+// M2 (#86, slice 86C): ServiceOfferingUpdateActive input — same
+// STRICT public field set as activation because the repository runs
+// the same activation completeness check before replacing the public
+// fields atomically. The lifecycle does NOT change (Active → Active);
+// the existing ServiceOfferingActivation rows are NOT touched.
+//
+// `sellerProfileId` is NOT carried on this input — the repository
+// resolves it from the locked persisted offering row, matching the
+// `pause` / `reactivate` contract (Codex fix #1 carried forward
+// from slice 86B). The route does not carry a stable
+// `sellerProfileId` reference; carrying one would also risk an
+// empty-string foreign-key violation if a caller forgot to wire it.
 export interface ServiceOfferingUpdateActiveInput {
   readonly offeringId: string;
   readonly workspaceId: string;
-  readonly sellerProfileId: string;
   readonly updatedByUserId: string;
   readonly title: string;
   readonly description: string;
@@ -687,9 +691,10 @@ export interface ServiceOfferingRepository {
   // -------------------------------------------------------------------------
   // M2 (#86): post-activation lifecycle commands.
   //
-  // `pause` (slice 86B) and `reactivate` (slice 86B) are required
-  // methods — both adapters implement them. `updateActive` remains
-  // optional and lands in slice 86C.
+  // `pause` and `reactivate` (slice 86B), `updateActive` (slice 86C),
+  // and `removeFinalSamplePendingCleanup` (slice 86D) are required
+  // methods — every adapter that participates in production traffic
+  // implements them.
   //
   // Idempotency contract enforced by each implementation, in order:
   //   1. acquire transaction + advisory lock(s)
@@ -736,24 +741,40 @@ export interface ServiceOfferingRepository {
   reactivate(input: ServiceOfferingReactivateInput): Promise<ServiceOfferingActivationResult>;
 
   /**
-   * Atomic Active → Active update: validate the complete resulting
-   * state, in-place update the public fields, append a new
-   * ServiceOfferingUpdate evidence row. The existing
-   * ServiceOfferingActivation rows are NOT touched (the activation
-   * timestamp from the original Draft → Active transition is
-   * preserved verbatim per ADR 0008).
+   * M2 (#86, slice 86C): atomic Active → Active update. Validates
+   * the complete resulting state via the same STRICT activation
+   * completeness contract, in-place updates the public fields,
+   * and appends one new `ServiceOfferingUpdate` evidence row. The
+   * existing `ServiceOfferingActivation` rows are NOT touched —
+   * the activation timestamp from the original Draft → Active
+   * transition is preserved verbatim per ADR 0008.
+   *
+   * Lock acquisition order mirrors `reactivate` (slice 86B):
+   *   (1) `service-offering:<offeringId>`,
+   *   (2) audio-sample per-offering,
+   *   (3) `seller-profile:<workspaceId>` (the workspaceLock
+   *       serializes the in-transaction SellerProfile.published
+   *       read against any concurrent SellerProfile suspension,
+   *       matching the same serialization Reactivate enforces).
    *
    * The (offeringId, idempotencyKey) DB unique constraint on
-   * `service_offering_updates` is the second defense; the
-   * per-offering + audio-sample advisory locks are the first.
+   * `service_offering_updates` is the second defense against
+   * transport-retry duplicates; the advisory locks above are the
+   * first. The idempotency lookup runs BEFORE the lifecycle
+   * precondition (Active required) so a same-key retry after a
+   * committed Update converges on the existing update row even if
+   * the offering has since transitioned (a same-key retry is
+   * the SAME operation; it does not surface
+   * `ServiceOfferingUpdateNotActiveError` after the fact).
    *
-   * Throws `ServiceOfferingIncompleteError` (mapped to
-   * SERVICE_OFFERING_INVALID_UPDATE) when the re-check fails.
+   * Throws `ServiceOfferingInvalidUpdateError` (mapped to
+   * `SERVICE_OFFERING_INVALID_UPDATE`) when the re-check fails.
    * Throws `ServiceOfferingNotFoundError` /
-   * `ServiceOfferingNotOwnedError` / `ServiceOfferingNotActiveError`
-   * per the slice 86C precondition rules.
+   * `ServiceOfferingNotOwnedError` /
+   * `ServiceOfferingUpdateNotActiveError` per the precondition
+   * rules. Throws `ServiceOfferingSellerProfileNotPublishedError`
+   * when the locked SellerProfile is not Published at the time of
+   * the in-transaction check.
    */
-  updateActive?(
-    input: ServiceOfferingUpdateActiveInput,
-  ): Promise<ServiceOfferingUpdateActiveResult>;
+  updateActive(input: ServiceOfferingUpdateActiveInput): Promise<ServiceOfferingUpdateActiveResult>;
 }

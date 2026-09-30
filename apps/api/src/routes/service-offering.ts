@@ -85,6 +85,8 @@ import {
   serviceOfferingPauseRequestV1Schema,
   serviceOfferingPauseResponseV1Schema,
   serviceOfferingReactivateRequestV1Schema,
+  serviceOfferingUpdateRequestV1Schema,
+  serviceOfferingUpdateResponseV1Schema,
   type Bg1PublicUserV1,
 } from "@soundhub/types";
 import type { AuthenticationService } from "../services/authentication.service.js";
@@ -137,6 +139,15 @@ export function createServiceOfferingRouter(deps: ServiceOfferingRouteDeps): Rou
   });
   router.post("/:workspaceId/service-offerings/:offeringId/reactivate", (req, res) => {
     void handleReactivate(req, res, deps);
+  });
+  // M2 (#86, slice 86C): PUT route for Active → Active atomic
+  // update. PUT matches the slice plan's state-model sketch
+  // ("Submit complete state: PUT /update") — POST would have implied
+  // a state-changing side effect from the perspective of caching
+  // proxies; PUT is the standard HTTP verb for "replace the
+  // resource's complete state with the request payload".
+  router.put("/:workspaceId/service-offerings/:offeringId/update", (req, res) => {
+    void handleUpdate(req, res, deps);
   });
   router.get("/:workspaceId/service-offerings", (req, res) => {
     void handleList(req, res, deps);
@@ -515,6 +526,92 @@ async function handleReactivate(
       res,
       200,
       serviceOfferingActivationResponseV1Schema.parse({
+        ...result,
+        safeReturnTo,
+      }),
+    );
+  } catch (err) {
+    writeServiceError(res, err, requestId);
+  }
+}
+
+// M2 (#86, slice 86C): Active → Active update handler.
+//
+// Authorization contract is identical to handleReactivate: the
+// service layer's `assertPersonalSellerCapability` enforces the
+// Personal-Workspace-only AND Seller-capable precondition. The
+// body schema is the existing STRICT activation schema (aliased
+// as `serviceOfferingUpdateRequestV1Schema`); the response shape
+// is the dedicated `ServiceOfferingUpdateResponseV1` (carrying
+// `updatedAt` instead of `activatedAt` so the OwnerView's
+// activation timestamp is NOT confused with the update moment).
+// On failure the prior public state is preserved — the
+// repository's rollback snapshot restores every column the
+// update would have replaced; the OwnerView re-rendered to the
+// client carries the SAME `activatedAt` from the original
+// Draft → Active transition.
+async function handleUpdate(
+  req: Request,
+  res: Response,
+  deps: ServiceOfferingRouteDeps,
+): Promise<void> {
+  const requestId = generateRequestId();
+  res.setHeader("x-request-id", requestId);
+  const actor = await resolveActor(req, res, deps);
+  if (!actor) return;
+  const offeringId = readOfferingId(req);
+  if (!offeringId) {
+    writeSafeError(
+      res,
+      buildSafeError("SERVICE_OFFERING_INVALID", "Missing serviceOfferingId", undefined, requestId),
+    );
+    return;
+  }
+  let rawBody: unknown;
+  try {
+    rawBody = await readBody(req);
+  } catch (err) {
+    if (err instanceof ServiceOfferingServiceError) {
+      writeTranslatedError(res, err.code, err.message, err.fieldErrors, requestId);
+      return;
+    }
+    writeSafeError(
+      res,
+      buildSafeError("SERVICE_OFFERING_INVALID", "Malformed request body", undefined, requestId),
+    );
+    return;
+  }
+  const parsed = serviceOfferingUpdateRequestV1Schema.safeParse(rawBody);
+  if (!parsed.success) {
+    const fields = parsed.error.issues.map((issue) => ({
+      path: issue.path.join("."),
+      code: issue.code,
+      message: issue.message,
+    }));
+    writeSafeError(
+      res,
+      buildSafeError("SERVICE_OFFERING_INVALID", "Malformed update request", fields, requestId),
+    );
+    return;
+  }
+  try {
+    const result = await deps.service.updateActive({
+      userAccountId: actor.userAccountId,
+      workspaceId: actor.workspaceId,
+      offeringId,
+      request: parsed.data,
+      requestId,
+    });
+    const safeReturnTo = await resolveSafeReturnTo(
+      deps,
+      actor.freshUser,
+      actor.workspaceId,
+      parsed.data.returnTo,
+    );
+    writeJson(
+      res,
+      200,
+      serviceOfferingUpdateResponseV1Schema.parse({
         ...result,
         safeReturnTo,
       }),
