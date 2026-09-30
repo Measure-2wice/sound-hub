@@ -229,17 +229,27 @@ export interface ServiceOfferingActivationEvidenceView {
 // only the facts established by the Pause command (no
 // `confirmationVersion` column — fabricating such a column would
 // invent an attestation the Pause command did not invoke).
+//
+// The repository resolves `sellerProfileId` from the locked offering
+// row inside the transaction; the field is NOT taken from the input
+// because the route does not have a stable reference to it. The
+// repository also requires a `playbackUrlFor` resolver so the returned
+// OwnerView's sample entries carry valid URLs (the
+// `serviceOfferingOwnerSampleSummaryV1Schema.playbackUrl` field is a
+// `z.string().url()`; a missing resolver makes the response un-parseable
+// for any conforming Active offering that has at least one CONFIRMED
+// Live sample).
 export type ServiceOfferingPauseReasonValue = "user_initiated" | "final_sample_removal";
 
 export interface ServiceOfferingPauseInput {
   readonly offeringId: string;
   readonly workspaceId: string;
-  readonly sellerProfileId: string;
   readonly pausedByUserId: string;
   readonly reason: ServiceOfferingPauseReasonValue;
   readonly idempotencyKey: string;
   readonly requestId: string;
   readonly now: Date;
+  readonly playbackUrlFor: (input: { offeringId: string; sampleId: string }) => string;
 }
 
 export interface ServiceOfferingPauseEvidenceView {
@@ -269,7 +279,6 @@ export interface ServiceOfferingPauseResult {
 export interface ServiceOfferingReactivateInput {
   readonly offeringId: string;
   readonly workspaceId: string;
-  readonly sellerProfileId: string;
   readonly reactivatedByUserId: string;
   readonly title: string;
   readonly description: string;
@@ -555,6 +564,35 @@ export class ServiceOfferingInvalidUpdateError extends Error {
   }
 }
 
+/**
+ * M2 (#86, slice 86B, Codex review fix): raised by `reactivate`
+ * when the SellerProfile's publication status changes between the
+ * service-level precondition and the repository transaction
+ * (or when the SellerProfile is not Published at the moment of
+ * the repository check). The check runs INSIDE the locked
+ * transaction AFTER the idempotency lookup and BEFORE the activation
+ * evidence row is inserted, so:
+ *   - a same-key retry of an already-committed Reactivate still
+ *     converges on the existing activation row regardless of
+ *     current SellerProfile status;
+ *   - a fresh Reactivate against a now-Suspended SellerProfile is
+ *     rejected with the same `SERVICE_OFFERING_SELLER_PROFILE_NOT_PUBLISHED`
+ *     envelope the service-level precondition uses.
+ * Surfaced as 422 `SERVICE_OFFERING_SELLER_PROFILE_NOT_PUBLISHED`.
+ */
+export class ServiceOfferingSellerProfileNotPublishedError extends Error {
+  constructor(
+    public readonly workspaceId: string,
+    public readonly sellerProfileId: string,
+    public readonly currentStatus: "Draft" | "Published" | "Suspended",
+  ) {
+    super(
+      `ServiceOffering reactivate requires a Published SellerProfile (workspace ${workspaceId} profile ${sellerProfileId} is ${currentStatus}).`,
+    );
+    this.name = "ServiceOfferingSellerProfileNotPublishedError";
+  }
+}
+
 export interface ServiceOfferingRepository {
   /**
    * Atomically create a Draft ServiceOffering for the Workspace's
@@ -649,16 +687,12 @@ export interface ServiceOfferingRepository {
   // -------------------------------------------------------------------------
   // M2 (#86): post-activation lifecycle commands.
   //
-  // These methods are OPTIONAL on the interface so slice 86A can
-  // establish the persistence + type contracts without introducing
-  // implementations that would amount to fake stub bodies. Slices
-  // 86B (Pause + Reactivate) and 86C (updateActive) add the
-  // implementations to both adapters AND tighten the interface to
-  // required methods; the call sites in those slices drop the `!`
-  // non-null assertion.
+  // `pause` (slice 86B) and `reactivate` (slice 86B) are required
+  // methods — both adapters implement them. `updateActive` remains
+  // optional and lands in slice 86C.
   //
   // Idempotency contract enforced by each implementation, in order:
-  //   1. acquire transaction + advisory lock
+  //   1. acquire transaction + advisory lock(s)
   //   2. lookup `(offeringId, idempotencyKey)` evidence row
   //   3. if found → return as converged success
   //   4. otherwise enforce the lifecycle precondition (status check)
@@ -669,18 +703,20 @@ export interface ServiceOfferingRepository {
    * Atomic Active → Paused transition + append-only evidence row
    * insertion. The (offeringId, idempotencyKey) DB unique constraint
    * on `service_offering_pauses` is the second defense against
-   * transport-retry duplicates; the advisory lock acquired at the
-   * start of the transaction is the first.
+   * transport-retry duplicates; the per-offering advisory lock
+   * acquired at the start of the transaction is the first.
    *
    * Throws `ServiceOfferingNotFoundError` if the offering row does
-   * not exist. Throws `ServiceOfferingNotActiveError` (or the
-   * derived `ServiceOfferingAlreadyPausedError` if the offering has
-   * already transitioned to Paused and the lookup found no row for
-   * the supplied idempotencyKey — see slice 86B precondition rules).
-   * Throws `ServiceOfferingNotOwnedError` if the offering is owned
-   * by a different workspace.
+   * not exist. Throws `ServiceOfferingAlreadyPausedError` if the
+   * offering has already transitioned to Paused and the lookup
+   * found no row for the supplied idempotencyKey (the precondition
+   * runs AFTER the idempotency pre-check, so a same-key retry
+   * converges on the existing pause row and does NOT surface this
+   * error). Throws `ServiceOfferingNotActiveError` if the offering
+   * is Draft or Archived. Throws `ServiceOfferingNotOwnedError` if
+   * the offering is owned by a different workspace.
    */
-  pause?(input: ServiceOfferingPauseInput): Promise<ServiceOfferingPauseResult>;
+  pause(input: ServiceOfferingPauseInput): Promise<ServiceOfferingPauseResult>;
 
   /**
    * Atomic Paused → Active transition + new ServiceOfferingActivation
@@ -697,7 +733,7 @@ export interface ServiceOfferingRepository {
    * `ServiceOfferingNotOwnedError` / `ServiceOfferingNotPausedError`
    * per the slice 86B precondition rules.
    */
-  reactivate?(input: ServiceOfferingReactivateInput): Promise<ServiceOfferingActivationResult>;
+  reactivate(input: ServiceOfferingReactivateInput): Promise<ServiceOfferingActivationResult>;
 
   /**
    * Atomic Active → Active update: validate the complete resulting

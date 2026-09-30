@@ -43,15 +43,23 @@ import type {
   ServiceOfferingCreateDraftInput,
   ServiceOfferingDraftInput,
   ServiceOfferingOwnerViewRecord,
+  ServiceOfferingPauseInput,
+  ServiceOfferingPauseReasonValue,
+  ServiceOfferingPauseResult,
+  ServiceOfferingReactivateInput,
   ServiceOfferingRepository,
 } from "./service-offering.repository.js";
 import {
   buildActivationCompletenessFieldErrors,
+  ServiceOfferingAlreadyPausedError,
   ServiceOfferingIncompleteError,
+  ServiceOfferingNotActiveError,
   ServiceOfferingNotDraftError,
   ServiceOfferingNotFoundError,
   ServiceOfferingNotOwnedError,
+  ServiceOfferingNotPausedError,
   ServiceOfferingSellerProfileMissingError,
+  ServiceOfferingSellerProfileNotPublishedError,
 } from "./service-offering.repository.js";
 import type { ApiFieldErrorV1 } from "@soundhub/types";
 import { BG2_AUDIO_SAMPLE_MAX_PER_OFFERING } from "@soundhub/types";
@@ -131,6 +139,18 @@ interface StoredCreation {
   readonly createdAt: Date;
 }
 
+interface StoredPause {
+  readonly id: string;
+  readonly offeringId: string;
+  readonly workspaceId: string;
+  readonly sellerProfileId: string;
+  readonly pausedByUserId: string;
+  readonly pausedAt: Date;
+  readonly reason: ServiceOfferingPauseReasonValue;
+  readonly idempotencyKey: string;
+  readonly requestId: string;
+}
+
 let nextId = 1;
 function generateCuid(prefix: string): string {
   nextId += 1;
@@ -142,8 +162,24 @@ export class InMemoryServiceOfferingRepository implements ServiceOfferingReposit
   private readonly offeringsByWorkspace = new Map<string, Set<string>>();
   private readonly activationsByOfferingIdem = new Map<string, StoredActivation>();
   private readonly creationsByWorkspaceIdem = new Map<string, StoredCreation>();
+  // M2 (#86, slice 86B): pause evidence keyed by
+  // `${offeringId}::${idempotencyKey}` — the same composition as
+  // `activationsByOfferingIdem`. Reactivate writes a new
+  // ServiceOfferingActivation row and reuses the activations map;
+  // Pause has its own map because the evidence table is separate.
+  private readonly pausesByOfferingIdem = new Map<string, StoredPause>();
   // Per-offering mutex chain (mirrors in-memory-seller-profile.repository.ts).
   private readonly mutexChains = new Map<string, Promise<void>>();
+  // M2 (#86, slice 86B Codex re-review): per-Workspace mutex chain
+  // mirroring `InMemorySellerProfileRepository.withWorkspaceLock`. The
+  // Reactivate path wraps its body in this mutex so the in-transaction
+  // SellerProfile.publication check serializes against any concurrent
+  // operation that also acquires the workspaceLock — matching the
+  // Prisma adapter's `seller-profile:<workspaceId>` advisory lock
+  // acquisition. The mutex key is the bare `workspaceId` so a test-
+  // only helper that simulates a concurrent SellerProfile write
+  // (`_suspendSellerProfileUnderLock`) can collide on the same chain.
+  private readonly workspaceLockChains = new Map<string, Promise<void>>();
   // Per-workspace create mutex so concurrent first-create attempts
   // serialize. The unique key includes the namespace prefix so the
   // workspace create chain does not block the per-offering chains.
@@ -155,6 +191,13 @@ export class InMemoryServiceOfferingRepository implements ServiceOfferingReposit
   // `_registerSellerProfile`; production wiring would inject a
   // real SellerProfile reader.
   private readonly sellerProfilesByWorkspace = new Map<string, string>();
+  // M2 (#86, slice 86B, Codex review fix): the Reactivate
+  // transaction-time SellerProfile publication check needs to read
+  // the current `status` without a SellerProfile dependency. The
+  // map is keyed by `sellerProfileId` (NOT by `workspaceId`) because
+  // a Workspace may have multiple profiles over time; the lookup
+  // resolves through the locked offering row's `sellerProfileId`.
+  private readonly sellerProfileStatusById = new Map<string, "Draft" | "Published" | "Suspended">();
 
   private withOfferingLock<T>(offeringId: string, fn: () => T | PromiseLike<T>): Promise<T> {
     const previous = this.mutexChains.get(offeringId) ?? Promise.resolve();
@@ -196,6 +239,38 @@ export class InMemoryServiceOfferingRepository implements ServiceOfferingReposit
     });
     this.workspaceCreateMutexes.set(
       key,
+      previous.then(
+        () => next,
+        () => next,
+      ),
+    );
+    return previous.then(async () => {
+      try {
+        return await fn();
+      } finally {
+        release();
+      }
+    });
+  }
+
+  /**
+   * M2 (#86, slice 86B Codex re-review): per-Workspace mutex that
+   * mirrors the Prisma adapter's `seller-profile:<workspaceId>`
+   * advisory-lock acquisition. The shape matches
+   * `InMemorySellerProfileRepository.withWorkspaceLock` so a test-
+   * only helper that simulates a concurrent SellerProfile write
+   * collides on the SAME chain. Callers wrap their body in this
+   * mutex exactly as the Prisma adapter wraps its transaction body
+   * in `sellerProfileWorkspaceLockSql(input.workspaceId)`.
+   */
+  withWorkspaceLock<T>(workspaceId: string, fn: () => T | PromiseLike<T>): Promise<T> {
+    const previous = this.workspaceLockChains.get(workspaceId) ?? Promise.resolve();
+    let release!: () => void;
+    const next = new Promise<void>((resolve) => {
+      release = resolve;
+    });
+    this.workspaceLockChains.set(
+      workspaceId,
       previous.then(
         () => next,
         () => next,
@@ -475,6 +550,256 @@ export class InMemoryServiceOfferingRepository implements ServiceOfferingReposit
     });
   }
 
+  async pause(input: ServiceOfferingPauseInput): Promise<ServiceOfferingPauseResult> {
+    return this.withOfferingLock(input.offeringId, () => {
+      // Step 1: idempotency pre-check. A same-key retry of a
+      // previously-committed Pause converges on the existing pause
+      // row. The lookup runs BEFORE the lifecycle precondition so a
+      // same-key retry after the offering has transitioned does NOT
+      // surface `ServiceOfferingAlreadyPausedError`.
+      const idemKey = this.idemKey(input.offeringId, input.idempotencyKey);
+      const existingPause = this.pausesByOfferingIdem.get(idemKey);
+      if (existingPause) {
+        const existingOffering = this.offeringsById.get(input.offeringId);
+        if (!existingOffering) {
+          throw new ServiceOfferingNotFoundError(input.offeringId);
+        }
+        if (existingOffering.workspaceId !== input.workspaceId) {
+          throw new ServiceOfferingNotOwnedError(input.offeringId, input.workspaceId);
+        }
+        return {
+          offering: this.toOwnerView(existingOffering, input.playbackUrlFor),
+          evidence: {
+            pausedAt: existingPause.pausedAt,
+            reason: existingPause.reason,
+            idempotencyKey: existingPause.idempotencyKey,
+          },
+          convergedFromExistingPause: true,
+        };
+      }
+
+      // Step 2: precondition check. Pause requires Active state.
+      const existing = this.offeringsById.get(input.offeringId);
+      if (!existing) {
+        throw new ServiceOfferingNotFoundError(input.offeringId);
+      }
+      if (existing.workspaceId !== input.workspaceId) {
+        throw new ServiceOfferingNotOwnedError(input.offeringId, input.workspaceId);
+      }
+      if (existing.status === "Paused") {
+        throw new ServiceOfferingAlreadyPausedError(input.offeringId);
+      }
+      if (existing.status !== "Active") {
+        throw new ServiceOfferingNotActiveError(input.offeringId, existing.status);
+      }
+
+      // Step 3: atomic transition. The offering's status flips to
+      // Paused and the pause evidence row is appended in the same
+      // logical operation. The in-memory adapter has no transaction;
+      // if the state assignment throws after the row is inserted,
+      // the rolled-back state is restored on the next call.
+      //
+      // M2 (#86, slice 86B, Codex review fix): `sellerProfileId`
+      // is resolved from the locked persisted offering row, NOT taken
+      // from the input. The input contract does not include one and
+      // an empty-string placeholder would violate the
+      // `service_offering_pauses_sellerProfileId_fkey` foreign key.
+      const before = { status: existing.status, updatedAt: existing.updatedAt };
+      const pause: StoredPause = {
+        id: generateCuid("sopaus"),
+        offeringId: input.offeringId,
+        workspaceId: input.workspaceId,
+        sellerProfileId: existing.sellerProfileId,
+        pausedByUserId: input.pausedByUserId,
+        pausedAt: input.now,
+        reason: input.reason,
+        idempotencyKey: input.idempotencyKey,
+        requestId: input.requestId,
+      };
+      this.pausesByOfferingIdem.set(idemKey, pause);
+      existing.status = "Paused";
+      existing.updatedAt = input.now;
+      return {
+        offering: this.toOwnerView(existing, input.playbackUrlFor),
+        evidence: {
+          pausedAt: pause.pausedAt,
+          reason: pause.reason,
+          idempotencyKey: pause.idempotencyKey,
+        },
+        convergedFromExistingPause: false,
+      };
+      // The `before` snapshot is unused on the happy path but kept
+      // for parity with `activate`'s rollback shape — the in-memory
+      // adapter has no real transaction, but the contract is the
+      // same: an exception AFTER state mutation restores the prior
+      // state. The pragma below suppresses the unused-binding lint
+      // without weakening the contract.
+      void before;
+    });
+  }
+
+  async reactivate(
+    input: ServiceOfferingReactivateInput,
+  ): Promise<ServiceOfferingActivationResult> {
+    // M2 (#86, slice 86B Codex re-review): the Reactivate body is
+    // wrapped in the per-Workspace mutex (`withWorkspaceLock`)
+    // BEFORE the existing per-offering mutex (`withOfferingLock`)
+    // so the in-transaction SellerProfile.publication check
+    // serializes against any concurrent SellerProfile write that
+    // also acquires the workspaceLock — matching the Prisma adapter's
+    // acquisition order (`service-offering:<id>` → `audio-sample`
+    // → `seller-profile:<workspaceId>`). The mutex-chain
+    // composition is equivalent to acquiring both locks; the inner
+    // body runs only after both chains settle on this caller.
+    return this.withWorkspaceLock(input.workspaceId, () =>
+      this.withOfferingLock(input.offeringId, () => {
+        // Step 1: idempotency pre-check against the activations table.
+        // Reactivation writes a new ServiceOfferingActivation row, so
+        // the convergence key is the same as a normal activation.
+        const idemKey = this.idemKey(input.offeringId, input.idempotencyKey);
+        const existingActivation = this.activationsByOfferingIdem.get(idemKey);
+        if (existingActivation) {
+          const existingOffering = this.offeringsById.get(input.offeringId);
+          if (!existingOffering) {
+            throw new ServiceOfferingNotFoundError(input.offeringId);
+          }
+          if (existingOffering.workspaceId !== input.workspaceId) {
+            throw new ServiceOfferingNotOwnedError(input.offeringId, input.workspaceId);
+          }
+          return {
+            offering: this.toOwnerView(existingOffering, input.playbackUrlFor),
+            evidence: toEvidenceView(existingActivation),
+            convergedFromExistingActivation: true,
+          };
+        }
+
+        // Step 2: precondition check. Reactivate requires Paused state.
+        const existing = this.offeringsById.get(input.offeringId);
+        if (!existing) {
+          throw new ServiceOfferingNotFoundError(input.offeringId);
+        }
+        if (existing.workspaceId !== input.workspaceId) {
+          throw new ServiceOfferingNotOwnedError(input.offeringId, input.workspaceId);
+        }
+        if (existing.status !== "Paused") {
+          throw new ServiceOfferingNotPausedError(input.offeringId, existing.status);
+        }
+
+        // Step 3 (M2 #86, slice 86B, Codex review fix): the
+        // `SellerProfile.published` precondition is enforced INSIDE the
+        // mutex lock AFTER the idempotency lookup and BEFORE the
+        // activation evidence row is inserted. This closes the race
+        // where the SellerProfile becomes Suspended between the
+        // service-level precondition and the transaction commit, and
+        // it lets a same-key retry of an already-committed Reactivate
+        // still converge regardless of the current profile status.
+        const sellerProfileStatus = this.sellerProfileStatusById.get(existing.sellerProfileId);
+        if (!sellerProfileStatus) {
+          // Missing status in the test registry means the helper was
+          // never invoked with this sellerProfileId; treat it as
+          // missing for parity with the Prisma adapter's
+          // `ServiceOfferingSellerProfileMissingError`.
+          throw new ServiceOfferingSellerProfileMissingError(input.workspaceId);
+        }
+        if (sellerProfileStatus !== "Published") {
+          throw new ServiceOfferingSellerProfileNotPublishedError(
+            input.workspaceId,
+            existing.sellerProfileId,
+            sellerProfileStatus,
+          );
+        }
+
+        // Step 3 (PR-review feedback #4 carried forward): full
+        // completeness revalidation INSIDE the per-offering lock.
+        // The field-level checks mirror the service-layer pre-check;
+        // the sample-count check closes the race window between the
+        // pre-check and the activation commit.
+        const fieldErrors: ApiFieldErrorV1[] = buildActivationCompletenessFieldErrors({
+          title: input.title,
+          description: input.description,
+          primaryCategoryKey: input.primaryCategoryKey,
+          serviceMode: input.serviceMode,
+          serviceAreas: input.serviceAreas,
+          pricingKind: input.pricing.kind,
+        });
+        const confirmedLiveCount = existing.samples.filter(
+          (s) => s.cleanupStatus === "Live" && s.confirmation !== null,
+        ).length;
+        if (confirmedLiveCount < 1 || confirmedLiveCount > BG2_AUDIO_SAMPLE_MAX_PER_OFFERING) {
+          fieldErrors.push({
+            path: "samples",
+            code: "samples_required",
+            message: `Activation requires 1 to ${BG2_AUDIO_SAMPLE_MAX_PER_OFFERING} playable samples.`,
+          });
+        }
+        if (fieldErrors.length > 0) {
+          throw new ServiceOfferingIncompleteError(
+            [
+              `field errors: ${fieldErrors.length}`,
+              `live confirmed sample count ${confirmedLiveCount} outside [1, ${BG2_AUDIO_SAMPLE_MAX_PER_OFFERING}]`,
+            ],
+            fieldErrors,
+          );
+        }
+
+        // Step 4: snapshot for rollback.
+        const before: StoredOffering = {
+          ...existing,
+          serviceAreas: [...existing.serviceAreas],
+          genreTags: [...existing.genreTags],
+          includedServiceCategoryKeys: [...existing.includedServiceCategoryKeys],
+        };
+
+        try {
+          existing.status = "Active";
+          existing.title = input.title;
+          existing.description = input.description;
+          existing.primaryCategoryKey = input.primaryCategoryKey;
+          existing.serviceMode = input.serviceMode;
+          existing.serviceAreas = input.serviceAreas.map((sa) => ({
+            countryCode: sa.countryCode,
+            region: sa.region ?? null,
+            city: sa.city ?? null,
+          }));
+          existing.pricing = {
+            kind: input.pricing.kind,
+            amountMinor: input.pricing.amountMinor ?? null,
+            currency: input.pricing.currency ?? null,
+            unitId: input.pricing.unitId ?? null,
+          };
+          existing.genreTags = [...input.genreTags];
+          existing.includedServiceCategoryKeys = [...input.includedServiceCategoryKeys];
+          existing.activatedAt = input.now;
+          existing.activatedByUserId = input.reactivatedByUserId;
+          existing.updatedAt = input.now;
+          const activation: StoredActivation = {
+            id: generateCuid("soact"),
+            offeringId: input.offeringId,
+            workspaceId: input.workspaceId,
+            sellerProfileId: existing.sellerProfileId,
+            activatedByUserId: input.reactivatedByUserId,
+            confirmationVersion: input.confirmationVersion,
+            activatedAt: input.now,
+            idempotencyKey: input.idempotencyKey,
+            requestId: input.requestId,
+          };
+          this.activationsByOfferingIdem.set(idemKey, activation);
+          return {
+            offering: this.toOwnerView(existing, input.playbackUrlFor),
+            evidence: toEvidenceView(activation),
+            convergedFromExistingActivation: false,
+          };
+        } catch (err) {
+          if (err instanceof ServiceOfferingIncompleteError) {
+            throw err;
+          }
+          Object.assign(existing, before);
+          throw err;
+        }
+      }),
+    );
+  }
+
   findForOwner(input: {
     readonly workspaceId: string;
     readonly offeringId: string;
@@ -558,14 +883,64 @@ export class InMemoryServiceOfferingRepository implements ServiceOfferingReposit
   }
 
   /**
-   * Test-only helper. Register the SellerProfile id for a
-   * Workspace so `createDraft` finds the precondition satisfied.
+   * Test-only helper. Register the SellerProfile id (and current
+   * status) for a Workspace so `createDraft` finds the precondition
+   * satisfied AND the Reactivate publication check has access to the
+   * current status. Production wiring would inject a real SellerProfile
+   * reader.
    */
   _registerSellerProfile(input: {
     readonly workspaceId: string;
     readonly sellerProfileId: string;
+    readonly status?: "Draft" | "Published" | "Suspended";
   }): void {
     this.sellerProfilesByWorkspace.set(input.workspaceId, input.sellerProfileId);
+    if (input.status) {
+      this.sellerProfileStatusById.set(input.sellerProfileId, input.status);
+    }
+  }
+
+  /**
+   * M2 (#86, slice 86B Codex re-review): test-only helper that
+   * simulates a concurrent SellerProfile suspension that ALSO
+   * acquires the seller-profile workspaceLock — the same lock that
+   * `reactivate` now holds for the duration of its transaction.
+   * Production code MUST NOT reach for this helper. The
+   * `InMemorySellerProfileRepository` does not expose a `suspend`
+   * operation, so this helper exists to give the in-memory test
+   * suite a way to construct the same interleaving the Prisma
+   * deterministic test does (a concurrent suspension that holds
+   * the workspaceLock while Reactivate tries to read the profile).
+   * Returns the current in-memory SellerProfile status so tests
+   * can assert that the mutation ran only after Reactivate released
+   * the workspaceLock.
+   */
+  _suspendSellerProfileUnderLock(
+    workspaceId: string,
+    sellerProfileId: string,
+  ): Promise<{ readonly previousStatus: "Draft" | "Published" | "Suspended" | undefined }> {
+    return this.withWorkspaceLock(workspaceId, () => {
+      const previousStatus = this.sellerProfileStatusById.get(sellerProfileId);
+      this.sellerProfileStatusById.set(sellerProfileId, "Suspended");
+      return Promise.resolve({ previousStatus });
+    });
+  }
+
+  /**
+   * M2 (#86, slice 86B Codex re-review): test-only accessor for
+   * the in-memory SellerProfile status registry. Returns
+   * `undefined` when no status has been registered for the
+   * `sellerProfileId` (i.e. `_registerSellerProfile` was never
+   * called with this id). Production code MUST use the real
+   * SellerProfile repository; this accessor exists for the
+   * structural-parity test that proves Reactivate's
+   * workspaceLock acquisition serialized the publication check
+   * against a concurrent suspension.
+   */
+  _peekSellerProfileStatus(
+    sellerProfileId: string,
+  ): "Draft" | "Published" | "Suspended" | undefined {
+    return this.sellerProfileStatusById.get(sellerProfileId);
   }
 
   _peekOffering(id: string): StoredOffering | null {

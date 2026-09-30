@@ -50,20 +50,16 @@ import {
   SellerProfileNotPublishedError,
 } from "./seller-profile.repository.js";
 
-/**
- * Stable per-Workspace lock key for `pg_advisory_xact_lock`. Mirrors
- * the `provisionIntentAtomically` primitive at
- * `apps/api/src/auth-repository/prisma-auth-repository.ts:511` —
- * Postgres's built-in `hashtext` returns int4, which is always in
- * signed-32-bit range and fits the `pg_advisory_xact_lock(int4, int4)`
- * two-argument form, sidestepping the signed-64-bit overflow that a
- * JS-side 64-bit FNV-1a would otherwise produce.
- */
-function workspaceLockSql(workspaceId: string): Prisma.Sql {
-  return Prisma.sql`
-    SELECT pg_advisory_xact_lock(hashtext(${`seller-profile:${workspaceId}`}::text))
-  `;
-}
+// M2 (#86, slice 86B Codex re-review): the SellerProfile
+// advisory-lock helper is now shared with the ServiceOffering
+// repository so both repositories acquire the EXACT same
+// `seller-profile:<workspaceId>` lock. The shared module lives at
+// `apps/api/src/repositories/seller-profile-workspace-lock.ts`.
+// Previously this was a private `workspaceLockSql(workspaceId)`
+// helper defined inline at the top of this file; the call sites at
+// `saveDraft` and `writePublication` now use the imported symbol
+// without any other behavior change.
+import { sellerProfileWorkspaceLockSql } from "./seller-profile-workspace-lock.js";
 
 const PROFILE_INCLUDE = {
   specialties: { include: { specialty: { select: { key: true, name: true } } } },
@@ -90,7 +86,7 @@ export class PrismaSellerProfileRepository implements SellerProfileRepository {
 
   async saveDraft(input: SellerProfileDraftInput): Promise<SellerProfileOwnerViewRecord> {
     return this.prisma.$transaction(async (tx) => {
-      await tx.$executeRaw(workspaceLockSql(input.workspaceId));
+      await tx.$executeRaw(sellerProfileWorkspaceLockSql(input.workspaceId));
 
       const existing = await tx.sellerProfile.findUnique({
         where: { workspaceId: input.workspaceId },
@@ -184,7 +180,7 @@ export class PrismaSellerProfileRepository implements SellerProfileRepository {
     requireDraft: boolean,
   ): Promise<SellerProfilePublicationResult> {
     return this.prisma.$transaction(async (tx) => {
-      await tx.$executeRaw(workspaceLockSql(input.workspaceId));
+      await tx.$executeRaw(sellerProfileWorkspaceLockSql(input.workspaceId));
 
       // Step 1: idempotency pre-check (first defense).
       const existingPublication = await tx.sellerProfilePublication.findUnique({

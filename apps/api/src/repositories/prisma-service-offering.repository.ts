@@ -56,21 +56,29 @@ import type {
   ServiceOfferingCreateDraftInput,
   ServiceOfferingDraftInput,
   ServiceOfferingOwnerViewRecord,
+  ServiceOfferingPauseInput,
+  ServiceOfferingPauseResult,
+  ServiceOfferingReactivateInput,
   ServiceOfferingRepository,
 } from "./service-offering.repository.js";
 import {
   buildActivationCompletenessFieldErrors,
+  ServiceOfferingAlreadyPausedError,
   ServiceOfferingIncompleteError,
+  ServiceOfferingNotActiveError,
   ServiceOfferingNotDraftError,
   ServiceOfferingNotFoundError,
   ServiceOfferingNotOwnedError,
+  ServiceOfferingNotPausedError,
   ServiceOfferingSellerProfileMissingError,
+  ServiceOfferingSellerProfileNotPublishedError,
   ServiceOfferingUnknownKeyError,
 } from "./service-offering.repository.js";
 import type { ApiFieldErrorV1 } from "@soundhub/types";
 import { BG2_AUDIO_SAMPLE_MAX_PER_OFFERING } from "@soundhub/types";
 import { SERVICE_OFFERING_AUDIO_MEDIA_CONFIRMATION_VERSIONS } from "@soundhub/types";
 import { acquireAudioSampleLockTx } from "../audio-repository/audio-sample-lock.js";
+import { sellerProfileWorkspaceLockSql } from "./seller-profile-workspace-lock.js";
 
 /**
  * Stable per-offering lock key for `pg_advisory_xact_lock`. Mirrors
@@ -688,6 +696,437 @@ export class PrismaServiceOfferingRepository implements ServiceOfferingRepositor
         // `ServiceOfferingIncompleteError` before any state change
         // for completeness failures; the snapshot rollback below
         // covers any other mid-write failure.
+        if (err instanceof ServiceOfferingIncompleteError) {
+          throw err;
+        }
+        await tx.serviceOffering
+          .update({
+            where: { id: input.offeringId },
+            data: before,
+          })
+          .catch(() => undefined);
+        throw err;
+      }
+    });
+  }
+
+  async pause(input: ServiceOfferingPauseInput): Promise<ServiceOfferingPauseResult> {
+    return this.prisma.$transaction(async (tx) => {
+      // M2 (#86, slice 86B): per-offering advisory lock only — Pause
+      // does not transition any audio sample, so the audio-sample
+      // lock is not required.
+      await tx.$executeRaw(offeringLockSql(input.offeringId));
+
+      // Step 1: idempotency pre-check. A transport retry of the same
+      // previously-committed Pause command converges on the existing
+      // pause row and returns it as `convergedFromExistingPause: true`.
+      // The lookup runs BEFORE the lifecycle precondition so a
+      // same-key retry after the offering has transitioned does NOT
+      // surface `ServiceOfferingAlreadyPausedError`.
+      const existingPause = await tx.serviceOfferingPause.findUnique({
+        where: {
+          offeringId_idempotencyKey: {
+            offeringId: input.offeringId,
+            idempotencyKey: input.idempotencyKey,
+          },
+        },
+      });
+      if (existingPause) {
+        const existingOffering = await tx.serviceOffering.findUnique({
+          where: { id: input.offeringId },
+          include: {
+            ...OFFERING_INCLUDE,
+            sellerProfile: { select: { workspaceId: true, id: true } },
+          },
+        });
+        if (!existingOffering) {
+          throw new ServiceOfferingNotFoundError(input.offeringId);
+        }
+        if (existingOffering.sellerProfile.workspaceId !== input.workspaceId) {
+          throw new ServiceOfferingNotOwnedError(input.offeringId, input.workspaceId);
+        }
+        return {
+          offering: toOwnerView(
+            existingOffering,
+            {
+              workspaceId: existingOffering.sellerProfile.workspaceId,
+              sellerProfileId: existingOffering.sellerProfile.id,
+            },
+            // M2 (#86, slice 86B, Codex review fix): carry the
+            // playbackUrlFor resolver into the idempotency-hit
+            // return path so the OwnerView's CONFIRMED Live samples
+            // surface valid URLs (the
+            // `serviceOfferingOwnerSampleSummaryV1Schema.playbackUrl`
+            // field is a `z.string().url()`).
+            input.playbackUrlFor,
+          ),
+          evidence: {
+            pausedAt: existingPause.pausedAt,
+            reason: existingPause.reason,
+            idempotencyKey: existingPause.idempotencyKey,
+          },
+          convergedFromExistingPause: true,
+        };
+      }
+
+      // Step 2: precondition. The lifecycle status check runs AFTER
+      // the idempotency pre-check so a same-key retry converges on
+      // the existing pause row regardless of the current state. The
+      // query joins the seller profile so the resolved profile id
+      // is available for the pause-evidence row insert.
+      const existing = await tx.serviceOffering.findUnique({
+        where: { id: input.offeringId },
+        include: { sellerProfile: { select: { workspaceId: true, id: true } } },
+      });
+      if (!existing) {
+        throw new ServiceOfferingNotFoundError(input.offeringId);
+      }
+      if (existing.sellerProfile.workspaceId !== input.workspaceId) {
+        throw new ServiceOfferingNotOwnedError(input.offeringId, input.workspaceId);
+      }
+      if (existing.status === "Paused") {
+        // The offering is already Paused but no pause evidence row
+        // exists for the supplied idempotencyKey — surface the
+        // dedicated precondition error.
+        throw new ServiceOfferingAlreadyPausedError(input.offeringId);
+      }
+      if (existing.status !== "Active") {
+        throw new ServiceOfferingNotActiveError(input.offeringId, existing.status);
+      }
+
+      // Step 3: atomic transition. The offering's status flips to
+      // Paused and the pause evidence row is inserted in the same
+      // transaction. Prisma rolls back on any failure — no evidence
+      // row is persisted if the status update fails.
+      //
+      // M2 (#86, slice 86B, Codex review fix): `sellerProfileId`
+      // is RESOLVED from the locked persisted offering row, NOT taken
+      // from the input. The route does not carry a stable
+      // `sellerProfileId` reference and the input contract does not
+      // include one. Resolving from `existing.sellerProfile.id`
+      // matches the Activate path's pattern and prevents the
+      // `service_offering_pauses_sellerProfileId_fkey` P2003
+      // foreign-key violation that an empty-string placeholder
+      // would cause.
+      const updated = await tx.serviceOffering.update({
+        where: { id: input.offeringId },
+        data: { status: "Paused" },
+        include: OFFERING_INCLUDE,
+      });
+      const evidence = await tx.serviceOfferingPause.create({
+        data: {
+          offeringId: input.offeringId,
+          workspaceId: input.workspaceId,
+          sellerProfileId: existing.sellerProfile.id,
+          pausedByUserId: input.pausedByUserId,
+          pausedAt: input.now,
+          reason: input.reason,
+          idempotencyKey: input.idempotencyKey,
+          requestId: input.requestId,
+        },
+      });
+
+      return {
+        offering: toOwnerView(
+          updated,
+          {
+            workspaceId: input.workspaceId,
+            sellerProfileId: existing.sellerProfile.id,
+          },
+          // M2 (#86, slice 86B, Codex review fix): carry the
+          // playbackUrlFor resolver into the fresh-execute return
+          // path so CONFIRMED Live samples surface valid URLs.
+          input.playbackUrlFor,
+        ),
+        evidence: {
+          pausedAt: evidence.pausedAt,
+          reason: evidence.reason,
+          idempotencyKey: evidence.idempotencyKey,
+        },
+        convergedFromExistingPause: false,
+      };
+    });
+  }
+
+  async reactivate(
+    input: ServiceOfferingReactivateInput,
+  ): Promise<ServiceOfferingActivationResult> {
+    return this.prisma.$transaction(async (tx) => {
+      // M2 (#86, slice 86B): lock acquisition order matches `activate`
+      // (offering first, audio-sample second) so Reactivate serializes
+      // against concurrent Pause + final-sample removal paths.
+      await tx.$executeRaw(offeringLockSql(input.offeringId));
+      await acquireAudioSampleLockTx(tx, input.offeringId);
+      // M2 (#86, slice 86B Codex re-review): acquire the same
+      // `seller-profile:<workspaceId>` advisory lock that the
+      // SellerProfile repository acquires at the top of every write
+      // transaction (`saveDraft` and `writePublication`). Without this
+      // acquisition, the in-transaction SellerProfile.published read
+      // below is not serialized against a concurrent SellerProfile
+      // status change — a suspension could COMMIT between this read
+      // and the activation evidence row insert, leaving a newly-Active
+      // offering associated with a now-Suspended profile. The lock
+      // helper is shared with the SellerProfile repository via
+      // `seller-profile-workspace-lock.ts` to guarantee byte-for-byte
+      // lock-key parity. Lock acquisition order across the slices
+      // (this file uses `service-offering:<id>` → `audio-sample` →
+      // `seller-profile:<workspaceId>`; SellerProfile writes acquire
+      // the third lock only; audio-sample writes acquire the second
+      // only) is deadlock-free.
+      await tx.$executeRaw(sellerProfileWorkspaceLockSql(input.workspaceId));
+
+      // Step 1: idempotency pre-check against the activations table.
+      // Reactivation writes a new ServiceOfferingActivation row, so the
+      // existing (offeringId, idempotencyKey) unique index is the
+      // convergence key — same as a normal activation.
+      const existingActivation = await tx.serviceOfferingActivation.findUnique({
+        where: {
+          offeringId_idempotencyKey: {
+            offeringId: input.offeringId,
+            idempotencyKey: input.idempotencyKey,
+          },
+        },
+      });
+      if (existingActivation) {
+        const existingOffering = await tx.serviceOffering.findUnique({
+          where: { id: input.offeringId },
+          include: {
+            ...OFFERING_INCLUDE,
+            sellerProfile: { select: { workspaceId: true, id: true } },
+          },
+        });
+        if (!existingOffering) {
+          throw new ServiceOfferingNotFoundError(input.offeringId);
+        }
+        if (existingOffering.sellerProfile.workspaceId !== input.workspaceId) {
+          throw new ServiceOfferingNotOwnedError(input.offeringId, input.workspaceId);
+        }
+        return {
+          offering: toOwnerView(
+            existingOffering,
+            {
+              workspaceId: existingOffering.sellerProfile.workspaceId,
+              sellerProfileId: existingOffering.sellerProfile.id,
+            },
+            input.playbackUrlFor,
+          ),
+          evidence: toEvidenceView(existingActivation),
+          convergedFromExistingActivation: true,
+        };
+      }
+
+      // Step 2: precondition. The lifecycle status check requires
+      // `Paused`; a reactivation on Active / Draft / Archived surfaces
+      // `ServiceOfferingNotPausedError`.
+      const existing = await tx.serviceOffering.findUnique({
+        where: { id: input.offeringId },
+        include: { sellerProfile: { select: { workspaceId: true, id: true } } },
+      });
+      if (!existing) {
+        throw new ServiceOfferingNotFoundError(input.offeringId);
+      }
+      if (existing.sellerProfile.workspaceId !== input.workspaceId) {
+        throw new ServiceOfferingNotOwnedError(input.offeringId, input.workspaceId);
+      }
+      if (existing.status !== "Paused") {
+        throw new ServiceOfferingNotPausedError(input.offeringId, existing.status);
+      }
+
+      // Step 3 (M2 #86, slice 86B, Codex re-review): the
+      // `SellerProfile.published` precondition is enforced INSIDE the
+      // locked transaction AFTER the idempotency lookup and BEFORE
+      // any activation evidence row is inserted. The SELECT runs
+      // UNDER the `seller-profile:<workspaceId>` advisory lock
+      // acquired at the top of this transaction, which serializes
+      // against any concurrent SellerProfile write that also
+      // acquires that lock (`saveDraft`, `writePublication`, and any
+      // future suspension operation that follows the same locking
+      // convention). Without that lock, a suspension could COMMIT
+      // between this read and the activation evidence insert below,
+      // leaving a newly-Active offering associated with a now-
+      // Suspended profile. The same-key retry of an already-committed
+      // Reactivate still converges regardless of the current profile
+      // status because the idempotency pre-check above returns BEFORE
+      // this read.
+      const sellerProfile = await tx.sellerProfile.findUnique({
+        where: { id: existing.sellerProfile.id },
+        select: { id: true, workspaceId: true, status: true },
+      });
+      if (!sellerProfile) {
+        throw new ServiceOfferingSellerProfileMissingError(input.workspaceId);
+      }
+      if (sellerProfile.workspaceId !== input.workspaceId) {
+        // Defense in depth: the offering row already FK-links the
+        // profile, but a workspace mismatch here is a data-integrity
+        // failure that must surface as a precondition rejection.
+        throw new ServiceOfferingNotOwnedError(input.offeringId, input.workspaceId);
+      }
+      if (sellerProfile.status !== "Published") {
+        throw new ServiceOfferingSellerProfileNotPublishedError(
+          input.workspaceId,
+          sellerProfile.id,
+          sellerProfile.status,
+        );
+      }
+
+      // Step 3: snapshot for rollback on any failure mid-write.
+      const before = {
+        title: existing.title,
+        description: existing.description,
+        primaryCategoryId: existing.primaryCategoryId,
+        serviceMode: existing.serviceMode,
+        status: existing.status,
+      };
+
+      try {
+        // Step 4: STRICT activation completeness recheck INSIDE the
+        // lock. A concurrent remove between the service-layer
+        // pre-check and the activation commit cannot produce a newly
+        // Active offering with zero qualifying samples.
+        const fieldErrors: ApiFieldErrorV1[] = buildActivationCompletenessFieldErrors({
+          title: input.title,
+          description: input.description,
+          primaryCategoryKey: input.primaryCategoryKey,
+          serviceMode: input.serviceMode,
+          serviceAreas: input.serviceAreas,
+          pricingKind: input.pricing.kind,
+        });
+        const confirmedLiveCount = await tx.serviceOfferingAudioSample.count({
+          where: {
+            offeringId: input.offeringId,
+            cleanupStatus: AudioSampleCleanupStatus.Live,
+            confirmationVersion: { not: null },
+            confirmedByUserId: { not: null },
+            confirmedAt: { not: null },
+          },
+        });
+        if (confirmedLiveCount < 1 || confirmedLiveCount > BG2_AUDIO_SAMPLE_MAX_PER_OFFERING) {
+          fieldErrors.push({
+            path: "samples",
+            code: "samples_required",
+            message: `Activation requires 1 to ${BG2_AUDIO_SAMPLE_MAX_PER_OFFERING} playable samples.`,
+          });
+        }
+        if (fieldErrors.length > 0) {
+          throw new ServiceOfferingIncompleteError(
+            [
+              `field errors: ${fieldErrors.length}`,
+              `live confirmed sample count ${confirmedLiveCount} outside [1, ${BG2_AUDIO_SAMPLE_MAX_PER_OFFERING}]`,
+            ],
+            fieldErrors,
+          );
+        }
+
+        // Step 5: atomic field replacement + status flip + activation
+        // evidence insertion. The complete STRICT public field set
+        // replaces the prior Paused state's fields in one transaction;
+        // the existing service_offering_activations rows remain
+        // untouched (the reactivation writes a NEW row, preserving
+        // the original activation timestamp per ADR 0008).
+        const categoryId = await resolvePrimaryCategoryId(tx, input.primaryCategoryKey);
+        const unitId = input.pricing.unitId
+          ? await resolvePricingUnitId(tx, input.pricing.unitId)
+          : null;
+        const updated = await tx.serviceOffering.update({
+          where: { id: input.offeringId },
+          data: {
+            status: "Active",
+            title: input.title,
+            description: input.description,
+            primaryCategoryId: categoryId,
+            serviceMode: input.serviceMode,
+            serviceAreas: {
+              deleteMany: {},
+              create: input.serviceAreas.map((sa) => ({
+                countryCode: sa.countryCode,
+                region: sa.region ?? null,
+                city: sa.city ?? null,
+              })),
+            },
+            pricing: {
+              upsert: {
+                create: {
+                  kind: input.pricing.kind,
+                  amountMinor: input.pricing.amountMinor ?? null,
+                  currency: input.pricing.currency ?? null,
+                  unitId,
+                },
+                update: {
+                  kind: input.pricing.kind,
+                  amountMinor: input.pricing.amountMinor ?? null,
+                  currency: input.pricing.currency ?? null,
+                  unitId,
+                },
+              },
+            },
+            genreTags: [...input.genreTags],
+            includedServices: {
+              deleteMany: {},
+              create: await resolveIncludedServices(tx, input.includedServiceCategoryKeys),
+            },
+          },
+          include: OFFERING_INCLUDE,
+        });
+
+        // Step 6: insert the reactivation evidence row. The
+        // (offeringId, idempotencyKey) DB unique constraint is the
+        // second defense if a concurrent same-key request slipped
+        // past the pre-check.
+        let activation;
+        try {
+          activation = await tx.serviceOfferingActivation.create({
+            data: {
+              offeringId: input.offeringId,
+              workspaceId: input.workspaceId,
+              sellerProfileId: existing.sellerProfile.id,
+              activatedByUserId: input.reactivatedByUserId,
+              confirmationVersion: input.confirmationVersion,
+              activatedAt: input.now,
+              idempotencyKey: input.idempotencyKey,
+              requestId: input.requestId,
+            },
+          });
+        } catch (err) {
+          if (err instanceof Prisma.PrismaClientKnownRequestError && err.code === "P2002") {
+            const winner = await tx.serviceOfferingActivation.findUnique({
+              where: {
+                offeringId_idempotencyKey: {
+                  offeringId: input.offeringId,
+                  idempotencyKey: input.idempotencyKey,
+                },
+              },
+            });
+            if (winner) {
+              return {
+                offering: toOwnerView(
+                  updated,
+                  {
+                    workspaceId: input.workspaceId,
+                    sellerProfileId: existing.sellerProfile.id,
+                  },
+                  input.playbackUrlFor,
+                ),
+                evidence: toEvidenceView(winner),
+                convergedFromExistingActivation: true,
+              };
+            }
+          }
+          throw err;
+        }
+
+        return {
+          offering: toOwnerView(
+            updated,
+            {
+              workspaceId: input.workspaceId,
+              sellerProfileId: existing.sellerProfile.id,
+            },
+            input.playbackUrlFor,
+          ),
+          evidence: toEvidenceView(activation),
+          convergedFromExistingActivation: false,
+        };
+      } catch (err) {
         if (err instanceof ServiceOfferingIncompleteError) {
           throw err;
         }

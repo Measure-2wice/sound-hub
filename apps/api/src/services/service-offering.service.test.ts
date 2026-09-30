@@ -152,6 +152,16 @@ function buildService(
     sellerProfileId: SELLER_PROFILE_ID,
     status: "Draft",
   });
+  // M2 (#86, slice 86B, Codex review fix): the Reactivate path now
+  // resolves the SellerProfile.published precondition INSIDE the
+  // repository transaction. The in-memory adapter reads the profile
+  // status from a test-only registry; tests must register the
+  // profile so the Reactivate precondition check has data.
+  repo._registerSellerProfile({
+    workspaceId: PERSONAL_WS_ID,
+    sellerProfileId: SELLER_PROFILE_ID,
+    status: input.sellerProfileStatus ?? "Published",
+  });
   const auth = new StubWorkspaceAuthorizationService();
   const playbackUrlFor = (input: { offeringId: string; sampleId: string }) =>
     `https://api.test/services/${input.offeringId}/samples/${input.sampleId}/play`;
@@ -555,5 +565,295 @@ void describe("ServiceOfferingService", () => {
     });
     assert.equal(result.offerings.length, 1);
     assert.equal(result.offerings[0]?.serviceOfferingId, "of_1");
+  });
+});
+
+void describe("ServiceOfferingService — Pause / Reactivate (M2 #86, slice 86B)", () => {
+  function minimalPauseRequest(overrides: { readonly idempotencyKey?: string } = {}) {
+    return {
+      idempotencyKey: overrides.idempotencyKey ?? "11111111-2222-3333-4444-555555555555",
+    };
+  }
+
+  void test("pause: Active offering flips to Paused and writes a pause evidence row", async () => {
+    const { service, repo } = buildService({ sellerProfileStatus: "Published" });
+    repo._seedOffering({
+      id: "of_1",
+      workspaceId: PERSONAL_WS_ID,
+      sellerProfileId: SELLER_PROFILE_ID,
+      status: "Active",
+    });
+    const result = await service.pause({
+      userAccountId: ACTING_USER,
+      workspaceId: PERSONAL_WS_ID,
+      offeringId: "of_1",
+      ...minimalPauseRequest(),
+      requestId: "req-pause-1",
+    });
+    assert.equal(result.ok, true);
+    assert.equal(result.offering.status, "Paused");
+    assert.equal(result.evidence.reason, "user_initiated");
+    assert.equal(result.evidence.idempotencyKey, "11111111-2222-3333-4444-555555555555");
+  });
+
+  void test("pause: same-key retry returns converged success without writing a second pause row", async () => {
+    const { service, repo } = buildService({ sellerProfileStatus: "Published" });
+    repo._seedOffering({
+      id: "of_1",
+      workspaceId: PERSONAL_WS_ID,
+      sellerProfileId: SELLER_PROFILE_ID,
+      status: "Active",
+    });
+    const first = await service.pause({
+      userAccountId: ACTING_USER,
+      workspaceId: PERSONAL_WS_ID,
+      offeringId: "of_1",
+      ...minimalPauseRequest(),
+      requestId: "req-pause-1",
+    });
+    const second = await service.pause({
+      userAccountId: ACTING_USER,
+      workspaceId: PERSONAL_WS_ID,
+      offeringId: "of_1",
+      ...minimalPauseRequest(),
+      requestId: "req-pause-2",
+    });
+    assert.deepEqual(second.evidence, first.evidence);
+  });
+
+  void test("pause: a Draft offering surfaces SERVICE_OFFERING_NOT_ACTIVE", async () => {
+    const { service, repo } = buildService({ sellerProfileStatus: "Published" });
+    repo._seedOffering({
+      id: "of_1",
+      workspaceId: PERSONAL_WS_ID,
+      sellerProfileId: SELLER_PROFILE_ID,
+      status: "Draft",
+    });
+    await assert.rejects(
+      service.pause({
+        userAccountId: ACTING_USER,
+        workspaceId: PERSONAL_WS_ID,
+        offeringId: "of_1",
+        ...minimalPauseRequest(),
+        requestId: "req-pause-1",
+      }),
+      (err: unknown) => {
+        assert.ok(err instanceof ServiceOfferingServiceError);
+        assert.equal((err as { code: string }).code, "SERVICE_OFFERING_NOT_ACTIVE");
+        return true;
+      },
+    );
+  });
+
+  void test("pause: a different-key Pause on a Paused offering surfaces SERVICE_OFFERING_ALREADY_PAUSED", async () => {
+    const { service, repo } = buildService({ sellerProfileStatus: "Published" });
+    repo._seedOffering({
+      id: "of_1",
+      workspaceId: PERSONAL_WS_ID,
+      sellerProfileId: SELLER_PROFILE_ID,
+      status: "Active",
+    });
+    await service.pause({
+      userAccountId: ACTING_USER,
+      workspaceId: PERSONAL_WS_ID,
+      offeringId: "of_1",
+      ...minimalPauseRequest({ idempotencyKey: "11111111-2222-3333-4444-555555555555" }),
+      requestId: "req-pause-1",
+    });
+    await assert.rejects(
+      service.pause({
+        userAccountId: ACTING_USER,
+        workspaceId: PERSONAL_WS_ID,
+        offeringId: "of_1",
+        ...minimalPauseRequest({ idempotencyKey: "22222222-3333-4444-5555-666666666666" }),
+        requestId: "req-pause-2",
+      }),
+      (err: unknown) => {
+        assert.ok(err instanceof ServiceOfferingServiceError);
+        assert.equal((err as { code: string }).code, "SERVICE_OFFERING_ALREADY_PAUSED");
+        return true;
+      },
+    );
+  });
+
+  void test("pause: an Organization actor surfaces SERVICE_OFFERING_FORBIDDEN", async () => {
+    const { service, repo, auth } = buildService({ sellerProfileStatus: "Published" });
+    void auth; // unused — flipped via input parameters below
+    repo._seedOffering({
+      id: "of_1",
+      workspaceId: ORG_WS_ID,
+      sellerProfileId: "sp_org",
+      status: "Active",
+    });
+    await assert.rejects(
+      service.pause({
+        userAccountId: ACTING_USER,
+        workspaceId: ORG_WS_ID,
+        offeringId: "of_1",
+        ...minimalPauseRequest(),
+        requestId: "req-pause-1",
+      }),
+      (err: unknown) => {
+        assert.ok(err instanceof ServiceOfferingServiceError);
+        assert.equal((err as { code: string }).code, "SERVICE_OFFERING_FORBIDDEN");
+        return true;
+      },
+    );
+  });
+
+  void test("pause: a Buyer-only Personal actor surfaces SERVICE_OFFERING_FORBIDDEN", async () => {
+    const { service, auth, repo } = buildService({ sellerProfileStatus: "Published" });
+    auth.personalMembership = buildPersonalMembership(["Buyer"]);
+    repo._seedOffering({
+      id: "of_1",
+      workspaceId: PERSONAL_WS_ID,
+      sellerProfileId: SELLER_PROFILE_ID,
+      status: "Active",
+    });
+    await assert.rejects(
+      service.pause({
+        userAccountId: ACTING_USER,
+        workspaceId: PERSONAL_WS_ID,
+        offeringId: "of_1",
+        ...minimalPauseRequest(),
+        requestId: "req-pause-1",
+      }),
+      (err: unknown) => {
+        assert.ok(err instanceof ServiceOfferingServiceError);
+        assert.equal((err as { code: string }).code, "SERVICE_OFFERING_FORBIDDEN");
+        return true;
+      },
+    );
+  });
+
+  void test("reactivate: Paused offering flips to Active and writes a new activation row", async () => {
+    const { service, repo } = buildService({ sellerProfileStatus: "Published" });
+    repo._seedOffering({
+      id: "of_1",
+      workspaceId: PERSONAL_WS_ID,
+      sellerProfileId: SELLER_PROFILE_ID,
+      status: "Paused",
+    });
+    repo._seedSample("of_1", {
+      sampleId: "s1",
+      label: "Demo",
+      byteSize: 1024,
+      displayOrder: 1,
+      storageRef: "ref://demo",
+      confirmation: {
+        version: "m2-audio-confirmation-v1",
+        confirmedByUserId: ACTING_USER,
+        confirmedAt: new Date(),
+      },
+    });
+    const result = await service.reactivate({
+      userAccountId: ACTING_USER,
+      workspaceId: PERSONAL_WS_ID,
+      offeringId: "of_1",
+      request: minimalActivate({}),
+      requestId: "req-reactivate-1",
+    });
+    assert.equal(result.ok, true);
+    assert.equal(result.offering.status, "Active");
+  });
+
+  void test("reactivate: an unpublished SellerProfile surfaces SERVICE_OFFERING_SELLER_PROFILE_NOT_PUBLISHED", async () => {
+    const { service, repo } = buildService({ sellerProfileStatus: "Draft" });
+    repo._seedOffering({
+      id: "of_1",
+      workspaceId: PERSONAL_WS_ID,
+      sellerProfileId: SELLER_PROFILE_ID,
+      status: "Paused",
+    });
+    repo._seedSample("of_1", {
+      sampleId: "s1",
+      label: "Demo",
+      byteSize: 1024,
+      displayOrder: 1,
+      storageRef: "ref://demo",
+      confirmation: {
+        version: "m2-audio-confirmation-v1",
+        confirmedByUserId: ACTING_USER,
+        confirmedAt: new Date(),
+      },
+    });
+    await assert.rejects(
+      service.reactivate({
+        userAccountId: ACTING_USER,
+        workspaceId: PERSONAL_WS_ID,
+        offeringId: "of_1",
+        request: minimalActivate({}),
+        requestId: "req-reactivate-1",
+      }),
+      (err: unknown) => {
+        assert.ok(err instanceof ServiceOfferingServiceError);
+        assert.equal(
+          (err as { code: string }).code,
+          "SERVICE_OFFERING_SELLER_PROFILE_NOT_PUBLISHED",
+        );
+        return true;
+      },
+    );
+  });
+
+  void test("reactivate: no CONFIRMED Live samples surfaces SERVICE_OFFERING_INCOMPLETE", async () => {
+    const { service, repo } = buildService({ sellerProfileStatus: "Published" });
+    repo._seedOffering({
+      id: "of_1",
+      workspaceId: PERSONAL_WS_ID,
+      sellerProfileId: SELLER_PROFILE_ID,
+      status: "Paused",
+    });
+    // No _seedSample call — the offering has zero CONFIRMED Live samples.
+    await assert.rejects(
+      service.reactivate({
+        userAccountId: ACTING_USER,
+        workspaceId: PERSONAL_WS_ID,
+        offeringId: "of_1",
+        request: minimalActivate({}),
+        requestId: "req-reactivate-1",
+      }),
+      (err: unknown) => {
+        assert.ok(err instanceof ServiceOfferingServiceError);
+        assert.equal((err as { code: string }).code, "SERVICE_OFFERING_INCOMPLETE");
+        return true;
+      },
+    );
+  });
+
+  void test("reactivate: an Organization actor surfaces SERVICE_OFFERING_FORBIDDEN", async () => {
+    const { service, repo } = buildService({ sellerProfileStatus: "Published" });
+    repo._seedOffering({
+      id: "of_1",
+      workspaceId: ORG_WS_ID,
+      sellerProfileId: "sp_org",
+      status: "Paused",
+    });
+    repo._seedSample("of_1", {
+      sampleId: "s1",
+      label: "Demo",
+      byteSize: 1024,
+      displayOrder: 1,
+      storageRef: "ref://demo",
+      confirmation: {
+        version: "m2-audio-confirmation-v1",
+        confirmedByUserId: ACTING_USER,
+        confirmedAt: new Date(),
+      },
+    });
+    await assert.rejects(
+      service.reactivate({
+        userAccountId: ACTING_USER,
+        workspaceId: ORG_WS_ID,
+        offeringId: "of_1",
+        request: minimalActivate({}),
+        requestId: "req-reactivate-1",
+      }),
+      (err: unknown) => {
+        assert.ok(err instanceof ServiceOfferingServiceError);
+        assert.equal((err as { code: string }).code, "SERVICE_OFFERING_FORBIDDEN");
+        return true;
+      },
+    );
   });
 });

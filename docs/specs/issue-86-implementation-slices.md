@@ -8,7 +8,7 @@
 
 ## Current review target
 
-**CURRENT REVIEW TARGET: `86A`**
+**CURRENT REVIEW TARGET: `86B`**
 
 Update this line only after the current slice has:
 

@@ -82,6 +82,9 @@ import {
   serviceOfferingDraftResponseV1Schema,
   serviceOfferingGetResponseV1Schema,
   serviceOfferingOwnerListResponseV1Schema,
+  serviceOfferingPauseRequestV1Schema,
+  serviceOfferingPauseResponseV1Schema,
+  serviceOfferingReactivateRequestV1Schema,
   type Bg1PublicUserV1,
 } from "@soundhub/types";
 import type { AuthenticationService } from "../services/authentication.service.js";
@@ -128,6 +131,12 @@ export function createServiceOfferingRouter(deps: ServiceOfferingRouteDeps): Rou
   });
   router.post("/:workspaceId/service-offerings/:offeringId/activate", (req, res) => {
     void handleActivate(req, res, deps);
+  });
+  router.post("/:workspaceId/service-offerings/:offeringId/pause", (req, res) => {
+    void handlePause(req, res, deps);
+  });
+  router.post("/:workspaceId/service-offerings/:offeringId/reactivate", (req, res) => {
+    void handleReactivate(req, res, deps);
   });
   router.get("/:workspaceId/service-offerings", (req, res) => {
     void handleList(req, res, deps);
@@ -346,6 +355,150 @@ async function handleActivate(
   }
   try {
     const result = await deps.service.activate({
+      userAccountId: actor.userAccountId,
+      workspaceId: actor.workspaceId,
+      offeringId,
+      request: parsed.data,
+      requestId,
+    });
+    const safeReturnTo = await resolveSafeReturnTo(
+      deps,
+      actor.freshUser,
+      actor.workspaceId,
+      parsed.data.returnTo,
+    );
+    writeJson(
+      res,
+      200,
+      serviceOfferingActivationResponseV1Schema.parse({
+        ...result,
+        safeReturnTo,
+      }),
+    );
+  } catch (err) {
+    writeServiceError(res, err, requestId);
+  }
+}
+
+// M2 (#86, slice 86B): Active → Paused transition handler.
+//
+// Authorization contract is identical to handleActivate: the
+// service layer's `assertPersonalSellerCapability` enforces the
+// Personal-Workspace-only AND Seller-capable precondition. The
+// `confirmEligibilityLoss`-style confirmation flag is NOT a part
+// of the Pause command — the Pause request body carries ONLY the
+// idempotencyKey (see `serviceOfferingPauseRequestV1Schema`).
+async function handlePause(
+  req: Request,
+  res: Response,
+  deps: ServiceOfferingRouteDeps,
+): Promise<void> {
+  const requestId = generateRequestId();
+  res.setHeader("x-request-id", requestId);
+  const actor = await resolveActor(req, res, deps);
+  if (!actor) return;
+  const offeringId = readOfferingId(req);
+  if (!offeringId) {
+    writeSafeError(
+      res,
+      buildSafeError("SERVICE_OFFERING_INVALID", "Missing serviceOfferingId", undefined, requestId),
+    );
+    return;
+  }
+  let rawBody: unknown;
+  try {
+    rawBody = await readBody(req);
+  } catch (err) {
+    if (err instanceof ServiceOfferingServiceError) {
+      writeTranslatedError(res, err.code, err.message, err.fieldErrors, requestId);
+      return;
+    }
+    writeSafeError(
+      res,
+      buildSafeError("SERVICE_OFFERING_INVALID", "Malformed request body", undefined, requestId),
+    );
+    return;
+  }
+  const parsed = serviceOfferingPauseRequestV1Schema.safeParse(rawBody);
+  if (!parsed.success) {
+    const fields = parsed.error.issues.map((issue) => ({
+      path: issue.path.join("."),
+      code: issue.code,
+      message: issue.message,
+    }));
+    writeSafeError(
+      res,
+      buildSafeError("SERVICE_OFFERING_INVALID", "Malformed pause request", fields, requestId),
+    );
+    return;
+  }
+  try {
+    const result = await deps.service.pause({
+      userAccountId: actor.userAccountId,
+      workspaceId: actor.workspaceId,
+      offeringId,
+      idempotencyKey: parsed.data.idempotencyKey,
+      requestId,
+    });
+    writeJson(res, 200, serviceOfferingPauseResponseV1Schema.parse(result));
+  } catch (err) {
+    writeServiceError(res, err, requestId);
+  }
+}
+
+// M2 (#86, slice 86B): Paused → Active transition handler.
+//
+// The body schema is the existing STRICT activation schema (aliased
+// as `serviceOfferingReactivateRequestV1Schema`). The response
+// shape is the activation response — reactivation writes a new
+// `ServiceOfferingActivation` evidence row whose `activatedAt` is
+// the reactivation moment. Existing activation rows are preserved.
+async function handleReactivate(
+  req: Request,
+  res: Response,
+  deps: ServiceOfferingRouteDeps,
+): Promise<void> {
+  const requestId = generateRequestId();
+  res.setHeader("x-request-id", requestId);
+  const actor = await resolveActor(req, res, deps);
+  if (!actor) return;
+  const offeringId = readOfferingId(req);
+  if (!offeringId) {
+    writeSafeError(
+      res,
+      buildSafeError("SERVICE_OFFERING_INVALID", "Missing serviceOfferingId", undefined, requestId),
+    );
+    return;
+  }
+  let rawBody: unknown;
+  try {
+    rawBody = await readBody(req);
+  } catch (err) {
+    if (err instanceof ServiceOfferingServiceError) {
+      writeTranslatedError(res, err.code, err.message, err.fieldErrors, requestId);
+      return;
+    }
+    writeSafeError(
+      res,
+      buildSafeError("SERVICE_OFFERING_INVALID", "Malformed request body", undefined, requestId),
+    );
+    return;
+  }
+  const parsed = serviceOfferingReactivateRequestV1Schema.safeParse(rawBody);
+  if (!parsed.success) {
+    const fields = parsed.error.issues.map((issue) => ({
+      path: issue.path.join("."),
+      code: issue.code,
+      message: issue.message,
+    }));
+    writeSafeError(
+      res,
+      buildSafeError("SERVICE_OFFERING_INVALID", "Malformed reactivate request", fields, requestId),
+    );
+    return;
+  }
+  try {
+    const result = await deps.service.reactivate({
       userAccountId: actor.userAccountId,
       workspaceId: actor.workspaceId,
       offeringId,

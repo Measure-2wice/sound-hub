@@ -108,10 +108,15 @@ describe("ServiceOffering route (in-memory)", () => {
       status: "Draft",
     });
     // The in-memory adapter maintains a minimal SellerProfile
-    // registry so `createDraft` can find the precondition satisfied.
+    // registry so `createDraft` can find the precondition satisfied
+    // AND the Reactivate publication check has access to the
+    // current status. The route setup registers Published by
+    // default; the Reactivate unpublished-profile test re-registers
+    // a Draft profile before the call.
     serviceOfferingRepository._registerSellerProfile({
       workspaceId: PERSONAL_WS,
       sellerProfileId: "sp_test",
+      status: "Published",
     });
     personalWorkspaceConvergenceService = new PersonalWorkspaceConvergenceService({
       authRepository: authRepo,
@@ -412,6 +417,184 @@ describe("ServiceOffering route (in-memory)", () => {
         confirmationVersion: "m2-service-activation-v1",
         idempotencyKey: "11111111-2222-3333-4444-555555555555",
       })
+      .set("Cookie", cookie)
+      .set("Content-Type", "application/json");
+    assert.equal(response.status, 422);
+    assert.equal(response.body.error.code, "SERVICE_OFFERING_SELLER_PROFILE_NOT_PUBLISHED");
+  });
+
+  // M2 (#86, slice 86B): POST pause route coverage.
+  // The in-memory adapter seeds the offering as Draft in `beforeEach`.
+  // The Pause precondition requires Active state, so each Pause test
+  // re-seeds the offering as Active before the call. The Published-
+  // SellerProfile path is NOT a Pause precondition — Pause does not
+  // require the SellerProfile to be Published, only that the actor
+  // is a current Personal-Workspace member with Seller capability.
+
+  function seedAsActive(id: string): void {
+    serviceOfferingRepository._seedOffering({
+      id,
+      workspaceId: PERSONAL_WS,
+      sellerProfileId: "sp_test",
+      status: "Active",
+    });
+  }
+
+  test("POST pause without a session returns SESSION_INVALID", async () => {
+    seedAsActive("of_test_pause_no_session");
+    const response = await request(app)
+      .post(`/api/workspaces/${PERSONAL_WS}/service-offerings/of_test_pause_no_session/pause`)
+      .send({ idempotencyKey: "11111111-2222-3333-4444-555555555555" })
+      .set("Content-Type", "application/json");
+    assert.equal(response.status, 401);
+    assert.equal(response.body.error.code, "SESSION_INVALID");
+  });
+
+  test("POST pause on an Organization Workspace returns SERVICE_OFFERING_FORBIDDEN", async () => {
+    seedAsActive("of_test_pause_org");
+    const cookie = await signIn(ORG_SELLER_EMAIL);
+    const response = await request(app)
+      .post(`/api/workspaces/${ORG_WS}/service-offerings/of_test_pause_org/pause`)
+      .send({ idempotencyKey: "11111111-2222-3333-4444-555555555555" })
+      .set("Cookie", cookie)
+      .set("Content-Type", "application/json");
+    assert.equal(response.status, 403);
+    assert.equal(response.body.error.code, "SERVICE_OFFERING_FORBIDDEN");
+  });
+
+  test("POST pause with a non-UUID idempotencyKey returns SERVICE_OFFERING_INVALID", async () => {
+    seedAsActive("of_test_pause_bad_uuid");
+    const cookie = await signIn(SELLER_EMAIL);
+    const response = await request(app)
+      .post(`/api/workspaces/${PERSONAL_WS}/service-offerings/of_test_pause_bad_uuid/pause`)
+      .send({ idempotencyKey: "not-a-uuid" })
+      .set("Cookie", cookie)
+      .set("Content-Type", "application/json");
+    assert.equal(response.status, 400);
+    assert.equal(response.body.error.code, "SERVICE_OFFERING_INVALID");
+  });
+
+  test("POST pause on an Active offering returns 200 with paused status and a pause evidence shape", async () => {
+    seedAsActive("of_test_pause_active");
+    const cookie = await signIn(SELLER_EMAIL);
+    const idempotencyKey = "11111111-2222-3333-4444-aaaaaaaaaaaa";
+    const response = await request(app)
+      .post(`/api/workspaces/${PERSONAL_WS}/service-offerings/of_test_pause_active/pause`)
+      .send({ idempotencyKey })
+      .set("Cookie", cookie)
+      .set("Content-Type", "application/json");
+    assert.equal(response.status, 200);
+    assert.equal(response.body.ok, true);
+    assert.equal(response.body.offering.status, "Paused");
+    assert.equal(response.body.evidence.reason, "user_initiated");
+    assert.equal(response.body.evidence.idempotencyKey, idempotencyKey);
+  });
+
+  test("POST pause same-key retry returns 200 with converged success", async () => {
+    seedAsActive("of_test_pause_retry");
+    const cookie = await signIn(SELLER_EMAIL);
+    const idempotencyKey = "11111111-2222-3333-4444-bbbbbbbbbbbb";
+    const first = await request(app)
+      .post(`/api/workspaces/${PERSONAL_WS}/service-offerings/of_test_pause_retry/pause`)
+      .send({ idempotencyKey })
+      .set("Cookie", cookie)
+      .set("Content-Type", "application/json");
+    assert.equal(first.status, 200);
+    const second = await request(app)
+      .post(`/api/workspaces/${PERSONAL_WS}/service-offerings/of_test_pause_retry/pause`)
+      .send({ idempotencyKey })
+      .set("Cookie", cookie)
+      .set("Content-Type", "application/json");
+    assert.equal(second.status, 200);
+    assert.deepEqual(second.body.evidence, first.body.evidence);
+  });
+
+  test("POST pause on a Draft offering returns 409 SERVICE_OFFERING_NOT_ACTIVE", async () => {
+    // `of_test_1` is seeded as Draft by `beforeEach`.
+    const cookie = await signIn(SELLER_EMAIL);
+    const response = await request(app)
+      .post(`/api/workspaces/${PERSONAL_WS}/service-offerings/of_test_1/pause`)
+      .send({ idempotencyKey: "11111111-2222-3333-4444-cccccccccccc" })
+      .set("Cookie", cookie)
+      .set("Content-Type", "application/json");
+    assert.equal(response.status, 409);
+    assert.equal(response.body.error.code, "SERVICE_OFFERING_NOT_ACTIVE");
+  });
+
+  test("POST pause different-key on a Paused offering returns 409 SERVICE_OFFERING_ALREADY_PAUSED", async () => {
+    seedAsActive("of_test_pause_dbl");
+    const cookie = await signIn(SELLER_EMAIL);
+    const first = await request(app)
+      .post(`/api/workspaces/${PERSONAL_WS}/service-offerings/of_test_pause_dbl/pause`)
+      .send({ idempotencyKey: "11111111-2222-3333-4444-dddddddddddd" })
+      .set("Cookie", cookie)
+      .set("Content-Type", "application/json");
+    assert.equal(first.status, 200);
+    const second = await request(app)
+      .post(`/api/workspaces/${PERSONAL_WS}/service-offerings/of_test_pause_dbl/pause`)
+      .send({ idempotencyKey: "22222222-3333-4444-5555-eeeeeeeeeeee" })
+      .set("Cookie", cookie)
+      .set("Content-Type", "application/json");
+    assert.equal(second.status, 409);
+    assert.equal(second.body.error.code, "SERVICE_OFFERING_ALREADY_PAUSED");
+  });
+
+  // M2 (#86, slice 86B): POST reactivate route coverage.
+  // The activate-route test pattern (above) is mirrored. Reactivate
+  // requires the SellerProfile.published precondition (same as
+  // activate), so the route returns SERVICE_OFFERING_SELLER_PROFILE_NOT_PUBLISHED
+  // for the test fixture (which seeds `getSellerProfileStatus: () => null`).
+
+  function seedAsPaused(id: string): void {
+    serviceOfferingRepository._seedOffering({
+      id,
+      workspaceId: PERSONAL_WS,
+      sellerProfileId: "sp_test",
+      status: "Paused",
+    });
+  }
+
+  const reactivateBody = {
+    title: "Haitian dancehall production",
+    description: "Arrangement + recording direction + editing.",
+    primaryCategoryKey: "music-production",
+    serviceMode: "Remote",
+    serviceAreas: [],
+    pricing: { kind: "StartingAt", amountMinor: 60000, currency: "USD", unitId: "per-track" },
+    genreTags: [],
+    includedServiceCategoryKeys: [],
+    confirmationVersion: "m2-service-activation-v1",
+    idempotencyKey: "11111111-2222-3333-4444-ffffffffffff",
+  } as const;
+
+  test("POST reactivate without a session returns SESSION_INVALID", async () => {
+    seedAsPaused("of_test_reactivate_no_session");
+    const response = await request(app)
+      .post(
+        `/api/workspaces/${PERSONAL_WS}/service-offerings/of_test_reactivate_no_session/reactivate`,
+      )
+      .send(reactivateBody)
+      .set("Content-Type", "application/json");
+    assert.equal(response.status, 401);
+    assert.equal(response.body.error.code, "SESSION_INVALID");
+  });
+
+  test("POST reactivate on an unpublished SellerProfile returns SERVICE_OFFERING_SELLER_PROFILE_NOT_PUBLISHED", async () => {
+    seedAsPaused("of_test_reactivate_unpub");
+    // The repository's Reactivate publication check runs inside the
+    // transaction and reads the SellerProfile status from the
+    // in-memory registry; the default Published registration must
+    // be overwritten with a Draft status to surface the precondition
+    // rejection.
+    serviceOfferingRepository._registerSellerProfile({
+      workspaceId: PERSONAL_WS,
+      sellerProfileId: "sp_test",
+      status: "Draft",
+    });
+    const cookie = await signIn(SELLER_EMAIL);
+    const response = await request(app)
+      .post(`/api/workspaces/${PERSONAL_WS}/service-offerings/of_test_reactivate_unpub/reactivate`)
+      .send(reactivateBody)
       .set("Cookie", cookie)
       .set("Content-Type", "application/json");
     assert.equal(response.status, 422);

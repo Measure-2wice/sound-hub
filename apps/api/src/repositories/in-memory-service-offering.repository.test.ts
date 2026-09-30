@@ -181,3 +181,420 @@ void describe("InMemoryServiceOfferingRepository", () => {
     );
   });
 });
+
+void describe("InMemoryServiceOfferingRepository — ServiceOfferingPause / ServiceOfferingReactivate (M2 #86, slice 86B)", () => {
+  // Minimal SeedSample helper used by the Pause / Reactivate tests
+  // below. CONFIRMED Live samples are required for Reactivate.
+  function seedConfirmedLive(
+    repo: InMemoryServiceOfferingRepository,
+    offeringId: string,
+    sampleId: string,
+  ) {
+    repo._seedSample(offeringId, {
+      sampleId,
+      label: sampleId,
+      byteSize: 1024,
+      displayOrder: 1,
+      storageRef: `s3://bucket/${sampleId}`,
+      cleanupStatus: "Live",
+      confirmation: {
+        version: "m2-audio-confirmation-v1",
+        confirmedByUserId: ACTIVATED_BY,
+        confirmedAt: new Date("2026-09-27T12:00:00.000Z"),
+      },
+    });
+  }
+
+  // Pause requires the offering to be in Active state. This helper
+  // seeds `of_a` as Active directly so each Pause test does not have
+  // to drive a separate Activate dance. The existing `buildRepo()`
+  // continues to seed Draft offerings for the legacy createDraft /
+  // saveDraft / activate tests.
+  function buildActiveRepo(): InMemoryServiceOfferingRepository {
+    const repo = new InMemoryServiceOfferingRepository();
+    repo._seedOffering({
+      id: "of_a",
+      workspaceId: WS_ID,
+      sellerProfileId: SELLER_PROFILE_ID,
+      status: "Active",
+    });
+    repo._seedOffering({
+      id: "of_b",
+      workspaceId: WS_ID,
+      sellerProfileId: SELLER_PROFILE_ID,
+      status: "Active",
+    });
+    // M2 (#86, slice 86B, Codex review fix): the Reactivate path
+    // checks SellerProfile.published inside the repository. Register
+    // the test SellerProfile as Published so the Reactivate tests
+    // can pass; the "unpublished" test re-registers a Draft profile.
+    repo._registerSellerProfile({
+      workspaceId: WS_ID,
+      sellerProfileId: SELLER_PROFILE_ID,
+      status: "Published",
+    });
+    return repo;
+  }
+
+  void describe("pause", () => {
+    void test("Pause on Active flips status, writes pause evidence, returns OwnerView with status Paused", async () => {
+      const repo = buildActiveRepo();
+      const idempotencyKey = "11111111-2222-3333-4444-555555555555";
+      const result = await repo.pause({
+        offeringId: "of_a",
+        workspaceId: WS_ID,
+        pausedByUserId: ACTIVATED_BY,
+        reason: "user_initiated",
+        idempotencyKey,
+        requestId: "req-1",
+        now: new Date("2026-09-27T13:00:00.000Z"),
+        playbackUrlFor: playbackUrl,
+      });
+      assert.equal(result.convergedFromExistingPause, false);
+      assert.equal(result.offering.status, "Paused");
+      assert.equal(result.evidence.reason, "user_initiated");
+      assert.equal(result.evidence.idempotencyKey, idempotencyKey);
+      assert.equal(result.evidence.pausedAt.toISOString(), "2026-09-27T13:00:00.000Z");
+    });
+
+    void test("Pause same-key retry converges on the existing pause row", async () => {
+      const repo = buildActiveRepo();
+      const idempotencyKey = "11111111-2222-3333-4444-555555555555";
+      const first = await repo.pause({
+        offeringId: "of_a",
+        workspaceId: WS_ID,
+        pausedByUserId: ACTIVATED_BY,
+        reason: "user_initiated",
+        idempotencyKey,
+        requestId: "req-1",
+        now: new Date("2026-09-27T13:00:00.000Z"),
+        playbackUrlFor: playbackUrl,
+      });
+      const second = await repo.pause({
+        offeringId: "of_a",
+        workspaceId: WS_ID,
+        pausedByUserId: ACTIVATED_BY,
+        reason: "user_initiated",
+        idempotencyKey,
+        requestId: "req-2",
+        now: new Date("2026-09-27T14:00:00.000Z"),
+        playbackUrlFor: playbackUrl,
+      });
+      assert.equal(second.convergedFromExistingPause, true);
+      assert.deepEqual(second.evidence, first.evidence);
+      assert.equal(second.offering.status, "Paused");
+    });
+
+    void test("Pause different-key on Paused throws AlreadyPausedError", async () => {
+      const repo = buildActiveRepo();
+      await repo.pause({
+        offeringId: "of_a",
+        workspaceId: WS_ID,
+        pausedByUserId: ACTIVATED_BY,
+        reason: "user_initiated",
+        idempotencyKey: "11111111-2222-3333-4444-555555555555",
+        requestId: "req-1",
+        now: new Date("2026-09-27T13:00:00.000Z"),
+        playbackUrlFor: playbackUrl,
+      });
+      await assert.rejects(
+        repo.pause({
+          offeringId: "of_a",
+          workspaceId: WS_ID,
+          pausedByUserId: ACTIVATED_BY,
+          reason: "user_initiated",
+          idempotencyKey: "22222222-3333-4444-5555-666666666666",
+          requestId: "req-2",
+          now: new Date("2026-09-27T14:00:00.000Z"),
+          playbackUrlFor: playbackUrl,
+        }),
+        (err: unknown) => {
+          assert.equal(
+            (err as { name?: string }).name,
+            "ServiceOfferingAlreadyPausedError",
+            "different-key Pause on Paused must surface AlreadyPausedError",
+          );
+          return true;
+        },
+      );
+    });
+
+    void test("Pause on Draft throws NotActiveError with currentStatus=Draft", async () => {
+      const repo = buildRepo();
+      await assert.rejects(
+        repo.pause({
+          offeringId: "of_a",
+          workspaceId: WS_ID,
+          pausedByUserId: ACTIVATED_BY,
+          reason: "user_initiated",
+          idempotencyKey: "11111111-2222-3333-4444-555555555555",
+          requestId: "req-1",
+          now: new Date(),
+          playbackUrlFor: playbackUrl,
+        }),
+        (err: unknown) => {
+          const e = err as { name?: string; currentStatus?: string };
+          assert.equal(e.name, "ServiceOfferingNotActiveError");
+          assert.equal(e.currentStatus, "Draft");
+          return true;
+        },
+      );
+    });
+
+    void test("Pause on a missing offering throws NotFoundError", async () => {
+      const repo = buildActiveRepo();
+      await assert.rejects(
+        repo.pause({
+          offeringId: "of_missing",
+          workspaceId: WS_ID,
+          pausedByUserId: ACTIVATED_BY,
+          reason: "user_initiated",
+          idempotencyKey: "11111111-2222-3333-4444-555555555555",
+          requestId: "req-1",
+          now: new Date(),
+          playbackUrlFor: playbackUrl,
+        }),
+        (err: unknown) => {
+          assert.equal((err as { name?: string }).name, "ServiceOfferingNotFoundError");
+          return true;
+        },
+      );
+    });
+
+    void test("Pause on a different Workspace throws NotOwnedError (route collapses to NOT_FOUND)", async () => {
+      const repo = buildActiveRepo();
+      await assert.rejects(
+        repo.pause({
+          offeringId: "of_a",
+          workspaceId: "ws_other",
+          pausedByUserId: ACTIVATED_BY,
+          reason: "user_initiated",
+          idempotencyKey: "11111111-2222-3333-4444-555555555555",
+          requestId: "req-1",
+          now: new Date(),
+          playbackUrlFor: playbackUrl,
+        }),
+        (err: unknown) => {
+          assert.equal((err as { name?: string }).name, "ServiceOfferingNotOwnedError");
+          return true;
+        },
+      );
+    });
+
+    void test("Pause persists the reason enum verbatim (final_sample_removal path)", async () => {
+      const repo = buildActiveRepo();
+      const result = await repo.pause({
+        offeringId: "of_a",
+        workspaceId: WS_ID,
+        pausedByUserId: ACTIVATED_BY,
+        reason: "final_sample_removal",
+        idempotencyKey: "11111111-2222-3333-4444-555555555555",
+        requestId: "req-1",
+        now: new Date(),
+        playbackUrlFor: playbackUrl,
+      });
+      assert.equal(result.evidence.reason, "final_sample_removal");
+    });
+  });
+
+  void describe("reactivate", () => {
+    // Reactivate requires the offering to be in Paused state. The
+    // setup helper re-seeds `of_a` directly as Paused so each test
+    // does not have to drive a separate Activate + Pause dance. The
+    // Pause tests above already cover the Pause precondition path.
+    function buildPausedRepo(): InMemoryServiceOfferingRepository {
+      const repo = new InMemoryServiceOfferingRepository();
+      repo._seedOffering({
+        id: "of_a",
+        workspaceId: WS_ID,
+        sellerProfileId: SELLER_PROFILE_ID,
+        status: "Paused",
+      });
+      repo._seedOffering({
+        id: "of_b",
+        workspaceId: WS_ID,
+        sellerProfileId: SELLER_PROFILE_ID,
+        status: "Paused",
+      });
+      // M2 (#86, slice 86B, Codex review fix): register the
+      // SellerProfile as Published so Reactivate precondition checks
+      // can succeed; the unpublished-profile test re-registers a
+      // Draft profile.
+      repo._registerSellerProfile({
+        workspaceId: WS_ID,
+        sellerProfileId: SELLER_PROFILE_ID,
+        status: "Published",
+      });
+      return repo;
+    }
+
+    function minimalReactivate(
+      overrides: Partial<Parameters<InMemoryServiceOfferingRepository["reactivate"]>[0]> = {},
+    ) {
+      return {
+        offeringId: "of_a",
+        workspaceId: WS_ID,
+        reactivatedByUserId: ACTIVATED_BY,
+        title: "Haitian dancehall production",
+        description: "Arrangement + recording direction + editing.",
+        primaryCategoryKey: "music-production",
+        serviceMode: "Remote" as const,
+        serviceAreas: [],
+        pricing: {
+          kind: "StartingAt" as const,
+          amountMinor: 60000,
+          currency: "USD",
+          unitId: "per-track",
+        },
+        genreTags: [],
+        includedServiceCategoryKeys: [],
+        confirmationVersion: "m2-service-activation-v1" as const,
+        idempotencyKey: "11111111-2222-3333-4444-555555555555",
+        requestId: "req-1",
+        now: new Date("2026-09-27T13:00:00.000Z"),
+        playbackUrlFor: playbackUrl,
+        ...overrides,
+      };
+    }
+
+    void test("Reactivate on Paused with full STRICT pass flips status, writes a new activation row, returns OwnerView with status Active", async () => {
+      const repo = buildPausedRepo();
+      seedConfirmedLive(repo, "of_a", "sample-1");
+      const result = await repo.reactivate(minimalReactivate({}));
+      assert.equal(result.convergedFromExistingActivation, false);
+      assert.equal(result.offering.status, "Active");
+      assert.equal(result.evidence.activatedAt.toISOString(), "2026-09-27T13:00:00.000Z");
+      assert.equal(result.evidence.confirmationVersion, "m2-service-activation-v1");
+    });
+
+    void test("Reactivate same-key retry converges on the existing activation row", async () => {
+      const repo = buildPausedRepo();
+      seedConfirmedLive(repo, "of_a", "sample-1");
+      const first = await repo.reactivate(minimalReactivate({}));
+      const second = await repo.reactivate(
+        minimalReactivate({
+          now: new Date("2026-09-27T14:00:00.000Z"),
+        }),
+      );
+      assert.equal(second.convergedFromExistingActivation, true);
+      assert.deepEqual(second.evidence, first.evidence);
+    });
+
+    void test("Reactivate different-key on Active throws NotPausedError with currentStatus=Active", async () => {
+      const repo = buildPausedRepo();
+      seedConfirmedLive(repo, "of_a", "sample-1");
+      // First Reactivate succeeds and flips the offering to Active.
+      await repo.reactivate(
+        minimalReactivate({ idempotencyKey: "11111111-2222-3333-4444-666666666666" }),
+      );
+      // Second Reactivate with a DIFFERENT idempotencyKey against the
+      // now-Active offering hits the NotPausedError precondition.
+      await assert.rejects(repo.reactivate(minimalReactivate({})), (err: unknown) => {
+        const e = err as { name?: string; currentStatus?: string };
+        assert.equal(e.name, "ServiceOfferingNotPausedError");
+        assert.equal(e.currentStatus, "Active");
+        return true;
+      });
+    });
+
+    void test("Reactivate on Draft throws NotPausedError with currentStatus=Draft", async () => {
+      const repo = buildRepo(); // seeds of_a as Draft
+      await assert.rejects(repo.reactivate(minimalReactivate({})), (err: unknown) => {
+        const e = err as { name?: string; currentStatus?: string };
+        assert.equal(e.name, "ServiceOfferingNotPausedError");
+        assert.equal(e.currentStatus, "Draft");
+        return true;
+      });
+    });
+
+    void test("Reactivate with no CONFIRMED Live samples throws IncompleteError carrying samples_required", async () => {
+      const repo = buildPausedRepo();
+      // No seedConfirmedLive call — the offering has zero Live samples.
+      await assert.rejects(repo.reactivate(minimalReactivate({})), (err: unknown) => {
+        const e = err as {
+          name?: string;
+          fieldErrors?: Array<{ path: string; code: string }>;
+        };
+        assert.equal(e.name, "ServiceOfferingIncompleteError");
+        assert.ok(
+          e.fieldErrors?.some((f) => f.path === "samples" && f.code === "samples_required"),
+          "IncompleteError must carry the samples_required field error",
+        );
+        return true;
+      });
+    });
+
+    void test("Reactivate with missing primaryCategoryKey throws IncompleteError carrying category_required", async () => {
+      const repo = buildPausedRepo();
+      seedConfirmedLive(repo, "of_a", "sample-1");
+      await assert.rejects(
+        repo.reactivate(minimalReactivate({ primaryCategoryKey: "" })),
+        (err: unknown) => {
+          const e = err as {
+            name?: string;
+            fieldErrors?: Array<{ path: string; code: string }>;
+          };
+          assert.equal(e.name, "ServiceOfferingIncompleteError");
+          assert.ok(
+            e.fieldErrors?.some(
+              (f) => f.path === "primaryCategoryKey" && f.code === "category_required",
+            ),
+            "IncompleteError must carry the category_required field error",
+          );
+          return true;
+        },
+      );
+    });
+
+    void test("Reactivate cross-workspace throws NotOwnedError", async () => {
+      const repo = buildPausedRepo();
+      seedConfirmedLive(repo, "of_a", "sample-1");
+      await assert.rejects(
+        repo.reactivate(minimalReactivate({ workspaceId: "ws_other" })),
+        (err: unknown) => {
+          assert.equal((err as { name?: string }).name, "ServiceOfferingNotOwnedError");
+          return true;
+        },
+      );
+    });
+
+    // M2 (#86, slice 86B Codex re-review): structural parity
+    // coverage for the Reactivate workspaceLock acquisition. The
+    // authoritative deterministic interleaving test lives in the
+    // Prisma test file (the Postgres advisory lock is the only
+    // artifact that can prove timing). This in-memory test verifies
+    // that the Reactivate body acquires the SAME
+    // `withWorkspaceLock(workspaceId, ...)` mutex chain that the
+    // test-only `_suspendSellerProfileUnderLock` helper acquires —
+    // so any future regression that drops the workspaceLock from
+    // Reactivate would be caught by the FIFO ordering guarantee.
+    void test("reactivate serializes against a concurrent suspension via the seller-profile workspaceLock", async () => {
+      const repo = buildPausedRepo();
+      seedConfirmedLive(repo, "of_a", "sample-1");
+
+      // Reactivate is called FIRST so it acquires the workspaceLock
+      // first under Node.js FIFO microtask scheduling. The
+      // concurrent suspension is forced to wait on the same
+      // workspaceLock until Reactivate releases it.
+      const reactivatePromise = repo.reactivate(minimalReactivate({}));
+      const suspensionPromise = repo._suspendSellerProfileUnderLock(WS_ID, SELLER_PROFILE_ID);
+
+      const [reactivateResult, suspensionResult] = await Promise.all([
+        reactivatePromise,
+        suspensionPromise,
+      ]);
+
+      // Reactivate won the workspaceLock first → completed Active
+      // BEFORE the suspension ran. The profile was Published at the
+      // time of Reactivate's publication check.
+      assert.equal(reactivateResult.offering.status, "Active");
+      assert.equal(reactivateResult.convergedFromExistingActivation, false);
+      // The suspension ran AFTER Reactivate released the lock;
+      // `_suspendSellerProfileUnderLock` returns the prior status
+      // so the test can confirm it observed Published (the value
+      // that was live when Reactivate committed).
+      assert.equal(suspensionResult.previousStatus, "Published");
+      assert.equal(repo._peekSellerProfileStatus(SELLER_PROFILE_ID), "Suspended");
+    });
+  });
+});
