@@ -176,6 +176,114 @@ export interface AudioRepository {
    * already-gone).
    */
   removeOrphanedStorage(storageRef: string): Promise<void>;
+
+  /**
+   * M2 (#86, slice 86D): atomic Active → Paused transition triggered
+   * by the removal of the final qualifying sample from an Active
+   * offering. The repository runs the entire operation in one DB
+   * transaction so the offering's lifecycle state and the sample's
+   * cleanup state can never disagree.
+   *
+   * In ONE database transaction:
+   *   1. Acquire the established lock order (service-offering,
+   *      audio-sample, seller-profile workspaceLock).
+   *   2. Verify the offering is `Active`. A non-Active offering
+   *      cannot undergo a final-sample eligibility-loss transition.
+   *   3. Verify the sample exists, belongs to this offering, and
+   *      is currently `Live` (not already PendingCleanup or
+   *      Removed — those surfaces already exist in the
+   *      non-final-sample path).
+   *   4. Verify the sample is the LAST `Live` CONFIRMED sample for
+   *      the offering. If other Live samples exist, this is a
+   *      non-final removal and the operation is rejected so the
+   *      application layer routes the call through the existing
+   *      non-final path.
+   *   5. Transition the offering's `status` to `Paused`.
+   *   6. Insert a `ServiceOfferingPause` evidence row with
+   *      `reason=final_sample_removal` and the supplied
+   *      `idempotencyKey` / `requestId` so transport retries
+   *      converge on the same Pause evidence row.
+   *   7. Mark the sample's `cleanupStatus` to `PendingCleanup`.
+   *
+   * After this method returns successfully, the application
+   * service attempts the provider-side delete (`storage.removeSample`)
+   * OUTSIDE the transaction. A provider failure leaves the
+   * offering Paused and the sample PendingCleanup so the
+   * `markPendingCleanup` + `finalizePendingCleanup` bounded retry
+   * can drive the storage delete to completion on the next
+   * operation against the offering — the offering's marketplace
+   * eligibility is never restored by a cleanup failure.
+   *
+   * Throws `AUDIO_SAMPLE_FINAL_REMOVAL_NOT_APPLICABLE` (the
+   * repository-typed error) when any precondition fails so the
+   * service can fall back to the non-final-sample path. Throws
+   * `AUDIO_SAMPLE_NOT_FOUND` / `AUDIO_OFFERING_NOT_FOUND` via
+   * the underlying get for missing entities.
+   */
+  removeFinalSamplePendingCleanup(input: {
+    readonly offeringId: string;
+    readonly sampleId: string;
+    readonly workspaceId: string;
+    readonly pausedByUserId: string;
+    readonly idempotencyKey: string;
+    readonly requestId: string;
+    readonly now: Date;
+  }): Promise<{
+    readonly offeringStatus: "Paused";
+    readonly sample: AudioSampleRecord;
+  }>;
+
+  /**
+   * M2 (#86, slice 86D Codex re-review): returns the durable
+   * `service_offering_pauses` row whose `reason` is
+   * `final_sample_removal` for the supplied
+   * `(offeringId, idempotencyKey)`, or `null` when no such row
+   * exists.
+   *
+   * The application service consults this method BEFORE
+   * `findSampleById` so a transport retry of the same logical
+   * removal — after the provider-side cleanup finalized the sample
+   * row — converges on the durable Pause evidence rather than
+   * failing with `AUDIO_SAMPLE_NOT_FOUND`. The service derives
+   * the `idempotencyKey` from the `(offeringId, sampleId)` tuple
+   * (the `removeFinalSamplePendingCleanup` derivation) so any
+   * retry of the same removal lands on the same evidence row.
+   *
+   * Read-only; no advisory lock required.
+   */
+  findFinalSampleRemovalPauseEvidence(input: {
+    readonly offeringId: string;
+    readonly idempotencyKey: string;
+  }): Promise<{
+    readonly offeringId: string;
+    readonly idempotencyKey: string;
+    readonly pausedAt: Date;
+    readonly pausedByUserId: string;
+    readonly requestId: string;
+  } | null>;
+}
+
+/**
+ * M2 (#86, slice 86D): raised by `removeFinalSamplePendingCleanup`
+ * when the precondition check fails — the offering is not Active,
+ * the sample is not Live, or there are other Live CONFIRMED
+ * samples for the offering. The application service catches this
+ * error and falls back to the non-final-sample removal path so the
+ * existing `markPendingCleanup` + `finalizePendingCleanup` flow
+ * runs unchanged. The error is NOT user-facing.
+ */
+export class AudioSampleFinalRemovalNotApplicableError extends Error {
+  constructor(
+    public readonly reason:
+      | "offering_not_active"
+      | "sample_not_live"
+      | "not_last_live_sample"
+      | "offering_not_found"
+      | "sample_not_found",
+  ) {
+    super(`removeFinalSamplePendingCleanup precondition not met: ${reason}`);
+    this.name = "AudioSampleFinalRemovalNotApplicableError";
+  }
 }
 
 /**

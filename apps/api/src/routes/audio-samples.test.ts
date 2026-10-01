@@ -323,14 +323,27 @@ describe("BG2 audio samples routes (in-memory, deterministic adapter)", () => {
       .delete(`/api/services/${OFFERING_ID}/audio-samples/${upload.body.sample.sampleId}`)
       .set("Cookie", cookie)
       .set("Content-Type", "application/json")
-      .send({ actingWorkspaceId: SELLER_WORKSPACE_ID });
+      .send({
+        actingWorkspaceId: SELLER_WORKSPACE_ID,
+        // M2 (#86, slice 86D): the offering has exactly one Live
+        // CONFIRMED sample, so removal is a final-sample-on-Active
+        // transition that requires explicit eligibility-loss
+        // confirmation.
+        confirmEligibilityLoss: true,
+      });
     assert.equal(remove.status, 200);
     assert.equal(remove.body.ok, true);
 
+    // After the final-sample removal the offering is Paused, so the
+    // buyer-side list route rejects with AUDIO_OFFERING_INELIGIBLE
+    // (403). The slice 86D invariant that the new sample after
+    // final-sample removal is buyer-ineligible is enforced via the
+    // offering-status flip rather than via the list-filter.
     const listAfter = await request(app)
       .get(`/api/services/${OFFERING_ID}/audio-samples`)
       .set("Cookie", cookie);
-    assert.equal(listAfter.body.samples.length, 0);
+    assert.equal(listAfter.status, 403);
+    assert.equal(listAfter.body.error.code, "AUDIO_OFFERING_INELIGIBLE");
   });
 
   test("a non-owner Workspace is rejected with AUDIO_OFFERING_INELIGIBLE (GS 8)", async () => {

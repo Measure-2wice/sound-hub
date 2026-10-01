@@ -27,6 +27,7 @@ import {
   MarketplaceCapability,
   Prisma,
   SellerProfileStatus,
+  ServiceOfferingPauseReason,
   ServiceOfferingStatus,
   WorkspaceStatus,
 } from "@soundhub/db";
@@ -36,11 +37,14 @@ import type {
   AudioSampleConfirmation,
   AudioSampleRecord,
 } from "./audio-repository.js";
+import { AudioSampleFinalRemovalNotApplicableError } from "./audio-repository.js";
 import {
   AUDIO_SAMPLE_LOCK_CLASS,
   acquireAudioSampleLockTx,
   audioSampleLockKey,
 } from "./audio-sample-lock.js";
+import { offeringLockSql } from "../repositories/service-offering-lock.js";
+import { sellerProfileWorkspaceLockSql } from "../repositories/seller-profile-workspace-lock.js";
 
 const MAX_SAMPLES_PER_OFFERING = 3;
 // Lock class — distinct from any other advisory-lock users in the
@@ -315,6 +319,238 @@ export class PrismaAudioRepository implements AudioRepository {
     await this.prisma.audioSampleOrphanedStorage.deleteMany({
       where: { storageRef },
     });
+  }
+
+  /**
+   * M2 (#86, slice 86D): atomic Active → Paused transition
+   * triggered by the removal of the final qualifying sample from
+   * an Active offering. See the interface docblock for the full
+   * contract.
+   *
+   * Lock acquisition order matches the established slice 86B /
+   * 86C pattern so concurrent writers serialize consistently:
+   *   (1) `service-offering:<offeringId>`
+   *   (2) audio-sample per-offering
+   *   (3) `seller-profile:<workspaceId>`
+   *
+   * The audio-sample lock prevents a concurrent `markPendingCleanup`
+   * / `finalizePendingCleanup` from landing on the same sample
+   * while we transition the offering; the workspaceLock serializes
+   * the offering's transition against a concurrent SellerProfile
+   * suspension (matching the slice 86B Reactivate pattern).
+   *
+   * The same-key idempotency lookup for the Pause evidence row
+   * runs BEFORE the precondition checks so a same-key retry of an
+   * already-committed final-sample removal converges on the
+   * existing Pause row regardless of the current offering /
+   * sample state.
+   */
+  async removeFinalSamplePendingCleanup(input: {
+    offeringId: string;
+    sampleId: string;
+    workspaceId: string;
+    pausedByUserId: string;
+    idempotencyKey: string;
+    requestId: string;
+    now: Date;
+  }): Promise<{
+    readonly offeringStatus: "Paused";
+    readonly sample: AudioSampleRecord;
+  }> {
+    return this.prisma.$transaction(async (tx) => {
+      // Lock acquisition order (matches the slice 86C Update pattern).
+      await tx.$executeRaw(offeringLockSql(input.offeringId));
+      await acquireAudioSampleLockTx(tx, input.offeringId);
+      await tx.$executeRaw(sellerProfileWorkspaceLockSql(input.workspaceId));
+
+      // Idempotency pre-check on the pause-evidence table. A
+      // same-key retry after a committed final-sample removal
+      // converges on the existing Pause row.
+      const existingPause = await tx.serviceOfferingPause.findUnique({
+        where: {
+          offeringId_idempotencyKey: {
+            offeringId: input.offeringId,
+            idempotencyKey: input.idempotencyKey,
+          },
+        },
+      });
+      if (existingPause) {
+        // The Pause row's `reason` confirms this was a final-sample
+        // removal (the slice plan's slice 86D invariant — Pause
+        // rows for `user_initiated` removals carry a different
+        // `requestId`/`idempotencyKey` shape because they're issued
+        // by the service-offering route, not the audio route).
+        if (existingPause.reason !== ServiceOfferingPauseReason.final_sample_removal) {
+          throw new AudioSampleFinalRemovalNotApplicableError("offering_not_active");
+        }
+        // Re-load the marked sample (the persisted row carries
+        // PendingCleanup status; the bounded retry path will
+        // finalize it once storage.delete resolves).
+        //
+        // M2 (#86, slice 86D Codex re-review): when `findUnique`
+        // returns null — because `finalizePendingCleanup` already
+        // deleted the row after a successful provider-side cleanup
+        // — we still converge. The durable Pause evidence row IS
+        // present, which is sufficient to prove the removal
+        // completed; we synthesize a record carrying the converged
+        // status (`Removed`) so the application service treats the
+        // retry as a successful removal. Without this branch a lost
+        // success response turns the same logical retry into
+        // `sample_not_found`, violating the issue #86 retry-safety
+        // invariant for consequential commands.
+        const markedSample = await tx.serviceOfferingAudioSample.findUnique({
+          where: {
+            id: input.sampleId,
+          },
+        });
+        if (!markedSample) {
+          return {
+            offeringStatus: "Paused" as const,
+            sample: {
+              sampleId: input.sampleId,
+              offeringId: input.offeringId,
+              label: "",
+              contentType: "audio/mpeg",
+              byteSize: 0,
+              displayOrder: 0,
+              storageRef: "",
+              cleanupStatus: AudioSampleCleanupStatus.Removed,
+              cleanupAttempts: 1,
+              confirmation: null,
+              createdAt: existingPause.pausedAt,
+              updatedAt: existingPause.pausedAt,
+            },
+          };
+        }
+        return {
+          offeringStatus: "Paused" as const,
+          sample: toRecord(markedSample),
+        };
+      }
+
+      // Step 2: precondition — offering must be Active.
+      const existing = await tx.serviceOffering.findUnique({
+        where: { id: input.offeringId },
+        select: { id: true, status: true, sellerProfileId: true },
+      });
+      if (!existing) {
+        throw new AudioSampleFinalRemovalNotApplicableError("offering_not_found");
+      }
+      if (existing.status !== ServiceOfferingStatus.Active) {
+        // A non-Active offering cannot undergo a final-sample
+        // eligibility-loss transition. The service catches this
+        // and falls back to the non-final-sample path.
+        throw new AudioSampleFinalRemovalNotApplicableError("offering_not_active");
+      }
+
+      // Step 3: precondition — sample must exist, belong to this
+      // offering, and be currently `Live`.
+      const sample = await tx.serviceOfferingAudioSample.findUnique({
+        where: {
+          id: input.sampleId,
+        },
+      });
+      if (!sample || sample.offeringId !== input.offeringId) {
+        throw new AudioSampleFinalRemovalNotApplicableError("sample_not_found");
+      }
+      if (sample.cleanupStatus !== AudioSampleCleanupStatus.Live) {
+        throw new AudioSampleFinalRemovalNotApplicableError("sample_not_live");
+      }
+
+      // Step 4: precondition — the sample must be the LAST CONFIRMED
+      // Live sample. A non-final removal does not require
+      // `confirmEligibilityLoss` and is rejected so the service
+      // layer routes through the non-final path.
+      const liveConfirmedCount = await tx.serviceOfferingAudioSample.count({
+        where: {
+          offeringId: input.offeringId,
+          cleanupStatus: AudioSampleCleanupStatus.Live,
+          confirmationVersion: { not: null },
+          confirmedByUserId: { not: null },
+          confirmedAt: { not: null },
+        },
+      });
+      if (liveConfirmedCount !== 1) {
+        throw new AudioSampleFinalRemovalNotApplicableError("not_last_live_sample");
+      }
+
+      // Step 5: atomic transition. The offering's status flips to
+      // Paused, the Pause evidence row is inserted, and the sample
+      // is marked PendingCleanup — all in this transaction. The
+      // DB unique constraint on `(offeringId, idempotencyKey)` is
+      // the second defense behind the application-layer pre-check.
+      await tx.serviceOffering.update({
+        where: { id: input.offeringId },
+        data: { status: ServiceOfferingStatus.Paused },
+      });
+      await tx.serviceOfferingPause.create({
+        data: {
+          offeringId: input.offeringId,
+          workspaceId: input.workspaceId,
+          sellerProfileId: existing.sellerProfileId,
+          pausedByUserId: input.pausedByUserId,
+          pausedAt: input.now,
+          reason: ServiceOfferingPauseReason.final_sample_removal,
+          idempotencyKey: input.idempotencyKey,
+          requestId: input.requestId,
+        },
+      });
+      const markedSample = await tx.serviceOfferingAudioSample.update({
+        where: { id: input.sampleId },
+        data: {
+          cleanupStatus: AudioSampleCleanupStatus.PendingCleanup,
+          cleanupAttempts: { increment: 1 },
+        },
+      });
+
+      return {
+        offeringStatus: "Paused" as const,
+        sample: toRecord(markedSample),
+      };
+    });
+  }
+
+  /**
+   * M2 (#86, slice 86D Codex re-review): read-only lookup for the
+   * durable `final_sample_removal` Pause evidence row. Returns
+   * `null` when no such row exists. Used by the application service
+   * to converge retries after the provider-side cleanup finalized
+   * the sample row (the sample row may have been deleted via
+   * `finalizePendingCleanup` but the durable Pause evidence row
+   * IS still present).
+   */
+  async findFinalSampleRemovalPauseEvidence(input: {
+    offeringId: string;
+    idempotencyKey: string;
+  }): Promise<{
+    readonly offeringId: string;
+    readonly idempotencyKey: string;
+    readonly pausedAt: Date;
+    readonly pausedByUserId: string;
+    readonly requestId: string;
+  } | null> {
+    const row = await this.prisma.serviceOfferingPause.findFirst({
+      where: {
+        offeringId: input.offeringId,
+        idempotencyKey: input.idempotencyKey,
+        reason: ServiceOfferingPauseReason.final_sample_removal,
+      },
+      select: {
+        offeringId: true,
+        idempotencyKey: true,
+        pausedAt: true,
+        pausedByUserId: true,
+        requestId: true,
+      },
+    });
+    if (!row) return null;
+    return {
+      offeringId: row.offeringId,
+      idempotencyKey: row.idempotencyKey,
+      pausedAt: row.pausedAt,
+      pausedByUserId: row.pausedByUserId,
+      requestId: row.requestId,
+    };
   }
 }
 

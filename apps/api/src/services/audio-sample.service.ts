@@ -53,7 +53,10 @@ import type {
   AudioSampleConfirmation,
   AudioSampleRecord,
 } from "../audio-repository/audio-repository.js";
-import { toPublicAudioSample } from "../audio-repository/audio-repository.js";
+import {
+  AudioSampleFinalRemovalNotApplicableError,
+  toPublicAudioSample,
+} from "../audio-repository/audio-repository.js";
 import {
   StorageReferenceUnknownError,
   StorageRejectedError,
@@ -75,7 +78,8 @@ export class AudioSampleError extends Error {
       | "AUDIO_PROVIDER_UNAVAILABLE"
       | "AUDIO_STORAGE_FAILED"
       | "INVALID_AUTH_REQUEST"
-      | "AUDIO_SAMPLE_MEDIA_CONFIRMATION_REQUIRED",
+      | "AUDIO_SAMPLE_MEDIA_CONFIRMATION_REQUIRED"
+      | "AUDIO_SAMPLE_FINAL_REMOVAL_CONFIRMATION_REQUIRED",
   ) {
     super(message);
     this.name = "AudioSampleError";
@@ -743,6 +747,90 @@ export class AudioSampleService {
         "AUDIO_OFFERING_INELIGIBLE",
       );
     }
+    // M2 (#86, slice 86D Codex re-review): consult the durable
+    // `final_sample_removal` Pause evidence row BEFORE
+    // `findSampleById` so a transport retry of the same logical
+    // removal — after the provider-side cleanup finalized the
+    // sample row — converges on the persisted outcome rather than
+    // failing with `AUDIO_SAMPLE_NOT_FOUND` (the sample row no
+    // longer exists at that point). The `idempotencyKey` is the
+    // same derivation the repository's
+    // `removeFinalSamplePendingCleanup` uses (slice 86D
+    // invariant); any retry of the same removal lands on the same
+    // evidence row.
+    const finalRemovalIdempotencyKey = `final-sample-removal:${input.offeringId}:${input.sampleId}`;
+    const finalRemovalEvidence = await this.repository.findFinalSampleRemovalPauseEvidence({
+      offeringId: input.offeringId,
+      idempotencyKey: finalRemovalIdempotencyKey,
+    });
+    if (finalRemovalEvidence) {
+      // The Pause evidence row is durable proof the repository
+      // committed the Active → Paused flip and marked the sample
+      // PendingCleanup. BUT it does NOT prove the provider-side
+      // cleanup completed — the Pause row is written BEFORE the
+      // `storage.removeSample` call. We must verify the sample's
+      // current cleanupStatus before claiming success:
+      //
+      //   - Sample row missing (`findSampleById` returns null):
+      //     `finalizePendingCleanup` already deleted the row after a
+      //     successful provider delete. Converged success.
+      //   - Sample row exists with `cleanupStatus="PendingCleanup"`:
+      //     the prior provider delete failed (or was never reached).
+      //     This is the in-flight retry case. Retry the provider
+      //     delete + finalize the row, OR continue returning
+      //     `AUDIO_STORAGE_FAILED` if the provider is still
+      //     unavailable. Either way, do NOT silently return
+      //     success — that would leave the storage object
+      //     indefinitely while the API reports success (Codex
+      //     blocker #1, 86D re-review).
+      //   - Sample row exists with `cleanupStatus="Live"`: only
+      //     reachable if the repository's transaction was rolled
+      //     back; the Pause evidence row alone is the durable
+      //     state. We accept it and return converged success.
+      const existingSample = await this.repository.findSampleById({
+        offeringId: input.offeringId,
+        sampleId: input.sampleId,
+      });
+      if (!existingSample || existingSample.cleanupStatus !== "PendingCleanup") {
+        // Converged success: either the sample row is gone
+        // (storage was finalized on a prior attempt) or the row
+        // survived the rollback. The durable Pause evidence row
+        // is the authoritative commitment of the lifecycle flip.
+        return {
+          sampleId: input.sampleId,
+          offeringId: input.offeringId,
+          removedAt: finalRemovalEvidence.pausedAt,
+        };
+      }
+      // The prior attempt left the sample PendingCleanup because
+      // the provider delete failed (or threw `StorageUnavailableError`).
+      // Retry the provider delete; on success, finalize the row.
+      // The retry path mirrors the normal final-sample removal's
+      // post-transaction provider flow exactly.
+      try {
+        await this.storage.removeSample(existingSample.storageRef);
+      } catch (err) {
+        if (err instanceof StorageReferenceUnknownError) {
+          // Already gone — fall through to finalize.
+        } else if (err instanceof StorageUnavailableError) {
+          throw new AudioSampleError(
+            "Storage provider is unavailable; sample is hidden from discovery and will be retried.",
+            "AUDIO_STORAGE_FAILED",
+          );
+        } else {
+          throw mapStorageError(err);
+        }
+      }
+      await this.repository.finalizePendingCleanup({
+        offeringId: input.offeringId,
+        sampleId: input.sampleId,
+      });
+      return {
+        sampleId: input.sampleId,
+        offeringId: input.offeringId,
+        removedAt: finalRemovalEvidence.pausedAt,
+      };
+    }
     const sample = await this.repository.findSampleById({
       offeringId: input.offeringId,
       sampleId: input.sampleId,
@@ -758,6 +846,123 @@ export class AudioSampleService {
         "Storage cleanup is in progress; retry the removal after the next operation against the offering.",
         "AUDIO_STORAGE_FAILED",
       );
+    }
+    // M2 (#86, slice 86D): the final-sample-on-Active atomic
+    // transition. If the offering is Active AND this sample is
+    // the LAST CONFIRMED Live sample, removing it would silently
+    // lose marketplace eligibility. The slice plan requires an
+    // explicit `confirmEligibilityLoss: true` flag on the request
+    // body; without the flag the service throws
+    // `AUDIO_SAMPLE_FINAL_REMOVAL_CONFIRMATION_REQUIRED`. With the
+    // flag, the repository's
+    // `removeFinalSamplePendingCleanup` runs the atomic transaction
+    // that transitions the offering Active → Paused + writes a
+    // Pause evidence row with reason=final_sample_removal + marks
+    // the sample PendingCleanup. The storage.delete runs AFTER
+    // the transaction commit; a provider failure leaves the
+    // offering Paused (the bounded retry completes the storage
+    // delete on the next operation against the offering) and the
+    // sample PendingCleanup — marketplace eligibility is never
+    // restored by a cleanup failure.
+    if (context.offeringStatus === "Active" && sample.confirmation !== null) {
+      const liveSamples = await this.repository.listSamplesForOffering(input.offeringId);
+      const confirmedLiveSamples = liveSamples.filter((s) => s.confirmation !== null);
+      const isLastConfirmedLive =
+        confirmedLiveSamples.length === 1 && confirmedLiveSamples[0]?.sampleId === input.sampleId;
+      if (isLastConfirmedLive) {
+        if (!input.confirmEligibilityLoss) {
+          // The slice plan's slice 86D invariant: a removal that
+          // would silently pause the marketplace eligibility of an
+          // Active offering requires the seller to send an
+          // explicit `confirmEligibilityLoss: true` flag. Without
+          // it, the application boundary raises
+          // `AUDIO_SAMPLE_FINAL_REMOVAL_CONFIRMATION_REQUIRED`
+          // (mapped to HTTP 400 by the route layer's
+          // `bg2AudioSampleRemoveRequestV1Schema` error envelope).
+          throw new AudioSampleError(
+            "Removing the final qualifying sample from an Active offering pauses the offering; explicit confirmation required.",
+            "AUDIO_SAMPLE_FINAL_REMOVAL_CONFIRMATION_REQUIRED",
+          );
+        }
+        // The repository derives the `(offeringId, idempotencyKey)`
+        // unique key for the Pause evidence row from the
+        // `(offeringId, sampleId)` tuple so a same-key retry of
+        // the same removal converges on the existing Pause row
+        // rather than inserting a duplicate.
+        const finalRemovalIdempotencyKey = `final-sample-removal:${input.offeringId}:${input.sampleId}`;
+        const finalRemovalRequestId = `audio-final-sample-removal:${input.offeringId}:${input.sampleId}`;
+        try {
+          await this.repository.removeFinalSamplePendingCleanup({
+            offeringId: input.offeringId,
+            sampleId: input.sampleId,
+            workspaceId: context.sellerWorkspaceId,
+            pausedByUserId: input.userAccountId,
+            idempotencyKey: finalRemovalIdempotencyKey,
+            requestId: finalRemovalRequestId,
+            now: new Date(this.now()),
+          });
+        } catch (err) {
+          if (err instanceof AudioSampleFinalRemovalNotApplicableError) {
+            // The repository's preconditions disagreed with the
+            // service-layer observation (race: another sample was
+            // marked PendingCleanup or another sample was added
+            // between the list and the call). The slice plan's
+            // fallback is to surface the precondition rejection —
+            // we re-read the context and route through the standard
+            // non-final path if the precondition no longer applies.
+            if (
+              err.reason === "not_last_live_sample" ||
+              err.reason === "sample_not_live" ||
+              err.reason === "offering_not_active" ||
+              err.reason === "offering_not_found" ||
+              err.reason === "sample_not_found"
+            ) {
+              // Fall through to the non-final path below; the
+              // offering/sample state has drifted past the
+              // final-sample preconditions. The non-final path
+              // uses `markPendingCleanup` and will succeed if the
+              // sample is still Live; otherwise it surfaces
+              // AUDIO_STORAGE_FAILED.
+              await this.repository.markPendingCleanup({
+                offeringId: input.offeringId,
+                sampleId: input.sampleId,
+              });
+            } else {
+              throw err;
+            }
+          } else {
+            throw err;
+          }
+        }
+        // Step 2: attempt the provider delete immediately. The
+        // offering is now Paused (atomic transition committed);
+        // a provider failure leaves the sample PendingCleanup and
+        // the offering Paused so the bounded retry can complete
+        // the storage delete later.
+        try {
+          await this.storage.removeSample(sample.storageRef);
+        } catch (err) {
+          if (err instanceof StorageReferenceUnknownError) {
+            // Already gone — fall through to finalize.
+          } else if (err instanceof StorageUnavailableError) {
+            throw new AudioSampleError(
+              "Storage provider is unavailable; sample is hidden from discovery and will be retried.",
+              "AUDIO_STORAGE_FAILED",
+            );
+          } else {
+            throw mapStorageError(err);
+          }
+        }
+        await this.repository.finalizePendingCleanup({
+          offeringId: input.offeringId,
+          sampleId: input.sampleId,
+        });
+        return {
+          sampleId: input.sampleId,
+          offeringId: input.offeringId,
+          removedAt: new Date(this.now()),
+        };
+      }
     }
     // Step 1: hide from discovery immediately by flipping the
     // status to PendingCleanup. The row survives so the bounded

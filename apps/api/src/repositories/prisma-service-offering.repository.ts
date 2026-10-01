@@ -85,18 +85,18 @@ import type { ApiFieldErrorV1 } from "@soundhub/types";
 import { BG2_AUDIO_SAMPLE_MAX_PER_OFFERING } from "@soundhub/types";
 import { SERVICE_OFFERING_AUDIO_MEDIA_CONFIRMATION_VERSIONS } from "@soundhub/types";
 import { acquireAudioSampleLockTx } from "../audio-repository/audio-sample-lock.js";
+import { offeringLockSql } from "./service-offering-lock.js";
 import { sellerProfileWorkspaceLockSql } from "./seller-profile-workspace-lock.js";
 
 /**
- * Stable per-offering lock key for `pg_advisory_xact_lock`. Mirrors
- * the SellerProfile lock pattern: hashtext on a namespaced string
- * returns int4, which fits the two-argument signed-32-bit signature.
+ * M2 (#86, slice 86D): the `offeringLockSql` helper is now shared
+ * with the audio sample repository's `removeFinalSamplePendingCleanup`
+ * path via `apps/api/src/repositories/service-offering-lock.ts`.
+ * The lock namespace (`service-offering:<offeringId>`) and SQL
+ * fragment are unchanged so existing lock-acquisition behavior is
+ * preserved. See the new module's docblock for the rationale.
  */
-function offeringLockSql(offeringId: string): Prisma.Sql {
-  return Prisma.sql`
-    SELECT pg_advisory_xact_lock(hashtext(${`service-offering:${offeringId}`}::text))
-  `;
-}
+// (helper removed; see service-offering-lock.ts)
 
 /**
  * Cryptographically random cuid-style suffix used to mint stable

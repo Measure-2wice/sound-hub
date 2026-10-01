@@ -33,6 +33,7 @@ import {
   audioSampleLockKey,
 } from "./audio-sample-lock.js";
 import { AudioSampleCleanupStatus } from "@soundhub/db";
+import { AudioSampleFinalRemovalNotApplicableError } from "./audio-repository.js";
 
 const repository = new PrismaAudioRepository(createTestPrismaClient());
 
@@ -57,6 +58,14 @@ async function cleanUpTestRows(): Promise<void> {
       where: { offering: { slug: { startsWith: TEST_SLUG_PREFIX } } },
     });
     await prisma.serviceOfferingCreation.deleteMany({
+      where: { offering: { slug: { startsWith: TEST_SLUG_PREFIX } } },
+    });
+    // M2 (#86, slice 86D): final-sample-on-Active transitions
+    // write a `service_offering_pauses` evidence row with
+    // `reason=final_sample_removal`. Clean those rows alongside
+    // the activation/creation rows so consecutive tests don't
+    // collide on the (offeringId, idempotencyKey) unique index.
+    await prisma.serviceOfferingPause.deleteMany({
       where: { offering: { slug: { startsWith: TEST_SLUG_PREFIX } } },
     });
     // Offerings own their audio samples via FK; deleting the
@@ -549,4 +558,353 @@ describe("PrismaAudioRepository P0-001", () => {
       await activationDbCli.$disconnect();
     }
   });
+});
+
+// =============================================================================
+// M2 (#86, slice 86D): direct repository coverage for the final-sample
+// `removeFinalSamplePendingCleanup` command. These tests assert the
+// atomic Active → Paused transition + Pause evidence row insertion +
+// sample PendingCleanup mark that the slice plan requires.
+//
+// All offerings seeded by these tests use the canonical
+// `TEST_SLUG_PREFIX` so the shared `cleanUpTestRows` hook in this
+// file deletes them before the next canonical seed reset; without
+// this the canonical seed snapshot would drift (`Offerings for
+// creole-beats-brooklyn count drifted: expected 1 got 2`).
+// =============================================================================
+
+const SLICE_86D_SLUG_PREFIX = "of-bg2-prisma-86d-";
+
+async function seedActiveOfferingWithSample(input: {
+  readonly id: string;
+  readonly sampleId: string;
+  readonly storageRef: string;
+  readonly userId: string;
+  readonly workspaceId: string;
+  readonly sellerProfileId: string;
+}): Promise<void> {
+  const prisma = createTestPrismaClient();
+  try {
+    await prisma.serviceOffering.upsert({
+      where: { id: input.id },
+      create: {
+        id: input.id,
+        slug: `${SLICE_86D_SLUG_PREFIX}${input.id}`,
+        sellerProfileId: input.sellerProfileId,
+        title: "Slice 86D test offering",
+        description: "Integration-test offering for the final-sample path.",
+        status: "Active",
+        serviceMode: "Remote",
+        primaryCategoryId: (
+          await prisma.serviceCategory.findFirstOrThrow({ where: { key: "music-production" } })
+        ).id,
+        genreTags: [],
+      },
+      update: { status: "Active" },
+    });
+    await prisma.serviceOfferingAudioSample.upsert({
+      where: { id: input.sampleId },
+      create: {
+        id: input.sampleId,
+        offeringId: input.id,
+        label: "Final-sample fixture",
+        contentType: "audio/mpeg",
+        byteSize: 1024,
+        displayOrder: 1,
+        storageRef: input.storageRef,
+        cleanupStatus: "Live",
+        confirmationVersion: "m2-audio-confirmation-v1",
+        confirmedByUserId: input.userId,
+        confirmedAt: new Date(),
+      },
+      update: {
+        cleanupStatus: "Live",
+        confirmationVersion: "m2-audio-confirmation-v1",
+        confirmedByUserId: input.userId,
+        confirmedAt: new Date(),
+      },
+    });
+  } finally {
+    await prisma.$disconnect();
+  }
+}
+
+void test("removeFinalSamplePendingCleanup: final-sample-on-Active atomically transitions the offering to Paused, writes a final_sample_removal Pause row, and marks the sample PendingCleanup", async () => {
+  const fixture = await seedOfferingWithContext();
+  const offeringId = `${SLICE_86D_SLUG_PREFIX}final-sample-happy`;
+  await seedActiveOfferingWithSample({
+    id: offeringId,
+    sampleId: "smp_86d_final_happy",
+    storageRef: "ref://86d-final-happy",
+    userId: fixture.userId,
+    workspaceId: fixture.workspaceId,
+    sellerProfileId: fixture.sellerProfileId,
+  });
+  const result = await repository.removeFinalSamplePendingCleanup({
+    offeringId,
+    sampleId: "smp_86d_final_happy",
+    workspaceId: fixture.workspaceId,
+    pausedByUserId: fixture.userId,
+    idempotencyKey: "11111111-2222-3333-4444-aaaaaaaaaaa1",
+    requestId: "req-86d-final-happy",
+    now: new Date(),
+  });
+  assert.equal(result.offeringStatus, "Paused");
+  assert.equal(result.sample.sampleId, "smp_86d_final_happy");
+  assert.equal(result.sample.cleanupStatus, "PendingCleanup");
+  // The offering must now be Paused.
+  const prisma = createTestPrismaClient();
+  try {
+    const offering = await prisma.serviceOffering.findUnique({
+      where: { id: offeringId },
+    });
+    assert.equal(offering?.status, "Paused");
+    // A Pause evidence row was written with `final_sample_removal`.
+    const pauseRows = await prisma.serviceOfferingPause.findMany({
+      where: { offeringId, reason: "final_sample_removal" },
+    });
+    assert.equal(pauseRows.length, 1);
+    // The sample is PendingCleanup with cleanupAttempts = 1.
+    const sample = await prisma.serviceOfferingAudioSample.findUnique({
+      where: { id: "smp_86d_final_happy" },
+    });
+    assert.equal(sample?.cleanupStatus, "PendingCleanup");
+    assert.equal(sample?.cleanupAttempts, 1);
+  } finally {
+    await prisma.$disconnect();
+  }
+});
+
+void test("removeFinalSamplePendingCleanup: same-key retry converges on the existing Pause row", async () => {
+  const fixture = await seedOfferingWithContext();
+  const offeringId = `${SLICE_86D_SLUG_PREFIX}final-sample-idem`;
+  await seedActiveOfferingWithSample({
+    id: offeringId,
+    sampleId: "smp_86d_final_idem",
+    storageRef: "ref://86d-final-idem",
+    userId: fixture.userId,
+    workspaceId: fixture.workspaceId,
+    sellerProfileId: fixture.sellerProfileId,
+  });
+  const baseInput = {
+    offeringId,
+    sampleId: "smp_86d_final_idem",
+    workspaceId: fixture.workspaceId,
+    pausedByUserId: fixture.userId,
+    idempotencyKey: "11111111-2222-3333-4444-aaaaaaaaaaa2",
+    requestId: "req-86d-final-idem",
+    now: new Date(),
+  };
+  const first = await repository.removeFinalSamplePendingCleanup(baseInput);
+  assert.equal(first.offeringStatus, "Paused");
+  // Same-key retry — no new Pause row is inserted, no new sample
+  // cleanupStatus flip.
+  const second = await repository.removeFinalSamplePendingCleanup(baseInput);
+  assert.equal(second.offeringStatus, "Paused");
+  const prisma = createTestPrismaClient();
+  try {
+    const pauseRows = await prisma.serviceOfferingPause.findMany({
+      where: { offeringId, reason: "final_sample_removal" },
+    });
+    assert.equal(pauseRows.length, 1, "idempotent retry must not insert a duplicate Pause row");
+    const sample = await prisma.serviceOfferingAudioSample.findUnique({
+      where: { id: "smp_86d_final_idem" },
+    });
+    assert.equal(sample?.cleanupAttempts, 1, "cleanupAttempts must NOT increment on retry");
+  } finally {
+    await prisma.$disconnect();
+  }
+});
+
+void test("removeFinalSamplePendingCleanup: rejects when the offering is not Active", async () => {
+  const fixture = await seedOfferingWithContext();
+  const offeringId = `${SLICE_86D_SLUG_PREFIX}final-sample-not-active`;
+  await seedActiveOfferingWithSample({
+    id: offeringId,
+    sampleId: "smp_86d_final_not_active",
+    storageRef: "ref://86d-final-not-active",
+    userId: fixture.userId,
+    workspaceId: fixture.workspaceId,
+    sellerProfileId: fixture.sellerProfileId,
+  });
+  // Demote the offering back to Draft so the precondition fails.
+  const prisma = createTestPrismaClient();
+  try {
+    await prisma.serviceOffering.update({
+      where: { id: offeringId },
+      data: { status: "Draft" },
+    });
+  } finally {
+    await prisma.$disconnect();
+  }
+  await assert.rejects(
+    repository.removeFinalSamplePendingCleanup({
+      offeringId,
+      sampleId: "smp_86d_final_not_active",
+      workspaceId: fixture.workspaceId,
+      pausedByUserId: fixture.userId,
+      idempotencyKey: "11111111-2222-3333-4444-aaaaaaaaaaa3",
+      requestId: "req-86d-final-not-active",
+      now: new Date(),
+    }),
+    (err: unknown) => {
+      return (
+        err instanceof AudioSampleFinalRemovalNotApplicableError &&
+        (err as unknown as { reason: string }).reason === "offering_not_active"
+      );
+    },
+  );
+});
+
+void test("removeFinalSamplePendingCleanup: rejects when the sample is not the last Live CONFIRMED sample", async () => {
+  const fixture = await seedOfferingWithContext();
+  const offeringId = `${SLICE_86D_SLUG_PREFIX}final-sample-not-last`;
+  await seedActiveOfferingWithSample({
+    id: offeringId,
+    sampleId: "smp_86d_final_a",
+    storageRef: "ref://86d-final-a",
+    userId: fixture.userId,
+    workspaceId: fixture.workspaceId,
+    sellerProfileId: fixture.sellerProfileId,
+  });
+  // Add a SECOND CONFIRMED Live sample — so the first is no longer
+  // the last.
+  const prisma = createTestPrismaClient();
+  try {
+    await prisma.serviceOfferingAudioSample.create({
+      data: {
+        offeringId,
+        id: "smp_86d_final_b",
+        label: "Second sample",
+        contentType: "audio/mpeg",
+        byteSize: 1024,
+        displayOrder: 2,
+        storageRef: "ref://86d-final-b",
+        cleanupStatus: "Live",
+        confirmationVersion: "m2-audio-confirmation-v1",
+        confirmedByUserId: fixture.userId,
+        confirmedAt: new Date(),
+      },
+    });
+  } finally {
+    await prisma.$disconnect();
+  }
+  await assert.rejects(
+    repository.removeFinalSamplePendingCleanup({
+      offeringId,
+      sampleId: "smp_86d_final_a",
+      workspaceId: fixture.workspaceId,
+      pausedByUserId: fixture.userId,
+      idempotencyKey: "11111111-2222-3333-4444-aaaaaaaaaaa4",
+      requestId: "req-86d-final-not-last",
+      now: new Date(),
+    }),
+    (err: unknown) => {
+      return (
+        err instanceof AudioSampleFinalRemovalNotApplicableError &&
+        (err as unknown as { reason: string }).reason === "not_last_live_sample"
+      );
+    },
+  );
+  // M2 (#86, slice 86D Codex re-review): the rejected call must
+  // preserve both the offering's lifecycle state AND the existing
+  // sample rows. Verify no partial-write.
+  const prisma2 = createTestPrismaClient();
+  try {
+    const offering = await prisma2.serviceOffering.findUnique({
+      where: { id: offeringId },
+    });
+    assert.equal(offering?.status, "Active", "offering must remain Active on rejected call");
+    const samples = await prisma2.serviceOfferingAudioSample.findMany({
+      where: { offeringId },
+      orderBy: { displayOrder: "asc" },
+    });
+    assert.equal(samples.length, 2);
+    assert.equal(samples[0]?.cleanupStatus, "Live");
+    assert.equal(samples[1]?.cleanupStatus, "Live");
+    const pauseRows = await prisma2.serviceOfferingPause.findMany({
+      where: { offeringId },
+    });
+    assert.equal(pauseRows.length, 0, "no Pause evidence row may be written on rejected call");
+  } finally {
+    await prisma2.$disconnect();
+  }
+});
+
+// M2 (#86, slice 86D Codex re-review): retry after the sample
+// row has been finalized by the bounded retry path. The Pause
+// evidence row is still present (it survives sample finalization);
+// the retry must converge on the durable evidence and return
+// offeringStatus="Paused" with a synthesized Removed-status sample
+// record, NOT throw `sample_not_found`.
+void test("removeFinalSamplePendingCleanup: converges on retry after the sample row has been finalized (durable Pause evidence is sufficient)", async () => {
+  const fixture = await seedOfferingWithContext();
+  const offeringId = `${SLICE_86D_SLUG_PREFIX}final-sample-retry-after-finalize`;
+  await seedActiveOfferingWithSample({
+    id: offeringId,
+    sampleId: "smp_86d_final_retry",
+    storageRef: "ref://86d-final-retry",
+    userId: fixture.userId,
+    workspaceId: fixture.workspaceId,
+    sellerProfileId: fixture.sellerProfileId,
+  });
+  const baseInput = {
+    offeringId,
+    sampleId: "smp_86d_final_retry",
+    workspaceId: fixture.workspaceId,
+    pausedByUserId: fixture.userId,
+    idempotencyKey: "11111111-2222-3333-4444-aaaaaaaaaaa5",
+    requestId: "req-86d-final-retry",
+    now: new Date(),
+  };
+  // First call: atomic transition + Pause evidence row + sample
+  // → PendingCleanup.
+  const first = await repository.removeFinalSamplePendingCleanup(baseInput);
+  assert.equal(first.offeringStatus, "Paused");
+  assert.equal(first.sample.cleanupStatus, "PendingCleanup");
+  // Simulate the bounded retry completing the storage delete:
+  // `finalizePendingCleanup` deletes the sample row.
+  await repository.finalizePendingCleanup({
+    offeringId,
+    sampleId: "smp_86d_final_retry",
+  });
+  const prisma = createTestPrismaClient();
+  try {
+    const sampleRow = await prisma.serviceOfferingAudioSample.findUnique({
+      where: { id: "smp_86d_final_retry" },
+    });
+    assert.equal(sampleRow, null, "finalizePendingCleanup deleted the sample row");
+    const pauseRows = await prisma.serviceOfferingPause.findMany({
+      where: { offeringId, reason: "final_sample_removal" },
+    });
+    assert.equal(pauseRows.length, 1, "durable Pause evidence row survives");
+  } finally {
+    await prisma.$disconnect();
+  }
+  // Second call (retry): same idempotencyKey. The repository
+  // must converge on the existing Pause evidence row rather
+  // than throw `sample_not_found`. The synthesized record carries
+  // cleanupStatus="Removed" so the application service treats
+  // the retry as a successful removal.
+  const second = await repository.removeFinalSamplePendingCleanup(baseInput);
+  assert.equal(second.offeringStatus, "Paused");
+  assert.equal(second.sample.sampleId, "smp_86d_final_retry");
+  assert.equal(second.sample.cleanupStatus, "Removed");
+  // Still exactly ONE Pause evidence row — the retry did NOT
+  // insert a duplicate.
+  const prisma2 = createTestPrismaClient();
+  try {
+    const pauseRows = await prisma2.serviceOfferingPause.findMany({
+      where: { offeringId, reason: "final_sample_removal" },
+    });
+    assert.equal(pauseRows.length, 1, "idempotent retry must not insert a duplicate Pause row");
+    // Offering remains Paused — the retry did NOT mutate the
+    // transition.
+    const offering = await prisma2.serviceOffering.findUnique({
+      where: { id: offeringId },
+    });
+    assert.equal(offering?.status, "Paused");
+  } finally {
+    await prisma2.$disconnect();
+  }
 });
