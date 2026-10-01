@@ -47,6 +47,7 @@ import type {
   ApiFieldErrorV1,
   ServiceOfferingActivationConfirmationVersionV1,
   ServiceOfferingOwnerSampleSummaryV1,
+  ServiceOfferingReadinessReasonCategory,
 } from "@soundhub/types";
 
 export interface ServiceOfferingDraftInput {
@@ -386,6 +387,16 @@ export interface ServiceOfferingOwnerViewRecord {
   readonly samples: readonly ServiceOfferingOwnerSampleSummaryV1[];
   readonly activatedAt: Date | null;
   readonly activatedByDisplayName: string | null;
+  // M2 (#86, slice 86F): readiness view, derived by the API runtime
+  // from the persisted state via the same pure predicate the
+  // operator inventory uses. The runtime is the source of truth;
+  // the web editor renders this verbatim and does not re-derive.
+  readonly readiness: {
+    readonly isAvailable: boolean;
+    readonly updateNeeded: boolean;
+    readonly reasonCategories: readonly ServiceOfferingReadinessReasonCategory[];
+    readonly isGrandfatheredNonconforming: boolean;
+  };
 }
 
 export interface ServiceOfferingActivationResult {

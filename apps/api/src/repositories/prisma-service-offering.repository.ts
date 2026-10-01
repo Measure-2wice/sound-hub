@@ -42,7 +42,14 @@
 // public response. The `activatedByUserId` / `createdByUserId` FKs
 // are the audit attribution.
 
-import { type PrismaClient, Prisma, AudioSampleCleanupStatus, PurchaseMode } from "@soundhub/db";
+import {
+  type PrismaClient,
+  Prisma,
+  AudioSampleCleanupStatus,
+  PurchaseMode,
+  deriveEffectiveConfirmationVersion,
+  deriveServiceOfferingReadiness,
+} from "@soundhub/db";
 import type { Prisma as PrismaTypes } from "@soundhub/db";
 import { randomBytes } from "node:crypto";
 import type {
@@ -83,7 +90,10 @@ import type {
 } from "./service-offering.repository.js";
 import type { ApiFieldErrorV1 } from "@soundhub/types";
 import { BG2_AUDIO_SAMPLE_MAX_PER_OFFERING } from "@soundhub/types";
-import { SERVICE_OFFERING_AUDIO_MEDIA_CONFIRMATION_VERSIONS } from "@soundhub/types";
+import {
+  SERVICE_OFFERING_ACTIVATION_CONFIRMATION_VERSIONS,
+  SERVICE_OFFERING_AUDIO_MEDIA_CONFIRMATION_VERSIONS,
+} from "@soundhub/types";
 import { acquireAudioSampleLockTx } from "../audio-repository/audio-sample-lock.js";
 import { offeringLockSql } from "./service-offering-lock.js";
 import { sellerProfileWorkspaceLockSql } from "./seller-profile-workspace-lock.js";
@@ -156,11 +166,21 @@ const OFFERING_INCLUDE = {
   activations: {
     orderBy: { activatedAt: "desc" },
     take: 1,
-    include: {
-      activatedBy: {
-        select: { email: true },
-      },
+    select: {
+      confirmationVersion: true,
+      activatedAt: true,
+      activatedBy: { select: { email: true } },
     },
+  },
+  // M2 (#86, slice 86F): the latest update row carries the
+  // confirmationVersion + updatedAt that the readiness predicate
+  // consumes via `deriveEffectiveConfirmationVersion`. A
+  // successful `updateActive` writes a new row here; a Draft or
+  // pre-86F offering has no rows.
+  updates: {
+    orderBy: { updatedAt: "desc" },
+    take: 1,
+    select: { confirmationVersion: true, updatedAt: true },
   },
 } satisfies PrismaTypes.ServiceOfferingInclude;
 
@@ -201,7 +221,7 @@ export class PrismaServiceOfferingRepository implements ServiceOfferingRepositor
           where: { id: existingCreation.offeringId },
           include: {
             ...OFFERING_INCLUDE,
-            sellerProfile: { select: { workspaceId: true, id: true } },
+            sellerProfile: { select: { workspaceId: true, id: true, status: true } },
           },
         });
         if (!existingOffering) {
@@ -218,6 +238,7 @@ export class PrismaServiceOfferingRepository implements ServiceOfferingRepositor
           {
             workspaceId: existingOffering.sellerProfile.workspaceId,
             sellerProfileId: existingOffering.sellerProfile.id,
+            sellerProfileStatus: existingOffering.sellerProfile.status,
           },
           input.playbackUrlFor,
         );
@@ -315,7 +336,7 @@ export class PrismaServiceOfferingRepository implements ServiceOfferingRepositor
               where: { id: winner.offeringId },
               include: {
                 ...OFFERING_INCLUDE,
-                sellerProfile: { select: { workspaceId: true, id: true } },
+                sellerProfile: { select: { workspaceId: true, id: true, status: true } },
               },
             });
             if (existingOffering) {
@@ -324,6 +345,7 @@ export class PrismaServiceOfferingRepository implements ServiceOfferingRepositor
                 {
                   workspaceId: existingOffering.sellerProfile.workspaceId,
                   sellerProfileId: existingOffering.sellerProfile.id,
+                  sellerProfileStatus: existingOffering.sellerProfile.status,
                 },
                 input.playbackUrlFor,
               );
@@ -339,7 +361,7 @@ export class PrismaServiceOfferingRepository implements ServiceOfferingRepositor
         where: { id },
         include: {
           ...OFFERING_INCLUDE,
-          sellerProfile: { select: { workspaceId: true, id: true } },
+          sellerProfile: { select: { workspaceId: true, id: true, status: true } },
         },
       });
       if (!created) {
@@ -350,6 +372,7 @@ export class PrismaServiceOfferingRepository implements ServiceOfferingRepositor
         {
           workspaceId: created.sellerProfile.workspaceId,
           sellerProfileId: created.sellerProfile.id,
+          sellerProfileStatus: created.sellerProfile.status,
         },
         input.playbackUrlFor,
       );
@@ -440,7 +463,7 @@ export class PrismaServiceOfferingRepository implements ServiceOfferingRepositor
       });
       const existingSellerProfile = await tx.sellerProfile.findUnique({
         where: { id: existing.sellerProfileId },
-        select: { id: true, workspaceId: true },
+        select: { id: true, workspaceId: true, status: true },
       });
       if (!existingSellerProfile) {
         throw new Error(
@@ -452,6 +475,7 @@ export class PrismaServiceOfferingRepository implements ServiceOfferingRepositor
         {
           workspaceId: existingSellerProfile.workspaceId,
           sellerProfileId: existingSellerProfile.id,
+          sellerProfileStatus: existingSellerProfile.status,
         },
         input.playbackUrlFor,
       );
@@ -490,7 +514,7 @@ export class PrismaServiceOfferingRepository implements ServiceOfferingRepositor
           where: { id: input.offeringId },
           include: {
             ...OFFERING_INCLUDE,
-            sellerProfile: { select: { workspaceId: true, id: true } },
+            sellerProfile: { select: { workspaceId: true, id: true, status: true } },
           },
         });
         if (!existingOffering) {
@@ -515,6 +539,7 @@ export class PrismaServiceOfferingRepository implements ServiceOfferingRepositor
             {
               workspaceId: existingOffering.sellerProfile.workspaceId,
               sellerProfileId: existingOffering.sellerProfile.id,
+              sellerProfileStatus: existingOffering.sellerProfile.status,
             },
             input.playbackUrlFor,
           ),
@@ -526,7 +551,7 @@ export class PrismaServiceOfferingRepository implements ServiceOfferingRepositor
       // Step 2: precondition check.
       const existing = await tx.serviceOffering.findUnique({
         where: { id: input.offeringId },
-        include: { sellerProfile: { select: { workspaceId: true, id: true } } },
+        include: { sellerProfile: { select: { workspaceId: true, id: true, status: true } } },
       });
       if (!existing) {
         throw new ServiceOfferingNotFoundError(input.offeringId);
@@ -675,6 +700,7 @@ export class PrismaServiceOfferingRepository implements ServiceOfferingRepositor
                   {
                     workspaceId: input.workspaceId,
                     sellerProfileId: existing.sellerProfile.id,
+                    sellerProfileStatus: existing.sellerProfile.status,
                   },
                   input.playbackUrlFor,
                 ),
@@ -692,6 +718,7 @@ export class PrismaServiceOfferingRepository implements ServiceOfferingRepositor
             {
               workspaceId: input.workspaceId,
               sellerProfileId: existing.sellerProfile.id,
+              sellerProfileStatus: existing.sellerProfile.status,
             },
             input.playbackUrlFor,
           ),
@@ -743,7 +770,7 @@ export class PrismaServiceOfferingRepository implements ServiceOfferingRepositor
           where: { id: input.offeringId },
           include: {
             ...OFFERING_INCLUDE,
-            sellerProfile: { select: { workspaceId: true, id: true } },
+            sellerProfile: { select: { workspaceId: true, id: true, status: true } },
           },
         });
         if (!existingOffering) {
@@ -758,6 +785,7 @@ export class PrismaServiceOfferingRepository implements ServiceOfferingRepositor
             {
               workspaceId: existingOffering.sellerProfile.workspaceId,
               sellerProfileId: existingOffering.sellerProfile.id,
+              sellerProfileStatus: existingOffering.sellerProfile.status,
             },
             // M2 (#86, slice 86B, Codex review fix): carry the
             // playbackUrlFor resolver into the idempotency-hit
@@ -783,7 +811,7 @@ export class PrismaServiceOfferingRepository implements ServiceOfferingRepositor
       // is available for the pause-evidence row insert.
       const existing = await tx.serviceOffering.findUnique({
         where: { id: input.offeringId },
-        include: { sellerProfile: { select: { workspaceId: true, id: true } } },
+        include: { sellerProfile: { select: { workspaceId: true, id: true, status: true } } },
       });
       if (!existing) {
         throw new ServiceOfferingNotFoundError(input.offeringId);
@@ -839,6 +867,7 @@ export class PrismaServiceOfferingRepository implements ServiceOfferingRepositor
           {
             workspaceId: input.workspaceId,
             sellerProfileId: existing.sellerProfile.id,
+            sellerProfileStatus: existing.sellerProfile.status,
           },
           // M2 (#86, slice 86B, Codex review fix): carry the
           // playbackUrlFor resolver into the fresh-execute return
@@ -899,7 +928,7 @@ export class PrismaServiceOfferingRepository implements ServiceOfferingRepositor
           where: { id: input.offeringId },
           include: {
             ...OFFERING_INCLUDE,
-            sellerProfile: { select: { workspaceId: true, id: true } },
+            sellerProfile: { select: { workspaceId: true, id: true, status: true } },
           },
         });
         if (!existingOffering) {
@@ -914,6 +943,7 @@ export class PrismaServiceOfferingRepository implements ServiceOfferingRepositor
             {
               workspaceId: existingOffering.sellerProfile.workspaceId,
               sellerProfileId: existingOffering.sellerProfile.id,
+              sellerProfileStatus: existingOffering.sellerProfile.status,
             },
             input.playbackUrlFor,
           ),
@@ -927,7 +957,7 @@ export class PrismaServiceOfferingRepository implements ServiceOfferingRepositor
       // `ServiceOfferingNotPausedError`.
       const existing = await tx.serviceOffering.findUnique({
         where: { id: input.offeringId },
-        include: { sellerProfile: { select: { workspaceId: true, id: true } } },
+        include: { sellerProfile: { select: { workspaceId: true, id: true, status: true } } },
       });
       if (!existing) {
         throw new ServiceOfferingNotFoundError(input.offeringId);
@@ -1110,6 +1140,7 @@ export class PrismaServiceOfferingRepository implements ServiceOfferingRepositor
                   {
                     workspaceId: input.workspaceId,
                     sellerProfileId: existing.sellerProfile.id,
+                    sellerProfileStatus: existing.sellerProfile.status,
                   },
                   input.playbackUrlFor,
                 ),
@@ -1127,6 +1158,7 @@ export class PrismaServiceOfferingRepository implements ServiceOfferingRepositor
             {
               workspaceId: input.workspaceId,
               sellerProfileId: existing.sellerProfile.id,
+              sellerProfileStatus: existing.sellerProfile.status,
             },
             input.playbackUrlFor,
           ),
@@ -1192,7 +1224,7 @@ export class PrismaServiceOfferingRepository implements ServiceOfferingRepositor
           where: { id: input.offeringId },
           include: {
             ...OFFERING_INCLUDE,
-            sellerProfile: { select: { workspaceId: true, id: true } },
+            sellerProfile: { select: { workspaceId: true, id: true, status: true } },
           },
         });
         if (!existingOffering) {
@@ -1207,6 +1239,7 @@ export class PrismaServiceOfferingRepository implements ServiceOfferingRepositor
             {
               workspaceId: existingOffering.sellerProfile.workspaceId,
               sellerProfileId: existingOffering.sellerProfile.id,
+              sellerProfileStatus: existingOffering.sellerProfile.status,
             },
             input.playbackUrlFor,
           ),
@@ -1228,7 +1261,7 @@ export class PrismaServiceOfferingRepository implements ServiceOfferingRepositor
       // intentionally does NOT carry an `activatedAt` field.
       const existing = await tx.serviceOffering.findUnique({
         where: { id: input.offeringId },
-        include: { sellerProfile: { select: { workspaceId: true, id: true } } },
+        include: { sellerProfile: { select: { workspaceId: true, id: true, status: true } } },
       });
       if (!existing) {
         throw new ServiceOfferingNotFoundError(input.offeringId);
@@ -1422,6 +1455,7 @@ export class PrismaServiceOfferingRepository implements ServiceOfferingRepositor
                   {
                     workspaceId: input.workspaceId,
                     sellerProfileId: existing.sellerProfile.id,
+                    sellerProfileStatus: existing.sellerProfile.status,
                   },
                   input.playbackUrlFor,
                 ),
@@ -1439,6 +1473,7 @@ export class PrismaServiceOfferingRepository implements ServiceOfferingRepositor
             {
               workspaceId: input.workspaceId,
               sellerProfileId: existing.sellerProfile.id,
+              sellerProfileStatus: existing.sellerProfile.status,
             },
             input.playbackUrlFor,
           ),
@@ -1472,7 +1507,7 @@ export class PrismaServiceOfferingRepository implements ServiceOfferingRepositor
       where: { id: input.offeringId },
       include: {
         ...OFFERING_INCLUDE,
-        sellerProfile: { select: { workspaceId: true, id: true } },
+        sellerProfile: { select: { workspaceId: true, id: true, status: true } },
       },
     });
     if (!row) return null;
@@ -1482,6 +1517,7 @@ export class PrismaServiceOfferingRepository implements ServiceOfferingRepositor
       {
         workspaceId: row.sellerProfile.workspaceId,
         sellerProfileId: row.sellerProfile.id,
+        sellerProfileStatus: row.sellerProfile.status,
       },
       input.playbackUrlFor,
     );
@@ -1495,7 +1531,7 @@ export class PrismaServiceOfferingRepository implements ServiceOfferingRepositor
       where: { sellerProfile: { workspaceId: input.workspaceId } },
       include: {
         ...OFFERING_INCLUDE,
-        sellerProfile: { select: { workspaceId: true, id: true } },
+        sellerProfile: { select: { workspaceId: true, id: true, status: true } },
       },
       orderBy: { title: "asc" },
     });
@@ -1505,6 +1541,7 @@ export class PrismaServiceOfferingRepository implements ServiceOfferingRepositor
         {
           workspaceId: row.sellerProfile.workspaceId,
           sellerProfileId: row.sellerProfile.id,
+          sellerProfileStatus: row.sellerProfile.status,
         },
         input.playbackUrlFor,
       ),
@@ -1622,14 +1659,27 @@ type OwnerViewRowShape = {
   // attribution is the actor's email — never the raw UserAccount
   // id — to keep the private identifier off the public DTO.
   readonly activations: readonly {
+    readonly confirmationVersion: string;
     readonly activatedAt: Date;
     readonly activatedBy: { readonly email: string | null } | null;
+  }[];
+  // M2 (#86, slice 86F): the single most recent `ServiceOfferingUpdate`
+  // row. `deriveEffectiveConfirmationVersion` merges this with the
+  // latest activation row to pick the chronologically newest event,
+  // which is the readiness predicate's `confirmationVersion` input.
+  readonly updates: readonly {
+    readonly confirmationVersion: string;
+    readonly updatedAt: Date;
   }[];
 };
 
 function toOwnerView(
   row: OwnerViewRowShape,
-  ctx: { readonly workspaceId: string; readonly sellerProfileId: string },
+  ctx: {
+    readonly workspaceId: string;
+    readonly sellerProfileId: string;
+    readonly sellerProfileStatus: "Draft" | "Published" | "Suspended";
+  },
   playbackUrlFor?: (input: { offeringId: string; sampleId: string }) => string,
 ): ServiceOfferingOwnerViewRecord {
   const samples: ServiceOfferingOwnerSampleSummaryV1[] = row.audioSamples.map((s) => {
@@ -1692,6 +1742,44 @@ function toOwnerView(
       }
     : null;
   const latestActivation = row.activations[0];
+  const latestUpdate = row.updates[0];
+  // M2 (#86, slice 86F): readiness is the runtime source of truth.
+  // The same pure predicate the operator inventory CLI uses derives
+  // these flags from the persisted state, so the web editor renders
+  // the verbatim view and never re-implements the rule.
+  const currentConfirmationVersion = SERVICE_OFFERING_ACTIVATION_CONFIRMATION_VERSIONS.at(-1);
+  if (!currentConfirmationVersion) {
+    throw new Error(
+      "SERVICE_OFFERING_ACTIVATION_CONFIRMATION_VERSIONS is empty; readiness cannot derive a current version.",
+    );
+  }
+  const effectiveConfirmationVersion = deriveEffectiveConfirmationVersion({
+    latestActivation: latestActivation
+      ? {
+          confirmationVersion: latestActivation.confirmationVersion,
+          occurredAt: latestActivation.activatedAt,
+        }
+      : null,
+    latestUpdate: latestUpdate
+      ? {
+          confirmationVersion: latestUpdate.confirmationVersion,
+          occurredAt: latestUpdate.updatedAt,
+        }
+      : null,
+  });
+  const readiness = deriveServiceOfferingReadiness({
+    status: row.status,
+    title: row.title,
+    description: row.description,
+    hasPrimaryCategory: row.primaryCategory !== null,
+    serviceMode: row.serviceMode ?? "Remote",
+    serviceAreaCount: row.serviceAreas.length,
+    hasPricing: row.pricing !== null,
+    confirmedLiveSampleCount: row.audioSamples.length,
+    sellerProfileStatus: ctx.sellerProfileStatus,
+    confirmationVersion: effectiveConfirmationVersion,
+    currentConfirmationVersion,
+  });
   return {
     serviceOfferingId: row.id,
     workspaceId: ctx.workspaceId,
@@ -1708,6 +1796,12 @@ function toOwnerView(
     samples,
     activatedAt: latestActivation ? latestActivation.activatedAt : null,
     activatedByDisplayName: latestActivation ? (latestActivation.activatedBy?.email ?? null) : null,
+    readiness: {
+      isAvailable: readiness.isAvailable,
+      updateNeeded: readiness.updateNeeded,
+      reasonCategories: [...readiness.reasonCategories],
+      isGrandfatheredNonconforming: readiness.isGrandfatheredNonconforming,
+    },
   };
 }
 

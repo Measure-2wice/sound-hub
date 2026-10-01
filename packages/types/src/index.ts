@@ -1291,6 +1291,43 @@ export type ServiceOfferingOwnerSampleSummaryV1 = z.infer<
   typeof serviceOfferingOwnerSampleSummaryV1Schema
 >;
 
+// M2 (#86, slice 86E + 86F): closed-shape readiness view, derived
+// by the API runtime from the same pure predicate the operator
+// inventory uses (`deriveServiceOfferingReadiness` from `@soundhub/db`).
+// The closed-set reason vocabulary is the slice 86E contract: no
+// silently-invented alternative buckets. The runtime consumes the
+// predicate so the UI never re-implements the rule.
+export const serviceOfferingReadinessV1Schema = z
+  .object({
+    isAvailable: z.boolean(),
+    updateNeeded: z.boolean(),
+    reasonCategories: z
+      .array(
+        z.enum([
+          "title-required",
+          "description-required",
+          "category-required",
+          "service-area-required",
+          "pricing-required",
+          "audio-sample-required",
+          "activation-confirmation-stale",
+          "seller-profile-not-published",
+        ]),
+      )
+      .max(8),
+    isGrandfatheredNonconforming: z.boolean(),
+  })
+  .strict();
+export type ServiceOfferingReadinessV1 = z.infer<typeof serviceOfferingReadinessV1Schema>;
+
+// Closed union of the readiness reason categories. Re-exported as
+// a named type so internal call sites (the API repository's
+// `ServiceOfferingOwnerViewRecord.readiness.reasonCategories`,
+// the in-memory adapter's `toOwnerView` helper) can carry the
+// closed set without restating the enum.
+export type ServiceOfferingReadinessReasonCategory =
+  ServiceOfferingReadinessV1["reasonCategories"][number];
+
 export const serviceOfferingOwnerViewV1Schema = z
   .object({
     serviceOfferingId: z.string().min(1).max(128),
@@ -1313,6 +1350,12 @@ export const serviceOfferingOwnerViewV1Schema = z
     samples: z.array(serviceOfferingOwnerSampleSummaryV1Schema).max(3),
     activatedAt: z.string().datetime().nullable(),
     activatedByDisplayName: z.string().min(1).max(200).nullable(),
+    // M2 (#86, slice 86F): readiness derived from the persisted
+    // state by the API runtime. The runtime's source of truth is
+    // `deriveServiceOfferingReadiness` from `@soundhub/db` — the
+    // same predicate the operator inventory CLI uses. The web
+    // editor renders this verbatim and does not re-derive.
+    readiness: serviceOfferingReadinessV1Schema,
   })
   .strict();
 export type ServiceOfferingOwnerViewV1 = z.infer<typeof serviceOfferingOwnerViewV1Schema>;

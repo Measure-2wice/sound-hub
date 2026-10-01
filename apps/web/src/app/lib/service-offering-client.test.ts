@@ -64,6 +64,12 @@ function expectedOfferingShape(): ServiceOfferingActivationResponseV1 {
       samples: [],
       activatedAt: "2026-09-27T13:00:00.000Z",
       activatedByDisplayName: "creole@example.com",
+      readiness: {
+        isAvailable: true,
+        updateNeeded: false,
+        reasonCategories: [],
+        isGrandfatheredNonconforming: false,
+      },
     },
     evidence: {
       activatedAt: "2026-09-27T13:00:00.000Z",
@@ -97,6 +103,12 @@ describe("M2 #86, slice 86B — ServiceOffering web client", () => {
           samples: [],
           activatedAt: null,
           activatedByDisplayName: null,
+          readiness: {
+            isAvailable: false,
+            updateNeeded: false,
+            reasonCategories: [],
+            isGrandfatheredNonconforming: false,
+          },
         },
         evidence: {
           pausedAt: "2026-09-27T13:00:00.000Z",

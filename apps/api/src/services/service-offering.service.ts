@@ -751,6 +751,17 @@ function toResponseOwnerView(record: ServiceOfferingOwnerViewRecord): ServiceOff
     samples: [...record.samples],
     activatedAt: record.activatedAt ? record.activatedAt.toISOString() : null,
     activatedByDisplayName: record.activatedByDisplayName,
+    // M2 (#86, slice 86F): readiness is derived server-side from
+    // the persisted state by the runtime; the web editor renders
+    // this verbatim. The mapper passes the in-memory shape through
+    // unchanged — every reason category is a plain string and
+    // every flag is a boolean.
+    readiness: {
+      isAvailable: record.readiness.isAvailable,
+      updateNeeded: record.readiness.updateNeeded,
+      reasonCategories: [...record.readiness.reasonCategories],
+      isGrandfatheredNonconforming: record.readiness.isGrandfatheredNonconforming,
+    },
   };
 }
 

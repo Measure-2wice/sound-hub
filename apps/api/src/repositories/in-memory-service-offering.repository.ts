@@ -67,7 +67,11 @@ import {
   ServiceOfferingUpdateNotActiveError,
 } from "./service-offering.repository.js";
 import type { ApiFieldErrorV1 } from "@soundhub/types";
-import { BG2_AUDIO_SAMPLE_MAX_PER_OFFERING } from "@soundhub/types";
+import {
+  BG2_AUDIO_SAMPLE_MAX_PER_OFFERING,
+  SERVICE_OFFERING_ACTIVATION_CONFIRMATION_VERSIONS,
+} from "@soundhub/types";
+import { deriveEffectiveConfirmationVersion, deriveServiceOfferingReadiness } from "@soundhub/db";
 
 type Status = "Draft" | "Active" | "Paused" | "Archived";
 type PricingKind = "Fixed" | "StartingAt" | "ContactForQuote";
@@ -1254,6 +1258,64 @@ export class InMemoryServiceOfferingRepository implements ServiceOfferingReposit
           ...(row.pricing.unitId !== null ? { unitId: row.pricing.unitId } : {}),
         }
       : null;
+    // M2 (#86, slice 86F): readiness is the runtime source of truth.
+    // Mirror the Prisma adapter's `toOwnerView`: compute the
+    // effective confirmation from BOTH activation + update evidence
+    // (chronologically newest event) and feed the predicate.
+    let latestActivation: { confirmationVersion: string; activatedAt: Date } | null = null;
+    for (const [, evidence] of this.activationsByOfferingIdem) {
+      if (evidence.offeringId !== row.id) continue;
+      if (latestActivation === null || evidence.activatedAt > latestActivation.activatedAt) {
+        latestActivation = {
+          confirmationVersion: evidence.confirmationVersion,
+          activatedAt: evidence.activatedAt,
+        };
+      }
+    }
+    let latestUpdate: { confirmationVersion: string; updatedAt: Date } | null = null;
+    for (const [, evidence] of this.updatesByOfferingIdem) {
+      if (evidence.offeringId !== row.id) continue;
+      if (latestUpdate === null || evidence.updatedAt > latestUpdate.updatedAt) {
+        latestUpdate = {
+          confirmationVersion: evidence.confirmationVersion,
+          updatedAt: evidence.updatedAt,
+        };
+      }
+    }
+    const currentConfirmationVersion = SERVICE_OFFERING_ACTIVATION_CONFIRMATION_VERSIONS.at(-1);
+    if (!currentConfirmationVersion) {
+      throw new Error(
+        "SERVICE_OFFERING_ACTIVATION_CONFIRMATION_VERSIONS is empty; readiness cannot derive a current version.",
+      );
+    }
+    const effectiveConfirmationVersion = deriveEffectiveConfirmationVersion({
+      latestActivation: latestActivation
+        ? {
+            confirmationVersion: latestActivation.confirmationVersion,
+            occurredAt: latestActivation.activatedAt,
+          }
+        : null,
+      latestUpdate: latestUpdate
+        ? {
+            confirmationVersion: latestUpdate.confirmationVersion,
+            occurredAt: latestUpdate.updatedAt,
+          }
+        : null,
+    });
+    const sellerProfileStatus = this.sellerProfileStatusById.get(row.sellerProfileId) ?? "Draft";
+    const readiness = deriveServiceOfferingReadiness({
+      status: row.status,
+      title: row.title,
+      description: row.description,
+      hasPrimaryCategory: row.primaryCategoryKey !== null,
+      serviceMode: row.serviceMode ?? "Remote",
+      serviceAreaCount: row.serviceAreas.length,
+      hasPricing: row.pricing !== null,
+      confirmedLiveSampleCount: samples.length,
+      sellerProfileStatus,
+      confirmationVersion: effectiveConfirmationVersion,
+      currentConfirmationVersion,
+    });
     return {
       serviceOfferingId: row.id,
       workspaceId: row.workspaceId,
@@ -1284,6 +1346,12 @@ export class InMemoryServiceOfferingRepository implements ServiceOfferingReposit
       // internally on `StoredActivation` for authorization /
       // audit and is never serialized to the OwnerView.
       activatedByDisplayName: null,
+      readiness: {
+        isAvailable: readiness.isAvailable,
+        updateNeeded: readiness.updateNeeded,
+        reasonCategories: [...readiness.reasonCategories],
+        isGrandfatheredNonconforming: readiness.isGrandfatheredNonconforming,
+      },
     };
   }
 }

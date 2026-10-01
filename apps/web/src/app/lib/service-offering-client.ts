@@ -32,6 +32,8 @@ import {
   serviceOfferingPauseResponseV1Schema,
   serviceOfferingReactivateRequestV1Schema,
   serviceOfferingTaxonomyResponseV1Schema,
+  serviceOfferingUpdateRequestV1Schema,
+  serviceOfferingUpdateResponseV1Schema,
   type ApiFieldErrorV1,
   type ServiceOfferingActivateRequestV1,
   type ServiceOfferingActivationResponseV1,
@@ -42,6 +44,8 @@ import {
   type ServiceOfferingOwnerViewV1,
   type ServiceOfferingPauseResponseV1,
   type ServiceOfferingTaxonomyResponseV1,
+  type ServiceOfferingUpdateRequestV1,
+  type ServiceOfferingUpdateResponseV1,
 } from "@soundhub/types";
 
 export type {
@@ -50,6 +54,7 @@ export type {
   ServiceOfferingActivationResponseV1,
   ServiceOfferingOwnerListResponseV1,
   ServiceOfferingTaxonomyResponseV1,
+  ServiceOfferingUpdateResponseV1,
 };
 
 export interface ServiceOfferingClientError {
@@ -316,4 +321,29 @@ export async function reactivateServiceOffering(input: {
   }
   const body: unknown = await response.json();
   return serviceOfferingActivationResponseV1Schema.parse(body);
+}
+
+// M2 (#86, slice 86F): typed Update command. The body reuses the
+// STRICT activation schema (the server-side contract treats updateActive
+// as a full activation recheck — same shape as Reactivate). The
+// response shape is `serviceOfferingUpdateResponseV1Schema` (carries
+// `updatedAt` rather than `activatedAt` per ADR 0008 — the activation
+// evidence is preserved verbatim).
+export async function updateActiveServiceOffering(input: {
+  readonly workspaceId: string;
+  readonly offeringId: string;
+  readonly update: ServiceOfferingUpdateRequestV1;
+}): Promise<ServiceOfferingUpdateResponseV1> {
+  const payload = serviceOfferingUpdateRequestV1Schema.parse(input.update);
+  const response = await fetch(offeringPath(input.workspaceId, input.offeringId, "/update"), {
+    method: "PUT",
+    credentials: "include",
+    headers: { "Content-Type": "application/json", Accept: "application/json" },
+    body: JSON.stringify(payload),
+  });
+  if (!response.ok) {
+    throw ensureError(null, await parseErrorResponse(response));
+  }
+  const body: unknown = await response.json();
+  return serviceOfferingUpdateResponseV1Schema.parse(body);
 }

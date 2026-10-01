@@ -40,6 +40,7 @@ import Link from "next/link";
 import { useParams, useRouter } from "next/navigation";
 import { useActingWorkspace, useSession } from "../../../../components/SessionProvider";
 import { Alert } from "../../../../components/ui/Alert";
+import { ConfirmationDialog } from "../../../../components/ui/ConfirmationDialog";
 import { Card } from "../../../../components/ui/Card";
 import {
   SaveDraftActions,
@@ -53,7 +54,10 @@ import {
   fetchServiceOffering,
   fetchServiceOfferingTaxonomy,
   generateServiceOfferingIdempotencyKey,
+  pauseServiceOffering,
+  reactivateServiceOffering,
   saveServiceOfferingDraft,
+  updateActiveServiceOffering,
 } from "../../../../lib/service-offering-client";
 import { fetchSellerProfile } from "../../../../lib/seller-profile-client";
 import {
@@ -73,6 +77,7 @@ import {
   ExpandMoreIcon,
   InfoIcon,
   LockIcon,
+  PauseIcon,
   RadioUncheckedIcon,
   SaveIcon,
   SyncAltIcon,
@@ -128,6 +133,23 @@ const SECTION_IDS = {
   optional: "section-optional",
   activation: "section-activation",
 } as const;
+
+// M2 (#86, slice 86F): the runtime-derived reason categories map to
+// human-readable, actionable copy. The closed set mirrors the
+// readiness predicate's vocabulary exactly; adding a new entry
+// requires extending both the predicate and this table.
+const REASON_CATEGORY_COPY: Record<string, string> = {
+  "title-required": "Add a title.",
+  "description-required": "Add a description.",
+  "category-required": "Pick a primary category.",
+  "service-area-required":
+    "Add a service area (In-Person and Hybrid offerings require at least one).",
+  "pricing-required": "Configure pricing.",
+  "audio-sample-required": "Upload at least one audio sample (max 3).",
+  "activation-confirmation-stale":
+    "The activation contract version has changed. Update and resubmit.",
+  "seller-profile-not-published": "Publish your Professional Profile to keep this offering live.",
+};
 
 // Phase 2 #85 Manual QA Round 3 — save-status fidelity: a
 // snapshot of the persisted draft fields. The status header row
@@ -638,8 +660,57 @@ function ServiceOfferingEditInner() {
     idempotencyKey: string;
   } | null>(null);
 
+  // M2 (#86, slice 86F): Pause / Update / Reactivate / final-sample
+  // dialog + transient state. On success the page re-fetches the
+  // offering so the new lifecycle state + readiness are visible.
+  // On failure the error envelope is surfaced via
+  // `asServiceOfferingClientError`.
+  const [pauseConfirmOpen, setPauseConfirmOpen] = useState(false);
+  const [pauseState, setPauseState] = useState<SaveDraftActionState>("idle");
+  const [pauseErrorMessage, setPauseErrorMessage] = useState<string | null>(null);
+  const [reactivateConfirmOpen, setReactivateConfirmOpen] = useState(false);
+  const [reactivateState, setReactivateState] = useState<SaveDraftActionState>("idle");
+  const [reactivateErrorMessage, setReactivateErrorMessage] = useState<string | null>(null);
+  const [updateState, setUpdateState] = useState<SaveDraftActionState>("idle");
+  const [updateErrorMessage, setUpdateErrorMessage] = useState<string | null>(null);
+  // localEditMode: "closed" → read-only Active; "active-update" → inputs
+  // locally unlocked with Submit / Cancel row. The slice plan's
+  // Update flow mandates this state machine. The slice plan's
+  // Reactivate flow mandates a SECOND local-edit mode
+  // (`paused-repair`): a Paused offering whose strict reactivation
+  // contract fails (e.g. blank title) must surface an in-place
+  // repair surface the seller can use to correct the field before
+  // re-submitting. `paused-repair` unlocks the same form inputs the
+  // Active Update path unlocks so the seller can repair missing /
+  // stale fields.
+  type LocalEditMode = "closed" | "active-update" | "paused-repair";
+  const [localEditMode, setLocalEditMode] = useState<LocalEditMode>("closed");
+  // updatedBannerOpen: transient "Service updated." banner visible
+  // for a short dwell after a successful Update submission.
+  const [updatedBannerOpen, setUpdatedBannerOpen] = useState(false);
+  // finalSampleConfirmId: pending final-sample removal that requires
+  // explicit consequence confirmation. The slice 86D invariant is
+  // that the seller MUST set `confirmEligibilityLoss: true` before
+  // the server-side atomic Active → Paused transition runs.
+  const [finalSampleConfirmId, setFinalSampleConfirmId] = useState<string | null>(null);
+
   const draftIdempotencyKeyRef = useRef<string | null>(null);
   const activateIdempotencyKeyRef = useRef<string | null>(null);
+  // M2 (#86, slice 86F): each consequential command retains its
+  // OWN idempotency key for the duration of one logical attempt.
+  // Sharing the activate key across Pause / Reactivate / Update
+  // would let a retry of one command accidentally reuse another
+  // command's identity — or generate a fresh one and lose
+  // server-side convergence.
+  const pauseIdempotencyKeyRef = useRef<string | null>(null);
+  const reactivateIdempotencyKeyRef = useRef<string | null>(null);
+  const updateIdempotencyKeyRef = useRef<string | null>(null);
+  // M2 (#86, slice 86F): the authoritative offering snapshot taken
+  // when Update was confirmed. Cancel rehydrates the form from this
+  // snapshot rather than refetching. Declared alongside the other
+  // unconditional refs to satisfy React's Rules of Hooks (no hook
+  // may appear after a conditional early return).
+  const localEditModeEntrySnapshotRef = useRef<ServiceOfferingOwnerViewV1 | null>(null);
 
   const params = useParams<{ offeringId: string }>();
   const offeringId = params?.offeringId ?? null;
@@ -682,7 +753,23 @@ function ServiceOfferingEditInner() {
   // per the QA brief (no Pause/edit-active behavior) — for those
   // lifecycles the page continues to render the existing Draft
   // presentation rather than fabricate new copy.
+  //
+  // M2 (#86, slice 86F): the readiness flags come from the runtime
+  // OwnerView payload. The web editor renders them verbatim and
+  // does not re-derive. A grandfathered Active row carries
+  // `isAvailable=true && updateNeeded=true`; the editor must surface
+  // BOTH signals (the slice plan's "Available + Update needed"
+  // invariant) and expose Pause / Update affordances regardless of
+  // conformance.
   const isActive = offering?.status === "Active";
+  // M2 (#86, slice 86F): Paused presentations use a distinct copy +
+  // entry surface from Draft (no Reactivate invented until slice 86F
+  // handler wiring landed). The slice plan locks in a separate Paused
+  // surface so the error case (Draft-only fallback) never appears
+  // when a Paused offering is re-opened.
+  const isPaused = offering?.status === "Paused";
+  const readiness = offering?.readiness;
+  const isGrandfathered = isActive && (readiness?.isGrandfatheredNonconforming ?? false);
 
   // Derive the section readiness state up front (before any early
   // return) so the sidebar / mobile jump / activation section all
@@ -1013,6 +1100,37 @@ function ServiceOfferingEditInner() {
     idempotencyKey: draftIdempotencyKeyRef.current ?? "",
   });
 
+  // M2 (#86, slice 86F): STRICT activate-shaped payload builder.
+  // Shared by Activate (Draft → Active), Reactivate (Paused →
+  // Active), and Update (Active → Active complete replacement).
+  // Each of those three commands re-runs the full activation
+  // contract, so they accept the same payload shape.
+  const buildActivatePayload = (idempotencyKey: string): ServiceOfferingActivateRequestV1 => ({
+    title: title.trim(),
+    description: description.trim(),
+    primaryCategoryKey,
+    serviceMode: serviceMode!,
+    ...(serviceAreaCountry
+      ? {
+          serviceAreas: [{ countryCode: serviceAreaCountry }],
+        }
+      : { serviceAreas: [] }),
+    pricing: {
+      kind: pricingKind!,
+      ...(pricingKind !== "ContactForQuote"
+        ? {
+            amountMinor: Math.round(Number(pricingAmount) * 100),
+            currency: "USD",
+            unitId: pricingUnit,
+          }
+        : {}),
+    },
+    genreTags,
+    includedServiceCategoryKeys: [],
+    confirmationVersion: "m2-service-activation-v1",
+    idempotencyKey,
+  });
+
   const handleSave = () => {
     if (draftIdempotencyKeyRef.current === null) {
       draftIdempotencyKeyRef.current = `draft-${crypto.randomUUID()}`;
@@ -1111,35 +1229,12 @@ function ServiceOfferingEditInner() {
     // safe at runtime — handleActivate cannot be reached without
     // the gate — and they preserve the STRICT activate schema's
     // required-field shape (`z.enum(...)`, not `z.enum(...).optional()`).
-    const payload: ServiceOfferingActivateRequestV1 = {
-      title: title.trim(),
-      description: description.trim(),
-      primaryCategoryKey,
-      serviceMode: serviceMode!,
-      // Activation is the canonical STRICT contract — service area
-      // is required when the mode is InPerson / Hybrid and the
-      // schema-level Zod refinement rejects missing values before
-      // the request reaches the API.
-      ...(serviceAreaCountry
-        ? {
-            serviceAreas: [{ countryCode: serviceAreaCountry }],
-          }
-        : { serviceAreas: [] }),
-      pricing: {
-        kind: pricingKind!,
-        ...(pricingKind !== "ContactForQuote"
-          ? {
-              amountMinor: Math.round(Number(pricingAmount) * 100),
-              currency: "USD",
-              unitId: pricingUnit,
-            }
-          : {}),
-      },
-      genreTags,
-      includedServiceCategoryKeys: [],
-      confirmationVersion: "m2-service-activation-v1",
-      idempotencyKey: activateIdempotencyKeyRef.current ?? generateServiceOfferingIdempotencyKey(),
-    };
+    if (activateIdempotencyKeyRef.current === null) {
+      activateIdempotencyKeyRef.current = generateServiceOfferingIdempotencyKey();
+    }
+    const payload = buildActivatePayload(
+      activateIdempotencyKeyRef.current ?? generateServiceOfferingIdempotencyKey(),
+    );
     try {
       const response = await activateServiceOffering({
         workspaceId: actingWorkspace.workspaceId,
@@ -1164,6 +1259,202 @@ function ServiceOfferingEditInner() {
         setActivateErrorMessage("Couldn't activate. Please try again.");
         setActivateState("error");
       }
+    }
+  };
+  // M2 (#86, slice 86F): Pause / Update / Reactivate handlers.
+  // The slice plan's UI states each require a real command path
+  // (no silent stubs). Each handler mirrors the activate pattern:
+  // generate the idempotency key on first call, surface the closed
+  // error envelope via `asServiceOfferingClientError`, and re-fetch
+  // the offering on success so the new lifecycle state + readiness
+  // render truthfully.
+
+  const handlePause = () => {
+    void performPause();
+  };
+  const performPause = async () => {
+    if (!offeringId) return;
+    setPauseState("saving");
+    try {
+      // Retain the idempotency key across retries of the SAME
+      // logical attempt (per blocker 2); a fresh click on the
+      // Pause button generates a new key.
+      if (pauseIdempotencyKeyRef.current === null) {
+        pauseIdempotencyKeyRef.current = generateServiceOfferingIdempotencyKey();
+      }
+      const response = await pauseServiceOffering({
+        workspaceId: actingWorkspace.workspaceId,
+        offeringId,
+        idempotencyKey: pauseIdempotencyKeyRef.current ?? generateServiceOfferingIdempotencyKey(),
+      });
+      setOffering(response.offering);
+      setPauseState("saved");
+      setPauseConfirmOpen(false);
+      pauseIdempotencyKeyRef.current = null; // next attempt gets a fresh key
+    } catch (err) {
+      const cls = asServiceOfferingClientError(err);
+      setPauseErrorMessage(cls ? cls.message : "Couldn't pause. Please try again.");
+      setPauseState("error");
+    }
+  };
+
+  const handleReactivate = () => {
+    // M2 (#86, slice 86F Codex re-review): Reactivate confirms
+    // the user-initiated intent then enters `paused-repair` mode
+    // so the seller can repair missing / stale fields if the
+    // strict reactivation contract rejects the current state. The
+    // slice plan locks: "Reactivate submits the complete
+    // replacement state" — the submit handler is `handleUpdateSubmit`,
+    // which calls `performUpdate` (which posts to `/update`). For
+    // the Reactivate flow we want the SAME submit handler to
+    // dispatch to `performReactivate` instead, but the local
+    // payload state is shared between the two paths (the form
+    // inputs are the source of truth). The flow:
+    //   1. Reactivate confirm → enter `paused-repair` mode
+    //   2. Submit (now bound to `paused-repair`) → performReactivate
+    //   3. On failure: stay in `paused-repair`, show error, preserve entered values
+    //   4. On success: leave `paused-repair`, status flips to Active
+    //
+    // The same Submit button testid (`service-offering-edit-update-submit`)
+    // is reused for visual continuity; the binding is selected by
+    // `localEditMode` inside the submit handler so the Reactivate
+    // case dispatches `performReactivate()` and the Active Update
+    // case dispatches `performUpdate()`.
+    if (offering) {
+      localEditModeEntrySnapshotRef.current = offering;
+    }
+    setReactivateConfirmOpen(false);
+    setReactivateState("idle");
+    setLocalEditMode("paused-repair");
+  };
+  const performReactivate = async () => {
+    if (!offeringId) return;
+    setReactivateState("saving");
+    setReactivateErrorMessage(null);
+    try {
+      if (reactivateIdempotencyKeyRef.current === null) {
+        reactivateIdempotencyKeyRef.current = generateServiceOfferingIdempotencyKey();
+      }
+      const response = await reactivateServiceOffering({
+        workspaceId: actingWorkspace.workspaceId,
+        offeringId,
+        activation: buildActivatePayload(
+          reactivateIdempotencyKeyRef.current ?? generateServiceOfferingIdempotencyKey(),
+        ),
+      });
+      setOffering(response.offering);
+      setReactivateState("saved");
+      setReactivateConfirmOpen(false);
+      reactivateIdempotencyKeyRef.current = null;
+      // M2 (#86, slice 86F Codex re-review): successful Reactivate
+      // must close the paused-repair state machine so the newly
+      // Active listing renders read-only. Closing localEditMode
+      // disables the form inputs (the (isActive || isPaused)
+      // gates revert to "locked unless local-edit"); clearing
+      // localEditModeEntrySnapshotRef prevents the next Update
+      // entry from accidentally rehydrating from the Reactivate
+      // snapshot; clearing reactivateErrorMessage removes any
+      // stale failure banner the prior attempt left behind.
+      setLocalEditMode("closed");
+      localEditModeEntrySnapshotRef.current = null;
+      setReactivateErrorMessage(null);
+    } catch (err) {
+      const cls = asServiceOfferingClientError(err);
+      setReactivateErrorMessage(cls ? cls.message : "Couldn't reactivate. Please try again.");
+      setReactivateState("error");
+    }
+  };
+
+  const handleUpdateConfirm = () => {
+    // Capture the authoritative snapshot so Cancel can restore
+    // exactly what the seller entered Update against.
+    if (offering) {
+      localEditModeEntrySnapshotRef.current = offering;
+    }
+    setUpdateState("idle");
+    setLocalEditMode("active-update");
+  };
+  // M2 (#86, slice 86F): extract form hydration so Cancel local
+  // edits can restore the authoritative snapshot.
+  // M2 (#86, slice 86F): explicit restoration. Persisted `null` and
+  // persisted `""` are both honored (NOT filtered by truthiness) so a
+  // seller who clears a field then cancels sees the cleared state
+  // restored. Used by Cancel-local-edits; the original persistence
+  // path (bootstrap fetch + hydrate after Save) flows through the
+  // same helper so behavior stays consistent.
+  const hydrateFormFromOwner = (o: ServiceOfferingOwnerViewV1): void => {
+    setTitle(o.title);
+    setDescription(o.description);
+    setPrimaryCategoryKey(o.primaryCategoryKey ?? "");
+    setServiceMode(o.serviceMode);
+    setServiceAreaCountry(
+      o.serviceAreas.length > 0 && o.serviceAreas[0] ? o.serviceAreas[0].countryCode : "",
+    );
+    setPricingKind(o.pricing?.kind ?? null);
+    setPricingAmount(
+      o.pricing?.amountMinor !== undefined ? String(o.pricing.amountMinor / 100) : null,
+    );
+    setPricingUnit(o.pricing?.unitId ?? "");
+    setGenreTags([...o.genreTags]);
+  };
+
+  const handleUpdateCancel = () => {
+    // Rehydrate the form from the snapshot taken at Update entry so
+    // the seller sees the originally persisted state, not the
+    // cancelled local edits.
+    if (localEditModeEntrySnapshotRef.current && offering) {
+      hydrateFormFromOwner(localEditModeEntrySnapshotRef.current);
+    }
+    setLocalEditMode("closed");
+    setUpdateErrorMessage(null);
+    localEditModeEntrySnapshotRef.current = null;
+  };
+  const handleUpdateSubmit = () => {
+    // M2 (#86, slice 86F Codex re-review): the submit handler
+    // dispatches to `performReactivate` when the user is in
+    // `paused-repair` mode (so the Reactivate path's submit goes
+    // to the strict reactivation contract) and to `performUpdate`
+    // when in `active-update` mode (so the Active Update path
+    // posts to the atomic Active → Active update endpoint). The
+    // visual surface is shared.
+    if (localEditMode === "paused-repair") {
+      void performReactivate();
+    } else {
+      void performUpdate();
+    }
+  };
+  const performUpdate = async () => {
+    if (!offeringId) return;
+    setUpdateState("saving");
+    setUpdateErrorMessage(null);
+    try {
+      if (updateIdempotencyKeyRef.current === null) {
+        updateIdempotencyKeyRef.current = generateServiceOfferingIdempotencyKey();
+      }
+      const response = await updateActiveServiceOffering({
+        workspaceId: actingWorkspace.workspaceId,
+        offeringId,
+        update: buildActivatePayload(
+          updateIdempotencyKeyRef.current ?? generateServiceOfferingIdempotencyKey(),
+        ),
+      });
+      setOffering(response.offering);
+      setUpdateState("saved");
+      setLocalEditMode("closed");
+      setUpdatedBannerOpen(true);
+      updateIdempotencyKeyRef.current = null;
+      // M2 (#86, slice 86F blocker 7): auto-dismiss the transient
+      // "Service updated." banner after a short dwell so the
+      // status pill (Update available) does not accumulate a
+      // permanent banner. Reduced-motion users see the banner
+      // for the full dwell; the banner's role="status" +
+      // aria-live="polite" surfaces the change to screen readers
+      // regardless of dwell duration.
+      window.setTimeout(() => setUpdatedBannerOpen(false), 4000);
+    } catch (err) {
+      const cls = asServiceOfferingClientError(err);
+      setUpdateErrorMessage(cls ? cls.message : "Couldn't update. Please try again.");
+      setUpdateState("error");
     }
   };
 
@@ -1215,8 +1506,24 @@ function ServiceOfferingEditInner() {
     }
   };
 
-  const handleRemoveSample = async (sample: Bg2AudioSamplePublicV1) => {
-    if (removeConfirmId !== null) return;
+  // M2 (#86, slice 86F): sample removal now branches on the slice 86D
+  // consequence contract. The LAST Live CONFIRMED sample on an Active
+  // offering requires explicit `confirmEligibilityLoss: true`; the
+  // editor surfaces a consequence dialog before the call. All other
+  // removals (Paused, non-final Active) proceed without confirmation.
+  // The owner-view `samples` array already filters to Live + confirmed
+  // // rows per the slice 86D OFFERING_INCLUDE; `samples.length === 1`
+  // is the closed final-sample indicator.
+  const isFinalQualifyingSample = (sample: Bg2AudioSamplePublicV1): boolean => {
+    if (!offering || offering.status !== "Active") return false;
+    const liveSamples = samples.filter((s) => s.playbackUrl && s.contentType === "audio/mpeg");
+    return liveSamples.length === 1 && liveSamples[0]?.sampleId === sample.sampleId;
+  };
+
+  const performSampleRemoval = async (
+    sample: Bg2AudioSamplePublicV1,
+    options: { readonly confirmEligibilityLoss: boolean },
+  ) => {
     setRemoveConfirmId(sample.sampleId);
     setSamplesError(null);
     try {
@@ -1224,18 +1531,56 @@ function ServiceOfferingEditInner() {
         offeringId,
         sample,
         actingWorkspaceId: actingWorkspace.workspaceId,
+        confirmEligibilityLoss: options.confirmEligibilityLoss,
       });
       const list = await listOfferingSamples({
         workspaceId: actingWorkspace.workspaceId,
         offeringId,
       });
       setSamples(list.samples);
+      // M2: a final-sample removal transitions the offering to Paused
+      // atomically (slice 86D invariant). Refetch the offering so
+      // the status pill + readiness reflect the new state.
+      if (options.confirmEligibilityLoss && offering?.status === "Active") {
+        try {
+          const refreshed = await fetchServiceOffering({
+            workspaceId: actingWorkspace.workspaceId,
+            offeringId,
+          });
+          if (refreshed.offering) setOffering(refreshed.offering);
+        } catch {
+          // The transition succeeded; the offering refetch is a
+          // best-effort follow-up. The seller will see the new
+          // state on next mount.
+        }
+      }
     } catch (err) {
       const msg = err instanceof Error ? err.message : "Could not remove sample.";
       setSamplesError(msg);
     } finally {
       setRemoveConfirmId(null);
+      setFinalSampleConfirmId(null);
     }
+  };
+
+  const handleRemoveSample = (sample: Bg2AudioSamplePublicV1) => {
+    if (removeConfirmId !== null) return;
+    if (isFinalQualifyingSample(sample)) {
+      // Require explicit consequence acknowledgement before the
+      // server-side Active → Paused transition (slice 86D).
+      setFinalSampleConfirmId(sample.sampleId);
+      return;
+    }
+    void performSampleRemoval(sample, { confirmEligibilityLoss: false });
+  };
+
+  const handleFinalSampleConfirm = () => {
+    const target = samples.find((s) => s.sampleId === finalSampleConfirmId);
+    if (!target) {
+      setFinalSampleConfirmId(null);
+      return;
+    }
+    void performSampleRemoval(target, { confirmEligibilityLoss: true });
   };
 
   const anchorForPath = (path: string): string => {
@@ -1325,21 +1670,40 @@ function ServiceOfferingEditInner() {
               <span
                 className={`inline-flex items-center gap-1.5 px-3 py-1 rounded-full border font-label-md text-xs font-bold uppercase tracking-wider ${
                   offering?.status === "Active"
-                    ? "bg-seaGlass/15 border-seaGlass/40 text-seaGlass"
+                    ? isGrandfathered
+                      ? "bg-gold/15 border-gold/40 text-gold"
+                      : "bg-seaGlass/15 border-seaGlass/40 text-seaGlass"
                     : "bg-surface-container border-primary-container/30 text-primary"
                 }`}
                 data-testid="service-offering-edit-status"
+                aria-label={
+                  offering?.status === "Active"
+                    ? isGrandfathered
+                      ? "Available but Update needed — see remediation reasons below"
+                      : "Available"
+                    : offering?.status === "Draft"
+                      ? "Private draft"
+                      : offering?.status === "Paused"
+                        ? "Paused"
+                        : "Archived"
+                }
               >
                 {offering?.status === "Active" ? (
                   <CheckCircleIcon width={14} height={14} />
+                ) : offering?.status === "Paused" ? (
+                  <PauseIcon width={14} height={14} />
                 ) : (
                   <LockIcon width={14} height={14} />
                 )}
                 {offering?.status === "Active"
-                  ? "Available"
+                  ? isGrandfathered
+                    ? "Available · Update needed"
+                    : "Available"
                   : offering?.status === "Draft"
                     ? "Private draft"
-                    : (offering?.status ?? "Private draft")}
+                    : offering?.status === "Paused"
+                      ? "Paused"
+                      : (offering?.status ?? "Private draft")}
               </span>
             </div>
             <div className="flex flex-col lg:flex-row lg:items-end lg:justify-between gap-3">
@@ -1358,7 +1722,7 @@ function ServiceOfferingEditInner() {
                       Reactivate invented). Draft offerings
                       continue to render "Edit your service"
                       unchanged. */}
-                  {isActive ? "Service details" : "Edit your service"}
+                  {isActive ? "Service details" : isPaused ? "Service paused" : "Edit your service"}
                 </h1>
                 {/* Phase 2 #85 Manual QA Round 8 — small truthful
                     active-only message reinforcing that the page
@@ -1372,6 +1736,13 @@ function ServiceOfferingEditInner() {
                     data-testid="service-offering-edit-read-only-notice"
                   >
                     This service is live. Editing is not available in this version.
+                  </p>
+                ) : isPaused ? (
+                  <p
+                    className="text-xs text-muted mt-1 max-w-2xl"
+                    data-testid="service-offering-edit-paused-read-only-notice"
+                  >
+                    This service is paused. Use Reactivate service to resume visibility.
                   </p>
                 ) : null}
                 {/* Phase 2 #85 Manual QA Round 5 — post-activation
@@ -1390,6 +1761,14 @@ function ServiceOfferingEditInner() {
                   >
                     This service is live. Buyers can now discover it in talent search and send
                     ProjectRequests.
+                  </p>
+                ) : isPaused ? (
+                  <p
+                    className="text-base text-muted mt-2 max-w-2xl"
+                    data-testid="service-offering-edit-paused-description"
+                  >
+                    This service is paused. Buyers cannot see it in search or send project requests.
+                    Reactivate resumes eligibility after the full activation contract re-runs.
                   </p>
                 ) : (
                   <p className="text-base text-muted mt-2 max-w-2xl">
@@ -1556,7 +1935,11 @@ function ServiceOfferingEditInner() {
                       // readers announce it, and form-submission
                       // pipelines skip it. No event-handler-only
                       // stub.
-                      disabled={isActive}
+                      disabled={
+                        (isActive || isPaused) &&
+                        localEditMode !== "active-update" &&
+                        localEditMode !== "paused-repair"
+                      }
                       className="w-full bg-surface-container-lowest text-ink px-3 py-2 rounded-md border border-surface-variant focus:outline-none focus:border-aubergine text-base aria-[invalid=true]:border-coral disabled:opacity-60 disabled:cursor-not-allowed"
                       data-testid="service-offering-edit-input-title"
                     />
@@ -1589,7 +1972,11 @@ function ServiceOfferingEditInner() {
                       }
                       // Phase 2 #85 Manual QA Round 8 — final active
                       // read-only presentation.
-                      disabled={isActive}
+                      disabled={
+                        (isActive || isPaused) &&
+                        localEditMode !== "active-update" &&
+                        localEditMode !== "paused-repair"
+                      }
                       className="w-full bg-surface-container-lowest text-ink px-3 py-2 rounded-md border border-surface-variant focus:outline-none focus:border-aubergine text-base aria-[invalid=true]:border-coral disabled:opacity-60 disabled:cursor-not-allowed"
                       data-testid="service-offering-edit-input-description"
                     />
@@ -1607,7 +1994,11 @@ function ServiceOfferingEditInner() {
                       onChange={(e) => setPrimaryCategoryKey(e.target.value)}
                       // Phase 2 #85 Manual QA Round 8 — final active
                       // read-only presentation.
-                      disabled={isActive}
+                      disabled={
+                        (isActive || isPaused) &&
+                        localEditMode !== "active-update" &&
+                        localEditMode !== "paused-repair"
+                      }
                       className="w-full bg-surface-container-lowest text-ink px-3 py-2 rounded-md border border-surface-variant focus:outline-none focus:border-aubergine text-base min-h-[44px] disabled:opacity-60 disabled:cursor-not-allowed"
                       data-testid="service-offering-edit-input-category"
                     >
@@ -1658,7 +2049,11 @@ function ServiceOfferingEditInner() {
                               onChange={() => setServiceMode(m)}
                               // Phase 2 #85 Manual QA Round 8 — final active
                               // read-only presentation.
-                              disabled={isActive}
+                              disabled={
+                                (isActive || isPaused) &&
+                                localEditMode !== "active-update" &&
+                                localEditMode !== "paused-repair"
+                              }
                               className="accent-aubergine w-4 h-4 disabled:opacity-60 disabled:cursor-not-allowed"
                               data-testid={`service-offering-edit-mode-${m}`}
                             />
@@ -1696,7 +2091,11 @@ function ServiceOfferingEditInner() {
                         onChange={(e) => setServiceAreaCountry(e.target.value)}
                         // Phase 2 #85 Manual QA Round 8 — final active
                         // read-only presentation.
-                        disabled={isActive}
+                        disabled={
+                          (isActive || isPaused) &&
+                          localEditMode !== "active-update" &&
+                          localEditMode !== "paused-repair"
+                        }
                         className="w-full bg-surface-container-lowest text-ink px-3 py-2 rounded-md border border-surface-variant focus:outline-none focus:border-aubergine text-base min-h-[44px] disabled:opacity-60 disabled:cursor-not-allowed"
                         data-testid="service-offering-edit-input-service-area-country"
                       >
@@ -1753,7 +2152,11 @@ function ServiceOfferingEditInner() {
                             // pointer); disabling the underlying
                             // input makes the whole card
                             // non-interactive.
-                            disabled={isActive}
+                            disabled={
+                              (isActive || isPaused) &&
+                              localEditMode !== "active-update" &&
+                              localEditMode !== "paused-repair"
+                            }
                             className="sr-only"
                             data-testid={`service-offering-edit-pricing-${k}`}
                           />
@@ -1792,7 +2195,11 @@ function ServiceOfferingEditInner() {
                             onChange={(e) => setPricingAmount(e.target.value)}
                             // Phase 2 #85 Manual QA Round 8 — final active
                             // read-only presentation.
-                            disabled={isActive}
+                            disabled={
+                              (isActive || isPaused) &&
+                              localEditMode !== "active-update" &&
+                              localEditMode !== "paused-repair"
+                            }
                             className="w-full pl-7 pr-3 py-2 bg-surface-container-lowest text-ink rounded-md border border-surface-variant focus:outline-none focus:border-aubergine text-base font-semibold disabled:opacity-60 disabled:cursor-not-allowed"
                             data-testid="service-offering-edit-input-amount"
                           />
@@ -1811,7 +2218,11 @@ function ServiceOfferingEditInner() {
                           onChange={(e) => setPricingUnit(e.target.value)}
                           // Phase 2 #85 Manual QA Round 8 — final active
                           // read-only presentation.
-                          disabled={isActive}
+                          disabled={
+                            (isActive || isPaused) &&
+                            localEditMode !== "active-update" &&
+                            localEditMode !== "paused-repair"
+                          }
                           className="w-full bg-surface-container-lowest text-ink px-3 py-2 rounded-md border border-surface-variant focus:outline-none focus:border-aubergine text-base min-h-[44px] disabled:opacity-60 disabled:cursor-not-allowed"
                           data-testid="service-offering-edit-input-unit"
                         >
@@ -1904,7 +2315,7 @@ function ServiceOfferingEditInner() {
                             // final-sample remove) that is explicitly
                             // out of scope for #85. Existing private
                             // sample playback stays available.
-                            disabled={isActive || removeConfirmId === sample.sampleId}
+                            disabled={removeConfirmId === sample.sampleId}
                             className="text-coral hover:bg-coral/10 font-label-md text-xs font-bold uppercase tracking-wider px-2 py-1 rounded transition-colors min-h-[44px] disabled:opacity-50 disabled:cursor-not-allowed"
                             data-testid="service-offering-edit-sample-remove"
                           >
@@ -1972,7 +2383,7 @@ function ServiceOfferingEditInner() {
                       Post-activation audio-removal /
                       eligibility-transition behavior is
                       explicitly out of scope for #85. */}
-                  {!isActive && samples.length < 3 && (
+                  {samples.length < 3 && (
                     <form
                       className="space-y-3 p-4 border border-dashed border-borderWarm rounded-xl bg-surface"
                       onSubmit={(e) => {
@@ -2085,7 +2496,11 @@ function ServiceOfferingEditInner() {
                       placeholder="e.g. Dancehall, Soca, Hip-hop"
                       // Phase 2 #85 Manual QA Round 8 — final active
                       // read-only presentation.
-                      disabled={isActive}
+                      disabled={
+                        (isActive || isPaused) &&
+                        localEditMode !== "active-update" &&
+                        localEditMode !== "paused-repair"
+                      }
                       className="w-full bg-surface-container-lowest text-ink px-3 py-2 rounded-md border border-surface-variant focus:outline-none focus:border-aubergine text-base disabled:opacity-60 disabled:cursor-not-allowed"
                       data-testid="service-offering-edit-input-genre-tags"
                     />
@@ -2102,7 +2517,11 @@ function ServiceOfferingEditInner() {
                               onClick={() => setGenreTags(genreTags.filter((t) => t !== tag))}
                               // Phase 2 #85 Manual QA Round 8 — final active
                               // read-only presentation.
-                              disabled={isActive}
+                              disabled={
+                                (isActive || isPaused) &&
+                                localEditMode !== "active-update" &&
+                                localEditMode !== "paused-repair"
+                              }
                               className="hover:text-coral rounded focus:outline-none focus-visible:outline focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-aubergine disabled:opacity-50 disabled:cursor-not-allowed"
                               aria-label={`Remove genre tag ${tag}`}
                               data-testid={`service-offering-edit-remove-genre-${tag}`}
@@ -2140,16 +2559,51 @@ function ServiceOfferingEditInner() {
                       transient `showActivateSummary` only fires
                       during the same browser session). */}
                   {isActive ? (
-                    <Alert
-                      role="status"
-                      variant="recovery"
-                      title="Service activated"
-                      data-testid="service-offering-edit-active-banner"
-                    >
-                      {offering?.activatedAt
-                        ? `Activated at ${offering.activatedAt}.`
-                        : "This service is live and accepting ProjectRequests."}
-                    </Alert>
+                    <>
+                      <Alert
+                        role="status"
+                        variant="recovery"
+                        title="Service activated"
+                        data-testid="service-offering-edit-active-banner"
+                      >
+                        {offering?.activatedAt
+                          ? `Activated at ${offering.activatedAt}.`
+                          : "This service is live and accepting ProjectRequests."}
+                      </Alert>
+                      {/* M2 (#86, slice 86F): grandfathered nonconforming
+                          surface. Per the slice plan, an Active offering
+                          that does not meet the current activation contract
+                          remains Available (marketplace eligibility is
+                          preserved) AND surfaces an Update-needed banner
+                          listing the actionable reason categories. The
+                          runtime computes the closed set; the editor
+                          renders it verbatim. */}
+                      {isGrandfathered && readiness && !isPaused ? (
+                        <Alert
+                          role="status"
+                          variant="recovery"
+                          title="Update needed"
+                          data-testid="service-offering-edit-update-needed-banner"
+                          aria-live="polite"
+                        >
+                          <p className="mb-2">
+                            This service stays live for buyers, but the activation contract has
+                            changed. Repairing these items keeps the listing healthy.
+                          </p>
+                          <ul className="list-disc list-inside space-y-1">
+                            {readiness.reasonCategories.map((category) => (
+                              <li key={category}>
+                                <span
+                                  data-testid={`service-offering-edit-update-needed-reason-${category}`}
+                                >
+                                  {REASON_CATEGORY_COPY[category]}
+                                </span>
+                              </li>
+                            ))}
+                          </ul>
+                        </Alert>
+                      ) : null}
+                    </>
                   ) : (
                     <div
                       className={`flex items-center gap-3 p-3 rounded-lg ${
@@ -2308,7 +2762,7 @@ function ServiceOfferingEditInner() {
                     </p>
                   )}
                   <div className="flex flex-wrap items-center gap-2 justify-end">
-                    {offering?.status !== "Active" ? (
+                    {offering?.status === "Draft" || offering?.status == null ? (
                       <>
                         <button
                           type="button"
@@ -2333,6 +2787,70 @@ function ServiceOfferingEditInner() {
                           <ArrowForwardIcon width={18} height={18} aria-hidden="true" />
                         </button>
                       </>
+                    ) : offering?.status === "Paused" ? (
+                      <>
+                        {/* M2 (#86, slice 86F): Paused branch.
+                            The slice plan locks in a distinct Paused
+                            surface. The Reactivate entry opens the
+                            confirmation dialog; the dialog's confirm
+                            calls performReactivate, which submits the
+                            complete strict payload. */}
+                        <button
+                          type="button"
+                          onClick={() => setReactivateConfirmOpen(true)}
+                          disabled={reactivateState === "saving"}
+                          className="inline-flex items-center gap-2 justify-center min-h-[44px] py-3 px-6 text-base font-medium text-white bg-coral hover:opacity-90 rounded focus:outline-none focus-visible:outline focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-coral disabled:opacity-50"
+                          data-testid="service-offering-edit-reactivate"
+                        >
+                          {reactivateState === "saving" ? "Reactivating…" : "Reactivate service"}
+                          <ArrowForwardIcon width={18} height={18} aria-hidden="true" />
+                        </button>
+                        <Link
+                          href={"/seller/services"}
+                          className="inline-flex items-center justify-center min-h-[44px] py-3 px-4 text-sm font-medium text-aubergine hover:text-aubergine-hover border border-aubergine rounded focus:outline-none focus-visible:outline focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-aubergine"
+                          data-testid="service-offering-edit-back"
+                        >
+                          Back to Your services
+                        </Link>
+                      </>
+                    ) : offering?.status === "Active" ? (
+                      <>
+                        {/* M2 (#86, slice 86F): Pause service entry.
+                            Marketplace progression flow that takes
+                            the offering out of search while keeping
+                            sample-upload permission. */}
+                        <button
+                          type="button"
+                          onClick={() => setPauseConfirmOpen(true)}
+                          disabled={pauseState === "saving"}
+                          className="inline-flex items-center gap-2 justify-center min-h-[44px] py-3 px-6 text-base font-medium text-aubergine border border-aubergine hover:bg-aubergine/10 rounded focus:outline-none focus-visible:outline focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-aubergine disabled:opacity-50"
+                          data-testid="service-offering-edit-pause"
+                        >
+                          <PauseIcon width={18} height={18} aria-hidden="true" />
+                          {pauseState === "saving" ? "Pausing…" : "Pause service"}
+                        </button>
+                        {/* M2 (#86, slice 86F): Update service entry.
+                            Opens local-edit mode in this slice's
+                            follow-up commit; the button presence is
+                            the slice-plan contract. */}
+                        <button
+                          type="button"
+                          onClick={handleUpdateConfirm}
+                          disabled={updateState === "saving"}
+                          className="inline-flex items-center gap-2 justify-center min-h-[44px] py-3 px-6 text-base font-medium text-white bg-coral hover:opacity-90 rounded focus:outline-none focus-visible:outline focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-coral disabled:opacity-50"
+                          data-testid="service-offering-edit-update"
+                        >
+                          Update service
+                          <ArrowForwardIcon width={18} height={18} aria-hidden="true" />
+                        </button>
+                        <Link
+                          href={"/seller/services"}
+                          className="inline-flex items-center justify-center min-h-[44px] py-3 px-4 text-sm font-medium text-aubergine hover:text-aubergine-hover border border-aubergine rounded focus:outline-none focus-visible:outline focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-aubergine"
+                          data-testid="service-offering-edit-back"
+                        >
+                          Back to Your services
+                        </Link>
+                      </>
                     ) : (
                       <Link
                         href={"/seller/services"}
@@ -2347,6 +2865,121 @@ function ServiceOfferingEditInner() {
               </div>
             </div>
 
+            {pauseConfirmOpen && actingWorkspace && (
+              <ConfirmationDialog
+                title="Pause this service?"
+                description="Pausing removes this service from buyer search and ProjectRequests. You can upload audio samples while paused. Reactivate resumes eligibility after the full activation contract re-runs."
+                confirmLabel="Confirm pause"
+                pending={pauseState === "saving"}
+                onConfirm={() => {
+                  if (pauseState !== "saving") handlePause();
+                }}
+                onCancel={() => setPauseConfirmOpen(false)}
+                testIdPrefix="service-offering-edit-pause-confirm"
+                identityContext={`Workspace: ${actingWorkspace.name}`}
+              />
+            )}
+            {pauseErrorMessage && (
+              <Alert
+                role="alert"
+                variant="failure"
+                title="Couldn't pause this service"
+                data-testid="service-offering-edit-pause-error"
+              >
+                {pauseErrorMessage}
+              </Alert>
+            )}
+            {reactivateConfirmOpen && actingWorkspace && (
+              <ConfirmationDialog
+                title="Reactivate this service?"
+                description="Reactivating re-runs the complete activation contract (title, description, category, service area, pricing, samples, profile publication). The current draft fields must satisfy the same STRICT contract as Activate; missing fields surface as field errors."
+                confirmLabel="Confirm reactivate"
+                pending={reactivateState === "saving"}
+                onConfirm={() => {
+                  if (reactivateState !== "saving") handleReactivate();
+                }}
+                onCancel={() => setReactivateConfirmOpen(false)}
+                testIdPrefix="service-offering-edit-reactivate-confirm"
+                identityContext={`Workspace: ${actingWorkspace.name}`}
+              />
+            )}
+            {reactivateErrorMessage && (
+              <Alert
+                role="alert"
+                variant="failure"
+                title="Couldn't reactivate this service"
+                data-testid="service-offering-edit-reactivate-error"
+              >
+                {reactivateErrorMessage}
+              </Alert>
+            )}
+            {finalSampleConfirmId && actingWorkspace && (
+              <ConfirmationDialog
+                title="Remove your only sample?"
+                description="Removing your last Live sample atomically transitions this service to Paused. Paused services are not visible to buyers until you Reactivate (which re-runs the full activation contract)."
+                confirmLabel="Remove and pause"
+                destructive
+                onConfirm={handleFinalSampleConfirm}
+                onCancel={() => setFinalSampleConfirmId(null)}
+                testIdPrefix="service-offering-edit-final-sample-remove-confirm"
+                identityContext={`Workspace: ${actingWorkspace.name}`}
+              />
+            )}
+            {updateErrorMessage && (
+              <Alert
+                role="alert"
+                variant="failure"
+                title="Couldn't update this service"
+                data-testid="service-offering-edit-update-error"
+              >
+                {updateErrorMessage}
+              </Alert>
+            )}
+            {updatedBannerOpen && (
+              <Alert
+                role="status"
+                variant="recovery"
+                title="Service updated."
+                data-testid="service-offering-edit-update-success-alert"
+              >
+                Your changes are live. The prior public state is preserved in the activation
+                history.
+              </Alert>
+            )}
+            {(localEditMode === "active-update" || localEditMode === "paused-repair") && (
+              <div
+                className="mt-4 flex flex-wrap items-center gap-2 justify-end"
+                data-testid="service-offering-edit-update-action-row"
+              >
+                <button
+                  type="button"
+                  onClick={handleUpdateCancel}
+                  className="inline-flex items-center justify-center min-h-[44px] py-3 px-4 text-sm font-medium text-ink underline"
+                  data-testid="service-offering-edit-update-cancel-button"
+                >
+                  Cancel local edits
+                </button>
+                <button
+                  type="button"
+                  onClick={handleUpdateSubmit}
+                  disabled={
+                    localEditMode === "paused-repair"
+                      ? reactivateState === "saving"
+                      : updateState === "saving"
+                  }
+                  className="inline-flex items-center gap-2 justify-center min-h-[44px] py-3 px-6 text-base font-medium text-white bg-coral hover:opacity-90 rounded focus:outline-none focus-visible:outline focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-coral disabled:opacity-50"
+                  data-testid="service-offering-edit-update-submit"
+                >
+                  {localEditMode === "paused-repair"
+                    ? reactivateState === "saving"
+                      ? "Reactivating…"
+                      : "Submit reactivate"
+                    : updateState === "saving"
+                      ? "Saving…"
+                      : "Submit update"}
+                </button>
+              </div>
+            )}
             {activateConfirmOpen && (
               <Alert
                 role="alert"

@@ -225,6 +225,12 @@ describe("ServiceOffering lifecycle contracts", () => {
       samples: [],
       activatedAt: null,
       activatedByDisplayName: null,
+      readiness: {
+        isAvailable: false,
+        updateNeeded: false,
+        reasonCategories: [],
+        isGrandfatheredNonconforming: false,
+      },
     };
     const full = serviceOfferingPauseResponseV1Schema.parse({
       ok: true,
@@ -235,6 +241,7 @@ describe("ServiceOffering lifecycle contracts", () => {
     });
     assert.equal(full.offering.status, "Paused");
     assert.equal(full.evidence.reason, "user_initiated");
+    assert.equal(full.offering.readiness.isAvailable, false);
   });
 
   test("update response preserves the original activation timestamp on the OwnerView", () => {
@@ -263,6 +270,12 @@ describe("ServiceOffering lifecycle contracts", () => {
       samples: [],
       activatedAt: "2026-09-27T12:00:00.000Z",
       activatedByDisplayName: "creole@example.com",
+      readiness: {
+        isAvailable: true,
+        updateNeeded: false,
+        reasonCategories: [],
+        isGrandfatheredNonconforming: false,
+      },
     };
     const full = serviceOfferingUpdateResponseV1Schema.parse({
       ok: true,

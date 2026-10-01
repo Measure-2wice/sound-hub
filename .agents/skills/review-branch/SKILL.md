@@ -14,6 +14,28 @@ This is a read-only review.
 
 The goal is not to improve everything in the repository. The goal is to determine whether the current branch correctly satisfies the authority granted by its ticket.
 
+## Slice-aware issue reviews
+
+Before performing the issue-completeness review, check whether the repository contains:
+
+`docs/specs/issue-<ISSUE_NUMBER>-implementation-slices.md`
+
+If no slice-plan document exists, continue with the normal full-issue review.
+
+If a slice-plan document exists:
+
+1. Read the GitHub issue first. It remains the authoritative overall contract.
+2. Read the implementation-slice document fully.
+3. Identify its `CURRENT REVIEW TARGET`.
+4. Read `references/slice-aware-review.md`.
+5. Apply those slice-aware review rules before evaluating issue completeness.
+
+Do not report a future-slice requirement as missing merely because it is intentionally deferred.
+
+A current-slice implementation is still blocking if it contradicts the overall issue, violates a cross-slice invariant, prematurely exposes incomplete future behavior, or makes a later slice impossible or unsafe.
+
+The final full-branch review must evaluate the entire GitHub issue after all slices are complete.
+
 ## Non-negotiable rules
 
 - Do not modify, create, delete, rename, format, or rewrite tracked files.
