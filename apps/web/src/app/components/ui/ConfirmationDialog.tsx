@@ -71,9 +71,33 @@ export function ConfirmationDialog({
   const confirmRef = useRef<HTMLButtonElement | null>(null);
   const restoreFocusRef = useRef<HTMLElement | null>(null);
 
+  // M2 (#86, slice 86F Tenki PR feedback): callers pass inline
+  // arrow functions for `onCancel` (and `onConfirm`). Without
+  // stabilization, every parent re-render would re-run this
+  // effect — the cleanup re-calls `restoreFocusRef.current.focus()`
+  // while the dialog is still open, stealing focus from the
+  // user's current position. We stabilize via refs so the effect
+  // only runs once per mount (when the dialog opens) and once on
+  // unmount (when the dialog closes).
+  const onCancelRef = useRef<() => void>(() => {});
+  const onConfirmRef = useRef<() => void>(() => {});
+  useEffect(() => {
+    onCancelRef.current = onCancel;
+  }, [onCancel]);
+  useEffect(() => {
+    onConfirmRef.current = onConfirm;
+  }, [onConfirm]);
+
   // Focus entry + Escape-to-dismiss + body scroll lock + focus
-  // restoration. Run as a single effect so the lifecycle is
-  // consistent.
+  // containment. Runs once per mount; `pending` is read via a
+  // ref so a pending-state change does not tear down + re-arm the
+  // effect mid-commit (which would re-snapshot `restoreFocusRef`
+  // and call focus() on a now-stale element).
+  const pendingRef = useRef(pending);
+  useEffect(() => {
+    pendingRef.current = pending;
+  }, [pending]);
+
   useEffect(() => {
     restoreFocusRef.current =
       document.activeElement instanceof HTMLElement ? document.activeElement : null;
@@ -84,10 +108,11 @@ export function ConfirmationDialog({
     const handleKeyDown = (event: KeyboardEvent) => {
       // Escape dismisses when cancellation is allowed. Per the M2 UX
       // contract, Escape is NOT unconditional while a command is
-      // actively committing (the `pending` flag).
-      if (event.key === "Escape" && !pending) {
+      // actively committing (the `pending` flag, read via ref so
+      // the latest value is honored without re-binding).
+      if (event.key === "Escape" && !pendingRef.current) {
         event.preventDefault();
-        onCancel();
+        onCancelRef.current();
         return;
       }
       // Tab / Shift+Tab focus containment. The dialog body is the
@@ -125,9 +150,17 @@ export function ConfirmationDialog({
       window.clearTimeout(focusTimer);
       document.removeEventListener("keydown", handleKeyDown);
       document.body.style.overflow = "";
+      // M2 (#86, slice 86F Tenki PR feedback): only restore focus
+      // when the dialog actually unmounts. The cleanup runs once
+      // at unmount; the effect never re-binds during the dialog's
+      // lifetime (see the ref-based stabilization above).
       restoreFocusRef.current?.focus?.();
     };
-  }, [onCancel, pending]);
+    // The effect intentionally depends on the empty dependency
+    // array — it is the dialog's mount lifecycle. `onCancel` /
+    // `pending` reach the handler via refs so identity changes do
+    // not tear the effect down mid-dialog.
+  }, []);
 
   const buttonClass = useMemo(
     () =>
@@ -138,12 +171,12 @@ export function ConfirmationDialog({
   );
 
   const handleConfirm = useCallback(() => {
-    onConfirm();
-  }, [onConfirm]);
+    onConfirmRef.current();
+  }, []);
   const handleCancel = useCallback(() => {
-    if (pending) return;
-    onCancel();
-  }, [onCancel, pending]);
+    if (pendingRef.current) return;
+    onCancelRef.current();
+  }, []);
 
   return (
     <div

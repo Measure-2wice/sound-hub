@@ -908,3 +908,77 @@ void test("removeFinalSamplePendingCleanup: converges on retry after the sample 
     await prisma2.$disconnect();
   }
 });
+
+// M2 (#86, slice 86F Tenki PR feedback): the false-positive
+// concern "service filter ignores `cleanupStatus`" was raised
+// against audio-sample.service.ts's "last confirmed Live" check.
+// This invariant test pins down the actual source of the filter:
+// both `listSamplesForOffering` implementations (Prisma + in-memory)
+// filter on `cleanupStatus: "Live"` at the repository layer. The
+// service's `liveSamples.filter((s) => s.confirmation !== null)`
+// therefore receives only Live rows, so a PendingCleanup sample
+// (left behind by a prior non-final removal) cannot enter the
+// "last Live confirmed" count. This test creates one Live +
+// one PendingCleanup + one confirmed-but-still-Live sample and
+// asserts the list excludes the PendingCleanup entry.
+test("listSamplesForOffering returns only Live rows (cleanupStatus invariant for #86 service filter)", async () => {
+  const { offeringId, userId } = await seedOfferingWithContext();
+  // Live + confirmed sample.
+  const live = await repository.createSampleWithCap({
+    offeringId,
+    label: "Live sample",
+    contentType: "audio/mpeg",
+    byteSize: 1024,
+    storageRef: "det:test:prisma:invariant-live",
+    confirmation: {
+      version: "m2-audio-confirmation-v1",
+      confirmedByUserId: userId,
+      confirmedAt: new Date(),
+    },
+  });
+  // Live + confirmed sample (the "would-be-final" candidate).
+  const liveAlso = await repository.createSampleWithCap({
+    offeringId,
+    label: "Live sample 2",
+    contentType: "audio/mpeg",
+    byteSize: 1024,
+    storageRef: "det:test:prisma:invariant-live-2",
+    confirmation: {
+      version: "m2-audio-confirmation-v1",
+      confirmedByUserId: userId,
+      confirmedAt: new Date(),
+    },
+  });
+  // PendingCleanup sample (would otherwise count as Live).
+  const pending = await repository.createSampleWithCap({
+    offeringId,
+    label: "PendingCleanup sample",
+    contentType: "audio/mpeg",
+    byteSize: 1024,
+    storageRef: "det:test:prisma:invariant-pending",
+    confirmation: {
+      version: "m2-audio-confirmation-v1",
+      confirmedByUserId: userId,
+      confirmedAt: new Date(),
+    },
+  });
+  assert.ok(pending, "createSampleWithCap (PendingCleanup) must succeed");
+  await repository.markPendingCleanup({
+    offeringId,
+    sampleId: pending.sampleId,
+  });
+  // The repository must exclude the PendingCleanup row. This
+  // is the single invariant the slice 86F service filter chain
+  // depends on.
+  const list = await repository.listSamplesForOffering(offeringId);
+  const listedIds = new Set(list.map((s) => s.sampleId));
+  assert.ok(live, "createSampleWithCap (Live 1) must succeed");
+  assert.ok(liveAlso, "createSampleWithCap (Live 2) must succeed");
+  assert.ok(listedIds.has(live.sampleId), "Live sample missing from list");
+  assert.ok(listedIds.has(liveAlso.sampleId), "second Live sample missing from list");
+  assert.equal(
+    listedIds.has(pending.sampleId),
+    false,
+    "PendingCleanup sample MUST NOT appear in listSamplesForOffering — the slice 86F service filter relies on this invariant",
+  );
+});
