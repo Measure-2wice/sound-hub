@@ -1438,6 +1438,11 @@ function ServiceOfferingEditInner() {
     }
     setLocalEditMode("closed");
     setUpdateErrorMessage(null);
+    // M2 (#86, slice 86F PR feedback): also clear the Reactivate
+    // error banner so a stale failure from a prior paused-repair
+    // submit attempt does not survive Cancel local edits on the
+    // shared action row.
+    setReactivateErrorMessage(null);
     localEditModeEntrySnapshotRef.current = null;
   };
   const handleUpdateSubmit = () => {

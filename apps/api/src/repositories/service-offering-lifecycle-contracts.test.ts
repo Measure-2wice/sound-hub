@@ -28,6 +28,7 @@ import { describe, test } from "node:test";
 import {
   apiErrorCodeV1Schema,
   bg2AudioSampleRemoveRequestV1Schema,
+  bg2AudioSampleRemoveResponseV1Schema,
   serviceOfferingActivateRequestV1Schema,
   serviceOfferingPauseEvidenceV1Schema,
   serviceOfferingPauseRequestV1Schema,
@@ -151,18 +152,27 @@ describe("ServiceOffering lifecycle contracts", () => {
 
     // The remove response schema must NOT include the eligibility-loss
     // flag — it is transient and never crosses the public DTO boundary.
-    const requestKeys = Object.keys(
-      bg2AudioSampleRemoveRequestV1Schema.parse({
-        actingWorkspaceId: "ws-1",
+    // M2 (#86, slice 86F PR feedback): assert against the RESPONSE
+    // schema (not the request schema) so the test proves the
+    // boundary it claims to prove. A request-only field is
+    // trivially absent from any response that doesn't carry it.
+    const responseKeys = Object.keys(
+      bg2AudioSampleRemoveResponseV1Schema.parse({
+        ok: true,
+        sampleId: "of-1-seed",
+        offeringId: "of-1",
+        removedAt: "2026-09-27T13:00:00.000Z",
       }),
     );
     assert.equal(
-      requestKeys.includes("confirmEligibilityLoss"),
+      responseKeys.includes("confirmEligibilityLoss"),
       false,
-      "the remove request schema must not expose confirmEligibilityLoss as a " +
-        "persisted response field — it is request-only",
+      "the remove response schema must not expose confirmEligibilityLoss — it is request-only",
     );
-    assert.ok(requestKeys.includes("actingWorkspaceId"));
+    assert.ok(responseKeys.includes("sampleId"));
+    assert.ok(responseKeys.includes("offeringId"));
+    assert.ok(responseKeys.includes("removedAt"));
+    assert.ok(responseKeys.includes("ok"));
   });
 
   test("pause evidence excludes activation confirmation", () => {
