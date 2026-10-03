@@ -398,6 +398,7 @@ function DesktopSectionNav({
   currentLabel,
   sections,
   isActive,
+  isPaused,
 }: {
   readonly currentLabel: string;
   readonly sections: ReadonlyArray<{
@@ -407,6 +408,7 @@ function DesktopSectionNav({
     readonly status: "complete" | "inProgress" | "optional";
   }>;
   readonly isActive: boolean;
+  readonly isPaused: boolean;
 }) {
   return (
     <aside className="hidden lg:block lg:col-span-4" aria-label="Service sections">
@@ -461,14 +463,18 @@ function DesktopSectionNav({
         </nav>
         <div className="pt-3 border-t border-borderWarm">
           <p className="font-label-md uppercase tracking-wider text-muted text-xs">
-            {isActive ? "Activation" : "Activation readiness"}
+            {isActive ? "Activation" : isPaused ? "Reactivation readiness" : "Activation readiness"}
           </p>
           <p className="text-sm text-ink mt-1 font-semibold">
             {isActive
               ? "Available"
               : sections.find((s) => s.id === SECTION_IDS.activation)?.status === "complete"
-                ? "Ready to activate"
-                : "Pending — see Activation readiness"}
+                ? isPaused
+                  ? "Ready to reactivate"
+                  : "Ready to activate"
+                : isPaused
+                  ? "Pending — see Reactivation readiness"
+                  : "Pending — see Activation readiness"}
           </p>
         </div>
       </div>
@@ -601,6 +607,19 @@ function ServiceOfferingEditInner() {
   // changes.
   const [serviceAreaCountry, setServiceAreaCountry] = useState("");
   const [genreTags, setGenreTags] = useState<string[]>([]);
+  // M2 (#86, slice 86F) Manual QA Round 4 — controlled input
+  // buffer for the genre-tag editor. The previous implementation
+  // reconstructed `value` from `genreTags.join(", ")` on every
+  // keystroke, so typing a trailing comma produced an empty
+  // array element that was filtered out, then React rerendered
+  // the controlled input with the comma dropped — the user
+  // could never begin a second tag. The raw buffer lets the user
+  // type whatever they want; the normalized array (above) is
+  // rebuilt only when the user opts to commit a delimiter (or
+  // when hydration / Cancel restores the snapshot). The submission
+  // path (`buildActivatePayload`) keeps using the normalized
+  // array so the persisted contract is identical.
+  const [genreTagsInput, setGenreTagsInput] = useState<string>("");
   // Phase 2 #85 Manual QA Round 3 — save-status fidelity:
   // captures the form-state values at the last moment the API
   // confirmed them (resume, or a successful Save draft). Null
@@ -984,7 +1003,15 @@ function ServiceOfferingEditInner() {
             setPricingAmount(String(o.pricing.amountMinor / 100));
           }
           if (o.pricing?.unitId) setPricingUnit(o.pricing.unitId);
-          if (o.genreTags.length > 0) setGenreTags([...o.genreTags]);
+          if (o.genreTags.length > 0) {
+            setGenreTags([...o.genreTags]);
+            // Mirror the persisted array into the raw input buffer
+            // so the input renders the same comma-separated text the
+            // user originally saved.
+            setGenreTagsInput(o.genreTags.join(", "));
+          } else {
+            setGenreTagsInput("");
+          }
           // Phase 2 #85 Manual QA Round 3 — save-status fidelity:
           // capture the baseline from the freshly-fetched
           // ServiceOffering row so the resume path renders
@@ -1396,6 +1423,10 @@ function ServiceOfferingEditInner() {
     );
     setPricingUnit(o.pricing?.unitId ?? "");
     setGenreTags([...o.genreTags]);
+    // M2 (#86, slice 86F) Manual QA Round 4 — also restore the raw
+    // input buffer so the visible text matches what was persisted,
+    // not what the user typed-then-discarded.
+    setGenreTagsInput(o.genreTags.join(", "));
   };
 
   const handleUpdateCancel = () => {
@@ -1632,6 +1663,26 @@ function ServiceOfferingEditInner() {
     (pricingKind === "ContactForQuote" || (Number(pricingAmount) > 0 && pricingUnit.length > 0)) &&
     liveSampleCount >= 1 &&
     offering?.status === "Draft";
+
+  // M2 (#86, slice 86F) Manual QA Round 2: the Reactivate entry
+  // shares the strict reactivation contract with Activate (the
+  // server re-runs the full activation recheck on /reactivate).
+  // `canReactivate` mirrors `canActivate` minus the Draft gate:
+  // the readiness conditions are identical, only the lifecycle
+  // status filter flips. The Reactivate button uses this gate so
+  // the UI does not invite an action known to be incomplete.
+  // Server-side validation remains the source of truth — this is
+  // a presentation gate, not a security boundary.
+  const canReactivate =
+    offering?.status === "Paused" &&
+    serviceMode !== null &&
+    pricingKind !== null &&
+    title.trim().length > 0 &&
+    description.trim().length > 0 &&
+    primaryCategoryKey.length > 0 &&
+    (!serviceAreaRequired || serviceAreaCountry.length > 0) &&
+    (pricingKind === "ContactForQuote" || (Number(pricingAmount) > 0 && pricingUnit.length > 0)) &&
+    liveSampleCount >= 1;
 
   // Phase 2 visual reconciliation: derive each section's
   // readiness from the same data the Activation section consumes.
@@ -1893,6 +1944,7 @@ function ServiceOfferingEditInner() {
                 currentLabel={currentSectionId}
                 sections={sectionNav}
                 isActive={isActive}
+                isPaused={isPaused}
               />
               <div className="col-span-1 lg:col-span-8 space-y-6">
                 {summaryItems.length > 0 && (
@@ -2485,9 +2537,21 @@ function ServiceOfferingEditInner() {
                     </p>
                     <input
                       type="text"
-                      value={genreTags.join(", ")}
+                      // M2 (#86, slice 86F) Manual QA Round 4 —
+                      // controlled value comes from the raw input
+                      // state (NOT `genreTags.join(", ")`) so typing
+                      // a trailing comma does not collapse the
+                      // buffer back to "Dancehall" and prevent the
+                      // user from beginning a second entry.
+                      value={genreTagsInput}
                       onChange={(e) => {
-                        const next = e.target.value
+                        const raw = e.target.value;
+                        setGenreTagsInput(raw);
+                        // Normalize + cap at 16. The trailing comma
+                        // and any empty fragments are dropped
+                        // BEFORE persistence so the submission
+                        // payload never contains an empty string.
+                        const next = raw
                           .split(",")
                           .map((s) => s.trim())
                           .filter((s) => s.length > 0);
@@ -2514,7 +2578,16 @@ function ServiceOfferingEditInner() {
                             {tag}
                             <button
                               type="button"
-                              onClick={() => setGenreTags(genreTags.filter((t) => t !== tag))}
+                              onClick={() => {
+                                // M2 (#86, slice 86F) Manual QA Round 4
+                                // — keep the raw input buffer in sync
+                                // with the normalized array so the
+                                // visible text reflects the chip's
+                                // removal.
+                                const remaining = genreTags.filter((t) => t !== tag);
+                                setGenreTags(remaining);
+                                setGenreTagsInput(remaining.join(", "));
+                              }}
                               // Phase 2 #85 Manual QA Round 8 — final active
                               // read-only presentation.
                               disabled={
@@ -2607,33 +2680,45 @@ function ServiceOfferingEditInner() {
                   ) : (
                     <div
                       className={`flex items-center gap-3 p-3 rounded-lg ${
-                        canActivate
-                          ? "bg-seaGlass/10 border border-seaGlass/40"
-                          : "bg-surface-container-low border border-borderWarm"
+                        isPaused
+                          ? canReactivate
+                            ? "bg-seaGlass/10 border border-seaGlass/40"
+                            : "bg-surface-container-low border border-borderWarm"
+                          : canActivate
+                            ? "bg-seaGlass/10 border border-seaGlass/40"
+                            : "bg-surface-container-low border border-borderWarm"
                       }`}
                       data-testid="service-offering-edit-readiness-banner"
                     >
-                      {canActivate ? (
-                        <VerifiedIcon
-                          className={canActivate ? "text-seaGlass" : "text-muted"}
-                          width={24}
-                          height={24}
-                        />
+                      {isPaused ? (
+                        canReactivate ? (
+                          <VerifiedIcon className="text-seaGlass" width={24} height={24} />
+                        ) : (
+                          <RadioUncheckedIcon className="text-muted" width={24} height={24} />
+                        )
+                      ) : canActivate ? (
+                        <VerifiedIcon className="text-seaGlass" width={24} height={24} />
                       ) : (
-                        <RadioUncheckedIcon
-                          className={canActivate ? "text-seaGlass" : "text-muted"}
-                          width={24}
-                          height={24}
-                        />
+                        <RadioUncheckedIcon className="text-muted" width={24} height={24} />
                       )}
                       <div>
                         <p className="font-label-lg text-sm font-semibold text-ink">
-                          {canActivate ? "Ready to activate" : "Not yet ready to activate"}
+                          {isPaused
+                            ? canReactivate
+                              ? "Ready to reactivate"
+                              : "Not yet ready to reactivate"
+                            : canActivate
+                              ? "Ready to activate"
+                              : "Not yet ready to activate"}
                         </p>
                         <p className="text-xs text-muted">
-                          {canActivate
-                            ? "All required fields completed. Activation makes this service visible in search and ProjectRequests."
-                            : "Complete the pending items below. Save draft preserves progress without activating."}
+                          {isPaused
+                            ? canReactivate
+                              ? "All required fields completed. Reactivate service resumes eligibility after the full activation contract re-runs."
+                              : "Complete the pending items below. Reactivate runs the full activation contract and will fail until every required field is set."
+                            : canActivate
+                              ? "All required fields completed. Activation makes this service visible in search and ProjectRequests."
+                              : "Complete the pending items below. Save draft preserves progress without activating."}
                         </p>
                       </div>
                     </div>
@@ -2742,23 +2827,24 @@ function ServiceOfferingEditInner() {
                       service visible to buyers"), which is false
                       on an Active offering (and would imply
                       activation is still pending when the rail
-                      already says "Available"). The fix branches
-                      on `!isActive` so the Active branch renders
-                      truthful existing-terminology copy ("This
-                      service is live and accepting
-                      ProjectRequests") and the Draft branch keeps
-                      the Save / Activate helper. Pause /
-                      re-activation behavior is NOT invented —
-                      the Active branch simply restates the
-                      already-persisted lifecycle. */}
-                  {!isActive ? (
+                      already says "Available").
+                      Slice 86F Manual QA Round 2 — split the helper
+                      into three lifecycle branches so the
+                      actionable CTA term (Activate vs Reactivate)
+                      matches the persisted lifecycle state. */}
+                  {isActive ? (
                     <p className="text-sm text-muted">
-                      Save draft preserves progress; Activate service makes this service visible to
-                      buyers.
+                      This service is live and accepting ProjectRequests.
+                    </p>
+                  ) : isPaused ? (
+                    <p className="text-sm text-muted">
+                      Reactivate service runs the full activation contract and resumes buyer
+                      visibility when ready.
                     </p>
                   ) : (
                     <p className="text-sm text-muted">
-                      This service is live and accepting ProjectRequests.
+                      Save draft preserves progress; Activate service makes this service visible to
+                      buyers.
                     </p>
                   )}
                   <div className="flex flex-wrap items-center gap-2 justify-end">
@@ -2794,24 +2880,47 @@ function ServiceOfferingEditInner() {
                             surface. The Reactivate entry opens the
                             confirmation dialog; the dialog's confirm
                             calls performReactivate, which submits the
-                            complete strict payload. */}
-                        <button
-                          type="button"
-                          onClick={() => setReactivateConfirmOpen(true)}
-                          disabled={reactivateState === "saving"}
-                          className="inline-flex items-center gap-2 justify-center min-h-[44px] py-3 px-6 text-base font-medium text-white bg-coral hover:opacity-90 rounded focus:outline-none focus-visible:outline focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-coral disabled:opacity-50"
-                          data-testid="service-offering-edit-reactivate"
-                        >
-                          {reactivateState === "saving" ? "Reactivating…" : "Reactivate service"}
-                          <ArrowForwardIcon width={18} height={18} aria-hidden="true" />
-                        </button>
-                        <Link
-                          href={"/seller/services"}
-                          className="inline-flex items-center justify-center min-h-[44px] py-3 px-4 text-sm font-medium text-aubergine hover:text-aubergine-hover border border-aubergine rounded focus:outline-none focus-visible:outline focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-aubergine"
-                          data-testid="service-offering-edit-back"
-                        >
-                          Back to Your services
-                        </Link>
+                            complete strict payload. Manual QA Round 3:
+                            once the user has already entered paused-
+                            repair mode (the action row renders Cancel +
+                            Submit reactivate below), suppress the
+                            redundant entry CTA + Back link so the
+                            surface doesn't show two competing
+                            reactivation controls. */}
+                        {localEditMode !== "paused-repair" ? (
+                          <>
+                            <button
+                              type="button"
+                              onClick={() => setReactivateConfirmOpen(true)}
+                              // M2 (#86, slice 86F) Manual QA Round 2:
+                              // gate the Reactivate entry on
+                              // `canReactivate` so a Paused offering
+                              // missing required fields does not
+                              // invite an action the strict
+                              // reactivation contract will reject.
+                              // Server-side validation remains the
+                              // source of truth; this is a
+                              // presentation gate, not a security
+                              // boundary.
+                              disabled={reactivateState === "saving" || !canReactivate}
+                              aria-disabled={reactivateState === "saving" || !canReactivate}
+                              className="inline-flex items-center gap-2 justify-center min-h-[44px] py-3 px-6 text-base font-medium text-white bg-coral hover:opacity-90 rounded focus:outline-none focus-visible:outline focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-coral disabled:opacity-50 disabled:cursor-not-allowed"
+                              data-testid="service-offering-edit-reactivate"
+                            >
+                              {reactivateState === "saving"
+                                ? "Reactivating…"
+                                : "Reactivate service"}
+                              <ArrowForwardIcon width={18} height={18} aria-hidden="true" />
+                            </button>
+                            <Link
+                              href={"/seller/services"}
+                              className="inline-flex items-center justify-center min-h-[44px] py-3 px-4 text-sm font-medium text-aubergine hover:text-aubergine-hover border border-aubergine rounded focus:outline-none focus-visible:outline focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-aubergine"
+                              data-testid="service-offering-edit-back"
+                            >
+                              Back to Your services
+                            </Link>
+                          </>
+                        ) : null}
                       </>
                     ) : offering?.status === "Active" ? (
                       <>

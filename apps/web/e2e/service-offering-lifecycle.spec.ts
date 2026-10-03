@@ -234,6 +234,84 @@ test.describe("Service-offering editor — slice 86F lifecycle / integrated QA",
     await expect(page.getByTestId("service-offering-edit-input-title")).toHaveValue(originalTitle);
   });
 
+  test("Genre affinity tags — typing a second tag, persistence, and Cancel restoration (Manual QA Round 4)", async ({
+    page,
+  }) => {
+    const email = `${EMAIL_PREFIX}genre-tags-${Date.now()}@example.test`;
+    const seed = seedActiveOffering(email, sidecarFor(email));
+    await signInViaDevUrl(page, email);
+    await openActiveOffering(page, seed.offeringId);
+    const tagsInput = page.getByTestId("service-offering-edit-input-genre-tags");
+    // The seeded offering carries ["dancehall"]; the input buffer
+    // mirrors the array on hydration.
+    await expect(tagsInput).toHaveValue("dancehall");
+    // Enter Update mode (Active local-edit) and type a second tag.
+    await page.getByTestId("service-offering-edit-update").click();
+    await expect(page.getByTestId("service-offering-edit-update-submit")).toBeVisible();
+    // The regression: typing a comma must not collapse the input.
+    await tagsInput.click();
+    await tagsInput.press("End");
+    await tagsInput.type(", Reggae");
+    await expect(tagsInput).toHaveValue("dancehall, Reggae");
+    // The chip row shows both tags.
+    await expect(page.getByText("dancehall", { exact: true })).toBeVisible();
+    await expect(page.getByText("Reggae", { exact: true })).toBeVisible();
+    // A trailing comma does not persist an empty tag — the
+    // trailing comma in the buffer produces no chip.
+    await tagsInput.type(",");
+    await expect(page.getByText("dancehall", { exact: true })).toBeVisible();
+    await expect(page.getByText("Reggae", { exact: true })).toBeVisible();
+    // Cancel local edits restores both the buffer and the chip row
+    // to the persisted state.
+    await page.getByTestId("service-offering-edit-update-cancel-button").click();
+    await expect(tagsInput).toHaveValue("dancehall");
+    await expect(page.getByText("dancehall", { exact: true })).toBeVisible();
+    await expect(page.getByText("Reggae", { exact: true })).not.toBeVisible();
+  });
+
+  test("Genre affinity tags — add Reggae, remove Reggae, reload round-trip (Manual QA Round 4)", async ({
+    page,
+  }) => {
+    const email = `${EMAIL_PREFIX}genre-tags-roundtrip-${Date.now()}@example.test`;
+    const seed = seedActiveOffering(email, sidecarFor(email));
+    await signInViaDevUrl(page, email);
+    await openActiveOffering(page, seed.offeringId);
+    const tagsInput = page.getByTestId("service-offering-edit-input-genre-tags");
+    await page.getByTestId("service-offering-edit-update").click();
+    await page.getByTestId("service-offering-edit-input-genre-tags").click();
+    await tagsInput.press("End");
+    await tagsInput.type(", Reggae");
+    await expect(tagsInput).toHaveValue("dancehall, Reggae");
+    await page.getByTestId("service-offering-edit-update-submit").click();
+    await expect(page.getByTestId("service-offering-edit-update-success-alert")).toBeVisible({
+      timeout: 15_000,
+    });
+    // Reload — both tags persist + the chip row + the raw buffer
+    // rehydrate from the API response.
+    await page.reload();
+    const tagsInputAfterReload = page.getByTestId("service-offering-edit-input-genre-tags");
+    await expect(tagsInputAfterReload).toHaveValue("dancehall, Reggae");
+    await expect(page.getByText("dancehall", { exact: true })).toBeVisible();
+    await expect(page.getByText("Reggae", { exact: true })).toBeVisible();
+    // Remove Reggae via the chip's remove control. The raw buffer
+    // AND the chip row both reflect the removal.
+    await page.getByTestId("service-offering-edit-update").click();
+    await page.getByTestId("service-offering-edit-remove-genre-Reggae").click();
+    await expect(tagsInputAfterReload).toHaveValue("dancehall");
+    await expect(page.getByText("Reggae", { exact: true })).not.toBeVisible();
+    await page.getByTestId("service-offering-edit-update-submit").click();
+    await expect(page.getByTestId("service-offering-edit-update-success-alert")).toBeVisible({
+      timeout: 15_000,
+    });
+    // Reload — only Dancehall persists.
+    await page.reload();
+    await expect(page.getByTestId("service-offering-edit-input-genre-tags")).toHaveValue(
+      "dancehall",
+    );
+    await expect(page.getByText("dancehall", { exact: true })).toBeVisible();
+    await expect(page.getByText("Reggae", { exact: true })).not.toBeVisible();
+  });
+
   test("Reactivate from Paused enters paused-repair mode and returns the offering to Active", async ({
     page,
   }) => {
@@ -505,6 +583,98 @@ test.describe("Service-offering editor — slice 86F lifecycle / integrated QA",
     }
   });
 
+  test("Paused helper copy uses Reactivate terminology (Manual QA Round 2 regression)", async ({
+    page,
+  }) => {
+    // Seeded as Paused with the existing sample so the
+    // reactivation-readiness contract passes — the Reactivate
+    // button must be enabled AND the helper must mention
+    // "Reactivate service". The Draft and Active branches are
+    // pinned by the visual-reconciliation suite at
+    // apps/web/src/app/seller/services/[offeringId]/edit/page.visual-reconciliation.test.ts
+    // (existing pins preserved).
+    const email = `${EMAIL_PREFIX}paused-copy-ready-${Date.now()}@example.test`;
+    const seed = seedActiveOffering(email, sidecarFor(email), ["paused"]);
+    await signInViaDevUrl(page, email);
+    await openPausedOffering(page, seed.offeringId);
+    // The bottom helper copy on the Paused state mentions
+    // "Reactivate service" (NOT "Activate service") so the
+    // actionable CTA term matches the persisted lifecycle.
+    const helper = page.locator("text=Reactivate service runs the full activation contract");
+    await expect(helper).toBeVisible();
+    // The readiness banner uses Reactivate terminology too.
+    const banner = page.getByTestId("service-offering-edit-readiness-banner");
+    await expect(banner).toContainText("Ready to reactivate");
+    // Reactivate entry is enabled because the seed satisfies
+    // every readiness condition (Live sample + complete fields).
+    await expect(page.getByTestId("service-offering-edit-reactivate")).toBeEnabled();
+  });
+
+  test("Reactivate button is disabled when reactivation readiness is Pending (Manual QA Round 2)", async ({
+    page,
+  }) => {
+    // Seed a Paused offering WITHOUT a Live sample so the strict
+    // reactivation contract would fail (liveSampleCount < 1).
+    const email = `${EMAIL_PREFIX}paused-copy-unready-${Date.now()}@example.test`;
+    const seed = seedActiveOffering(email, sidecarFor(email), ["paused", "omit-sample"]);
+    await signInViaDevUrl(page, email);
+    await openPausedOffering(page, seed.offeringId);
+    // The readiness banner shows "Not yet ready to reactivate".
+    const banner = page.getByTestId("service-offering-edit-readiness-banner");
+    await expect(banner).toContainText("Not yet ready to reactivate");
+    // The Reactivate entry is DISABLED so the UI does not invite
+    // an action known to be incomplete.
+    const reactivate = page.getByTestId("service-offering-edit-reactivate");
+    await expect(reactivate).toBeDisabled();
+    // The dialog must not appear when the disabled button is
+    // force-clicked (the `disabled` HTML attribute short-circuits
+    // the click handler). The presentation gate stays a
+    // presentation gate; the server contract remains the source
+    // of truth.
+    await reactivate.click({ force: true }).catch(() => undefined);
+    await expect(page.getByTestId("service-offering-edit-reactivate-confirm")).not.toBeVisible();
+  });
+
+  test("Paused sidebar helper uses Reactivate terminology when readiness is complete (Manual QA Round 3)", async ({
+    page,
+  }) => {
+    const email = `${EMAIL_PREFIX}paused-sidebar-${Date.now()}@example.test`;
+    const seed = seedActiveOffering(email, sidecarFor(email), ["paused"]);
+    await signInViaDevUrl(page, email);
+    await openPausedOffering(page, seed.offeringId);
+    // The desktop sidebar helper reads "Reactivation readiness" +
+    // "Ready to reactivate" on Paused (Draft preserves "Activation
+    // readiness" + "Ready to activate").
+    const sidebar = page.locator("aside");
+    await expect(sidebar).toContainText("Reactivation readiness");
+    await expect(sidebar).toContainText("Ready to reactivate");
+    await expect(sidebar).not.toContainText("Ready to activate");
+  });
+
+  test("Paused suppresses redundant Reactivate CTA + Back link once paused-repair mode is entered (Manual QA Round 3)", async ({
+    page,
+  }) => {
+    const email = `${EMAIL_PREFIX}paused-repair-suppress-${Date.now()}@example.test`;
+    const seed = seedActiveOffering(email, sidecarFor(email), ["paused"]);
+    await signInViaDevUrl(page, email);
+    await openPausedOffering(page, seed.offeringId);
+    // Entry CTA + Back link are visible BEFORE the user enters
+    // paused-repair mode (the slice plan's normal Paused surface).
+    const reactivateButton = page.getByTestId("service-offering-edit-reactivate");
+    const backLink = page.getByTestId("service-offering-edit-back");
+    await expect(reactivateButton).toBeVisible();
+    await expect(backLink).toBeVisible();
+    // Enter paused-repair mode via the Reactivate confirmation
+    // dialog. The action row (Cancel local edits + Submit
+    // reactivate) appears; the entry CTA + Back link disappear so
+    // the surface doesn't show two competing reactivation controls.
+    await reactivateButton.click();
+    await page.getByTestId("service-offering-edit-reactivate-confirm-confirm").click();
+    await expect(page.getByTestId("service-offering-edit-update-submit")).toBeVisible();
+    await expect(reactivateButton).not.toBeVisible();
+    await expect(backLink).not.toBeVisible();
+  });
+
   test("Viewport reflow at 393px mobile", async ({ browser }) => {
     const email = `${EMAIL_PREFIX}viewport-${Date.now()}@example.test`;
     const seed = seedActiveOffering(email, sidecarFor(email));
@@ -545,6 +715,20 @@ test.describe("Service-offering editor — slice 86F lifecycle / integrated QA",
     await page.getByTestId("service-offering-edit-pause").click();
     const dialog = page.getByTestId("service-offering-edit-pause-confirm");
     await expect(dialog).toBeVisible();
+    // The dialog panel itself must be visually opaque so
+    // background content (audio player, playback error, upload
+    // controls) does not bleed through the surface — manual visual
+    // QA regression. The panel is the inner surface element; the
+    // outer backdrop is intentionally translucent (`bg-ink/40`).
+    // The regression pins the OBSERVABLE property (a non-
+    // transparent panel background color) without coupling to the
+    // specific Tailwind class.
+    const panelBackground = await dialog.evaluate((el) => {
+      const inner = el.querySelector("div");
+      return inner ? window.getComputedStyle(inner).backgroundColor : "";
+    });
+    expect(panelBackground).not.toBe("rgba(0, 0, 0, 0)");
+    expect(panelBackground).not.toBe("transparent");
     // Target the CONFIRM BUTTON (testid ends in `-confirm-confirm`)
     // for the focused-element check, not the dialog container.
     const confirmButton = page.getByTestId("service-offering-edit-pause-confirm-confirm");

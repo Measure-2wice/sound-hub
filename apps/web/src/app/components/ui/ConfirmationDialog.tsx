@@ -155,7 +155,7 @@ export function ConfirmationDialog({
       data-testid={testIdPrefix}
       className="fixed inset-0 z-50 flex items-center justify-center bg-ink/40 px-4 motion-safe:animate-[fade-in_120ms_ease-out]"
     >
-      <div className="w-full max-w-md rounded-lg border border-borderWarm bg-surface-container-lowest p-6 shadow-lg">
+      <div className="w-full max-w-md rounded-lg border border-borderWarm bg-canvas p-6 shadow-lg">
         <h2 id={titleId} className="font-serif text-lg text-ink mb-2" tabIndex={-1}>
           {title}
         </h2>
