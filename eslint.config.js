@@ -55,6 +55,8 @@ export default [
             "packages/db/prisma/snapshot-probe.ts",
             "packages/db/prisma/seed-recovery-user.ts",
             "packages/db/prisma/seed-recovery-user.test.ts",
+            "packages/db/prisma/inventory-grandfathered-offerings.ts",
+            "packages/db/prisma/inventory-grandfathered-offerings.test.ts",
           ],
         },
         tsconfigRootDir: import.meta.dirname,

@@ -13,7 +13,11 @@
     "db:migrate:deploy": "prisma migrate deploy",
     "db:reset:test": "echo \"db:reset:test has moved to scripts/db-test-reset.mjs; use 'pnpm db:test:reset' at the repo root.\" && exit 1",
     "db:studio": "prisma studio",
-    "db:seed": "tsx prisma/seed.ts"
+    "db:seed": "tsx prisma/seed.ts",
+    "db:inventory": "tsx prisma/inventory-grandfathered-offerings.ts",
+    "db:test:integration": "TEST_DATABASE_URL=postgresql://soundhub:password@localhost:5433/soundhub_m1_test pnpm -w db:test:reset && TEST_DATABASE_URL=postgresql://soundhub:password@localhost:5433/soundhub_m1_test pnpm -w db:test:seed && TEST_DATABASE_URL=postgresql://soundhub:password@localhost:5433/soundhub_m1_test node --import tsx --test prisma/inventory-grandfathered-offerings.test.ts",
+    "test": "node --import tsx --test src/grandfathering/service-offering-readiness.test.ts",
+    "test:integration": "pnpm db:test:integration"
   },
   "dependencies": {
     "@prisma/adapter-pg": "^7.9.1",

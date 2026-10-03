@@ -226,6 +226,11 @@ describe("AudioSampleService", () => {
       offeringId: OFFERING_ID,
       sampleId: uploaded.sample.sampleId,
       actingWorkspaceId: SELLER_WORKSPACE,
+      // M2 (#86, slice 86D): the offering has exactly one Live
+      // CONFIRMED sample, so removal is the final-sample-on-Active
+      // transition that requires explicit eligibility-loss
+      // confirmation.
+      confirmEligibilityLoss: true,
     });
     assert.equal(removed.sampleId, uploaded.sample.sampleId);
 
@@ -518,9 +523,29 @@ describe("AudioSampleService", () => {
       offeringId: OFFERING_ID,
       sampleId: uploaded.sample.sampleId,
       actingWorkspaceId: SELLER_WORKSPACE,
+      // M2 (#86, slice 86D): final-sample-on-Active eligibility
+      // loss confirmation.
+      confirmEligibilityLoss: true,
     });
-    const after = await service.listSamplesForBuyer(OFFERING_ID);
-    assert.equal(after.samples.length, 0);
+    // After final-sample removal the offering is Paused. The
+    // buyer-side list now rejects the offering as
+    // `AUDIO_OFFERING_INELIGIBLE` (it requires Active + Published +
+    // Active Workspace + Seller capability). The seller-side list
+    // still works on Paused offerings and returns an empty array
+    // (PendingCleanup + Live samples are filtered out by
+    // `listSamplesForOffering`).
+    await assert.rejects(
+      service.listSamplesForBuyer(OFFERING_ID),
+      (err: unknown) =>
+        err instanceof AudioSampleError &&
+        (err as { code: string }).code === "AUDIO_OFFERING_INELIGIBLE",
+    );
+    const sellerList = await service.listSamplesForSeller({
+      userAccountId: SELLER_USER,
+      offeringId: OFFERING_ID,
+      actingWorkspaceId: SELLER_WORKSPACE,
+    });
+    assert.equal(sellerList.samples.length, 0);
   });
 
   test("removal of an unknown sample returns AUDIO_SAMPLE_NOT_FOUND", async () => {
@@ -1373,6 +1398,9 @@ describe("AudioSampleService", () => {
           offeringId: OFFERING_ID,
           sampleId: uploaded.sample.sampleId,
           actingWorkspaceId: SELLER_WORKSPACE,
+          // M2 (#86, slice 86D): final-sample-on-Active requires
+          // explicit eligibility-loss confirmation.
+          confirmEligibilityLoss: true,
         }),
       (err: unknown) => err instanceof AudioSampleError && err.code === "AUDIO_STORAGE_FAILED",
     );
@@ -1380,10 +1408,29 @@ describe("AudioSampleService", () => {
     // The sample must be hidden from discovery immediately, AND a
     // PendingCleanup row must survive so the next operation can
     // drive the bounded retry.
-    const list = await service.listSamplesForBuyer(OFFERING_ID);
+    //
+    // M2 (#86, slice 86D Codex re-review): because this is the
+    // final-sample-on-Active path with `confirmEligibilityLoss: true`,
+    // the offering is now Paused. The buyer-side list rejects the
+    // offering as `AUDIO_OFFERING_INELIGIBLE` (it requires Active).
+    // The seller-side list still surfaces the PendingCleanup row
+    // is absent — `listSamplesForOffering` filters out non-Live
+    // rows so PendingCleanup samples are hidden from both surfaces.
+    await assert.rejects(
+      service.listSamplesForBuyer(OFFERING_ID),
+      (err: unknown) =>
+        err instanceof AudioSampleError &&
+        (err as { code: string }).code === "AUDIO_OFFERING_INELIGIBLE",
+    );
+    const sellerList = await service.listSamplesForSeller({
+      userAccountId: SELLER_USER,
+      offeringId: OFFERING_ID,
+      actingWorkspaceId: SELLER_WORKSPACE,
+    });
     assert.equal(
-      list.samples.find((s) => s.sampleId === uploaded.sample.sampleId),
+      sellerList.samples.find((s) => s.sampleId === uploaded.sample.sampleId),
       undefined,
+      "PendingCleanup sample is hidden from seller list (slice 86 §2 invariant)",
     );
     // Recreate the service to simulate a process restart; the
     // PendingCleanup row must survive and the next operation
@@ -1473,6 +1520,9 @@ describe("AudioSampleService", () => {
           offeringId: OFFERING_ID,
           sampleId: uploaded.sample.sampleId,
           actingWorkspaceId: SELLER_WORKSPACE,
+          // M2 (#86, slice 86D): final-sample-on-Active requires
+          // explicit eligibility-loss confirmation.
+          confirmEligibilityLoss: true,
         }),
       (err: unknown) => err instanceof AudioSampleError && err.code === "AUDIO_STORAGE_FAILED",
     );
@@ -1491,10 +1541,24 @@ describe("AudioSampleService", () => {
       actingWorkspaceId: SELLER_WORKSPACE,
     });
     assert.ok(attempt >= 2, "bounded retry attempted at least twice");
-    // After the retry, the PendingCleanup row is gone — buyer list
-    // is empty and a fresh service sees no further cleanup work.
-    const finalList = await service.listSamplesForBuyer(OFFERING_ID);
-    assert.equal(finalList.samples.length, 0);
+    // After the retry, the PendingCleanup row is gone and the
+    // offering remains Paused (final-sample-on-Active invariant).
+    // The buyer-side list now rejects the offering as
+    // AUDIO_OFFERING_INELIGIBLE (it requires Active); the seller
+    // list returns an empty array (the sample row is finalized and
+    // `listSamplesForOffering` filters out non-Live rows).
+    await assert.rejects(
+      service.listSamplesForBuyer(OFFERING_ID),
+      (err: unknown) =>
+        err instanceof AudioSampleError &&
+        (err as { code: string }).code === "AUDIO_OFFERING_INELIGIBLE",
+    );
+    const finalSellerList = await service.listSamplesForSeller({
+      userAccountId: SELLER_USER,
+      offeringId: OFFERING_ID,
+      actingWorkspaceId: SELLER_WORKSPACE,
+    });
+    assert.equal(finalSellerList.samples.length, 0);
   });
 
   test("P0-001 + P1-001: playback URL never exposes bucket, path, or storage ref", async () => {
@@ -1550,6 +1614,9 @@ describe("AudioSampleService", () => {
       offeringId: OFFERING_ID,
       sampleId: uploaded.sample.sampleId,
       actingWorkspaceId: SELLER_WORKSPACE,
+      // M2 (#86, slice 86D): final-sample-on-Active requires
+      // explicit eligibility-loss confirmation.
+      confirmEligibilityLoss: true,
     });
     const after = await service.getBytesForPlayback({
       offeringId: OFFERING_ID,
@@ -1589,5 +1656,592 @@ describe("AudioSampleService", () => {
       "legacy sample carries no `confirmation` field in the public DTO",
     );
     assert.ok(sample.playbackUrl, "legacy sample still has a playable URL");
+  });
+
+  // ===========================================================================
+  // M2 (#86, slice 86D): final-sample-on-Active service tests
+  // ===========================================================================
+  void describe("slice 86D final-sample-on-Active", () => {
+    test("removeSample on the LAST CONFIRMED Live sample without confirmEligibilityLoss rejects with AUDIO_SAMPLE_FINAL_REMOVAL_CONFIRMATION_REQUIRED", async () => {
+      const storage = new DeterministicStorageAdapter();
+      const repo = makeAudioRepo();
+      const service = buildService(repo, storage);
+      const uploaded = await service.uploadSample({
+        userAccountId: SELLER_USER,
+        offeringId: OFFERING_ID,
+        actingWorkspaceId: SELLER_WORKSPACE,
+        label: "Final sample",
+        contentType: "audio/mpeg",
+        byteSize: 1024,
+        bytes: mp3Bytes(1024),
+        mediaUseConfirmation: {
+          version: "m2-audio-confirmation-v1",
+          confirmedAt: new Date(),
+        },
+      });
+      // No `confirmEligibilityLoss` flag — must reject.
+      await assert.rejects(
+        service.removeSample({
+          userAccountId: SELLER_USER,
+          offeringId: OFFERING_ID,
+          sampleId: uploaded.sample.sampleId,
+          actingWorkspaceId: SELLER_WORKSPACE,
+        }),
+        (err: unknown) => {
+          assert.ok(err instanceof AudioSampleError);
+          assert.equal(
+            (err as { code: string }).code,
+            "AUDIO_SAMPLE_FINAL_REMOVAL_CONFIRMATION_REQUIRED",
+          );
+          return true;
+        },
+      );
+      // The rejection did not mutate state — the sample is still
+      // listed on the buyer-side list (the public DTO does not
+      // carry `cleanupStatus`, but the Live row remains because
+      // markPendingCleanup was never called).
+      const after = await service.listSamplesForBuyer(OFFERING_ID);
+      assert.equal(after.samples.length, 1);
+    });
+
+    test("removeSample on the LAST CONFIRMED Live sample WITH confirmEligibilityLoss transitions the offering to Paused and removes the sample", async () => {
+      const storage = new DeterministicStorageAdapter();
+      const repo = makeAudioRepo();
+      const service = buildService(repo, storage);
+      const uploaded = await service.uploadSample({
+        userAccountId: SELLER_USER,
+        offeringId: OFFERING_ID,
+        actingWorkspaceId: SELLER_WORKSPACE,
+        label: "Final sample with confirmation",
+        contentType: "audio/mpeg",
+        byteSize: 1024,
+        bytes: mp3Bytes(1024),
+        mediaUseConfirmation: {
+          version: "m2-audio-confirmation-v1",
+          confirmedAt: new Date(),
+        },
+      });
+      await service.removeSample({
+        userAccountId: SELLER_USER,
+        offeringId: OFFERING_ID,
+        sampleId: uploaded.sample.sampleId,
+        actingWorkspaceId: SELLER_WORKSPACE,
+        confirmEligibilityLoss: true,
+      });
+      // The offering transitioned to Paused — observable via
+      // `getOfferingContext` (M2 #86 slice 86D Codex re-review
+      // mirror fix). The buyer-side list now rejects the offering
+      // as `AUDIO_OFFERING_INELIGIBLE` because the offering is no
+      // longer Active.
+      const contextAfter = await repo.getOfferingContext(OFFERING_ID);
+      assert.equal(contextAfter?.offeringStatus, "Paused");
+      await assert.rejects(
+        service.listSamplesForBuyer(OFFERING_ID),
+        (err: unknown) =>
+          err instanceof AudioSampleError &&
+          (err as { code: string }).code === "AUDIO_OFFERING_INELIGIBLE",
+      );
+    });
+
+    test("removeSample on a non-final Live sample (offering has 2 samples) does NOT require confirmEligibilityLoss", async () => {
+      const storage = new DeterministicStorageAdapter();
+      const repo = makeAudioRepo();
+      const service = buildService(repo, storage);
+      const a = await service.uploadSample({
+        userAccountId: SELLER_USER,
+        offeringId: OFFERING_ID,
+        actingWorkspaceId: SELLER_WORKSPACE,
+        label: "Sample A",
+        contentType: "audio/mpeg",
+        byteSize: 1024,
+        bytes: mp3Bytes(1024),
+        mediaUseConfirmation: {
+          version: "m2-audio-confirmation-v1",
+          confirmedAt: new Date(),
+        },
+      });
+      const b = await service.uploadSample({
+        userAccountId: SELLER_USER,
+        offeringId: OFFERING_ID,
+        actingWorkspaceId: SELLER_WORKSPACE,
+        label: "Sample B",
+        contentType: "audio/mpeg",
+        byteSize: 1024,
+        bytes: mp3Bytes(1024),
+        mediaUseConfirmation: {
+          version: "m2-audio-confirmation-v1",
+          confirmedAt: new Date(),
+        },
+      });
+      // Removing `a` while `b` is still Live is the non-final-sample
+      // path — no flag required, the offering stays Active.
+      await service.removeSample({
+        userAccountId: SELLER_USER,
+        offeringId: OFFERING_ID,
+        sampleId: a.sample.sampleId,
+        actingWorkspaceId: SELLER_WORKSPACE,
+      });
+      const after = await service.listSamplesForBuyer(OFFERING_ID);
+      assert.equal(after.samples.length, 1);
+      assert.equal(after.samples[0]?.sampleId, b.sample.sampleId);
+    });
+
+    test("removeSample on the LAST CONFIRMED Live sample from a Draft offering does NOT require confirmEligibilityLoss", async () => {
+      // A Draft offering cannot be Paused by a final-sample
+      // transition (Draft is not Active). The non-final removal
+      // path runs instead.
+      const storage = new DeterministicStorageAdapter();
+      const repo = new InMemoryAudioRepository({
+        offerings: [
+          {
+            offeringId: DRAFT_OFFERING_ID,
+            offeringStatus: "Draft",
+            sellerProfileStatus: "Published",
+            sellerWorkspaceId: SELLER_WORKSPACE,
+            sellerWorkspaceStatus: "Active",
+            hasSellerCapability: true,
+            title: "Draft offering",
+          },
+        ],
+      });
+      const service = buildService(repo, storage);
+      const uploaded = await service.uploadSample({
+        userAccountId: SELLER_USER,
+        offeringId: DRAFT_OFFERING_ID,
+        actingWorkspaceId: SELLER_WORKSPACE,
+        label: "Final sample on Draft",
+        contentType: "audio/mpeg",
+        byteSize: 1024,
+        bytes: mp3Bytes(1024),
+        mediaUseConfirmation: {
+          version: "m2-audio-confirmation-v1",
+          confirmedAt: new Date(),
+        },
+      });
+      // No `confirmEligibilityLoss` — but the offering is Draft so
+      // the final-sample precondition does NOT apply. Removal
+      // succeeds via the non-final path.
+      const result = await service.removeSample({
+        userAccountId: SELLER_USER,
+        offeringId: DRAFT_OFFERING_ID,
+        sampleId: uploaded.sample.sampleId,
+        actingWorkspaceId: SELLER_WORKSPACE,
+      });
+      assert.equal(result.sampleId, uploaded.sample.sampleId);
+    });
+
+    // M2 (#86, slice 86D Codex re-review): a transport retry after
+    // the bounded retry has finalized the sample row converges on
+    // the durable final_sample_removal Pause evidence rather than
+    // throwing AUDIO_SAMPLE_NOT_FOUND. The first removal commits the
+    // transition; the second removal simulates a lost success
+    // response that the client retries — the service must
+    // converge and return the same outcome.
+    test("removeSample converges on retry after the sample row has been finalized (durable Pause evidence)", async () => {
+      const storage = new DeterministicStorageAdapter();
+      const repo = makeAudioRepo();
+      const service = buildService(repo, storage);
+      const uploaded = await service.uploadSample({
+        userAccountId: SELLER_USER,
+        offeringId: OFFERING_ID,
+        actingWorkspaceId: SELLER_WORKSPACE,
+        label: "Final sample retry",
+        contentType: "audio/mpeg",
+        byteSize: 1024,
+        bytes: mp3Bytes(1024),
+        mediaUseConfirmation: {
+          version: "m2-audio-confirmation-v1",
+          confirmedAt: new Date(),
+        },
+      });
+      const first = await service.removeSample({
+        userAccountId: SELLER_USER,
+        offeringId: OFFERING_ID,
+        sampleId: uploaded.sample.sampleId,
+        actingWorkspaceId: SELLER_WORKSPACE,
+        confirmEligibilityLoss: true,
+      });
+      assert.equal(first.sampleId, uploaded.sample.sampleId);
+      // Retry (simulating a lost success response). The service
+      // MUST converge and return the same outcome — NOT throw
+      // AUDIO_SAMPLE_NOT_FOUND.
+      const second = await service.removeSample({
+        userAccountId: SELLER_USER,
+        offeringId: OFFERING_ID,
+        sampleId: uploaded.sample.sampleId,
+        actingWorkspaceId: SELLER_WORKSPACE,
+        confirmEligibilityLoss: true,
+      });
+      assert.equal(second.sampleId, uploaded.sample.sampleId);
+      // The offering is Paused — buyer list rejects, seller list
+      // is empty.
+      await assert.rejects(
+        service.listSamplesForBuyer(OFFERING_ID),
+        (err: unknown) =>
+          err instanceof AudioSampleError &&
+          (err as { code: string }).code === "AUDIO_OFFERING_INELIGIBLE",
+      );
+    });
+
+    // M2 (#86, slice 86D Codex re-review): provider failure during
+    // final-sample removal must leave the offering Paused + the
+    // sample PendingCleanup + the buyer list buyer-ineligible. The
+    // bounded retry on the next operation can drive the storage
+    // delete to completion; marketplace eligibility is NEVER
+    // restored by a cleanup failure (slice 86D invariant).
+    test("removeSample provider failure on final-sample removal leaves offering Paused + sample PendingCleanup + buyer-ineligible", async () => {
+      const flakyStorage = {
+        uploadSample: (
+          input: Parameters<typeof DeterministicStorageAdapter.prototype.uploadSample>[0],
+        ): ReturnType<typeof DeterministicStorageAdapter.prototype.uploadSample> => {
+          const inner = new DeterministicStorageAdapter();
+          return inner.uploadSample(input);
+        },
+        getPlaybackReference: (
+          input: Parameters<typeof DeterministicStorageAdapter.prototype.getPlaybackReference>[0],
+        ): ReturnType<typeof DeterministicStorageAdapter.prototype.getPlaybackReference> => {
+          const inner = new DeterministicStorageAdapter();
+          return inner.getPlaybackReference(input);
+        },
+        getPlaybackBytes: (
+          ref: string,
+        ): ReturnType<typeof DeterministicStorageAdapter.prototype.getPlaybackBytes> => {
+          const inner = new DeterministicStorageAdapter();
+          return inner.getPlaybackBytes(ref);
+        },
+        removeSample: (
+          ref: string,
+        ): ReturnType<typeof DeterministicStorageAdapter.prototype.removeSample> => {
+          void ref;
+          throw new StorageUnavailableError("provider unavailable");
+        },
+      };
+      const repo = makeAudioRepo();
+      const service = new AudioSampleService({
+        repository: repo,
+        // eslint-disable-next-line @typescript-eslint/no-unnecessary-type-assertion
+        storage: flakyStorage as never,
+        workspaceAuthorization: new WorkspaceAuthorizationService({
+          authRepository: makeAuthRepo(),
+        }),
+      });
+      const uploaded = await service.uploadSample({
+        userAccountId: SELLER_USER,
+        offeringId: OFFERING_ID,
+        actingWorkspaceId: SELLER_WORKSPACE,
+        label: "Final sample provider failure",
+        contentType: "audio/mpeg",
+        byteSize: 1024,
+        bytes: mp3Bytes(1024),
+        mediaUseConfirmation: {
+          version: "m2-audio-confirmation-v1",
+          confirmedAt: new Date(),
+        },
+      });
+      // Storage unavailable → AUDIO_STORAGE_FAILED, but the
+      // offering is now Paused and the sample is PendingCleanup.
+      await assert.rejects(
+        service.removeSample({
+          userAccountId: SELLER_USER,
+          offeringId: OFFERING_ID,
+          sampleId: uploaded.sample.sampleId,
+          actingWorkspaceId: SELLER_WORKSPACE,
+          confirmEligibilityLoss: true,
+        }),
+        (err: unknown) =>
+          err instanceof AudioSampleError &&
+          (err as { code: string }).code === "AUDIO_STORAGE_FAILED",
+      );
+      // The offering transitioned to Paused (verified via the
+      // context mirror).
+      const contextAfter = await repo.getOfferingContext(OFFERING_ID);
+      assert.equal(contextAfter?.offeringStatus, "Paused");
+      // The sample is still PendingCleanup — visible to the bounded
+      // retry but hidden from discovery.
+      const sellerList = await service.listSamplesForSeller({
+        userAccountId: SELLER_USER,
+        offeringId: OFFERING_ID,
+        actingWorkspaceId: SELLER_WORKSPACE,
+      });
+      assert.equal(
+        sellerList.samples.length,
+        0,
+        "PendingCleanup sample is hidden from seller list",
+      );
+      // The buyer list rejects the offering as AUDIO_OFFERING_INELIGIBLE
+      // (it requires Active). The marketplace eligibility is NEVER
+      // restored by a cleanup failure.
+      await assert.rejects(
+        service.listSamplesForBuyer(OFFERING_ID),
+        (err: unknown) =>
+          err instanceof AudioSampleError &&
+          (err as { code: string }).code === "AUDIO_OFFERING_INELIGIBLE",
+      );
+    });
+
+    // M2 (#86, slice 86D Codex re-review): a replacement upload
+    // after the final-sample removal remains buyer-ineligible (the
+    // offering is Paused). The seller-side upload is allowed
+    // (carrying the slice 86D invariant "A replacement sample
+    // uploaded while Paused never auto-reactivates the offering").
+    test("replacement upload after final-sample removal remains non-buyer-eligible (no auto-reactivation)", async () => {
+      const storage = new DeterministicStorageAdapter();
+      const repo = makeAudioRepo();
+      const service = buildService(repo, storage);
+      const first = await service.uploadSample({
+        userAccountId: SELLER_USER,
+        offeringId: OFFERING_ID,
+        actingWorkspaceId: SELLER_WORKSPACE,
+        label: "First sample",
+        contentType: "audio/mpeg",
+        byteSize: 1024,
+        bytes: mp3Bytes(1024),
+        mediaUseConfirmation: {
+          version: "m2-audio-confirmation-v1",
+          confirmedAt: new Date(),
+        },
+      });
+      // Final-sample removal — offering transitions to Paused.
+      await service.removeSample({
+        userAccountId: SELLER_USER,
+        offeringId: OFFERING_ID,
+        sampleId: first.sample.sampleId,
+        actingWorkspaceId: SELLER_WORKSPACE,
+        confirmEligibilityLoss: true,
+      });
+      // Replacement upload while Paused — the seller-side upload
+      // path is allowed (the sample is persisted) but the buyer
+      // list remains ineligible because the offering is Paused.
+      const replacement = await service.uploadSample({
+        userAccountId: SELLER_USER,
+        offeringId: OFFERING_ID,
+        actingWorkspaceId: SELLER_WORKSPACE,
+        label: "Replacement sample",
+        contentType: "audio/mpeg",
+        byteSize: 1024,
+        bytes: mp3Bytes(1024),
+        mediaUseConfirmation: {
+          version: "m2-audio-confirmation-v1",
+          confirmedAt: new Date(),
+        },
+      });
+      // The seller-side list surfaces the replacement sample (the
+      // seller can manage samples on Paused offerings).
+      const sellerList = await service.listSamplesForSeller({
+        userAccountId: SELLER_USER,
+        offeringId: OFFERING_ID,
+        actingWorkspaceId: SELLER_WORKSPACE,
+      });
+      assert.equal(sellerList.samples.length, 1, "seller can see replacement on Paused offering");
+      assert.equal(sellerList.samples[0]?.sampleId, replacement.sample.sampleId);
+      // The buyer list STILL rejects the offering — the replacement
+      // sample is NOT auto-reactivated to buyer-visible.
+      await assert.rejects(
+        service.listSamplesForBuyer(OFFERING_ID),
+        (err: unknown) =>
+          err instanceof AudioSampleError &&
+          (err as { code: string }).code === "AUDIO_OFFERING_INELIGIBLE",
+      );
+    });
+
+    // M2 (#86, slice 86D Codex re-review): fail-then-recover same-
+    // command. The first attempt fails on the provider delete; the
+    // Pause evidence row is already committed (the repository
+    // transaction ran before the provider call). Without the
+    // sample-status check, a retry would silently return success
+    // while the storage object + PendingCleanup row remained
+    // indefinitely. With the fix, the retry drives the bounded
+    // provider-delete retry + finalize on the same command, then
+    // returns converged success.
+    test("removeSample same-command retry after provider failure drives the bounded provider retry + finalize (durable Pause evidence + PendingCleanup)", async () => {
+      let attempt = 0;
+      const recoveredStorage = {
+        uploadSample: (
+          input: Parameters<typeof DeterministicStorageAdapter.prototype.uploadSample>[0],
+        ): ReturnType<typeof DeterministicStorageAdapter.prototype.uploadSample> => {
+          const inner = new DeterministicStorageAdapter();
+          return inner.uploadSample(input);
+        },
+        getPlaybackReference: (
+          input: Parameters<typeof DeterministicStorageAdapter.prototype.getPlaybackReference>[0],
+        ): ReturnType<typeof DeterministicStorageAdapter.prototype.getPlaybackReference> => {
+          const inner = new DeterministicStorageAdapter();
+          return inner.getPlaybackReference(input);
+        },
+        getPlaybackBytes: (
+          ref: string,
+        ): ReturnType<typeof DeterministicStorageAdapter.prototype.getPlaybackBytes> => {
+          const inner = new DeterministicStorageAdapter();
+          return inner.getPlaybackBytes(ref);
+        },
+        removeSample: (
+          ref: string,
+        ): ReturnType<typeof DeterministicStorageAdapter.prototype.removeSample> => {
+          void ref;
+          attempt += 1;
+          if (attempt === 1) {
+            throw new StorageUnavailableError("provider down");
+          }
+          const inner = new DeterministicStorageAdapter();
+          return inner.removeSample(ref);
+        },
+      };
+      const repo = makeAudioRepo();
+      const service = new AudioSampleService({
+        repository: repo,
+        // eslint-disable-next-line @typescript-eslint/no-unnecessary-type-assertion
+        storage: recoveredStorage as never,
+        workspaceAuthorization: new WorkspaceAuthorizationService({
+          authRepository: makeAuthRepo(),
+        }),
+      });
+      const uploaded = await service.uploadSample({
+        userAccountId: SELLER_USER,
+        offeringId: OFFERING_ID,
+        actingWorkspaceId: SELLER_WORKSPACE,
+        label: "Fail then recover",
+        contentType: "audio/mpeg",
+        byteSize: 1024,
+        bytes: mp3Bytes(1024),
+        mediaUseConfirmation: {
+          version: "m2-audio-confirmation-v1",
+          confirmedAt: new Date(),
+        },
+      });
+      // First attempt: provider fails → AUDIO_STORAGE_FAILED.
+      // The offering is now Paused, the sample is PendingCleanup.
+      await assert.rejects(
+        service.removeSample({
+          userAccountId: SELLER_USER,
+          offeringId: OFFERING_ID,
+          sampleId: uploaded.sample.sampleId,
+          actingWorkspaceId: SELLER_WORKSPACE,
+          confirmEligibilityLoss: true,
+        }),
+        (err: unknown) =>
+          err instanceof AudioSampleError &&
+          (err as { code: string }).code === "AUDIO_STORAGE_FAILED",
+      );
+      assert.equal(attempt, 1, "first attempt invoked storage.removeSample once (returned 503)");
+      // Same-command retry after provider recovery: the service
+      // MUST invoke storage.removeSample AGAIN (attempt=2) and
+      // finalize the PendingCleanup row. The retry MUST converge
+      // on success and report the bounded retry completed.
+      const retry = await service.removeSample({
+        userAccountId: SELLER_USER,
+        offeringId: OFFERING_ID,
+        sampleId: uploaded.sample.sampleId,
+        actingWorkspaceId: SELLER_WORKSPACE,
+        confirmEligibilityLoss: true,
+      });
+      assert.equal(retry.sampleId, uploaded.sample.sampleId);
+      assert.equal(attempt, 2, "retry must drive a SECOND storage.removeSample call");
+      // The sample row is finalized (deleted) after the bounded
+      // retry path completed.
+      const finalList = await service.listSamplesForSeller({
+        userAccountId: SELLER_USER,
+        offeringId: OFFERING_ID,
+        actingWorkspaceId: SELLER_WORKSPACE,
+      });
+      assert.equal(
+        finalList.samples.length,
+        0,
+        "PendingCleanup row must be finalized after the retry's provider delete succeeded",
+      );
+    });
+
+    // M2 (#86, slice 86D Codex re-review): when the provider is
+    // STILL unavailable on the same-command retry, the retry MUST
+    // continue to surface AUDIO_STORAGE_FAILED (the bounded retry
+    // path's fail-closed invariant).
+    test("removeSample same-command retry with provider still unavailable continues to surface AUDIO_STORAGE_FAILED (fail-closed retry)", async () => {
+      const stillFlakyStorage = {
+        uploadSample: (
+          input: Parameters<typeof DeterministicStorageAdapter.prototype.uploadSample>[0],
+        ): ReturnType<typeof DeterministicStorageAdapter.prototype.uploadSample> => {
+          const inner = new DeterministicStorageAdapter();
+          return inner.uploadSample(input);
+        },
+        getPlaybackReference: (
+          input: Parameters<typeof DeterministicStorageAdapter.prototype.getPlaybackReference>[0],
+        ): ReturnType<typeof DeterministicStorageAdapter.prototype.getPlaybackReference> => {
+          const inner = new DeterministicStorageAdapter();
+          return inner.getPlaybackReference(input);
+        },
+        getPlaybackBytes: (
+          ref: string,
+        ): ReturnType<typeof DeterministicStorageAdapter.prototype.getPlaybackBytes> => {
+          const inner = new DeterministicStorageAdapter();
+          return inner.getPlaybackBytes(ref);
+        },
+        removeSample: (
+          ref: string,
+        ): ReturnType<typeof DeterministicStorageAdapter.prototype.removeSample> => {
+          void ref;
+          throw new StorageUnavailableError("provider still down");
+        },
+      };
+      const repo = makeAudioRepo();
+      const service = new AudioSampleService({
+        repository: repo,
+        // eslint-disable-next-line @typescript-eslint/no-unnecessary-type-assertion
+        storage: stillFlakyStorage as never,
+        workspaceAuthorization: new WorkspaceAuthorizationService({
+          authRepository: makeAuthRepo(),
+        }),
+      });
+      const uploaded = await service.uploadSample({
+        userAccountId: SELLER_USER,
+        offeringId: OFFERING_ID,
+        actingWorkspaceId: SELLER_WORKSPACE,
+        label: "Still flaky",
+        contentType: "audio/mpeg",
+        byteSize: 1024,
+        bytes: mp3Bytes(1024),
+        mediaUseConfirmation: {
+          version: "m2-audio-confirmation-v1",
+          confirmedAt: new Date(),
+        },
+      });
+      // First attempt: AUDIO_STORAGE_FAILED.
+      await assert.rejects(
+        service.removeSample({
+          userAccountId: SELLER_USER,
+          offeringId: OFFERING_ID,
+          sampleId: uploaded.sample.sampleId,
+          actingWorkspaceId: SELLER_WORKSPACE,
+          confirmEligibilityLoss: true,
+        }),
+        (err: unknown) =>
+          err instanceof AudioSampleError &&
+          (err as { code: string }).code === "AUDIO_STORAGE_FAILED",
+      );
+      // Retry while provider STILL down — the service MUST continue
+      // to surface AUDIO_STORAGE_FAILED rather than silently
+      // returning success (the prior blocker: storage object
+      // would remain indefinitely).
+      await assert.rejects(
+        service.removeSample({
+          userAccountId: SELLER_USER,
+          offeringId: OFFERING_ID,
+          sampleId: uploaded.sample.sampleId,
+          actingWorkspaceId: SELLER_WORKSPACE,
+          confirmEligibilityLoss: true,
+        }),
+        (err: unknown) =>
+          err instanceof AudioSampleError &&
+          (err as { code: string }).code === "AUDIO_STORAGE_FAILED",
+      );
+      // The Pause evidence row is still present (the offering
+      // remains Paused); the sample is still PendingCleanup (the
+      // bounded retry can complete the storage delete on the next
+      // operation).
+      const sellerList = await service.listSamplesForSeller({
+        userAccountId: SELLER_USER,
+        offeringId: OFFERING_ID,
+        actingWorkspaceId: SELLER_WORKSPACE,
+      });
+      assert.equal(sellerList.samples.length, 0);
+    });
   });
 });

@@ -13,6 +13,7 @@ import type {
   AudioSampleConfirmation,
   AudioSampleRecord,
 } from "./audio-repository.js";
+import { AudioSampleFinalRemovalNotApplicableError } from "./audio-repository.js";
 
 export interface InMemoryAudioFixture {
   readonly offerings?: readonly InMemoryAudioOffering[];
@@ -44,6 +45,27 @@ export interface InMemoryAudioSampleSeed {
 export class InMemoryAudioRepository implements AudioRepository {
   private readonly contexts = new Map<string, AudioOfferingContext>();
   private readonly samples = new Map<string, AudioSampleRecord & { readonly _seeded?: boolean }>();
+  // M2 (#86, slice 86D): tracking the offering's lifecycle status
+  // + the append-only Pause evidence rows so the in-memory
+  // `removeFinalSamplePendingCleanup` mirror can verify preconditions
+  // and persist a deterministic Pause row keyed by the same
+  // `(offeringId, idempotencyKey)` unique constraint the Prisma
+  // adapter enforces. The in-memory adapter is a test seam only;
+  // production wiring always uses the Prisma adapter.
+  private readonly offeringStatusById = new Map<string, AudioOfferingContext["offeringStatus"]>();
+  private readonly pauseEvidenceByOfferingIdem = new Map<
+    string,
+    {
+      readonly offeringId: string;
+      readonly workspaceId: string;
+      readonly sellerProfileId: string;
+      readonly pausedByUserId: string;
+      readonly pausedAt: Date;
+      readonly reason: "user_initiated" | "final_sample_removal";
+      readonly idempotencyKey: string;
+      readonly requestId: string;
+    }
+  >();
 
   constructor(fixture: InMemoryAudioFixture = {}) {
     for (const offering of fixture.offerings ?? []) {
@@ -56,6 +78,11 @@ export class InMemoryAudioRepository implements AudioRepository {
         hasSellerCapability: offering.hasSellerCapability,
         title: offering.title,
       });
+      // M2 (#86, slice 86D): mirror the offering's lifecycle status
+      // so the in-memory `removeFinalSamplePendingCleanup` path can
+      // transition it. The Prisma adapter reads this from
+      // `service_offerings.status` directly.
+      this.offeringStatusById.set(offering.offeringId, offering.offeringStatus);
     }
     for (const seed of fixture.samples ?? []) {
       const id = seed.sampleId ?? `smp-${randomUUID().slice(0, 12)}`;
@@ -78,7 +105,26 @@ export class InMemoryAudioRepository implements AudioRepository {
   }
 
   getOfferingContext(offeringId: string): Promise<AudioOfferingContext | null> {
-    return Promise.resolve(this.contexts.get(offeringId) ?? null);
+    const original = this.contexts.get(offeringId);
+    if (!original) return Promise.resolve(null);
+    // M2 (#86, slice 86D Codex re-review): the `contexts` map
+    // captures the seeded status; the lifecycle mirror
+    // (`offeringStatusById`) tracks the post-transition status
+    // (final-sample removal transitions Active → Paused). Read
+    // the mirror as the authoritative post-transition status so
+    // downstream consumers (e.g. the audio sample service's
+    // "is this the last Live sample?" check on a replacement
+    // upload after final removal) observe the Paused state and
+    // do not auto-reactivate the offering. Without this, a
+    // replacement upload would see Active and the new sample
+    // would become buyer-visible, violating the issue #86
+    // cross-slice invariant "A replacement sample uploaded while
+    // Paused never auto-reactivates the offering."
+    const status = this.offeringStatusById.get(offeringId) ?? original.offeringStatus;
+    return Promise.resolve({
+      ...original,
+      offeringStatus: status,
+    });
   }
 
   listSamplesForOffering(offeringId: string): Promise<readonly AudioSampleRecord[]> {
@@ -256,5 +302,164 @@ export class InMemoryAudioRepository implements AudioRepository {
       createdAt: now,
       updatedAt: now,
     });
+  }
+
+  /**
+   * M2 (#86, slice 86D): in-memory mirror of the Prisma adapter's
+   * `removeFinalSamplePendingCleanup`. The in-memory adapter has
+   * no real advisory locks — the test-only helper verifies the
+   * preconditions + transitions the offering + marks the sample
+   * PendingCleanup + appends a Pause evidence row, in the same
+   * observable order the Prisma adapter commits them. The
+   * `(offeringId, idempotencyKey)` uniqueness is enforced by the
+   * `pauseEvidenceByOfferingIdem` Map's key.
+   */
+  removeFinalSamplePendingCleanup(input: {
+    offeringId: string;
+    sampleId: string;
+    workspaceId: string;
+    pausedByUserId: string;
+    idempotencyKey: string;
+    requestId: string;
+    now: Date;
+  }): Promise<{
+    readonly offeringStatus: "Paused";
+    readonly sample: AudioSampleRecord;
+  }> {
+    return Promise.resolve().then(
+      (): {
+        readonly offeringStatus: "Paused";
+        readonly sample: AudioSampleRecord;
+      } => {
+        // Idempotency pre-check on the pause-evidence table.
+        const pauseKey = `${input.offeringId}::${input.idempotencyKey}`;
+        const existingPause = this.pauseEvidenceByOfferingIdem.get(pauseKey);
+        if (existingPause) {
+          if (existingPause.reason !== "final_sample_removal") {
+            throw new AudioSampleFinalRemovalNotApplicableError("offering_not_active");
+          }
+          const marked = this.samples.get(input.sampleId);
+          if (!marked) {
+            throw new AudioSampleFinalRemovalNotApplicableError("sample_not_found");
+          }
+          return { offeringStatus: "Paused" as const, sample: marked };
+        }
+
+        // Step 1: precondition — offering must be Active.
+        const offeringStatus = this.offeringStatusById.get(input.offeringId);
+        if (!offeringStatus) {
+          throw new AudioSampleFinalRemovalNotApplicableError("offering_not_found");
+        }
+        if (offeringStatus !== "Active") {
+          throw new AudioSampleFinalRemovalNotApplicableError("offering_not_active");
+        }
+
+        // Step 2: precondition — sample must exist and be Live.
+        const sample = this.samples.get(input.sampleId);
+        if (!sample || sample.offeringId !== input.offeringId) {
+          throw new AudioSampleFinalRemovalNotApplicableError("sample_not_found");
+        }
+        if (sample.cleanupStatus !== "Live") {
+          throw new AudioSampleFinalRemovalNotApplicableError("sample_not_live");
+        }
+
+        // Step 3: precondition — sample must be the LAST CONFIRMED
+        // Live sample. CONFIRMED = confirmationVersion/By/At all set
+        // (matching the Prisma adapter's filter).
+        let liveConfirmedCount = 0;
+        for (const s of this.samples.values()) {
+          if (
+            s.offeringId === input.offeringId &&
+            s.cleanupStatus === "Live" &&
+            s.confirmation !== null
+          ) {
+            liveConfirmedCount += 1;
+          }
+        }
+        if (liveConfirmedCount !== 1) {
+          throw new AudioSampleFinalRemovalNotApplicableError("not_last_live_sample");
+        }
+
+        // Step 4: atomic transition. The offering transitions to
+        // Paused, a Pause evidence row is appended, the sample is
+        // marked PendingCleanup — all observable in this single
+        // synchronous block (the in-memory adapter has no real
+        // transaction but mirrors the Prisma adapter's commit
+        // order so observable behavior matches).
+        this.offeringStatusById.set(input.offeringId, "Paused");
+        const context = this.contexts.get(input.offeringId);
+        const sellerProfileId = "sp-mirror"; // Mirror only; tests register profiles via ServiceOfferingRepository._registerSellerProfile.
+        this.pauseEvidenceByOfferingIdem.set(pauseKey, {
+          offeringId: input.offeringId,
+          workspaceId: input.workspaceId,
+          sellerProfileId,
+          pausedByUserId: input.pausedByUserId,
+          pausedAt: input.now,
+          reason: "final_sample_removal",
+          idempotencyKey: input.idempotencyKey,
+          requestId: input.requestId,
+        });
+        const markedSample: AudioSampleRecord = {
+          ...sample,
+          cleanupStatus: "PendingCleanup",
+          cleanupAttempts: sample.cleanupAttempts + 1,
+          updatedAt: input.now,
+        };
+        this.samples.set(input.sampleId, markedSample);
+        // The contexts map is keyed by AudioOfferingContext; the
+        // offeringStatus change is reflected through `offeringStatusById`.
+        // The next `getOfferingContext` read returns the new status
+        // because the constructor mirrors `offering.offeringStatus`
+        // into both maps.
+        void context;
+        return {
+          offeringStatus: "Paused" as const,
+          sample: markedSample,
+        };
+      },
+    );
+  }
+
+  /**
+   * M2 (#86, slice 86D Codex re-review): in-memory mirror of the
+   * Prisma adapter's read-only lookup. Reads
+   * `pauseEvidenceByOfferingIdem` and returns the row only when
+   * its `reason === "final_sample_removal"`; returns `null`
+   * otherwise. Used by the application service to converge
+   * retries after provider-side cleanup finalized the sample
+   * row (the durable Pause evidence row is still present).
+   */
+  findFinalSampleRemovalPauseEvidence(input: {
+    offeringId: string;
+    idempotencyKey: string;
+  }): Promise<{
+    readonly offeringId: string;
+    readonly idempotencyKey: string;
+    readonly pausedAt: Date;
+    readonly pausedByUserId: string;
+    readonly requestId: string;
+  } | null> {
+    return Promise.resolve().then(
+      (): {
+        readonly offeringId: string;
+        readonly idempotencyKey: string;
+        readonly pausedAt: Date;
+        readonly pausedByUserId: string;
+        readonly requestId: string;
+      } | null => {
+        const pauseKey = `${input.offeringId}::${input.idempotencyKey}`;
+        const row = this.pauseEvidenceByOfferingIdem.get(pauseKey);
+        if (!row || row.reason !== "final_sample_removal") {
+          return null;
+        }
+        return {
+          offeringId: row.offeringId,
+          idempotencyKey: row.idempotencyKey,
+          pausedAt: row.pausedAt,
+          pausedByUserId: row.pausedByUserId,
+          requestId: row.requestId,
+        };
+      },
+    );
   }
 }

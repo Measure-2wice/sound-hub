@@ -47,6 +47,7 @@ import type {
   ApiFieldErrorV1,
   ServiceOfferingActivationConfirmationVersionV1,
   ServiceOfferingOwnerSampleSummaryV1,
+  ServiceOfferingReadinessReasonCategory,
 } from "@soundhub/types";
 
 export interface ServiceOfferingDraftInput {
@@ -221,6 +222,146 @@ export interface ServiceOfferingActivationEvidenceView {
   readonly idempotencyKey: string;
 }
 
+// M2 (#86): ServiceOfferingPause evidence and input shapes.
+//
+// Pause authorization is independent of activation completeness — a
+// grandfathered nonconforming Active offering must remain pausable
+// without satisfying the activation contract. Pause therefore records
+// only the facts established by the Pause command (no
+// `confirmationVersion` column — fabricating such a column would
+// invent an attestation the Pause command did not invoke).
+//
+// The repository resolves `sellerProfileId` from the locked offering
+// row inside the transaction; the field is NOT taken from the input
+// because the route does not have a stable reference to it. The
+// repository also requires a `playbackUrlFor` resolver so the returned
+// OwnerView's sample entries carry valid URLs (the
+// `serviceOfferingOwnerSampleSummaryV1Schema.playbackUrl` field is a
+// `z.string().url()`; a missing resolver makes the response un-parseable
+// for any conforming Active offering that has at least one CONFIRMED
+// Live sample).
+export type ServiceOfferingPauseReasonValue = "user_initiated" | "final_sample_removal";
+
+export interface ServiceOfferingPauseInput {
+  readonly offeringId: string;
+  readonly workspaceId: string;
+  readonly pausedByUserId: string;
+  readonly reason: ServiceOfferingPauseReasonValue;
+  readonly idempotencyKey: string;
+  readonly requestId: string;
+  readonly now: Date;
+  readonly playbackUrlFor: (input: { offeringId: string; sampleId: string }) => string;
+}
+
+export interface ServiceOfferingPauseEvidenceView {
+  readonly pausedAt: Date;
+  readonly reason: ServiceOfferingPauseReasonValue;
+  readonly idempotencyKey: string;
+}
+
+export interface ServiceOfferingPauseResult {
+  readonly offering: ServiceOfferingOwnerViewRecord;
+  readonly evidence: ServiceOfferingPauseEvidenceView;
+  /**
+   * `true` when the operation converged on an already-persisted
+   * pause row (transport retry after a lost response). The caller
+   * treats this as success.
+   */
+  readonly convergedFromExistingPause: boolean;
+}
+
+// M2 (#86): ServiceOfferingReactivate input — same STRICT public
+// field set as activation because the repository re-runs the same
+// activation completeness check. Failure leaves the offering Paused
+// (no new ServiceOfferingActivation row written). The reactivation
+// idempotencyKey is bound to the existing
+// (offeringId, idempotencyKey) DB unique constraint on the
+// `service_offering_activations` table.
+export interface ServiceOfferingReactivateInput {
+  readonly offeringId: string;
+  readonly workspaceId: string;
+  readonly reactivatedByUserId: string;
+  readonly title: string;
+  readonly description: string;
+  readonly primaryCategoryKey: string;
+  readonly serviceMode: "Remote" | "InPerson" | "Hybrid";
+  readonly serviceAreas: readonly {
+    readonly countryCode: string;
+    readonly region?: string;
+    readonly city?: string;
+  }[];
+  readonly pricing: {
+    readonly kind: "Fixed" | "StartingAt" | "ContactForQuote";
+    readonly amountMinor?: number;
+    readonly currency?: string;
+    readonly unitId?: string;
+  };
+  readonly genreTags: readonly string[];
+  readonly includedServiceCategoryKeys: readonly string[];
+  readonly confirmationVersion: ServiceOfferingActivationConfirmationVersionV1;
+  readonly idempotencyKey: string;
+  readonly requestId: string;
+  readonly now: Date;
+  readonly playbackUrlFor: (input: { offeringId: string; sampleId: string }) => string;
+}
+
+// M2 (#86, slice 86C): ServiceOfferingUpdateActive input — same
+// STRICT public field set as activation because the repository runs
+// the same activation completeness check before replacing the public
+// fields atomically. The lifecycle does NOT change (Active → Active);
+// the existing ServiceOfferingActivation rows are NOT touched.
+//
+// `sellerProfileId` is NOT carried on this input — the repository
+// resolves it from the locked persisted offering row, matching the
+// `pause` / `reactivate` contract (Codex fix #1 carried forward
+// from slice 86B). The route does not carry a stable
+// `sellerProfileId` reference; carrying one would also risk an
+// empty-string foreign-key violation if a caller forgot to wire it.
+export interface ServiceOfferingUpdateActiveInput {
+  readonly offeringId: string;
+  readonly workspaceId: string;
+  readonly updatedByUserId: string;
+  readonly title: string;
+  readonly description: string;
+  readonly primaryCategoryKey: string;
+  readonly serviceMode: "Remote" | "InPerson" | "Hybrid";
+  readonly serviceAreas: readonly {
+    readonly countryCode: string;
+    readonly region?: string;
+    readonly city?: string;
+  }[];
+  readonly pricing: {
+    readonly kind: "Fixed" | "StartingAt" | "ContactForQuote";
+    readonly amountMinor?: number;
+    readonly currency?: string;
+    readonly unitId?: string;
+  };
+  readonly genreTags: readonly string[];
+  readonly includedServiceCategoryKeys: readonly string[];
+  readonly confirmationVersion: ServiceOfferingActivationConfirmationVersionV1;
+  readonly idempotencyKey: string;
+  readonly requestId: string;
+  readonly now: Date;
+  readonly playbackUrlFor: (input: { offeringId: string; sampleId: string }) => string;
+}
+
+export interface ServiceOfferingUpdateEvidenceView {
+  readonly updatedAt: Date;
+  readonly confirmationVersion: ServiceOfferingActivationConfirmationVersionV1;
+  readonly idempotencyKey: string;
+}
+
+export interface ServiceOfferingUpdateActiveResult {
+  readonly offering: ServiceOfferingOwnerViewRecord;
+  readonly evidence: ServiceOfferingUpdateEvidenceView;
+  /**
+   * `true` when the operation converged on an already-persisted
+   * update row (transport retry after a lost response). The caller
+   * treats this as success.
+   */
+  readonly convergedFromExistingUpdate: boolean;
+}
+
 export interface ServiceOfferingOwnerViewRecord {
   readonly serviceOfferingId: string;
   readonly workspaceId: string;
@@ -246,6 +387,16 @@ export interface ServiceOfferingOwnerViewRecord {
   readonly samples: readonly ServiceOfferingOwnerSampleSummaryV1[];
   readonly activatedAt: Date | null;
   readonly activatedByDisplayName: string | null;
+  // M2 (#86, slice 86F): readiness view, derived by the API runtime
+  // from the persisted state via the same pure predicate the
+  // operator inventory uses. The runtime is the source of truth;
+  // the web editor renders this verbatim and does not re-derive.
+  readonly readiness: {
+    readonly isAvailable: boolean;
+    readonly updateNeeded: boolean;
+    readonly reasonCategories: readonly ServiceOfferingReadinessReasonCategory[];
+    readonly isGrandfatheredNonconforming: boolean;
+  };
 }
 
 export interface ServiceOfferingActivationResult {
@@ -348,6 +499,115 @@ export class ServiceOfferingSellerProfileMissingError extends Error {
   }
 }
 
+// M2 (#86): typed errors for the post-activation lifecycle commands.
+// The service layer translates each into the corresponding safe
+// envelope via `mapStatus` (see `apps/api/src/lib/errors.ts`).
+
+/**
+ * Raised by `pause` when the offering row does not exist.
+ */
+export class ServiceOfferingNotActiveError extends Error {
+  constructor(
+    public readonly offeringId: string,
+    public readonly currentStatus: "Draft" | "Active" | "Paused" | "Archived",
+  ) {
+    super(`ServiceOffering ${offeringId} is ${currentStatus}; pause requires Active`);
+    this.name = "ServiceOfferingNotActiveError";
+  }
+}
+
+/**
+ * Raised by `pause` when the offering has already transitioned to
+ * Paused AND no pause evidence row exists for the supplied
+ * idempotencyKey (the lookup-before-precondition rule from the
+ * corrected idempotency table). A retry of the same
+ * previously-committed idempotencyKey converges on the existing
+ * pause row and does NOT surface this error.
+ */
+export class ServiceOfferingAlreadyPausedError extends Error {
+  constructor(public readonly offeringId: string) {
+    super(`ServiceOffering ${offeringId} is already Paused`);
+    this.name = "ServiceOfferingAlreadyPausedError";
+  }
+}
+
+/**
+ * Raised by `reactivate` when the offering is not in Paused state
+ * AND no ServiceOfferingActivation evidence row exists for the
+ * supplied reactivation idempotencyKey. Surfaced as 409
+ * `SERVICE_OFFERING_NOT_PAUSED`.
+ */
+export class ServiceOfferingNotPausedError extends Error {
+  constructor(
+    public readonly offeringId: string,
+    public readonly currentStatus: "Draft" | "Active" | "Paused" | "Archived",
+  ) {
+    super(`ServiceOffering ${offeringId} is ${currentStatus}; reactivate requires Paused`);
+    this.name = "ServiceOfferingNotPausedError";
+  }
+}
+
+/**
+ * Raised by `updateActive` when the offering is not in Active state
+ * AND no ServiceOfferingUpdate evidence row exists for the supplied
+ * update idempotencyKey. Surfaced as 409 `SERVICE_OFFERING_NOT_ACTIVE`.
+ */
+export class ServiceOfferingUpdateNotActiveError extends Error {
+  constructor(
+    public readonly offeringId: string,
+    public readonly currentStatus: "Draft" | "Active" | "Paused" | "Archived",
+  ) {
+    super(`ServiceOffering ${offeringId} is ${currentStatus}; updateActive requires Active`);
+    this.name = "ServiceOfferingUpdateNotActiveError";
+  }
+}
+
+/**
+ * Raised by `updateActive` when the payload fails the activation
+ * completeness check inside the transaction. Surfaced as 422
+ * `SERVICE_OFFERING_INVALID_UPDATE` carrying the field-error list.
+ * Mirrors the `ServiceOfferingIncompleteError` semantics for the
+ * update flow.
+ */
+export class ServiceOfferingInvalidUpdateError extends Error {
+  constructor(
+    public readonly reasons: readonly string[],
+    public readonly fieldErrors: readonly ApiFieldErrorV1[] = [],
+  ) {
+    super(`Update completeness re-check failed: ${reasons.join(", ")}`);
+    this.name = "ServiceOfferingInvalidUpdateError";
+  }
+}
+
+/**
+ * M2 (#86, slice 86B, Codex review fix): raised by `reactivate`
+ * when the SellerProfile's publication status changes between the
+ * service-level precondition and the repository transaction
+ * (or when the SellerProfile is not Published at the moment of
+ * the repository check). The check runs INSIDE the locked
+ * transaction AFTER the idempotency lookup and BEFORE the activation
+ * evidence row is inserted, so:
+ *   - a same-key retry of an already-committed Reactivate still
+ *     converges on the existing activation row regardless of
+ *     current SellerProfile status;
+ *   - a fresh Reactivate against a now-Suspended SellerProfile is
+ *     rejected with the same `SERVICE_OFFERING_SELLER_PROFILE_NOT_PUBLISHED`
+ *     envelope the service-level precondition uses.
+ * Surfaced as 422 `SERVICE_OFFERING_SELLER_PROFILE_NOT_PUBLISHED`.
+ */
+export class ServiceOfferingSellerProfileNotPublishedError extends Error {
+  constructor(
+    public readonly workspaceId: string,
+    public readonly sellerProfileId: string,
+    public readonly currentStatus: "Draft" | "Published" | "Suspended",
+  ) {
+    super(
+      `ServiceOffering reactivate requires a Published SellerProfile (workspace ${workspaceId} profile ${sellerProfileId} is ${currentStatus}).`,
+    );
+    this.name = "ServiceOfferingSellerProfileNotPublishedError";
+  }
+}
+
 export interface ServiceOfferingRepository {
   /**
    * Atomically create a Draft ServiceOffering for the Workspace's
@@ -438,4 +698,94 @@ export interface ServiceOfferingRepository {
    * editor's readiness checklist cannot drift.
    */
   countLiveConfirmedSamples(offeringId: string): Promise<number>;
+
+  // -------------------------------------------------------------------------
+  // M2 (#86): post-activation lifecycle commands.
+  //
+  // `pause` and `reactivate` (slice 86B), `updateActive` (slice 86C),
+  // and `removeFinalSamplePendingCleanup` (slice 86D) are required
+  // methods — every adapter that participates in production traffic
+  // implements them.
+  //
+  // Idempotency contract enforced by each implementation, in order:
+  //   1. acquire transaction + advisory lock(s)
+  //   2. lookup `(offeringId, idempotencyKey)` evidence row
+  //   3. if found → return as converged success
+  //   4. otherwise enforce the lifecycle precondition (status check)
+  //   5. then execute the command
+  // -------------------------------------------------------------------------
+
+  /**
+   * Atomic Active → Paused transition + append-only evidence row
+   * insertion. The (offeringId, idempotencyKey) DB unique constraint
+   * on `service_offering_pauses` is the second defense against
+   * transport-retry duplicates; the per-offering advisory lock
+   * acquired at the start of the transaction is the first.
+   *
+   * Throws `ServiceOfferingNotFoundError` if the offering row does
+   * not exist. Throws `ServiceOfferingAlreadyPausedError` if the
+   * offering has already transitioned to Paused and the lookup
+   * found no row for the supplied idempotencyKey (the precondition
+   * runs AFTER the idempotency pre-check, so a same-key retry
+   * converges on the existing pause row and does NOT surface this
+   * error). Throws `ServiceOfferingNotActiveError` if the offering
+   * is Draft or Archived. Throws `ServiceOfferingNotOwnedError` if
+   * the offering is owned by a different workspace.
+   */
+  pause(input: ServiceOfferingPauseInput): Promise<ServiceOfferingPauseResult>;
+
+  /**
+   * Atomic Paused → Active transition + new ServiceOfferingActivation
+   * evidence row insertion. The (offeringId, idempotencyKey) DB
+   * unique constraint on `service_offering_activations` is the
+   * second defense; the per-offering + per-offering audio-sample
+   * advisory locks are the first.
+   *
+   * INSIDE the transaction the repository re-runs the activation
+   * completeness check (`buildActivationCompletenessFieldErrors` +
+   * CONFIRMED Live sample count + `SellerProfile.published`
+   * precondition). Throws `ServiceOfferingIncompleteError` when the
+   * re-check fails. Throws `ServiceOfferingNotFoundError` /
+   * `ServiceOfferingNotOwnedError` / `ServiceOfferingNotPausedError`
+   * per the slice 86B precondition rules.
+   */
+  reactivate(input: ServiceOfferingReactivateInput): Promise<ServiceOfferingActivationResult>;
+
+  /**
+   * M2 (#86, slice 86C): atomic Active → Active update. Validates
+   * the complete resulting state via the same STRICT activation
+   * completeness contract, in-place updates the public fields,
+   * and appends one new `ServiceOfferingUpdate` evidence row. The
+   * existing `ServiceOfferingActivation` rows are NOT touched —
+   * the activation timestamp from the original Draft → Active
+   * transition is preserved verbatim per ADR 0008.
+   *
+   * Lock acquisition order mirrors `reactivate` (slice 86B):
+   *   (1) `service-offering:<offeringId>`,
+   *   (2) audio-sample per-offering,
+   *   (3) `seller-profile:<workspaceId>` (the workspaceLock
+   *       serializes the in-transaction SellerProfile.published
+   *       read against any concurrent SellerProfile suspension,
+   *       matching the same serialization Reactivate enforces).
+   *
+   * The (offeringId, idempotencyKey) DB unique constraint on
+   * `service_offering_updates` is the second defense against
+   * transport-retry duplicates; the advisory locks above are the
+   * first. The idempotency lookup runs BEFORE the lifecycle
+   * precondition (Active required) so a same-key retry after a
+   * committed Update converges on the existing update row even if
+   * the offering has since transitioned (a same-key retry is
+   * the SAME operation; it does not surface
+   * `ServiceOfferingUpdateNotActiveError` after the fact).
+   *
+   * Throws `ServiceOfferingInvalidUpdateError` (mapped to
+   * `SERVICE_OFFERING_INVALID_UPDATE`) when the re-check fails.
+   * Throws `ServiceOfferingNotFoundError` /
+   * `ServiceOfferingNotOwnedError` /
+   * `ServiceOfferingUpdateNotActiveError` per the precondition
+   * rules. Throws `ServiceOfferingSellerProfileNotPublishedError`
+   * when the locked SellerProfile is not Published at the time of
+   * the in-transaction check.
+   */
+  updateActive(input: ServiceOfferingUpdateActiveInput): Promise<ServiceOfferingUpdateActiveResult>;
 }

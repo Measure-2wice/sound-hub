@@ -594,6 +594,40 @@ export const apiErrorCodeV1Schema = z.enum([
   // request is structurally incomplete without the field.
   "AUDIO_SAMPLE_MEDIA_CONFIRMATION_REQUIRED",
   "SERVICE_OFFERING_INTERNAL_FAILED",
+  // M2 (#86): post-activation lifecycle surface.
+  // Pause authorization is independent of activation completeness;
+  // a grandfathered nonconforming Active offering must remain pausable.
+  // Reactivate re-runs the entire current activation contract. Update
+  // (Active → Active) atomically replaces the public fields.
+  //
+  // 409 — Pause attempted on a non-Active offering (already Paused,
+  // Draft, or Archived). A retry of the same previously-committed
+  // idempotencyKey converges on the existing pause row and does NOT
+  // surface this code; only a NEW key against an already-Paused
+  // offering triggers this envelope.
+  "SERVICE_OFFERING_ALREADY_PAUSED",
+  // 409 — Reactivate attempted on a non-Paused offering (Active,
+  // Draft, or Archived). A retry of the same previously-committed
+  // idempotencyKey converges on the existing reactivation row and
+  // does NOT surface this code.
+  "SERVICE_OFFERING_NOT_PAUSED",
+  // 409 — Update attempted on a non-Active offering (Paused, Draft,
+  // or Archived). A retry of the same previously-committed
+  // idempotencyKey converges on the existing update row.
+  "SERVICE_OFFERING_NOT_ACTIVE",
+  // 422 — Update payload is well-formed but semantically incomplete
+  // (mirrors the SERVICE_OFFERING_INCOMPLETE pattern from activation).
+  // The safe envelope carries `fields` for the multi-error summary.
+  "SERVICE_OFFERING_INVALID_UPDATE",
+  // M2 (#86): removing the final qualifying sample from an Active
+  // offering requires an explicit eligibility-loss confirmation on
+  // the request body (`confirmEligibilityLoss: true`). A removal
+  // without that flag against the last qualifying Active sample
+  // returns this 400 — a 422 (semantic) would be misleading because
+  // the request is structurally incomplete without the explicit
+  // confirmation field. The flag is transient and is never persisted
+  // on the sample row.
+  "AUDIO_SAMPLE_FINAL_REMOVAL_CONFIRMATION_REQUIRED",
 ]);
 export type ApiErrorCodeV1 = z.infer<typeof apiErrorCodeV1Schema>;
 
@@ -1257,6 +1291,43 @@ export type ServiceOfferingOwnerSampleSummaryV1 = z.infer<
   typeof serviceOfferingOwnerSampleSummaryV1Schema
 >;
 
+// M2 (#86, slice 86E + 86F): closed-shape readiness view, derived
+// by the API runtime from the same pure predicate the operator
+// inventory uses (`deriveServiceOfferingReadiness` from `@soundhub/db`).
+// The closed-set reason vocabulary is the slice 86E contract: no
+// silently-invented alternative buckets. The runtime consumes the
+// predicate so the UI never re-implements the rule.
+export const serviceOfferingReadinessV1Schema = z
+  .object({
+    isAvailable: z.boolean(),
+    updateNeeded: z.boolean(),
+    reasonCategories: z
+      .array(
+        z.enum([
+          "title-required",
+          "description-required",
+          "category-required",
+          "service-area-required",
+          "pricing-required",
+          "audio-sample-required",
+          "activation-confirmation-stale",
+          "seller-profile-not-published",
+        ]),
+      )
+      .max(8),
+    isGrandfatheredNonconforming: z.boolean(),
+  })
+  .strict();
+export type ServiceOfferingReadinessV1 = z.infer<typeof serviceOfferingReadinessV1Schema>;
+
+// Closed union of the readiness reason categories. Re-exported as
+// a named type so internal call sites (the API repository's
+// `ServiceOfferingOwnerViewRecord.readiness.reasonCategories`,
+// the in-memory adapter's `toOwnerView` helper) can carry the
+// closed set without restating the enum.
+export type ServiceOfferingReadinessReasonCategory =
+  ServiceOfferingReadinessV1["reasonCategories"][number];
+
 export const serviceOfferingOwnerViewV1Schema = z
   .object({
     serviceOfferingId: z.string().min(1).max(128),
@@ -1279,6 +1350,12 @@ export const serviceOfferingOwnerViewV1Schema = z
     samples: z.array(serviceOfferingOwnerSampleSummaryV1Schema).max(3),
     activatedAt: z.string().datetime().nullable(),
     activatedByDisplayName: z.string().min(1).max(200).nullable(),
+    // M2 (#86, slice 86F): readiness derived from the persisted
+    // state by the API runtime. The runtime's source of truth is
+    // `deriveServiceOfferingReadiness` from `@soundhub/db` — the
+    // same predicate the operator inventory CLI uses. The web
+    // editor renders this verbatim and does not re-derive.
+    readiness: serviceOfferingReadinessV1Schema,
   })
   .strict();
 export type ServiceOfferingOwnerViewV1 = z.infer<typeof serviceOfferingOwnerViewV1Schema>;
@@ -1338,6 +1415,110 @@ export const serviceOfferingGetResponseV1Schema = z
   })
   .strict();
 export type ServiceOfferingGetResponseV1 = z.infer<typeof serviceOfferingGetResponseV1Schema>;
+
+// ---------- M2 (#86): ServiceOffering pause / reactivate / updateActive ----------
+//
+// These commands reuse the STRICT activation contract for Reactivate
+// and `updateActive` because both re-run the complete activation
+// validation. We DO NOT reimplement the field rules here — the
+// activation Zod schema (defined above) is the single source of truth.
+// The aliases below make the call-site typing explicit and give
+// consumers a stable reference even if the underlying schema ever
+// gains an internal-only field.
+//
+// The Pause command carries only an idempotencyKey. Authorization
+// (Personal-Workspace-only AND Seller-capable AND ownership) and
+// precondition (status === "Active") are enforced server-side; the
+// Pause request body has no business field beyond the retry-identity
+// UUID.
+
+// Pause request: idempotencyKey only.
+// The Pause command is a single-state transition; the request body
+// carries no field payload beyond the retry-identity UUID. All
+// authorization, precondition, and persistence decisions live
+// server-side. The schema is strict — any additional field (for
+// example a future `returnTo` redirect hint) must be added
+// intentionally to the schema rather than smuggled through.
+export const serviceOfferingPauseRequestV1Schema = z
+  .object({
+    idempotencyKey: z.string().uuid().min(36).max(64),
+  })
+  .strict();
+export type ServiceOfferingPauseRequestV1 = z.infer<typeof serviceOfferingPauseRequestV1Schema>;
+
+// Pause evidence view (private to the persistence layer; the
+// response-side shape below wraps it with the OwnerView for the
+// route handler).
+export const serviceOfferingPauseEvidenceV1Schema = z
+  .object({
+    pausedAt: z.string().datetime(),
+    reason: z.enum(["user_initiated", "final_sample_removal"]),
+    idempotencyKey: z.string().uuid().min(36).max(64),
+  })
+  .strict();
+export type ServiceOfferingPauseEvidenceV1 = z.infer<typeof serviceOfferingPauseEvidenceV1Schema>;
+
+// Pause response: same shape as the draft / activate responses —
+// the OwnerView of the now-Paused offering plus the pause evidence.
+export const serviceOfferingPauseResponseV1Schema = z
+  .object({
+    ok: z.literal(true),
+    offering: serviceOfferingOwnerViewV1Schema,
+    evidence: serviceOfferingPauseEvidenceV1Schema,
+    returnTo: z.string().min(1).max(256).nullable(),
+    safeReturnTo: z.string().min(1).max(256).nullable(),
+  })
+  .strict();
+export type ServiceOfferingPauseResponseV1 = z.infer<typeof serviceOfferingPauseResponseV1Schema>;
+
+// Reactivate request: alias of the existing STRICT activation request
+// schema. Reactivate carries the same complete public field set with
+// the same idempotencyKey + confirmationVersion contract because the
+// repository re-runs the same activation completeness check
+// (buildActivationCompletenessFieldErrors + CONFIRMED Live sample
+// count + SellerProfile.published precondition). Failure leaves the
+// offering Paused.
+export const serviceOfferingReactivateRequestV1Schema = serviceOfferingActivateRequestV1Schema;
+export type ServiceOfferingReactivateRequestV1 = ServiceOfferingActivateRequestV1;
+// The response shape is the existing activation response — Reactivate
+// produces a new ServiceOfferingActivation evidence row whose
+// `pausedAt`/`activatedAt` field carries the reactivation moment.
+export type ServiceOfferingReactivateResponseV1 = ServiceOfferingActivationResponseV1;
+
+// Update request: alias of the existing STRICT activation request
+// schema. `updateActive` carries the same complete public field set
+// because the repository runs the same activation completeness check.
+// On success the public fields are replaced atomically and one
+// ServiceOfferingUpdate evidence row is appended; on failure the
+// prior public state is preserved verbatim per ADR 0008.
+export const serviceOfferingUpdateRequestV1Schema = serviceOfferingActivateRequestV1Schema;
+export type ServiceOfferingUpdateRequestV1 = ServiceOfferingActivateRequestV1;
+
+// Update evidence view (private to the persistence layer).
+export const serviceOfferingUpdateEvidenceV1Schema = z
+  .object({
+    updatedAt: z.string().datetime(),
+    confirmationVersion: z.enum(SERVICE_OFFERING_ACTIVATION_CONFIRMATION_VERSIONS),
+    idempotencyKey: z.string().uuid().min(36).max(64),
+  })
+  .strict();
+export type ServiceOfferingUpdateEvidenceV1 = z.infer<typeof serviceOfferingUpdateEvidenceV1Schema>;
+
+// Update response: the OwnerView of the now-updated Active offering
+// plus the update evidence. The response deliberately does NOT include
+// any `activatedAt` re-write or update metadata exposed on the
+// OwnerView — the activation history is preserved unchanged per ADR
+// 0008.
+export const serviceOfferingUpdateResponseV1Schema = z
+  .object({
+    ok: z.literal(true),
+    offering: serviceOfferingOwnerViewV1Schema,
+    evidence: serviceOfferingUpdateEvidenceV1Schema,
+    returnTo: z.string().min(1).max(256).nullable(),
+    safeReturnTo: z.string().min(1).max(256).nullable(),
+  })
+  .strict();
+export type ServiceOfferingUpdateResponseV1 = z.infer<typeof serviceOfferingUpdateResponseV1Schema>;
 
 // ---------- ServiceOffering taxonomy (controlled values) ----------
 //
@@ -2290,6 +2471,25 @@ export const bg2AudioSampleRemoveResponseV1Schema = z
   })
   .strict();
 export type Bg2AudioSampleRemoveResponseV1 = z.infer<typeof bg2AudioSampleRemoveResponseV1Schema>;
+
+// ---------- Remove request ----------
+//
+// M2 (#86): removing the final qualifying sample from an Active
+// offering atomically transitions the offering to Paused and removes
+// the sample from application-visible state before provider cleanup.
+// To prevent an accidental marketplace-eligibility loss, the
+// application boundary requires an explicit `confirmEligibilityLoss:
+// true` flag on the request when the removal would be the last
+// qualifying Active sample. A removal without the flag against that
+// condition returns AUDIO_SAMPLE_FINAL_REMOVAL_CONFIRMATION_REQUIRED.
+// The flag is transient and is never persisted on the sample row.
+export const bg2AudioSampleRemoveRequestV1Schema = z
+  .object({
+    actingWorkspaceId: z.string().min(1).max(128),
+    confirmEligibilityLoss: z.boolean().optional(),
+  })
+  .strict();
+export type Bg2AudioSampleRemoveRequestV1 = z.infer<typeof bg2AudioSampleRemoveRequestV1Schema>;
 
 // ---------- Stable limits exposed for runtime validation ----------
 //

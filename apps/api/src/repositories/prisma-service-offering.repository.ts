@@ -42,7 +42,14 @@
 // public response. The `activatedByUserId` / `createdByUserId` FKs
 // are the audit attribution.
 
-import { type PrismaClient, Prisma, AudioSampleCleanupStatus, PurchaseMode } from "@soundhub/db";
+import {
+  type PrismaClient,
+  Prisma,
+  AudioSampleCleanupStatus,
+  PurchaseMode,
+  deriveEffectiveConfirmationVersion,
+  deriveServiceOfferingReadiness,
+} from "@soundhub/db";
 import type { Prisma as PrismaTypes } from "@soundhub/db";
 import { randomBytes } from "node:crypto";
 import type {
@@ -56,32 +63,50 @@ import type {
   ServiceOfferingCreateDraftInput,
   ServiceOfferingDraftInput,
   ServiceOfferingOwnerViewRecord,
+  ServiceOfferingPauseInput,
+  ServiceOfferingPauseResult,
+  ServiceOfferingReactivateInput,
   ServiceOfferingRepository,
 } from "./service-offering.repository.js";
 import {
   buildActivationCompletenessFieldErrors,
+  ServiceOfferingAlreadyPausedError,
   ServiceOfferingIncompleteError,
+  ServiceOfferingInvalidUpdateError,
+  ServiceOfferingNotActiveError,
   ServiceOfferingNotDraftError,
   ServiceOfferingNotFoundError,
   ServiceOfferingNotOwnedError,
+  ServiceOfferingNotPausedError,
   ServiceOfferingSellerProfileMissingError,
+  ServiceOfferingSellerProfileNotPublishedError,
   ServiceOfferingUnknownKeyError,
+  ServiceOfferingUpdateNotActiveError,
+} from "./service-offering.repository.js";
+import type {
+  ServiceOfferingUpdateActiveInput,
+  ServiceOfferingUpdateActiveResult,
+  ServiceOfferingUpdateEvidenceView,
 } from "./service-offering.repository.js";
 import type { ApiFieldErrorV1 } from "@soundhub/types";
 import { BG2_AUDIO_SAMPLE_MAX_PER_OFFERING } from "@soundhub/types";
-import { SERVICE_OFFERING_AUDIO_MEDIA_CONFIRMATION_VERSIONS } from "@soundhub/types";
+import {
+  SERVICE_OFFERING_ACTIVATION_CONFIRMATION_VERSIONS,
+  SERVICE_OFFERING_AUDIO_MEDIA_CONFIRMATION_VERSIONS,
+} from "@soundhub/types";
 import { acquireAudioSampleLockTx } from "../audio-repository/audio-sample-lock.js";
+import { offeringLockSql } from "./service-offering-lock.js";
+import { sellerProfileWorkspaceLockSql } from "./seller-profile-workspace-lock.js";
 
 /**
- * Stable per-offering lock key for `pg_advisory_xact_lock`. Mirrors
- * the SellerProfile lock pattern: hashtext on a namespaced string
- * returns int4, which fits the two-argument signed-32-bit signature.
+ * M2 (#86, slice 86D): the `offeringLockSql` helper is now shared
+ * with the audio sample repository's `removeFinalSamplePendingCleanup`
+ * path via `apps/api/src/repositories/service-offering-lock.ts`.
+ * The lock namespace (`service-offering:<offeringId>`) and SQL
+ * fragment are unchanged so existing lock-acquisition behavior is
+ * preserved. See the new module's docblock for the rationale.
  */
-function offeringLockSql(offeringId: string): Prisma.Sql {
-  return Prisma.sql`
-    SELECT pg_advisory_xact_lock(hashtext(${`service-offering:${offeringId}`}::text))
-  `;
-}
+// (helper removed; see service-offering-lock.ts)
 
 /**
  * Cryptographically random cuid-style suffix used to mint stable
@@ -141,11 +166,21 @@ const OFFERING_INCLUDE = {
   activations: {
     orderBy: { activatedAt: "desc" },
     take: 1,
-    include: {
-      activatedBy: {
-        select: { email: true },
-      },
+    select: {
+      confirmationVersion: true,
+      activatedAt: true,
+      activatedBy: { select: { email: true } },
     },
+  },
+  // M2 (#86, slice 86F): the latest update row carries the
+  // confirmationVersion + updatedAt that the readiness predicate
+  // consumes via `deriveEffectiveConfirmationVersion`. A
+  // successful `updateActive` writes a new row here; a Draft or
+  // pre-86F offering has no rows.
+  updates: {
+    orderBy: { updatedAt: "desc" },
+    take: 1,
+    select: { confirmationVersion: true, updatedAt: true },
   },
 } satisfies PrismaTypes.ServiceOfferingInclude;
 
@@ -186,7 +221,7 @@ export class PrismaServiceOfferingRepository implements ServiceOfferingRepositor
           where: { id: existingCreation.offeringId },
           include: {
             ...OFFERING_INCLUDE,
-            sellerProfile: { select: { workspaceId: true, id: true } },
+            sellerProfile: { select: { workspaceId: true, id: true, status: true } },
           },
         });
         if (!existingOffering) {
@@ -203,6 +238,7 @@ export class PrismaServiceOfferingRepository implements ServiceOfferingRepositor
           {
             workspaceId: existingOffering.sellerProfile.workspaceId,
             sellerProfileId: existingOffering.sellerProfile.id,
+            sellerProfileStatus: existingOffering.sellerProfile.status,
           },
           input.playbackUrlFor,
         );
@@ -300,7 +336,7 @@ export class PrismaServiceOfferingRepository implements ServiceOfferingRepositor
               where: { id: winner.offeringId },
               include: {
                 ...OFFERING_INCLUDE,
-                sellerProfile: { select: { workspaceId: true, id: true } },
+                sellerProfile: { select: { workspaceId: true, id: true, status: true } },
               },
             });
             if (existingOffering) {
@@ -309,6 +345,7 @@ export class PrismaServiceOfferingRepository implements ServiceOfferingRepositor
                 {
                   workspaceId: existingOffering.sellerProfile.workspaceId,
                   sellerProfileId: existingOffering.sellerProfile.id,
+                  sellerProfileStatus: existingOffering.sellerProfile.status,
                 },
                 input.playbackUrlFor,
               );
@@ -324,7 +361,7 @@ export class PrismaServiceOfferingRepository implements ServiceOfferingRepositor
         where: { id },
         include: {
           ...OFFERING_INCLUDE,
-          sellerProfile: { select: { workspaceId: true, id: true } },
+          sellerProfile: { select: { workspaceId: true, id: true, status: true } },
         },
       });
       if (!created) {
@@ -335,6 +372,7 @@ export class PrismaServiceOfferingRepository implements ServiceOfferingRepositor
         {
           workspaceId: created.sellerProfile.workspaceId,
           sellerProfileId: created.sellerProfile.id,
+          sellerProfileStatus: created.sellerProfile.status,
         },
         input.playbackUrlFor,
       );
@@ -425,7 +463,7 @@ export class PrismaServiceOfferingRepository implements ServiceOfferingRepositor
       });
       const existingSellerProfile = await tx.sellerProfile.findUnique({
         where: { id: existing.sellerProfileId },
-        select: { id: true, workspaceId: true },
+        select: { id: true, workspaceId: true, status: true },
       });
       if (!existingSellerProfile) {
         throw new Error(
@@ -437,6 +475,7 @@ export class PrismaServiceOfferingRepository implements ServiceOfferingRepositor
         {
           workspaceId: existingSellerProfile.workspaceId,
           sellerProfileId: existingSellerProfile.id,
+          sellerProfileStatus: existingSellerProfile.status,
         },
         input.playbackUrlFor,
       );
@@ -475,7 +514,7 @@ export class PrismaServiceOfferingRepository implements ServiceOfferingRepositor
           where: { id: input.offeringId },
           include: {
             ...OFFERING_INCLUDE,
-            sellerProfile: { select: { workspaceId: true, id: true } },
+            sellerProfile: { select: { workspaceId: true, id: true, status: true } },
           },
         });
         if (!existingOffering) {
@@ -500,6 +539,7 @@ export class PrismaServiceOfferingRepository implements ServiceOfferingRepositor
             {
               workspaceId: existingOffering.sellerProfile.workspaceId,
               sellerProfileId: existingOffering.sellerProfile.id,
+              sellerProfileStatus: existingOffering.sellerProfile.status,
             },
             input.playbackUrlFor,
           ),
@@ -511,7 +551,7 @@ export class PrismaServiceOfferingRepository implements ServiceOfferingRepositor
       // Step 2: precondition check.
       const existing = await tx.serviceOffering.findUnique({
         where: { id: input.offeringId },
-        include: { sellerProfile: { select: { workspaceId: true, id: true } } },
+        include: { sellerProfile: { select: { workspaceId: true, id: true, status: true } } },
       });
       if (!existing) {
         throw new ServiceOfferingNotFoundError(input.offeringId);
@@ -660,6 +700,7 @@ export class PrismaServiceOfferingRepository implements ServiceOfferingRepositor
                   {
                     workspaceId: input.workspaceId,
                     sellerProfileId: existing.sellerProfile.id,
+                    sellerProfileStatus: existing.sellerProfile.status,
                   },
                   input.playbackUrlFor,
                 ),
@@ -677,6 +718,7 @@ export class PrismaServiceOfferingRepository implements ServiceOfferingRepositor
             {
               workspaceId: input.workspaceId,
               sellerProfileId: existing.sellerProfile.id,
+              sellerProfileStatus: existing.sellerProfile.status,
             },
             input.playbackUrlFor,
           ),
@@ -702,6 +744,760 @@ export class PrismaServiceOfferingRepository implements ServiceOfferingRepositor
     });
   }
 
+  async pause(input: ServiceOfferingPauseInput): Promise<ServiceOfferingPauseResult> {
+    return this.prisma.$transaction(async (tx) => {
+      // M2 (#86, slice 86B): per-offering advisory lock only — Pause
+      // does not transition any audio sample, so the audio-sample
+      // lock is not required.
+      await tx.$executeRaw(offeringLockSql(input.offeringId));
+
+      // Step 1: idempotency pre-check. A transport retry of the same
+      // previously-committed Pause command converges on the existing
+      // pause row and returns it as `convergedFromExistingPause: true`.
+      // The lookup runs BEFORE the lifecycle precondition so a
+      // same-key retry after the offering has transitioned does NOT
+      // surface `ServiceOfferingAlreadyPausedError`.
+      const existingPause = await tx.serviceOfferingPause.findUnique({
+        where: {
+          offeringId_idempotencyKey: {
+            offeringId: input.offeringId,
+            idempotencyKey: input.idempotencyKey,
+          },
+        },
+      });
+      if (existingPause) {
+        const existingOffering = await tx.serviceOffering.findUnique({
+          where: { id: input.offeringId },
+          include: {
+            ...OFFERING_INCLUDE,
+            sellerProfile: { select: { workspaceId: true, id: true, status: true } },
+          },
+        });
+        if (!existingOffering) {
+          throw new ServiceOfferingNotFoundError(input.offeringId);
+        }
+        if (existingOffering.sellerProfile.workspaceId !== input.workspaceId) {
+          throw new ServiceOfferingNotOwnedError(input.offeringId, input.workspaceId);
+        }
+        return {
+          offering: toOwnerView(
+            existingOffering,
+            {
+              workspaceId: existingOffering.sellerProfile.workspaceId,
+              sellerProfileId: existingOffering.sellerProfile.id,
+              sellerProfileStatus: existingOffering.sellerProfile.status,
+            },
+            // M2 (#86, slice 86B, Codex review fix): carry the
+            // playbackUrlFor resolver into the idempotency-hit
+            // return path so the OwnerView's CONFIRMED Live samples
+            // surface valid URLs (the
+            // `serviceOfferingOwnerSampleSummaryV1Schema.playbackUrl`
+            // field is a `z.string().url()`).
+            input.playbackUrlFor,
+          ),
+          evidence: {
+            pausedAt: existingPause.pausedAt,
+            reason: existingPause.reason,
+            idempotencyKey: existingPause.idempotencyKey,
+          },
+          convergedFromExistingPause: true,
+        };
+      }
+
+      // Step 2: precondition. The lifecycle status check runs AFTER
+      // the idempotency pre-check so a same-key retry converges on
+      // the existing pause row regardless of the current state. The
+      // query joins the seller profile so the resolved profile id
+      // is available for the pause-evidence row insert.
+      const existing = await tx.serviceOffering.findUnique({
+        where: { id: input.offeringId },
+        include: { sellerProfile: { select: { workspaceId: true, id: true, status: true } } },
+      });
+      if (!existing) {
+        throw new ServiceOfferingNotFoundError(input.offeringId);
+      }
+      if (existing.sellerProfile.workspaceId !== input.workspaceId) {
+        throw new ServiceOfferingNotOwnedError(input.offeringId, input.workspaceId);
+      }
+      if (existing.status === "Paused") {
+        // The offering is already Paused but no pause evidence row
+        // exists for the supplied idempotencyKey — surface the
+        // dedicated precondition error.
+        throw new ServiceOfferingAlreadyPausedError(input.offeringId);
+      }
+      if (existing.status !== "Active") {
+        throw new ServiceOfferingNotActiveError(input.offeringId, existing.status);
+      }
+
+      // Step 3: atomic transition. The offering's status flips to
+      // Paused and the pause evidence row is inserted in the same
+      // transaction. Prisma rolls back on any failure — no evidence
+      // row is persisted if the status update fails.
+      //
+      // M2 (#86, slice 86B, Codex review fix): `sellerProfileId`
+      // is RESOLVED from the locked persisted offering row, NOT taken
+      // from the input. The route does not carry a stable
+      // `sellerProfileId` reference and the input contract does not
+      // include one. Resolving from `existing.sellerProfile.id`
+      // matches the Activate path's pattern and prevents the
+      // `service_offering_pauses_sellerProfileId_fkey` P2003
+      // foreign-key violation that an empty-string placeholder
+      // would cause.
+      const updated = await tx.serviceOffering.update({
+        where: { id: input.offeringId },
+        data: { status: "Paused" },
+        include: OFFERING_INCLUDE,
+      });
+      const evidence = await tx.serviceOfferingPause.create({
+        data: {
+          offeringId: input.offeringId,
+          workspaceId: input.workspaceId,
+          sellerProfileId: existing.sellerProfile.id,
+          pausedByUserId: input.pausedByUserId,
+          pausedAt: input.now,
+          reason: input.reason,
+          idempotencyKey: input.idempotencyKey,
+          requestId: input.requestId,
+        },
+      });
+
+      return {
+        offering: toOwnerView(
+          updated,
+          {
+            workspaceId: input.workspaceId,
+            sellerProfileId: existing.sellerProfile.id,
+            sellerProfileStatus: existing.sellerProfile.status,
+          },
+          // M2 (#86, slice 86B, Codex review fix): carry the
+          // playbackUrlFor resolver into the fresh-execute return
+          // path so CONFIRMED Live samples surface valid URLs.
+          input.playbackUrlFor,
+        ),
+        evidence: {
+          pausedAt: evidence.pausedAt,
+          reason: evidence.reason,
+          idempotencyKey: evidence.idempotencyKey,
+        },
+        convergedFromExistingPause: false,
+      };
+    });
+  }
+
+  async reactivate(
+    input: ServiceOfferingReactivateInput,
+  ): Promise<ServiceOfferingActivationResult> {
+    return this.prisma.$transaction(async (tx) => {
+      // M2 (#86, slice 86B): lock acquisition order matches `activate`
+      // (offering first, audio-sample second) so Reactivate serializes
+      // against concurrent Pause + final-sample removal paths.
+      await tx.$executeRaw(offeringLockSql(input.offeringId));
+      await acquireAudioSampleLockTx(tx, input.offeringId);
+      // M2 (#86, slice 86B Codex re-review): acquire the same
+      // `seller-profile:<workspaceId>` advisory lock that the
+      // SellerProfile repository acquires at the top of every write
+      // transaction (`saveDraft` and `writePublication`). Without this
+      // acquisition, the in-transaction SellerProfile.published read
+      // below is not serialized against a concurrent SellerProfile
+      // status change — a suspension could COMMIT between this read
+      // and the activation evidence row insert, leaving a newly-Active
+      // offering associated with a now-Suspended profile. The lock
+      // helper is shared with the SellerProfile repository via
+      // `seller-profile-workspace-lock.ts` to guarantee byte-for-byte
+      // lock-key parity. Lock acquisition order across the slices
+      // (this file uses `service-offering:<id>` → `audio-sample` →
+      // `seller-profile:<workspaceId>`; SellerProfile writes acquire
+      // the third lock only; audio-sample writes acquire the second
+      // only) is deadlock-free.
+      await tx.$executeRaw(sellerProfileWorkspaceLockSql(input.workspaceId));
+
+      // Step 1: idempotency pre-check against the activations table.
+      // Reactivation writes a new ServiceOfferingActivation row, so the
+      // existing (offeringId, idempotencyKey) unique index is the
+      // convergence key — same as a normal activation.
+      const existingActivation = await tx.serviceOfferingActivation.findUnique({
+        where: {
+          offeringId_idempotencyKey: {
+            offeringId: input.offeringId,
+            idempotencyKey: input.idempotencyKey,
+          },
+        },
+      });
+      if (existingActivation) {
+        const existingOffering = await tx.serviceOffering.findUnique({
+          where: { id: input.offeringId },
+          include: {
+            ...OFFERING_INCLUDE,
+            sellerProfile: { select: { workspaceId: true, id: true, status: true } },
+          },
+        });
+        if (!existingOffering) {
+          throw new ServiceOfferingNotFoundError(input.offeringId);
+        }
+        if (existingOffering.sellerProfile.workspaceId !== input.workspaceId) {
+          throw new ServiceOfferingNotOwnedError(input.offeringId, input.workspaceId);
+        }
+        return {
+          offering: toOwnerView(
+            existingOffering,
+            {
+              workspaceId: existingOffering.sellerProfile.workspaceId,
+              sellerProfileId: existingOffering.sellerProfile.id,
+              sellerProfileStatus: existingOffering.sellerProfile.status,
+            },
+            input.playbackUrlFor,
+          ),
+          evidence: toEvidenceView(existingActivation),
+          convergedFromExistingActivation: true,
+        };
+      }
+
+      // Step 2: precondition. The lifecycle status check requires
+      // `Paused`; a reactivation on Active / Draft / Archived surfaces
+      // `ServiceOfferingNotPausedError`.
+      const existing = await tx.serviceOffering.findUnique({
+        where: { id: input.offeringId },
+        include: { sellerProfile: { select: { workspaceId: true, id: true, status: true } } },
+      });
+      if (!existing) {
+        throw new ServiceOfferingNotFoundError(input.offeringId);
+      }
+      if (existing.sellerProfile.workspaceId !== input.workspaceId) {
+        throw new ServiceOfferingNotOwnedError(input.offeringId, input.workspaceId);
+      }
+      if (existing.status !== "Paused") {
+        throw new ServiceOfferingNotPausedError(input.offeringId, existing.status);
+      }
+
+      // Step 3 (M2 #86, slice 86B, Codex re-review): the
+      // `SellerProfile.published` precondition is enforced INSIDE the
+      // locked transaction AFTER the idempotency lookup and BEFORE
+      // any activation evidence row is inserted. The SELECT runs
+      // UNDER the `seller-profile:<workspaceId>` advisory lock
+      // acquired at the top of this transaction, which serializes
+      // against any concurrent SellerProfile write that also
+      // acquires that lock (`saveDraft`, `writePublication`, and any
+      // future suspension operation that follows the same locking
+      // convention). Without that lock, a suspension could COMMIT
+      // between this read and the activation evidence insert below,
+      // leaving a newly-Active offering associated with a now-
+      // Suspended profile. The same-key retry of an already-committed
+      // Reactivate still converges regardless of the current profile
+      // status because the idempotency pre-check above returns BEFORE
+      // this read.
+      const sellerProfile = await tx.sellerProfile.findUnique({
+        where: { id: existing.sellerProfile.id },
+        select: { id: true, workspaceId: true, status: true },
+      });
+      if (!sellerProfile) {
+        throw new ServiceOfferingSellerProfileMissingError(input.workspaceId);
+      }
+      if (sellerProfile.workspaceId !== input.workspaceId) {
+        // Defense in depth: the offering row already FK-links the
+        // profile, but a workspace mismatch here is a data-integrity
+        // failure that must surface as a precondition rejection.
+        throw new ServiceOfferingNotOwnedError(input.offeringId, input.workspaceId);
+      }
+      if (sellerProfile.status !== "Published") {
+        throw new ServiceOfferingSellerProfileNotPublishedError(
+          input.workspaceId,
+          sellerProfile.id,
+          sellerProfile.status,
+        );
+      }
+
+      // Step 3: snapshot for rollback on any failure mid-write.
+      const before = {
+        title: existing.title,
+        description: existing.description,
+        primaryCategoryId: existing.primaryCategoryId,
+        serviceMode: existing.serviceMode,
+        status: existing.status,
+      };
+
+      try {
+        // Step 4: STRICT activation completeness recheck INSIDE the
+        // lock. A concurrent remove between the service-layer
+        // pre-check and the activation commit cannot produce a newly
+        // Active offering with zero qualifying samples.
+        const fieldErrors: ApiFieldErrorV1[] = buildActivationCompletenessFieldErrors({
+          title: input.title,
+          description: input.description,
+          primaryCategoryKey: input.primaryCategoryKey,
+          serviceMode: input.serviceMode,
+          serviceAreas: input.serviceAreas,
+          pricingKind: input.pricing.kind,
+        });
+        const confirmedLiveCount = await tx.serviceOfferingAudioSample.count({
+          where: {
+            offeringId: input.offeringId,
+            cleanupStatus: AudioSampleCleanupStatus.Live,
+            confirmationVersion: { not: null },
+            confirmedByUserId: { not: null },
+            confirmedAt: { not: null },
+          },
+        });
+        if (confirmedLiveCount < 1 || confirmedLiveCount > BG2_AUDIO_SAMPLE_MAX_PER_OFFERING) {
+          fieldErrors.push({
+            path: "samples",
+            code: "samples_required",
+            message: `Activation requires 1 to ${BG2_AUDIO_SAMPLE_MAX_PER_OFFERING} playable samples.`,
+          });
+        }
+        if (fieldErrors.length > 0) {
+          throw new ServiceOfferingIncompleteError(
+            [
+              `field errors: ${fieldErrors.length}`,
+              `live confirmed sample count ${confirmedLiveCount} outside [1, ${BG2_AUDIO_SAMPLE_MAX_PER_OFFERING}]`,
+            ],
+            fieldErrors,
+          );
+        }
+
+        // Step 5: atomic field replacement + status flip + activation
+        // evidence insertion. The complete STRICT public field set
+        // replaces the prior Paused state's fields in one transaction;
+        // the existing service_offering_activations rows remain
+        // untouched (the reactivation writes a NEW row, preserving
+        // the original activation timestamp per ADR 0008).
+        const categoryId = await resolvePrimaryCategoryId(tx, input.primaryCategoryKey);
+        const unitId = input.pricing.unitId
+          ? await resolvePricingUnitId(tx, input.pricing.unitId)
+          : null;
+        const updated = await tx.serviceOffering.update({
+          where: { id: input.offeringId },
+          data: {
+            status: "Active",
+            title: input.title,
+            description: input.description,
+            primaryCategoryId: categoryId,
+            serviceMode: input.serviceMode,
+            serviceAreas: {
+              deleteMany: {},
+              create: input.serviceAreas.map((sa) => ({
+                countryCode: sa.countryCode,
+                region: sa.region ?? null,
+                city: sa.city ?? null,
+              })),
+            },
+            pricing: {
+              upsert: {
+                create: {
+                  kind: input.pricing.kind,
+                  amountMinor: input.pricing.amountMinor ?? null,
+                  currency: input.pricing.currency ?? null,
+                  unitId,
+                },
+                update: {
+                  kind: input.pricing.kind,
+                  amountMinor: input.pricing.amountMinor ?? null,
+                  currency: input.pricing.currency ?? null,
+                  unitId,
+                },
+              },
+            },
+            genreTags: [...input.genreTags],
+            includedServices: {
+              deleteMany: {},
+              create: await resolveIncludedServices(tx, input.includedServiceCategoryKeys),
+            },
+          },
+          include: OFFERING_INCLUDE,
+        });
+
+        // Step 6: insert the reactivation evidence row. The
+        // (offeringId, idempotencyKey) DB unique constraint is the
+        // second defense if a concurrent same-key request slipped
+        // past the pre-check.
+        let activation;
+        try {
+          activation = await tx.serviceOfferingActivation.create({
+            data: {
+              offeringId: input.offeringId,
+              workspaceId: input.workspaceId,
+              sellerProfileId: existing.sellerProfile.id,
+              activatedByUserId: input.reactivatedByUserId,
+              confirmationVersion: input.confirmationVersion,
+              activatedAt: input.now,
+              idempotencyKey: input.idempotencyKey,
+              requestId: input.requestId,
+            },
+          });
+        } catch (err) {
+          if (err instanceof Prisma.PrismaClientKnownRequestError && err.code === "P2002") {
+            const winner = await tx.serviceOfferingActivation.findUnique({
+              where: {
+                offeringId_idempotencyKey: {
+                  offeringId: input.offeringId,
+                  idempotencyKey: input.idempotencyKey,
+                },
+              },
+            });
+            if (winner) {
+              return {
+                offering: toOwnerView(
+                  updated,
+                  {
+                    workspaceId: input.workspaceId,
+                    sellerProfileId: existing.sellerProfile.id,
+                    sellerProfileStatus: existing.sellerProfile.status,
+                  },
+                  input.playbackUrlFor,
+                ),
+                evidence: toEvidenceView(winner),
+                convergedFromExistingActivation: true,
+              };
+            }
+          }
+          throw err;
+        }
+
+        return {
+          offering: toOwnerView(
+            updated,
+            {
+              workspaceId: input.workspaceId,
+              sellerProfileId: existing.sellerProfile.id,
+              sellerProfileStatus: existing.sellerProfile.status,
+            },
+            input.playbackUrlFor,
+          ),
+          evidence: toEvidenceView(activation),
+          convergedFromExistingActivation: false,
+        };
+      } catch (err) {
+        if (err instanceof ServiceOfferingIncompleteError) {
+          throw err;
+        }
+        await tx.serviceOffering
+          .update({
+            where: { id: input.offeringId },
+            data: before,
+          })
+          .catch(() => undefined);
+        throw err;
+      }
+    });
+  }
+
+  async updateActive(
+    input: ServiceOfferingUpdateActiveInput,
+  ): Promise<ServiceOfferingUpdateActiveResult> {
+    return this.prisma.$transaction(async (tx) => {
+      // M2 (#86, slice 86C): lock acquisition order matches
+      // `reactivate` (slice 86B re-review) — offering first,
+      // audio-sample second, seller-profile workspaceLock third.
+      // The workspaceLock is required because Update re-runs the
+      // current activation contract, including the
+      // `SellerProfile.published` precondition (per the cross-slice
+      // Authorization invariant). Without the workspaceLock, a
+      // concurrent SellerProfile suspension could commit between
+      // the publication read below and the update evidence insert,
+      // leaving a freshly-updated offering associated with a
+      // now-Suspended profile. Lock acquisition order across the
+      // slices is consistent (this transaction uses all three;
+      // SellerProfile writes use the workspaceLock only; audio-
+      // sample writes use the audio-sample lock only; pause uses
+      // the offering lock only) and is therefore deadlock-free.
+      await tx.$executeRaw(offeringLockSql(input.offeringId));
+      await acquireAudioSampleLockTx(tx, input.offeringId);
+      await tx.$executeRaw(sellerProfileWorkspaceLockSql(input.workspaceId));
+
+      // Step 1: idempotency pre-check against the updates table.
+      // The (offeringId, idempotencyKey) unique index on
+      // `service_offering_updates` is the convergence key. A
+      // transport retry with the same key returns the SAME
+      // evidence row + the SAME updated OwnerView (re-read with
+      // the playbackUrlFor resolver so the response's `playbackUrl`
+      // per sample parses through `z.string().url()` — same
+      // Codex/Tenki fix that activate + reactivate carry).
+      const existingUpdate = await tx.serviceOfferingUpdate.findUnique({
+        where: {
+          offeringId_idempotencyKey: {
+            offeringId: input.offeringId,
+            idempotencyKey: input.idempotencyKey,
+          },
+        },
+      });
+      if (existingUpdate) {
+        const existingOffering = await tx.serviceOffering.findUnique({
+          where: { id: input.offeringId },
+          include: {
+            ...OFFERING_INCLUDE,
+            sellerProfile: { select: { workspaceId: true, id: true, status: true } },
+          },
+        });
+        if (!existingOffering) {
+          throw new ServiceOfferingNotFoundError(input.offeringId);
+        }
+        if (existingOffering.sellerProfile.workspaceId !== input.workspaceId) {
+          throw new ServiceOfferingNotOwnedError(input.offeringId, input.workspaceId);
+        }
+        return {
+          offering: toOwnerView(
+            existingOffering,
+            {
+              workspaceId: existingOffering.sellerProfile.workspaceId,
+              sellerProfileId: existingOffering.sellerProfile.id,
+              sellerProfileStatus: existingOffering.sellerProfile.status,
+            },
+            input.playbackUrlFor,
+          ),
+          evidence: toUpdateEvidenceView(existingUpdate),
+          convergedFromExistingUpdate: true,
+        };
+      }
+
+      // Step 2: precondition check. Update requires Active state;
+      // a same-key retry after the offering has since transitioned
+      // would NOT reach this branch (the idempotency pre-check
+      // above would have returned the existing update row).
+      //
+      // The query selects only the columns the precondition +
+      // rollback snapshot need; the activation timestamp is NOT a
+      // column on `service_offerings` (it lives on the related
+      // `service_offering_activations` row queried via
+      // OFFERING_INCLUDE on the post-update read), so the snapshot
+      // intentionally does NOT carry an `activatedAt` field.
+      const existing = await tx.serviceOffering.findUnique({
+        where: { id: input.offeringId },
+        include: { sellerProfile: { select: { workspaceId: true, id: true, status: true } } },
+      });
+      if (!existing) {
+        throw new ServiceOfferingNotFoundError(input.offeringId);
+      }
+      if (existing.sellerProfile.workspaceId !== input.workspaceId) {
+        throw new ServiceOfferingNotOwnedError(input.offeringId, input.workspaceId);
+      }
+      if (existing.status !== "Active") {
+        throw new ServiceOfferingUpdateNotActiveError(input.offeringId, existing.status);
+      }
+
+      // Step 3 (M2 #86, slice 86C): the `SellerProfile.published`
+      // precondition is enforced INSIDE the locked transaction
+      // AFTER the idempotency lookup and BEFORE the update evidence
+      // row is inserted. The workspaceLock acquired at the top
+      // serializes against any concurrent SellerProfile write that
+      // also acquires that lock (`saveDraft`, `writePublication`,
+      // and any future suspension operation). Same-key retry of an
+      // already-committed Update converges regardless of the current
+      // SellerProfile status because the idempotency pre-check
+      // above returns BEFORE this read.
+      const sellerProfile = await tx.sellerProfile.findUnique({
+        where: { id: existing.sellerProfile.id },
+        select: { id: true, workspaceId: true, status: true },
+      });
+      if (!sellerProfile) {
+        throw new ServiceOfferingSellerProfileMissingError(input.workspaceId);
+      }
+      if (sellerProfile.workspaceId !== input.workspaceId) {
+        throw new ServiceOfferingNotOwnedError(input.offeringId, input.workspaceId);
+      }
+      if (sellerProfile.status !== "Published") {
+        throw new ServiceOfferingSellerProfileNotPublishedError(
+          input.workspaceId,
+          sellerProfile.id,
+          sellerProfile.status,
+        );
+      }
+
+      // Step 4: full STRICT activation completeness re-check INSIDE
+      // the offering lock. The audio-sample lock acquired at the
+      // top serializes against any concurrent audio-sample remove
+      // so a remove that lands between the service-layer pre-check
+      // and the update commit cannot produce an updated offering
+      // with zero qualifying samples. The field-level checks mirror
+      // `activate`'s STRICT contract; the sample-count check
+      // closes the same race window the activation recheck does.
+      // The repository raises `ServiceOfferingInvalidUpdateError`
+      // (mapped to `SERVICE_OFFERING_INVALID_UPDATE`) instead of
+      // the activation-shared `ServiceOfferingIncompleteError` so
+      // the route + service can distinguish a 422 Update rejection
+      // from a 422 Activation rejection at the error-envelope
+      // level. The error carries the same `fieldErrors` shape the
+      // editor renders for the activation flow.
+      const fieldErrors: ApiFieldErrorV1[] = buildActivationCompletenessFieldErrors({
+        title: input.title,
+        description: input.description,
+        primaryCategoryKey: input.primaryCategoryKey,
+        serviceMode: input.serviceMode,
+        serviceAreas: input.serviceAreas,
+        pricingKind: input.pricing.kind,
+      });
+      const confirmedLiveCount = await tx.serviceOfferingAudioSample.count({
+        where: {
+          offeringId: input.offeringId,
+          cleanupStatus: AudioSampleCleanupStatus.Live,
+          confirmationVersion: { not: null },
+          confirmedByUserId: { not: null },
+          confirmedAt: { not: null },
+        },
+      });
+      if (confirmedLiveCount < 1 || confirmedLiveCount > BG2_AUDIO_SAMPLE_MAX_PER_OFFERING) {
+        fieldErrors.push({
+          path: "samples",
+          code: "samples_required",
+          message: `Update requires 1 to ${BG2_AUDIO_SAMPLE_MAX_PER_OFFERING} playable samples.`,
+        });
+      }
+      if (fieldErrors.length > 0) {
+        throw new ServiceOfferingInvalidUpdateError(
+          [
+            `field errors: ${fieldErrors.length}`,
+            `live confirmed sample count ${confirmedLiveCount} outside [1, ${BG2_AUDIO_SAMPLE_MAX_PER_OFFERING}]`,
+          ],
+          fieldErrors,
+        );
+      }
+
+      // Step 5: snapshot for rollback on any failure mid-write.
+      // The snapshot includes every column the update will replace
+      // — title, description, primaryCategoryId, serviceMode —
+      // plus the `status` column as a defense-in-depth check (the
+      // update path never writes `status`, so a non-matching value
+      // in the rollback is a hard failure signal). The activation
+      // timestamp lives on the related `service_offering_activations`
+      // table queried via OFFERING_INCLUDE on the post-update read;
+      // it is preserved verbatim because the update path never
+      // touches the activations table.
+      const before = {
+        title: existing.title,
+        description: existing.description,
+        primaryCategoryId: existing.primaryCategoryId,
+        serviceMode: existing.serviceMode,
+        status: existing.status,
+      };
+
+      try {
+        const categoryId = await resolvePrimaryCategoryId(tx, input.primaryCategoryKey);
+        const unitId = input.pricing.unitId
+          ? await resolvePricingUnitId(tx, input.pricing.unitId)
+          : null;
+        const updated = await tx.serviceOffering.update({
+          where: { id: input.offeringId },
+          data: {
+            // Status NOT changed — stays Active per the 86C invariant.
+            title: input.title,
+            description: input.description,
+            primaryCategoryId: categoryId,
+            serviceMode: input.serviceMode,
+            serviceAreas: {
+              deleteMany: {},
+              create: input.serviceAreas.map((sa) => ({
+                countryCode: sa.countryCode,
+                region: sa.region ?? null,
+                city: sa.city ?? null,
+              })),
+            },
+            pricing: {
+              upsert: {
+                create: {
+                  kind: input.pricing.kind,
+                  amountMinor: input.pricing.amountMinor ?? null,
+                  currency: input.pricing.currency ?? null,
+                  unitId,
+                },
+                update: {
+                  kind: input.pricing.kind,
+                  amountMinor: input.pricing.amountMinor ?? null,
+                  currency: input.pricing.currency ?? null,
+                  unitId,
+                },
+              },
+            },
+            genreTags: [...input.genreTags],
+            includedServices: {
+              deleteMany: {},
+              create: await resolveIncludedServices(tx, input.includedServiceCategoryKeys),
+            },
+            // The original activation timestamp + actor are NOT
+            // touched — Update preserves the activation history per
+            // ADR 0008 (the slice plan's "Owner-facing lifecycle
+            // history" invariant).
+          },
+          include: OFFERING_INCLUDE,
+        });
+
+        // Step 6: insert the update evidence row. The DB unique
+        // constraint on (offeringId, idempotencyKey) is the second
+        // defense if a concurrent same-key request slipped past the
+        // pre-check. We catch `P2002` and resolve the winner so the
+        // route layer sees a converged success even when the race
+        // was lost at the DB level.
+        let updateEvidence;
+        try {
+          updateEvidence = await tx.serviceOfferingUpdate.create({
+            data: {
+              offeringId: input.offeringId,
+              workspaceId: input.workspaceId,
+              sellerProfileId: existing.sellerProfile.id,
+              updatedByUserId: input.updatedByUserId,
+              confirmationVersion: input.confirmationVersion,
+              updatedAt: input.now,
+              idempotencyKey: input.idempotencyKey,
+              requestId: input.requestId,
+            },
+          });
+        } catch (err) {
+          if (err instanceof Prisma.PrismaClientKnownRequestError && err.code === "P2002") {
+            const winner = await tx.serviceOfferingUpdate.findUnique({
+              where: {
+                offeringId_idempotencyKey: {
+                  offeringId: input.offeringId,
+                  idempotencyKey: input.idempotencyKey,
+                },
+              },
+            });
+            if (winner) {
+              return {
+                offering: toOwnerView(
+                  updated,
+                  {
+                    workspaceId: input.workspaceId,
+                    sellerProfileId: existing.sellerProfile.id,
+                    sellerProfileStatus: existing.sellerProfile.status,
+                  },
+                  input.playbackUrlFor,
+                ),
+                evidence: toUpdateEvidenceView(winner),
+                convergedFromExistingUpdate: true,
+              };
+            }
+          }
+          throw err;
+        }
+
+        return {
+          offering: toOwnerView(
+            updated,
+            {
+              workspaceId: input.workspaceId,
+              sellerProfileId: existing.sellerProfile.id,
+              sellerProfileStatus: existing.sellerProfile.status,
+            },
+            input.playbackUrlFor,
+          ),
+          evidence: toUpdateEvidenceView(updateEvidence),
+          convergedFromExistingUpdate: false,
+        };
+      } catch (err) {
+        if (err instanceof ServiceOfferingInvalidUpdateError) {
+          // No state change has occurred yet at this point in
+          // the transaction; nothing to roll back. Prisma's
+          // transaction scope aborts automatically.
+          throw err;
+        }
+        await tx.serviceOffering
+          .update({
+            where: { id: input.offeringId },
+            data: before,
+          })
+          .catch(() => undefined);
+        throw err;
+      }
+    });
+  }
+
   async findForOwner(input: {
     readonly workspaceId: string;
     readonly offeringId: string;
@@ -711,7 +1507,7 @@ export class PrismaServiceOfferingRepository implements ServiceOfferingRepositor
       where: { id: input.offeringId },
       include: {
         ...OFFERING_INCLUDE,
-        sellerProfile: { select: { workspaceId: true, id: true } },
+        sellerProfile: { select: { workspaceId: true, id: true, status: true } },
       },
     });
     if (!row) return null;
@@ -721,6 +1517,7 @@ export class PrismaServiceOfferingRepository implements ServiceOfferingRepositor
       {
         workspaceId: row.sellerProfile.workspaceId,
         sellerProfileId: row.sellerProfile.id,
+        sellerProfileStatus: row.sellerProfile.status,
       },
       input.playbackUrlFor,
     );
@@ -734,7 +1531,7 @@ export class PrismaServiceOfferingRepository implements ServiceOfferingRepositor
       where: { sellerProfile: { workspaceId: input.workspaceId } },
       include: {
         ...OFFERING_INCLUDE,
-        sellerProfile: { select: { workspaceId: true, id: true } },
+        sellerProfile: { select: { workspaceId: true, id: true, status: true } },
       },
       orderBy: { title: "asc" },
     });
@@ -744,6 +1541,7 @@ export class PrismaServiceOfferingRepository implements ServiceOfferingRepositor
         {
           workspaceId: row.sellerProfile.workspaceId,
           sellerProfileId: row.sellerProfile.id,
+          sellerProfileStatus: row.sellerProfile.status,
         },
         input.playbackUrlFor,
       ),
@@ -861,14 +1659,27 @@ type OwnerViewRowShape = {
   // attribution is the actor's email — never the raw UserAccount
   // id — to keep the private identifier off the public DTO.
   readonly activations: readonly {
+    readonly confirmationVersion: string;
     readonly activatedAt: Date;
     readonly activatedBy: { readonly email: string | null } | null;
+  }[];
+  // M2 (#86, slice 86F): the single most recent `ServiceOfferingUpdate`
+  // row. `deriveEffectiveConfirmationVersion` merges this with the
+  // latest activation row to pick the chronologically newest event,
+  // which is the readiness predicate's `confirmationVersion` input.
+  readonly updates: readonly {
+    readonly confirmationVersion: string;
+    readonly updatedAt: Date;
   }[];
 };
 
 function toOwnerView(
   row: OwnerViewRowShape,
-  ctx: { readonly workspaceId: string; readonly sellerProfileId: string },
+  ctx: {
+    readonly workspaceId: string;
+    readonly sellerProfileId: string;
+    readonly sellerProfileStatus: "Draft" | "Published" | "Suspended";
+  },
   playbackUrlFor?: (input: { offeringId: string; sampleId: string }) => string,
 ): ServiceOfferingOwnerViewRecord {
   const samples: ServiceOfferingOwnerSampleSummaryV1[] = row.audioSamples.map((s) => {
@@ -931,6 +1742,44 @@ function toOwnerView(
       }
     : null;
   const latestActivation = row.activations[0];
+  const latestUpdate = row.updates[0];
+  // M2 (#86, slice 86F): readiness is the runtime source of truth.
+  // The same pure predicate the operator inventory CLI uses derives
+  // these flags from the persisted state, so the web editor renders
+  // the verbatim view and never re-implements the rule.
+  const currentConfirmationVersion = SERVICE_OFFERING_ACTIVATION_CONFIRMATION_VERSIONS.at(-1);
+  if (!currentConfirmationVersion) {
+    throw new Error(
+      "SERVICE_OFFERING_ACTIVATION_CONFIRMATION_VERSIONS is empty; readiness cannot derive a current version.",
+    );
+  }
+  const effectiveConfirmationVersion = deriveEffectiveConfirmationVersion({
+    latestActivation: latestActivation
+      ? {
+          confirmationVersion: latestActivation.confirmationVersion,
+          occurredAt: latestActivation.activatedAt,
+        }
+      : null,
+    latestUpdate: latestUpdate
+      ? {
+          confirmationVersion: latestUpdate.confirmationVersion,
+          occurredAt: latestUpdate.updatedAt,
+        }
+      : null,
+  });
+  const readiness = deriveServiceOfferingReadiness({
+    status: row.status,
+    title: row.title,
+    description: row.description,
+    hasPrimaryCategory: row.primaryCategory !== null,
+    serviceMode: row.serviceMode ?? "Remote",
+    serviceAreaCount: row.serviceAreas.length,
+    hasPricing: row.pricing !== null,
+    confirmedLiveSampleCount: row.audioSamples.length,
+    sellerProfileStatus: ctx.sellerProfileStatus,
+    confirmationVersion: effectiveConfirmationVersion,
+    currentConfirmationVersion,
+  });
   return {
     serviceOfferingId: row.id,
     workspaceId: ctx.workspaceId,
@@ -947,6 +1796,12 @@ function toOwnerView(
     samples,
     activatedAt: latestActivation ? latestActivation.activatedAt : null,
     activatedByDisplayName: latestActivation ? (latestActivation.activatedBy?.email ?? null) : null,
+    readiness: {
+      isAvailable: readiness.isAvailable,
+      updateNeeded: readiness.updateNeeded,
+      reasonCategories: [...readiness.reasonCategories],
+      isGrandfatheredNonconforming: readiness.isGrandfatheredNonconforming,
+    },
   };
 }
 
@@ -957,6 +1812,23 @@ function toEvidenceView(p: {
 }): ServiceOfferingActivationEvidenceView {
   return {
     activatedAt: p.activatedAt,
+    confirmationVersion: p.confirmationVersion as ServiceOfferingActivationConfirmationVersionV1,
+    idempotencyKey: p.idempotencyKey,
+  };
+}
+
+// M2 (#86, slice 86C): project a `service_offering_updates` row
+// onto the public `ServiceOfferingUpdateEvidenceView` shape. The
+// `confirmationVersion` carries the same closed enum value as
+// activation ("m2-service-activation-v1") because `updateActive`
+// re-runs the same activation contract.
+function toUpdateEvidenceView(p: {
+  updatedAt: Date;
+  confirmationVersion: string;
+  idempotencyKey: string;
+}): ServiceOfferingUpdateEvidenceView {
+  return {
+    updatedAt: p.updatedAt,
     confirmationVersion: p.confirmationVersion as ServiceOfferingActivationConfirmationVersionV1,
     idempotencyKey: p.idempotencyKey,
   };

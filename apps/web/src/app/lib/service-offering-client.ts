@@ -28,7 +28,12 @@ import {
   serviceOfferingDraftResponseV1Schema,
   serviceOfferingGetResponseV1Schema,
   serviceOfferingOwnerListResponseV1Schema,
+  serviceOfferingPauseRequestV1Schema,
+  serviceOfferingPauseResponseV1Schema,
+  serviceOfferingReactivateRequestV1Schema,
   serviceOfferingTaxonomyResponseV1Schema,
+  serviceOfferingUpdateRequestV1Schema,
+  serviceOfferingUpdateResponseV1Schema,
   type ApiFieldErrorV1,
   type ServiceOfferingActivateRequestV1,
   type ServiceOfferingActivationResponseV1,
@@ -37,7 +42,10 @@ import {
   type ServiceOfferingGetResponseV1,
   type ServiceOfferingOwnerListResponseV1,
   type ServiceOfferingOwnerViewV1,
+  type ServiceOfferingPauseResponseV1,
   type ServiceOfferingTaxonomyResponseV1,
+  type ServiceOfferingUpdateRequestV1,
+  type ServiceOfferingUpdateResponseV1,
 } from "@soundhub/types";
 
 export type {
@@ -46,6 +54,7 @@ export type {
   ServiceOfferingActivationResponseV1,
   ServiceOfferingOwnerListResponseV1,
   ServiceOfferingTaxonomyResponseV1,
+  ServiceOfferingUpdateResponseV1,
 };
 
 export interface ServiceOfferingClientError {
@@ -262,4 +271,79 @@ export function asServiceOfferingClientError(err: unknown): ServiceOfferingClien
     }
   }
   return null;
+}
+
+// M2 (#86, slice 86B): typed Pause command. The body carries ONLY
+// the idempotencyKey per the strict pause contract; the request schema
+// rejects every other field. The browser keeps the same `credentials:
+// "include"` + shared error-translation envelope as the existing
+// commands so the editor renders one uniform retry / authorization
+// surface.
+export async function pauseServiceOffering(input: {
+  readonly workspaceId: string;
+  readonly offeringId: string;
+  readonly idempotencyKey: string;
+}): Promise<ServiceOfferingPauseResponseV1> {
+  const payload = serviceOfferingPauseRequestV1Schema.parse({
+    idempotencyKey: input.idempotencyKey,
+  });
+  const response = await fetch(offeringPath(input.workspaceId, input.offeringId, "/pause"), {
+    method: "POST",
+    credentials: "include",
+    headers: { "Content-Type": "application/json", Accept: "application/json" },
+    body: JSON.stringify(payload),
+  });
+  if (!response.ok) {
+    throw ensureError(null, await parseErrorResponse(response));
+  }
+  const body: unknown = await response.json();
+  return serviceOfferingPauseResponseV1Schema.parse(body);
+}
+
+// M2 (#86, slice 86B): typed Reactivate command. The body reuses the
+// STRICT activation schema (the server-side contract treats reactivate
+// as a full activation recheck). The response shape matches the
+// activation response — reactivate writes a new activation row.
+export async function reactivateServiceOffering(input: {
+  readonly workspaceId: string;
+  readonly offeringId: string;
+  readonly activation: ServiceOfferingActivateRequestV1;
+}): Promise<ServiceOfferingActivationResponseV1> {
+  const payload = serviceOfferingReactivateRequestV1Schema.parse(input.activation);
+  const response = await fetch(offeringPath(input.workspaceId, input.offeringId, "/reactivate"), {
+    method: "POST",
+    credentials: "include",
+    headers: { "Content-Type": "application/json", Accept: "application/json" },
+    body: JSON.stringify(payload),
+  });
+  if (!response.ok) {
+    throw ensureError(null, await parseErrorResponse(response));
+  }
+  const body: unknown = await response.json();
+  return serviceOfferingActivationResponseV1Schema.parse(body);
+}
+
+// M2 (#86, slice 86F): typed Update command. The body reuses the
+// STRICT activation schema (the server-side contract treats updateActive
+// as a full activation recheck — same shape as Reactivate). The
+// response shape is `serviceOfferingUpdateResponseV1Schema` (carries
+// `updatedAt` rather than `activatedAt` per ADR 0008 — the activation
+// evidence is preserved verbatim).
+export async function updateActiveServiceOffering(input: {
+  readonly workspaceId: string;
+  readonly offeringId: string;
+  readonly update: ServiceOfferingUpdateRequestV1;
+}): Promise<ServiceOfferingUpdateResponseV1> {
+  const payload = serviceOfferingUpdateRequestV1Schema.parse(input.update);
+  const response = await fetch(offeringPath(input.workspaceId, input.offeringId, "/update"), {
+    method: "PUT",
+    credentials: "include",
+    headers: { "Content-Type": "application/json", Accept: "application/json" },
+    body: JSON.stringify(payload),
+  });
+  if (!response.ok) {
+    throw ensureError(null, await parseErrorResponse(response));
+  }
+  const body: unknown = await response.json();
+  return serviceOfferingUpdateResponseV1Schema.parse(body);
 }

@@ -122,6 +122,16 @@ export function LockIcon(props: IconProps) {
   );
 }
 
+export function PauseIcon(props: IconProps) {
+  return (
+    <svg {...baseProps(props)}>
+      {props.title ? <title>{props.title}</title> : null}
+      <rect x="6" y="5" width="4" height="14" rx="1" />
+      <rect x="14" y="5" width="4" height="14" rx="1" />
+    </svg>
+  );
+}
+
 export function ExpandMoreIcon(props: IconProps) {
   return (
     <svg {...baseProps(props)}>

@@ -47,6 +47,14 @@ export default function SellerAudioPage() {
   const [selectedWorkspaceName, setSelectedWorkspaceName] = useState<string>("");
   const [selectedOfferingId, setSelectedOfferingId] = useState<string>("");
   const [selectedOfferingTitle, setSelectedOfferingTitle] = useState<string>("");
+  // M2 (#86, slice 86F Tenki PR feedback round 3): the dashboard
+  // panel does NOT consume an `offeringStatus` prop. The server's
+  // rejection envelope (`AUDIO_SAMPLE_FINAL_REMOVAL_CONFIRMATION_REQUIRED`,
+  // code from the safe envelope) is the single source of truth for
+  // "is this the final sample?" — pre-classifying in the browser
+  // would race the server's authoritative state. The dropdown
+  // label (`offering.title ({offering.status})`) shows the user the
+  // offering's status, but the panel itself does not need to know.
   const [actingVerified, setActingVerified] = useState<boolean>(false);
 
   useEffect(() => {

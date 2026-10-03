@@ -151,6 +151,19 @@ export async function seedMultiWorkspaceUser(
   }
 }
 
+async function writeSeedSidecar(
+  path: string,
+  payload: {
+    readonly email: string;
+    readonly userAccountId: string;
+    readonly personalWorkspaceId: string;
+    readonly organizationWorkspaceId: string;
+  },
+): Promise<void> {
+  const fs = await import("node:fs/promises");
+  await fs.writeFile(path, JSON.stringify(payload, null, 2));
+}
+
 const isMainModule =
   typeof process !== "undefined" &&
   process.argv[1] !== undefined &&
@@ -171,7 +184,7 @@ if (isMainModule) {
   const suspendOrganization = process.env.SUSPEND_ORG === "1";
   const suspendPersonal = process.env.SUSPEND_PERSONAL === "1";
   seedMultiWorkspaceUser(email, { suspendOrganization, suspendPersonal })
-    .then((result) => {
+    .then(async (result) => {
       const tags = [
         suspendOrganization ? "suspended-org" : null,
         suspendPersonal ? "suspended-personal" : null,
@@ -181,6 +194,16 @@ if (isMainModule) {
       console.log(
         `✓ seeded multi-workspace user: ${email} (userId=${result.userAccountId} personal=${result.personalWorkspaceId} org=${result.organizationWorkspaceId}${tags ? " " + tags : ""})`,
       );
+      // Sidecar JSON for Playwright fixtures (avoids log-line parsing).
+      const sidecar = process.env.MULTI_WORKSPACE_USER_SIDECAR;
+      if (sidecar) {
+        await writeSeedSidecar(sidecar, {
+          email,
+          userAccountId: result.userAccountId,
+          personalWorkspaceId: result.personalWorkspaceId,
+          organizationWorkspaceId: result.organizationWorkspaceId,
+        });
+      }
     })
     .catch((err: unknown) => {
       console.error("✗ seed-multi-workspace-user failed:", err);

@@ -49,7 +49,7 @@ export function buildSafeError(
   return { status, body };
 }
 
-function mapStatus(code: ApiErrorCodeV1): number {
+export function mapStatus(code: ApiErrorCodeV1): number {
   switch (code) {
     case "INVALID_JSON":
     case "INVALID_SEARCH_CRITERIA":
@@ -323,6 +323,37 @@ function mapStatus(code: ApiErrorCodeV1): number {
       return 422;
     case "SERVICE_OFFERING_INTERNAL_FAILED":
       return 500;
+    // M2 (#86): post-activation lifecycle. The mapping mirrors the
+    // existing ServiceOffering pattern: 409 for state-precondition
+    // mismatches (Pause of a non-Active offering, Reactivate of a
+    // non-Paused offering, Update of a non-Active offering); 422
+    // for the Update completeness rejection (mirrors
+    // SERVICE_OFFERING_INCOMPLETE); 400 for the audio-side
+    // final-removal confirmation flag omission.
+    case "SERVICE_OFFERING_ALREADY_PAUSED":
+    case "SERVICE_OFFERING_NOT_PAUSED":
+    case "SERVICE_OFFERING_NOT_ACTIVE":
+      // 409 Conflict. The offering is in the wrong lifecycle state
+      // for the requested command; a retry that re-sends the same
+      // idempotencyKey after a committed command returns the
+      // existing evidence row (converged success) and does NOT
+      // surface this code.
+      return 409;
+    case "SERVICE_OFFERING_INVALID_UPDATE":
+      // Semantic-but-well-formed rejection: the Update payload is
+      // valid but the offering does not satisfy the full current
+      // contract. The safe envelope carries `fields` for the
+      // multi-error summary.
+      return 422;
+    case "AUDIO_SAMPLE_FINAL_REMOVAL_CONFIRMATION_REQUIRED":
+      // M2 (#86): the seller attempted to remove the last qualifying
+      // sample from an Active offering without the explicit
+      // `confirmEligibilityLoss` flag on the request body. The flag
+      // is transient (never persisted) and required only on this
+      // condition — surface as 400 because the request is
+      // structurally incomplete without the explicit confirmation
+      // field.
+      return 400;
   }
 }
 

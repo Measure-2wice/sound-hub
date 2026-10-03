@@ -155,6 +155,13 @@ export async function removeOfferingSample(input: {
   readonly offeringId: string;
   readonly sample: Bg2AudioSamplePublicV1;
   readonly actingWorkspaceId: string;
+  // M2 (#86, slice 86D + 86F): when the seller removes the LAST
+  // CONFIRMED Live sample from an Active offering, the application
+  // boundary enforces an explicit consequence acknowledgement. The
+  // server-side slice 86D handler enforces this; passing the flag
+  // enables the atomic Active → Paused transition (the eligibility-
+  // loss path). Omitting it returns AUDIO_SAMPLE_FINAL_REMOVAL_CONFIRMATION_REQUIRED.
+  readonly confirmEligibilityLoss?: boolean;
 }): Promise<Bg2AudioSampleRemoveResponseV1> {
   const response = await fetch(
     `/api/services/${encodeURIComponent(input.offeringId)}/audio-samples/${encodeURIComponent(
@@ -167,7 +174,12 @@ export async function removeOfferingSample(input: {
         Accept: "application/json",
         "Content-Type": "application/json",
       },
-      body: JSON.stringify({ actingWorkspaceId: input.actingWorkspaceId }),
+      body: JSON.stringify({
+        actingWorkspaceId: input.actingWorkspaceId,
+        ...(input.confirmEligibilityLoss !== undefined
+          ? { confirmEligibilityLoss: input.confirmEligibilityLoss }
+          : {}),
+      }),
     },
   );
   if (!response.ok) throw await parseErrorResponse(response);

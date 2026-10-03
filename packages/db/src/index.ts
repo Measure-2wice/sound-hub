@@ -57,3 +57,25 @@ export {
   resolveApprovedTestDatabaseUrl,
 } from "./test-database-url.js";
 export type { ApprovedTestTarget } from "./test-database-url.js";
+
+// M2 (#86, slice 86E): the grandfathering readiness predicate.
+// The slice plan's "Dependency boundary" section requires a legal
+// shared location for the pure predicate so both the runtime
+// ServiceOffering composition (apps/api, future 86F) and the
+// operator inventory script (`packages/db/prisma/`) can consume
+// it. `@soundhub/db` is already a declared runtime dependency
+// of `apps/api`, so the re-exports below let 86F wire the predicate
+// into the editor's lifecycle view without introducing a new
+// dependency edge or reversing the monorepo direction.
+export {
+  deriveEffectiveConfirmationVersion,
+  deriveServiceOfferingReadiness,
+  SERVICE_OFFERING_MAX_CONFIRMED_LIVE_SAMPLES,
+  SERVICE_OFFERING_MIN_CONFIRMED_LIVE_SAMPLES,
+} from "./grandfathering/service-offering-readiness.js";
+export type {
+  EffectiveConfirmationVersionInput,
+  ServiceOfferingReadiness,
+  ServiceOfferingReadinessInput,
+  ServiceOfferingReadinessReasonCategory,
+} from "./grandfathering/service-offering-readiness.js";

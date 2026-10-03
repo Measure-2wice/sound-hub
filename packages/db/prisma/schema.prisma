@@ -163,6 +163,18 @@ enum PaymentIntentFailureDetailCategory {
   CONFIRMATION_MISMATCH
 }
 
+// M2 (#86): closed set of reasons a ServiceOfferingPause evidence
+// row can carry. Pause authorization is independent of activation
+// completeness; the `user_initiated` reason covers explicit seller
+// Pause commands, while `final_sample_removal` records the automatic
+// Active → Paused transition when the last qualifying sample is
+// removed from an Active offering. The closed set prevents
+// fabrication of alternative reasons.
+enum ServiceOfferingPauseReason {
+  user_initiated
+  final_sample_removal
+}
+
 // ---------- Identity and authority ----------
 
 model UserAccount {
@@ -243,6 +255,14 @@ model UserAccount {
   // ServiceOfferingCreation evidence table; ON DELETE RESTRICT on
   // the FK preserves the durable creation record.
   createdServiceOfferings          ServiceOfferingCreation[]   @relation("ServiceOfferingCreationCreatedBy")
+  // M2 (#86): reverse relation on the ServiceOfferingPause evidence
+  // table. ON DELETE RESTRICT on the FK preserves the durable pause
+  // evidence row even if the source UserAccount is hard-deleted.
+  pausedServiceOfferings           ServiceOfferingPause[]      @relation("ServiceOfferingPausePausedBy")
+  // M2 (#86): reverse relation on the ServiceOfferingUpdate evidence
+  // table. ON DELETE RESTRICT on the FK preserves the durable update
+  // evidence row even if the source UserAccount is hard-deleted.
+  updatedServiceOfferings          ServiceOfferingUpdate[]     @relation("ServiceOfferingUpdateUpdatedBy")
 
   @@map("user_accounts")
 }
@@ -360,6 +380,14 @@ model Workspace {
   // table; ON DELETE RESTRICT on the FK preserves the durable
   // evidence row.
   serviceOfferingCreations   ServiceOfferingCreation[]
+  // M2 (#86): narrow append-only pause evidence. The reverse
+  // relation on the ServiceOfferingPause table; ON DELETE RESTRICT
+  // on the FK preserves the durable pause evidence row.
+  serviceOfferingPauses     ServiceOfferingPause[]
+  // M2 (#86): narrow append-only update evidence. The reverse
+  // relation on the ServiceOfferingUpdate table; ON DELETE RESTRICT
+  // on the FK preserves the durable update evidence row.
+  serviceOfferingUpdates    ServiceOfferingUpdate[]
 
   @@map("workspaces")
 }
@@ -426,6 +454,14 @@ model SellerProfile {
   // evidence table; ON DELETE RESTRICT on the FK preserves the
   // durable evidence row.
   offeringActivations   ServiceOfferingActivation[]
+  // M2 (#86): reverse relation on the ServiceOfferingPause evidence
+  // table. ON DELETE RESTRICT on the FK preserves the durable pause
+  // evidence row.
+  serviceOfferingPauses ServiceOfferingPause[]
+  // M2 (#86): reverse relation on the ServiceOfferingUpdate evidence
+  // table. ON DELETE RESTRICT on the FK preserves the durable update
+  // evidence row.
+  serviceOfferingUpdates ServiceOfferingUpdate[]
 
   @@index([status, updatedAt], map: "seller_profiles_status_updatedAt_idx")
   @@map("seller_profiles")
@@ -569,6 +605,14 @@ model ServiceOffering {
   // M2 (#85) PR-review feedback: reverse relation on the
   // ServiceOfferingCreation evidence table.
   creations            ServiceOfferingCreation[]
+  // M2 (#86): reverse relation on the ServiceOfferingPause evidence
+  // table. ON DELETE RESTRICT on the FK preserves the durable pause
+  // evidence row.
+  pauses               ServiceOfferingPause[]
+  // M2 (#86): reverse relation on the ServiceOfferingUpdate evidence
+  // table. ON DELETE RESTRICT on the FK preserves the durable update
+  // evidence row.
+  updates              ServiceOfferingUpdate[]
   // BG4 references: a ServiceOffering can be selected by many
   // ProjectRequests over time and become the basis for many Deals.
   // RESTRICT on delete prevents an offering from being removed
@@ -645,6 +689,89 @@ model ServiceOfferingCreation {
   @@unique([workspaceId, idempotencyKey], map: "service_offering_creations_workspace_idem_unique_idx")
   @@index([offeringId], map: "service_offering_creations_offering_idx")
   @@map("service_offering_creations")
+}
+
+// M2 (#86): narrow append-only ServiceOfferingPause evidence.
+//
+// Pause authorization is INDEPENDENT of activation completeness — a
+// grandfathered nonconforming Active offering must remain pausable
+// without satisfying the activation contract. Pause therefore records
+// only the facts established by the Pause command and does NOT carry an
+// activation `confirmationVersion` column. Fabricating such a column
+// would invent an attestation that the Pause command did not invoke.
+//
+// Each successful Pause (explicit user-initiated or the atomic
+// Active → Paused transition triggered by final-sample removal) creates
+// ONE row; same-attempt retry transport duplicates are rejected by the
+// (offeringId, idempotencyKey) unique constraint. ON DELETE RESTRICT
+// on every FK preserves the durable evidence row even if the source
+// UserAccount, Workspace, or SellerProfile is hard-deleted.
+model ServiceOfferingPause {
+  id              String                     @id @default(cuid())
+  offeringId      String
+  workspaceId     String
+  sellerProfileId String
+  pausedByUserId  String
+  pausedAt        DateTime                   @default(now())
+  // Closed enum recording WHY the offering was paused. No other
+  // values are accepted; fabrication of alternative reasons is
+  // prohibited by the schema.
+  reason          ServiceOfferingPauseReason
+  // Client-supplied UUID generated when a new Pause attempt begins.
+  // Retained across uncertain transport outcomes and explicit Retry
+  // actions; cleared only on definitive success or user-initiated
+  // payload change.
+  idempotencyKey  String
+  requestId       String
+
+  offering      ServiceOffering @relation(fields: [offeringId], references: [id], onDelete: Restrict)
+  workspace     Workspace      @relation(fields: [workspaceId], references: [id], onDelete: Restrict)
+  sellerProfile SellerProfile  @relation(fields: [sellerProfileId], references: [id], onDelete: Restrict)
+  pausedBy      UserAccount    @relation("ServiceOfferingPausePausedBy", fields: [pausedByUserId], references: [id], onDelete: Restrict)
+
+  @@unique([offeringId, idempotencyKey], map: "service_offering_pauses_offering_idem_unique_idx")
+  @@index([offeringId, pausedAt(sort: Desc)], map: "service_offering_pauses_offering_pausedAt_idx")
+  @@index([workspaceId], map: "service_offering_pauses_workspace_idx")
+  @@map("service_offering_pauses")
+}
+
+// M2 (#86): narrow append-only ServiceOfferingUpdate evidence.
+//
+// Required for durable same-idempotency-key retry convergence on the
+// `updateActive` command. A successful Active → Active update does
+// NOT rewrite or create ServiceOfferingActivation evidence; the
+// activation timestamp from the original Draft → Active transition
+// is preserved verbatim per ADR 0008.
+//
+// `confirmationVersion` carries the same closed enum value as
+// activation ("m2-service-activation-v1") because `updateActive`
+// re-runs the complete activation contract. Failure preserves the
+// prior public state; on success, the public fields are replaced
+// atomically and one new Update row is appended.
+//
+// Same-attempt retry transport duplicates are rejected by the
+// (offeringId, idempotencyKey) unique constraint. ON DELETE RESTRICT
+// on every FK preserves the durable evidence row.
+model ServiceOfferingUpdate {
+  id                  String   @id @default(cuid())
+  offeringId          String
+  workspaceId         String
+  sellerProfileId     String
+  updatedByUserId     String
+  confirmationVersion String
+  updatedAt           DateTime @default(now())
+  idempotencyKey      String
+  requestId           String
+
+  offering      ServiceOffering @relation(fields: [offeringId], references: [id], onDelete: Restrict)
+  workspace     Workspace      @relation(fields: [workspaceId], references: [id], onDelete: Restrict)
+  sellerProfile SellerProfile  @relation(fields: [sellerProfileId], references: [id], onDelete: Restrict)
+  updatedBy     UserAccount    @relation("ServiceOfferingUpdateUpdatedBy", fields: [updatedByUserId], references: [id], onDelete: Restrict)
+
+  @@unique([offeringId, idempotencyKey], map: "service_offering_updates_offering_idem_unique_idx")
+  @@index([offeringId, updatedAt(sort: Desc)], map: "service_offering_updates_offering_updatedAt_idx")
+  @@index([workspaceId], map: "service_offering_updates_workspace_idx")
+  @@map("service_offering_updates")
 }
 
 model IncludedService {
